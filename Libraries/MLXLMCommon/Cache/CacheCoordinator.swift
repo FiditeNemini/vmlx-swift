@@ -530,6 +530,10 @@ public final class CacheCoordinator: @unchecked Sendable {
                     diskArrays: arrays,
                     mediaSalt: mediaSalt)
                 if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
+                    touchSuccessfulDiskRestore(
+                        matchedTokens: prefix,
+                        matchedBoundary: boundary,
+                        mediaSalt: mediaSalt)
                     ftrace("HIT disk boundary=\(boundary) remaining=\(tokens.count - boundary) ssm=\(ssmStates?.count ?? -1) fmtV=\(TQDiskSerializer.formatVersion(of: arrays))")
                     return .hit(
                         matchedTokens: boundary,
@@ -665,6 +669,83 @@ public final class CacheCoordinator: @unchecked Sendable {
             return nil
         }
         return entry.isComplete ? entry.states : nil
+    }
+
+    /// Keep the exact hybrid KV + recurrent companion pair on one recency.
+    ///
+    /// The directly served boundary was already touched by `DiskCache.fetch`.
+    /// Hybrid caches need their linked recurrent companion touched with the
+    /// same timestamp before quota can observe the pair. Stable checkpoints are
+    /// deliberately excluded here because the runtime has not yet proved that
+    /// it retained the fetched arrays.
+    private func touchSuccessfulDiskRestore(
+        matchedTokens: [Int],
+        matchedBoundary: Int,
+        mediaSalt: String?
+    ) {
+        guard isHybrid, let diskCache else { return }
+        let recency = Date()
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+
+        _ = diskCache.touchRecency(
+            tokens: matchedTokens,
+            mediaSalt: mediaSalt,
+            at: recency)
+        _ = ssmStateCache.diskStore?.touchRecency(
+            tokens: matchedTokens,
+            boundary: matchedBoundary,
+            mediaSalt: mediaSalt,
+            at: recency)
+    }
+
+    /// Refresh only processor-proven stable checkpoints after a caller has
+    /// retained a disk restore. Calling this before architecture-specific
+    /// restore validation can keep an entry hot even when the runtime rolls
+    /// back to full prefill, so every production caller invokes it only from
+    /// its retained `diskArrays` branch.
+    ///
+    /// Path-dependent hybrid caches persist the stable checkpoint one token
+    /// short, matching the safe-seed rule used by fetch/store. Every touch is
+    /// content-addressed with the active model/media namespace and updates only
+    /// an existing entry; no missing or incompatible checkpoint is invented.
+    func touchStableDiskCheckpointsAfterRetainedRestore(
+        requestTokens: [Int],
+        matchedTokenCount: Int,
+        preferredDiskBoundaries: [Int],
+        skipExactDiskBoundary: Bool,
+        mediaSalt: String?
+    ) {
+        guard let diskCache,
+              matchedTokenCount > 0,
+              matchedTokenCount <= requestTokens.count
+        else { return }
+        let recency = Date()
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+
+        let stableBoundaries = Set(preferredDiskBoundaries.compactMap { boundary in
+            let storedBoundary = skipExactDiskBoundary ? boundary - 1 : boundary
+            return storedBoundary > 0 && storedBoundary <= matchedTokenCount
+                ? storedBoundary
+                : nil
+        })
+        for boundary in stableBoundaries {
+            let tokens = boundary == requestTokens.count
+                ? requestTokens
+                : Array(requestTokens.prefix(boundary))
+            let touchedKV = diskCache.touchRecency(
+                tokens: tokens,
+                mediaSalt: mediaSalt,
+                at: recency)
+            if touchedKV, isHybrid {
+                _ = ssmStateCache.diskStore?.touchRecency(
+                    tokens: tokens,
+                    boundary: boundary,
+                    mediaSalt: mediaSalt,
+                    at: recency)
+            }
+        }
     }
 
     // MARK: - Store
