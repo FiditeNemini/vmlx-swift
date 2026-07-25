@@ -17,6 +17,7 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         var text = content
+        let isExplicitTaggedAttempt = startTag.map { content.contains($0) } ?? false
 
         // Strip tags if present
         if let start = startTag, let startRange = text.range(of: start) {
@@ -44,38 +45,34 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
             return jsonToolCall
         }
 
-        let funcName: String
-        let argsString: String
-
-        // Required brackets pattern (matches Python reference: r"\[(\w+)\((.*?)\)\]")
-        // The required \] forces .*? to backtrack past nested ) inside argument values.
-        let bracketPattern = #"\[(\w+)\((.*?)\)\]"#
-        if let regex = try? NSRegularExpression(
-            pattern: bracketPattern, options: [.dotMatchesLineSeparators]),
-            let match = regex.firstMatch(
-                in: text, options: [], range: NSRange(text.startIndex..., in: text)),
-            let nameRange = Range(match.range(at: 1), in: text),
-            let argsRange = Range(match.range(at: 2), in: text)
-        {
-            funcName = String(text[nameRange])
-            argsString = String(text[argsRange])
-        } else {
-            // Fallback for without-brackets case: use string indices to find the
-            // outermost parentheses, avoiding the greedy/non-greedy regex pitfall.
-            guard let openParen = text.firstIndex(of: "("),
-                let closeParen = text.lastIndex(of: ")")
-            else { return nil }
-
-            let name = text[text.startIndex ..< openParen]
-            guard !name.isEmpty, name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" })
-            else { return nil }
-
-            funcName = String(name)
-            argsString = String(text[text.index(after: openParen) ..< closeParen])
+        guard let invocation = balancedFunctionInvocations(in: text).first else {
+            return nil
         }
-
-        let arguments = parseArguments(argsString, funcName: funcName, tools: tools)
+        let funcName = invocation.name
+        let arguments: [String: any Sendable]
+        switch parseArgumentsResult(
+            invocation.arguments,
+            funcName: funcName,
+            tools: tools)
+        {
+        case .success(let parsed):
+            arguments = parsed
+        case .failure(let failure):
+            guard isExplicitTaggedAttempt, toolNames(tools: tools).contains(funcName) else {
+                return nil
+            }
+            return invalidToolCall(name: funcName, failure: failure)
+        }
         guard acceptsToolCall(name: funcName, arguments: arguments, tools: tools) else {
+            if isExplicitTaggedAttempt,
+                toolNames(tools: tools).contains(funcName),
+                let failure = schemaFailure(
+                    name: funcName,
+                    arguments: arguments,
+                    tools: tools)
+            {
+                return invalidToolCall(name: funcName, failure: failure)
+            }
             return nil
         }
         return ToolCall(function: .init(name: funcName, arguments: arguments))
@@ -84,20 +81,29 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
     /// At end-of-sequence, extract every pythonic call in the buffer —
     /// Pythonic models legitimately emit multiple `name(args)` invocations
     /// inside one `[...]` block, and the default protocol `parseEOS` only
-    /// surfaces the first. Byte-compatible with upstream
-    /// ml-explore/mlx-swift-lm so `LFM2` streams behave identically.
+    /// surfaces the first. Parsing is balanced rather than regular-expression
+    /// based so parentheses inside nested values or quoted strings cannot
+    /// truncate a call or consume a following call.
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         if let startTag {
             let calls =
                 toolCallBuffer
                 .components(separatedBy: startTag)
                 .filter { !$0.isEmpty }
-                .flatMap { parseMultiple(content: $0, tools: tools) }
+                .flatMap {
+                    parseMultiple(
+                        content: $0,
+                        tools: tools,
+                        quarantineMalformedRegisteredAttempts: true)
+                }
             if !calls.isEmpty {
                 return calls
             }
         } else {
-            let calls = parseMultiple(content: toolCallBuffer, tools: tools)
+            let calls = parseMultiple(
+                content: toolCallBuffer,
+                tools: tools,
+                quarantineMalformedRegisteredAttempts: false)
             if !calls.isEmpty {
                 return calls
             }
@@ -109,8 +115,13 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         return []
     }
 
-    private func parseMultiple(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+    private func parseMultiple(
+        content: String,
+        tools: [[String: any Sendable]]?,
+        quarantineMalformedRegisteredAttempts: Bool
+    ) -> [ToolCall] {
         var text = content
+        let hasExplicitEndTag = endTag.map { text.contains($0) } ?? false
 
         if let end = endTag, let endRange = text.range(of: end) {
             text = String(text[..<endRange.lowerBound])
@@ -118,87 +129,580 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
 
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Match every `name(args)` — NSRegularExpression (not Swift regex
-        // literal) keeps us compatible with older Swift toolchains that
-        // don't parse `#/(?s)(\w+)\((.*?)\)/#` at compile time. The `(?s)`
-        // dotall flag is expressed via `.dotMatchesLineSeparators`.
-        let pattern = #"(\w+)\(([^)]*(?:\)[^)]*)*?)\)"#
-        guard let regex = try? NSRegularExpression(
-            pattern: pattern, options: [.dotMatchesLineSeparators])
-        else { return [] }
-        let matches = regex.matches(
-            in: text, options: [], range: NSRange(text.startIndex..., in: text))
+        // LFM can explicitly terminate its native tool envelope while
+        // omitting only the outer list closer:
+        //
+        //   <|tool_call_start|>[registered_tool(name='x')<|tool_call_end|>
+        //
+        // The function invocation itself is balanced, but executing it would
+        // silently repair model output. Dropping the entire tagged attempt is
+        // also wrong: the agent sees neither a tool result nor a correction
+        // opportunity and may falsely claim success. Quarantine this exact,
+        // observed protocol failure as structured invalid arguments only when
+        // the model emitted BOTH native tags and the completed inner
+        // invocation names a registered tool. Untagged prose, unknown tools,
+        // a missing native end tag, and an unbalanced inner invocation remain
+        // non-executable.
+        if quarantineMalformedRegisteredAttempts,
+            hasExplicitEndTag,
+            text.hasPrefix("["),
+            !text.hasSuffix("]")
+        {
+            let body = String(text.dropFirst())
+            if let invocation = balancedFunctionInvocations(in: body).first,
+                toolNames(tools: tools).contains(invocation.name)
+            {
+                return [
+                    invalidToolCall(
+                        name: invocation.name,
+                        failure: ArgumentFailure(
+                            message: "malformed native tool envelope: missing closing ]",
+                            field: "envelope",
+                            expected: "[name(...)]"
+                        )
+                    )
+                ]
+            }
+            return []
+        }
 
         var results: [ToolCall] = []
-        for match in matches {
-            guard let nameRange = Range(match.range(at: 1), in: text),
-                let argsRange = Range(match.range(at: 2), in: text)
-            else { continue }
-            let funcName = String(text[nameRange])
-            let argsString = String(text[argsRange])
-            let arguments = parseArguments(argsString, funcName: funcName, tools: tools)
-            guard acceptsToolCall(name: funcName, arguments: arguments, tools: tools) else {
+        for invocation in balancedFunctionInvocations(in: text) {
+            let registered = toolNames(tools: tools).contains(invocation.name)
+            let arguments: [String: any Sendable]
+            switch parseArgumentsResult(
+                invocation.arguments,
+                funcName: invocation.name,
+                tools: tools)
+            {
+            case .success(let parsed):
+                arguments = parsed
+            case .failure(let failure):
+                if quarantineMalformedRegisteredAttempts, registered {
+                    results.append(invalidToolCall(name: invocation.name, failure: failure))
+                }
                 continue
             }
-            results.append(ToolCall(function: .init(name: funcName, arguments: arguments)))
+
+            guard
+                acceptsToolCall(
+                    name: invocation.name,
+                    arguments: arguments,
+                    tools: tools)
+            else {
+                if quarantineMalformedRegisteredAttempts,
+                    registered,
+                    let failure = schemaFailure(
+                        name: invocation.name,
+                        arguments: arguments,
+                        tools: tools)
+                {
+                    results.append(invalidToolCall(name: invocation.name, failure: failure))
+                }
+                continue
+            }
+            results.append(
+                ToolCall(function: .init(name: invocation.name, arguments: arguments)))
         }
         return results
     }
 
-    /// Parse Pythonic keyword arguments: arg1='value1', arg2="value2", arg3=123
-    private func parseArguments(
+    private struct FunctionInvocation {
+        let name: String
+        let arguments: String
+    }
+
+    /// Find `name(...)` invocations while respecting nested parentheses and
+    /// quoted strings. A truncated invocation is never returned. When the
+    /// native bracket-list wrapper is present, it must also be complete.
+    private func balancedFunctionInvocations(in input: String) -> [FunctionInvocation] {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let text: String
+        if trimmed.hasPrefix("[") {
+            guard trimmed.hasSuffix("]") else { return [] }
+            text = String(trimmed.dropFirst().dropLast())
+        } else {
+            text = trimmed
+        }
+
+        var invocations: [FunctionInvocation] = []
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            guard text[cursor].isLetter || text[cursor] == "_" else {
+                cursor = text.index(after: cursor)
+                continue
+            }
+
+            let nameStart = cursor
+            cursor = text.index(after: cursor)
+            while cursor < text.endIndex,
+                text[cursor].isLetter || text[cursor].isNumber || text[cursor] == "_"
+            {
+                cursor = text.index(after: cursor)
+            }
+            let nameEnd = cursor
+            while cursor < text.endIndex,
+                text[cursor].unicodeScalars.allSatisfy({
+                    CharacterSet.whitespacesAndNewlines.contains($0)
+                })
+            {
+                cursor = text.index(after: cursor)
+            }
+            guard cursor < text.endIndex, text[cursor] == "(" else {
+                continue
+            }
+
+            let openParen = cursor
+            let argumentsStart = text.index(after: openParen)
+            cursor = argumentsStart
+            var depth = 1
+            var quote: Character?
+            var escaped = false
+            var closeParen: String.Index?
+
+            while cursor < text.endIndex {
+                let character = text[cursor]
+                if let activeQuote = quote {
+                    if escaped {
+                        escaped = false
+                    } else if character == "\\" {
+                        escaped = true
+                    } else if character == activeQuote {
+                        quote = nil
+                    }
+                } else {
+                    switch character {
+                    case "'", "\"":
+                        quote = character
+                    case "(":
+                        depth += 1
+                    case ")":
+                        depth -= 1
+                        if depth == 0 {
+                            closeParen = cursor
+                        }
+                    default:
+                        break
+                    }
+                }
+
+                cursor = text.index(after: cursor)
+                if closeParen != nil { break }
+            }
+
+            guard let closeParen, quote == nil, !escaped else {
+                return invocations
+            }
+            invocations.append(
+                FunctionInvocation(
+                    name: String(text[nameStart ..< nameEnd]),
+                    arguments: String(text[argumentsStart ..< closeParen])))
+        }
+        return invocations
+    }
+
+    /// Parse one Pythonic keyword-argument list.
+    ///
+    /// This is internal so parser families that explicitly recover the same
+    /// native syntax can share one balanced implementation. It intentionally
+    /// accepts only keyword arguments or the existing single-string
+    /// positional form; malformed mixed fields are rejected as a whole.
+    func parseArguments(
         _ argsString: String,
         funcName: String,
         tools: [[String: any Sendable]]?
-    ) -> [String: any Sendable] {
-        var arguments: [String: any Sendable] = [:]
+    ) -> [String: any Sendable]? {
+        guard case .success(let arguments) = parseArgumentsResult(
+            argsString,
+            funcName: funcName,
+            tools: tools)
+        else {
+            return nil
+        }
+        return arguments
+    }
 
-        // Pattern for key=value pairs, handling quoted strings with possible commas inside
-        // This handles: key='value', key="value", key=123, key=True, key=None
-        let argPattern = #"(\w+)\s*=\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^,\)]+)"#
+    private struct ArgumentFailure {
+        let message: String
+        let field: String
+        let expected: String
+    }
 
-        guard let regex = try? NSRegularExpression(pattern: argPattern, options: []) else {
-            return arguments
+    private enum ArgumentParseResult {
+        case success([String: any Sendable])
+        case failure(ArgumentFailure)
+    }
+
+    private func parseArgumentsResult(
+        _ argsString: String,
+        funcName: String,
+        tools: [[String: any Sendable]]?
+    ) -> ArgumentParseResult {
+        guard let fields = splitTopLevelArguments(argsString) else {
+            return .failure(
+                ArgumentFailure(
+                    message: "malformed or unbalanced argument list",
+                    field: "arguments",
+                    expected: "balanced name=value arguments"))
         }
 
-        let matches = regex.matches(
-            in: argsString, options: [], range: NSRange(argsString.startIndex..., in: argsString))
+        if fields.count == 1,
+            splitKeywordArgument(fields[0]) == nil,
+            let positionalString = parseSinglePositionalString(argsString),
+            let firstRequiredParameter = requiredParameterNames(funcName: funcName, tools: tools)
+                .first
+        {
+            return .success([
+                firstRequiredParameter: convertParameterValue(
+                    positionalString, paramName: firstRequiredParameter, funcName: funcName,
+                    tools: tools)
+            ])
+        }
 
-        for match in matches {
-            guard let keyRange = Range(match.range(at: 1), in: argsString),
-                let valueRange = Range(match.range(at: 2), in: argsString)
-            else { continue }
+        var arguments: [String: any Sendable] = [:]
+        for field in fields {
+            guard let (key, rawValue) = splitKeywordArgument(field) else {
+                return .failure(
+                    ArgumentFailure(
+                        message: "malformed argument: expected name=value",
+                        field: "arguments",
+                        expected: "keyword arguments"))
+            }
+            guard arguments[key] == nil else {
+                // Do not silently choose the first or last value. The two
+                // values can differ, and executing either would invent model
+                // intent. Explicit native envelopes surface this as a
+                // retryable parser error at the tool boundary.
+                return .failure(
+                    ArgumentFailure(
+                        message: "duplicate argument: \(key)",
+                        field: key,
+                        expected: "one value per declared parameter"))
+            }
+            arguments[key] = decodeArgumentValue(
+                rawValue,
+                paramName: key,
+                funcName: funcName,
+                tools: tools)
+        }
+        return .success(arguments)
+    }
 
-            let key = String(argsString[keyRange])
-            var value = String(argsString[valueRange]).trimmingCharacters(in: .whitespaces)
+    private func schemaFailure(
+        name: String,
+        arguments: [String: any Sendable],
+        tools: [[String: any Sendable]]?
+    ) -> ArgumentFailure? {
+        let spec = toolSpec(named: name, tools: tools)
+        if let missing = spec.required?.first(where: { arguments[$0] == nil }) {
+            return ArgumentFailure(
+                message: "missing required argument: \(missing)",
+                field: missing,
+                expected: "required parameter")
+        }
+        if let properties = spec.properties,
+            let unknown = arguments.keys.sorted().first(where: { !properties.contains($0) })
+        {
+            return ArgumentFailure(
+                message: "unknown argument: \(unknown)",
+                field: unknown,
+                expected: "declared parameter")
+        }
+        return nil
+    }
 
-            // Remove surrounding quotes if present
-            if (value.hasPrefix("'") && value.hasSuffix("'"))
-                || (value.hasPrefix("\"") && value.hasSuffix("\""))
-            {
-                value = String(value.dropFirst().dropLast())
-                // Unescape escaped quotes
-                value = value.replacingOccurrences(of: "\\'", with: "'")
-                value = value.replacingOccurrences(of: "\\\"", with: "\"")
-                value = value.replacingOccurrences(of: "\\n", with: "\n")
-                value = value.replacingOccurrences(of: "\\t", with: "\t")
-                value = value.replacingOccurrences(of: "\\\\", with: "\\")
+    private func invalidToolCall(name: String, failure: ArgumentFailure) -> ToolCall {
+        ToolCall(
+            function: .init(
+                name: name,
+                arguments: [
+                    "_error": "invalid_tool_arguments",
+                    "_tool": name,
+                    "_message": failure.message,
+                    "_field": failure.field,
+                    "_expected": failure.expected,
+                ]))
+    }
+
+    /// Split at commas only when outside strings and balanced containers.
+    /// The previous regular expression stopped at the first comma inside a
+    /// list or dictionary, corrupting nested `rows=[{...}]` arguments.
+    private func splitTopLevelArguments(_ input: String) -> [String]? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        var fields: [String] = []
+        var start = input.startIndex
+        var index = input.startIndex
+        var quote: Character?
+        var escaped = false
+        var roundDepth = 0
+        var squareDepth = 0
+        var curlyDepth = 0
+
+        while index < input.endIndex {
+            let character = input[index]
+            if let activeQuote = quote {
+                if escaped {
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == activeQuote {
+                    quote = nil
+                }
+            } else {
+                switch character {
+                case "'", "\"":
+                    quote = character
+                case "(":
+                    roundDepth += 1
+                case ")":
+                    roundDepth -= 1
+                case "[":
+                    squareDepth += 1
+                case "]":
+                    squareDepth -= 1
+                case "{":
+                    curlyDepth += 1
+                case "}":
+                    curlyDepth -= 1
+                case "," where roundDepth == 0 && squareDepth == 0 && curlyDepth == 0:
+                    fields.append(String(input[start ..< index]))
+                    start = input.index(after: index)
+                default:
+                    break
+                }
+
+                guard roundDepth >= 0, squareDepth >= 0, curlyDepth >= 0 else {
+                    return nil
+                }
+            }
+            index = input.index(after: index)
+        }
+
+        guard quote == nil,
+            !escaped,
+            roundDepth == 0,
+            squareDepth == 0,
+            curlyDepth == 0
+        else {
+            return nil
+        }
+        fields.append(String(input[start ..< input.endIndex]))
+        return fields
+    }
+
+    private func splitKeywordArgument(_ field: String) -> (String, String)? {
+        let trimmed = field.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        var index = trimmed.startIndex
+        var quote: Character?
+        var escaped = false
+        var roundDepth = 0
+        var squareDepth = 0
+        var curlyDepth = 0
+
+        while index < trimmed.endIndex {
+            let character = trimmed[index]
+            if let activeQuote = quote {
+                if escaped {
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == activeQuote {
+                    quote = nil
+                }
+            } else {
+                switch character {
+                case "'", "\"":
+                    quote = character
+                case "(":
+                    roundDepth += 1
+                case ")":
+                    roundDepth -= 1
+                case "[":
+                    squareDepth += 1
+                case "]":
+                    squareDepth -= 1
+                case "{":
+                    curlyDepth += 1
+                case "}":
+                    curlyDepth -= 1
+                case "=" where roundDepth == 0 && squareDepth == 0 && curlyDepth == 0:
+                    let key = trimmed[..<index]
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard let first = key.first,
+                        first.isLetter || first == "_",
+                        key.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" })
+                    else {
+                        return nil
+                    }
+                    let valueStart = trimmed.index(after: index)
+                    let value = trimmed[valueStart...]
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !value.isEmpty else { return nil }
+                    return (key, value)
+                default:
+                    break
+                }
+            }
+            index = trimmed.index(after: index)
+        }
+        return nil
+    }
+
+    private func decodeArgumentValue(
+        _ rawValue: String,
+        paramName: String,
+        funcName: String,
+        tools: [[String: any Sendable]]?
+    ) -> any Sendable {
+        var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if (value.hasPrefix("'") && value.hasSuffix("'"))
+            || (value.hasPrefix("\"") && value.hasSuffix("\""))
+        {
+            value = String(value.dropFirst().dropLast())
+            value = value.replacingOccurrences(of: "\\'", with: "'")
+            value = value.replacingOccurrences(of: "\\\"", with: "\"")
+            value = value.replacingOccurrences(of: "\\n", with: "\n")
+            value = value.replacingOccurrences(of: "\\r", with: "\r")
+            value = value.replacingOccurrences(of: "\\t", with: "\t")
+            value = value.replacingOccurrences(of: "\\\\", with: "\\")
+            return convertParameterValue(
+                value, paramName: paramName, funcName: funcName, tools: tools)
+        }
+
+        let schemaType = getParameterType(
+            funcName: funcName, paramName: paramName, tools: tools
+        )?.lowercased()
+        if schemaType != "string",
+            schemaType == nil
+                || schemaType == "array"
+                || schemaType == "object"
+                || schemaType?.hasPrefix("list") == true
+                || schemaType?.hasPrefix("dict") == true,
+            let container = parsePythonContainerLiteral(value)
+        {
+            return container
+        }
+
+        if schemaType != "string" {
+            switch value {
+            case "True": return true
+            case "False": return false
+            case "None": return NSNull()
+            default: break
+            }
+        }
+        return convertParameterValue(
+            value, paramName: paramName, funcName: funcName, tools: tools)
+    }
+
+    private func parsePythonContainerLiteral(_ value: String) -> (any Sendable)? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            (trimmed.first == "[" && trimmed.last == "]")
+                || (trimmed.first == "{" && trimmed.last == "}")
+        else {
+            return nil
+        }
+        guard let normalized = normalizePythonLiteralAsJSON(trimmed),
+            let data = normalized.data(using: .utf8)
+        else {
+            return nil
+        }
+        return deserializeJSON(data)
+    }
+
+    /// Convert only the literal subset emitted by native Python-style tool
+    /// templates: quoted strings, JSON containers, numbers, and the exact
+    /// `True`/`False`/`None` scalars. This is not source evaluation.
+    private func normalizePythonLiteralAsJSON(_ value: String) -> String? {
+        let characters = Array(value)
+        var output = ""
+        var index = 0
+        var quote: Character?
+        var escaped = false
+
+        while index < characters.count {
+            let character = characters[index]
+            if let activeQuote = quote {
+                if escaped {
+                    switch character {
+                    case "'" where activeQuote == "'":
+                        output.append("'")
+                    case "'" where activeQuote == "\"":
+                        output.append("'")
+                    case "\"":
+                        output.append("\\\"")
+                    case "\\", "/", "b", "f", "n", "r", "t", "u":
+                        output.append("\\")
+                        output.append(character)
+                    default:
+                        return nil
+                    }
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == activeQuote {
+                    output.append("\"")
+                    quote = nil
+                } else if character == "\n" {
+                    output.append("\\n")
+                } else if character == "\r" {
+                    output.append("\\r")
+                } else if character == "\t" {
+                    output.append("\\t")
+                } else if character == "\"" {
+                    output.append("\\\"")
+                } else {
+                    output.append(character)
+                }
+                index += 1
+                continue
             }
 
-            // Convert value based on schema type if available
-            arguments[key] = convertParameterValue(
-                value, paramName: key, funcName: funcName, tools: tools)
+            if character == "'" || character == "\"" {
+                quote = character
+                output.append("\"")
+                index += 1
+                continue
+            }
+
+            if character.isLetter || character == "_" {
+                let start = index
+                index += 1
+                while index < characters.count,
+                    characters[index].isLetter
+                        || characters[index].isNumber
+                        || characters[index] == "_"
+                {
+                    index += 1
+                }
+                let token = String(characters[start ..< index])
+                switch token {
+                case "True": output.append("true")
+                case "False": output.append("false")
+                case "None": output.append("null")
+                case "true", "false", "null": output.append(token)
+                default:
+                    // Bare identifiers and executable expressions are outside
+                    // the literal grammar and must not be guessed.
+                    return nil
+                }
+                continue
+            }
+
+            output.append(character)
+            index += 1
         }
 
-        if arguments.isEmpty,
-            let positionalString = parseSinglePositionalString(argsString),
-            let firstRequiredParameter = requiredParameterNames(funcName: funcName, tools: tools).first
-        {
-            arguments[firstRequiredParameter] = convertParameterValue(
-                positionalString, paramName: firstRequiredParameter, funcName: funcName, tools: tools)
-        }
-
-        return arguments
+        guard quote == nil, !escaped else { return nil }
+        return output
     }
 
     private func parseSinglePositionalString(_ argsString: String) -> String? {
@@ -206,7 +710,7 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         guard trimmed.count >= 2 else { return nil }
 
         let quote = trimmed.first
-        guard (quote == "'" || quote == "\""), trimmed.last == quote else { return nil }
+        guard quote == "'" || quote == "\"", trimmed.last == quote else { return nil }
 
         var value = String(trimmed.dropFirst().dropLast())
         value = value.replacingOccurrences(of: "\\'", with: "'")
