@@ -300,21 +300,26 @@ public final class NanbeigeModel: Module, LLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     public init(_ configuration: NanbeigeConfiguration) {
+        let vocabularySize = configuration.vocabularySize
+        let hiddenSize = configuration.hiddenSize
+        let cacheSlots = configuration.cacheSlots
+        let runtimeCacheSlots = configuration.runtime?.cacheSlots
+        let tiedWordEmbeddings = configuration.tieWordEmbeddings
+
         self.configuration = configuration
-        vocabularySize = configuration.vocabularySize
+        self.vocabularySize = vocabularySize
         kvHeads = Array(
             repeating: configuration.kvHeads,
-            count: configuration.cacheSlots)
+            count: cacheSlots)
         model = NanbeigeModelInner(configuration)
-        if !configuration.tieWordEmbeddings {
+        if !tiedWordEmbeddings {
             _lmHead.wrappedValue = Linear(
-                configuration.hiddenSize,
-                configuration.vocabularySize,
+                hiddenSize,
+                vocabularySize,
                 bias: false)
         }
         precondition(
-            configuration.runtime?.cacheSlots == nil
-                || configuration.runtime?.cacheSlots == kvHeads.count,
+            runtimeCacheSlots == nil || runtimeCacheSlots == kvHeads.count,
             "nanbeige: bundle cache_slots does not match runtime cache topology")
     }
 
