@@ -103,6 +103,7 @@ public enum LLMTypeRegistry {
             "mimo": create(MiMoConfiguration.self, MiMoModel.init),
             "mimo_v2": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
             "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
+            "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
             "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
             "minimax_m2": { data in
                 // Peek at weight_format — "mxtq" routes to the JANGTQ variant,
