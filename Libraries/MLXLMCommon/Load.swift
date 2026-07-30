@@ -638,18 +638,10 @@ public func loadWeights(
             let biasKey = "\(matchedBase).bias"
             let tup: (groupSize: Int, bits: Int, mode: QuantizationMode)?
             if let effectivePerLayerQuantization {
-                let explicit = baseCandidates.lazy.compactMap { candidate -> BaseConfiguration.Quantization? in
-                    guard let option = effectivePerLayerQuantization.perLayerQuantization[candidate] else {
-                        return nil
-                    }
-                    switch option {
-                    case .skip:
-                        return nil
-                    case .quantize(let quantization):
-                        return quantization
-                    }
-                }.first
-                tup = (explicit ?? effectivePerLayerQuantization.quantization)?.asTuple
+                // Module paths omit the checkpoint's leading `model.` prefix.
+                // Resolve through the canonical per-layer API so the module's
+                // own bits and group size reach the quantization predicate.
+                tup = effectivePerLayerQuantization.quantization(layer: path)?.asTuple
             } else {
                 tup = quantization?.asTuple
             }

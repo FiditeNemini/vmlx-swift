@@ -83,9 +83,25 @@ public struct BaseConfiguration: Codable, Sendable {
             self.perLayerQuantization = perLayerQuantization
         }
 
+        /// Return an explicit layer override without falling back to the
+        /// top-level quantization default.
+        ///
+        /// Checkpoint metadata conventionally prefixes text-model paths with
+        /// `model.`, while Swift module trees expose the same paths without
+        /// that wrapper. Keep the stored metadata unchanged for round trips,
+        /// but normalize both spellings at the lookup boundary.
+        func explicitQuantizationOption(layer: String) -> QuantizationOption? {
+            for candidate in Self.layerPathCandidates(layer) {
+                if let option = perLayerQuantization[candidate] {
+                    return option
+                }
+            }
+            return nil
+        }
+
         /// The quantization to apply for the given layer name or nil for no quantization.
         public func quantization(layer: String) -> Quantization? {
-            if let perLayer = perLayerQuantization[layer] {
+            if let perLayer = explicitQuantizationOption(layer: layer) {
                 switch perLayer {
                 case .skip:
                     return nil
@@ -95,6 +111,50 @@ public struct BaseConfiguration: Codable, Sendable {
             } else {
                 return quantization
             }
+        }
+
+        private static func layerPathCandidates(_ layer: String) -> [String] {
+            var seen = Set<String>()
+            var candidates = [String]()
+
+            func add(_ value: String) {
+                guard seen.insert(value).inserted else { return }
+                candidates.append(value)
+            }
+
+            func addWithAttentionAlias(_ value: String) {
+                add(value)
+                if value.contains(".attn.") {
+                    add(value.replacingOccurrences(of: ".attn.", with: ".self_attn."))
+                } else if value.hasSuffix(".attn") {
+                    add(String(value.dropLast(".attn".count)) + ".self_attn")
+                }
+            }
+
+            addWithAttentionAlias(layer)
+            if layer.hasPrefix("language_model.model.") {
+                let modelPath = String(layer.dropFirst("language_model.".count))
+                addWithAttentionAlias(modelPath)
+                addWithAttentionAlias(String(modelPath.dropFirst("model.".count)))
+            } else if layer.hasPrefix("language_model.") {
+                let innerPath = String(layer.dropFirst("language_model.".count))
+                addWithAttentionAlias(innerPath)
+                if innerPath.hasPrefix("model.") {
+                    addWithAttentionAlias(String(innerPath.dropFirst("model.".count)))
+                } else {
+                    addWithAttentionAlias("model.\(innerPath)")
+                }
+            } else if layer.hasPrefix("model.") {
+                let barePath = String(layer.dropFirst("model.".count))
+                addWithAttentionAlias(barePath)
+                addWithAttentionAlias("language_model.\(layer)")
+                addWithAttentionAlias("language_model.\(barePath)")
+            } else {
+                addWithAttentionAlias("model.\(layer)")
+                addWithAttentionAlias("language_model.\(layer)")
+                addWithAttentionAlias("language_model.model.\(layer)")
+            }
+            return candidates
         }
     }
 
