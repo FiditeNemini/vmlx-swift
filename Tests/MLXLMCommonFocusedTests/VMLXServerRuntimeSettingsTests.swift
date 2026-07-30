@@ -769,7 +769,7 @@ struct VMLXServerRuntimeSettingsTests {
             ("zaya", .zayaXml, "think_xml"),
             ("deepseek_v4_flash", .dsml, "think_xml"),
             ("gemma4", .gemma4, "harmony"),
-            ("hy3", .hunyuan, "think_xml"),
+            ("hy3", .hunyuan, "hy_v3"),
             ("nemotron_h", .nemotron, "think_xml"),
         ]
         let settings = VMLXServerRuntimeSettings()
