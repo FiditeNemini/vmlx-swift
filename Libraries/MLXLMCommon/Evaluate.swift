@@ -1845,6 +1845,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         guard let coordinator,
             coordinator.canPersistBoundaries,
             !skipBoundary,
+            input.cachePromptIntent != .reusablePrefixWarmup,
             promptTokenIds.count > 1,
             !input.hasMediaContent,
             !input.requiresPostPrepareCacheKey,
@@ -1906,6 +1907,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 audio: input.audio,
                 mediaTokenIds: input.mediaTokenIds,
                 cacheScopeSalt: input.cacheScopeSalt,
+                cachePromptIntent: input.cachePromptIntent,
                 toolSchemas: input.toolSchemas)
             : nil
         let tail = LMInput(
@@ -1914,6 +1916,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 mask: flatMask.map { slice($0[split...]) },
                 tokenIds: tailTokenIds),
             cacheScopeSalt: input.cacheScopeSalt,
+            cachePromptIntent: input.cachePromptIntent,
             toolSchemas: input.toolSchemas)
         return (head, tail)
     }
@@ -2238,6 +2241,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         // processor-proven boundary keep the existing storage policy.
         let usesCanonicalHybridBoundary =
             coordinator.isHybrid && hybridStripBoundary != nil
+        let isReusablePrefixWarmup =
+            originalInput.cachePromptIntent == .reusablePrefixWarmup
 
         func store(
             tokens: [Int],
@@ -2349,6 +2354,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
                 if !usesCanonicalHybridBoundary,
+                   !isReusablePrefixWarmup,
                    requiresDiskBackedRestore,
                    !skipDiskBackedToolPromptSeedBoundary,
                    promptTokenIds.count > 1
@@ -2472,6 +2478,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         guard !usesCanonicalHybridBoundary,
+            !isReusablePrefixWarmup,
             includeGeneratedBoundary, !generatedTokenIds.isEmpty
         else { return }
         guard !needsCacheQuantization else { return }

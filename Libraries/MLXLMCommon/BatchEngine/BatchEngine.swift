@@ -2742,6 +2742,8 @@ public actor BatchEngine {
             // existing prompt/post-answer policy.
             let usesCanonicalHybridBoundary =
                 coordinator.isHybrid && sharedPromptStripBoundary != nil
+            let isReusablePrefixWarmup =
+                slot.originalInput.cachePromptIntent == .reusablePrefixWarmup
 
             func storeCacheEntry(tokens: [Int], snapshot: [KVCache], label: String) {
                 guard !tokens.isEmpty else { return }
@@ -2929,6 +2931,7 @@ public actor BatchEngine {
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
                 if !usesCanonicalHybridBoundary,
+                   !isReusablePrefixWarmup,
                    requiresDiskBackedRestore,
                    !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
                    promptTokens.count > 1,
@@ -3061,6 +3064,7 @@ public actor BatchEngine {
             // it covers prompt + generated tokens exactly enough to resume.
             let generatedBoundaryTokens = promptTokens + slot.generatedTokenIds
             if !usesCanonicalHybridBoundary,
+               !isReusablePrefixWarmup,
                reason == .stop,
                !slot.disablesGeneratedCacheBoundary,
                !containsUnprovenZayaTurboQuantDiskState(slot.cache),

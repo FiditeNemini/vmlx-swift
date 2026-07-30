@@ -33,6 +33,20 @@ public struct THW: Sendable {
 /// The ``ModelContext`` holds the ``UserInputProcessor`` associated with a
 /// ``LanguageModel``.
 public struct LMInput {
+    /// How the prepared prompt participates in prefix-cache persistence.
+    ///
+    /// Ordinary generation requests may derive template-specific history
+    /// boundaries and may persist a post-generation boundary. A
+    /// ``reusablePrefixWarmup`` is different: its complete token stream has
+    /// already been proven by the caller to be an exact prefix of a future
+    /// request. The runtime must persist that prompt boundary verbatim, must
+    /// not strip another generation scaffold from it, and must not cache the
+    /// warmup's throwaway decoded tokens.
+    public enum CachePromptIntent: Sendable, Equatable {
+        case generation
+        case reusablePrefixWarmup
+    }
+
     public let text: Text
     public let image: ProcessedImage?
     public let video: ProcessedVideo?
@@ -78,6 +92,9 @@ public struct LMInput {
     /// deliberately persisted for reuse by unrelated new chat sessions and may
     /// require an architecture-native rederive when a cache cannot be trimmed.
     public let cacheStablePrefixTokenCounts: [Int]
+
+    /// Typed cache-persistence contract for this prepared prompt.
+    public let cachePromptIntent: CachePromptIntent
 
     /// Representation of tokenized input text.
     public struct Text {
@@ -187,6 +204,7 @@ public struct LMInput {
         cacheScopeSalt: String? = nil,
         cachePrefixTokenCounts: [Int] = [],
         cacheStablePrefixTokenCounts: [Int] = [],
+        cachePromptIntent: CachePromptIntent = .generation,
         toolSchemas: [ToolSpec]? = nil
     ) {
         self.init(
@@ -194,6 +212,7 @@ public struct LMInput {
             cacheScopeSalt: cacheScopeSalt,
             cachePrefixTokenCounts: cachePrefixTokenCounts,
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
+            cachePromptIntent: cachePromptIntent,
             toolSchemas: toolSchemas)
     }
 
@@ -205,6 +224,7 @@ public struct LMInput {
         cacheScopeSalt: String? = nil,
         cachePrefixTokenCounts: [Int] = [],
         cacheStablePrefixTokenCounts: [Int] = [],
+        cachePromptIntent: CachePromptIntent = .generation,
         toolSchemas: [ToolSpec]? = nil
     ) {
         self.text = text
@@ -215,6 +235,7 @@ public struct LMInput {
         self.cacheScopeSalt = cacheScopeSalt
         self.cachePrefixTokenCounts = cachePrefixTokenCounts
         self.cacheStablePrefixTokenCounts = cacheStablePrefixTokenCounts
+        self.cachePromptIntent = cachePromptIntent
         self.toolSchemas = toolSchemas
     }
 
@@ -228,6 +249,7 @@ public struct LMInput {
             cacheScopeSalt: cacheScopeSalt,
             cachePrefixTokenCounts: cachePrefixTokenCounts,
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
+            cachePromptIntent: cachePromptIntent,
             toolSchemas: schemas)
     }
 }
@@ -256,6 +278,7 @@ public extension LMInput {
         promptTokenIds: [Int],
         boundary: Int
     ) -> Bool {
+        guard cachePromptIntent != .reusablePrefixWarmup else { return false }
         guard hasMediaContent else { return true }
         guard !requiresPostPrepareCacheKey,
               boundary > 0,

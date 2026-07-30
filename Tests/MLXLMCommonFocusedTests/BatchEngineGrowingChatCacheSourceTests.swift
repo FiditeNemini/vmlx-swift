@@ -6,6 +6,50 @@ import Testing
 
 @Suite("BatchEngine growing-chat cache source coverage")
 struct BatchEngineGrowingChatCacheSourceTests {
+    @Test("reusable-prefix warmup intent survives input copies and forbids hybrid stripping")
+    func reusablePrefixWarmupIntentIsPreserved() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/LanguageModel.swift",
+            encoding: .utf8)
+
+        #expect(source.contains("public enum CachePromptIntent: Sendable, Equatable"))
+        #expect(source.contains("case reusablePrefixWarmup"))
+        #expect(source.contains("cachePromptIntent: CachePromptIntent = .generation"))
+        #expect(source.components(
+            separatedBy: "cachePromptIntent: cachePromptIntent").count - 1 == 2)
+        #expect(source.contains(
+            "guard cachePromptIntent != .reusablePrefixWarmup else { return false }"))
+    }
+
+    @Test("all generation paths persist the exact warmup prompt and reject throwaway boundaries")
+    func cacheWarmupPersistenceContractCoversAllGenerationPaths() throws {
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let batch = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let mtp = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            encoding: .utf8)
+
+        #expect(evaluate.contains(
+            "input.cachePromptIntent != .reusablePrefixWarmup"))
+        #expect(evaluate.contains(
+            "originalInput.cachePromptIntent == .reusablePrefixWarmup"))
+        #expect(batch.contains(
+            "slot.originalInput.cachePromptIntent == .reusablePrefixWarmup"))
+        #expect(mtp.contains(
+            "originalInput.cachePromptIntent == .reusablePrefixWarmup"))
+        #expect(mtp.contains("originalInput.canCaptureHybridStripBoundary("))
+
+        // Solo and batched paths each gate both their N-1/generated stores;
+        // native MTP has no N-1 writer and gates its generated store.
+        #expect(evaluate.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 2)
+        #expect(batch.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 2)
+        #expect(mtp.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 1)
+    }
+
     @Test("coordinator miss resets only populated caller-owned caches")
     func coordinatorMissResetRequiresPopulatedCache() {
         let empty = KVCacheSimple()
