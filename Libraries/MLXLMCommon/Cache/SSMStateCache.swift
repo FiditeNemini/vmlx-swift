@@ -127,7 +127,8 @@ public final class SSMStateCache: @unchecked Sendable {
         boundary: Int,
         mediaSalt: String? = nil,
         isComplete: Bool = true,
-        persistToDisk: Bool = true
+        persistToDisk: Bool = true,
+        enforceDiskQuota: Bool = true
     ) {
         let key = Self.makeKey(tokens: tokens, boundary: boundary, mediaSalt: mediaSalt, modelKey: modelKey)
 
@@ -190,7 +191,8 @@ public final class SSMStateCache: @unchecked Sendable {
                 tokens: tokens,
                 boundary: boundary,
                 mediaSalt: mediaSalt,
-                isComplete: isComplete)
+                isComplete: isComplete,
+                enforceQuota: enforceDiskQuota)
         }
     }
 

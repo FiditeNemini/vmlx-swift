@@ -176,6 +176,23 @@ public final class DiskCache: @unchecked Sendable {
     ///   - tokens: Token IDs used to compute the cache key hash.
     ///   - arrays: Dictionary of named MLX arrays to persist.
     public func store(tokens: [Int], arrays: [String: MLXArray], mediaSalt: String? = nil) {
+        store(
+            tokens: tokens,
+            arrays: arrays,
+            mediaSalt: mediaSalt,
+            enforceQuota: true)
+    }
+
+    /// Coordinator-only transactional store. The unified coordinator writes
+    /// KV and recurrent companion payloads under one combined quota lock, so
+    /// it defers this cache's standalone quota pass until the linked group is
+    /// complete. Direct callers retain the historical per-cache quota above.
+    func store(
+        tokens: [Int],
+        arrays: [String: MLXArray],
+        mediaSalt: String? = nil,
+        enforceQuota: Bool
+    ) {
         let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
         let url = safetensorsURL(for: hash)
         let tokenCount = tokens.count
@@ -274,7 +291,9 @@ public final class DiskCache: @unchecked Sendable {
             } else {
                 validatedFiles.removeValue(forKey: hash)
             }
-            _evictIfNeededLocked()
+            if enforceQuota {
+                _evictIfNeededLocked()
+            }
         } catch {
             // Best-effort: swallow so a write failure doesn't fail
             // the caller's request — the model output is already

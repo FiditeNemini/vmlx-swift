@@ -771,6 +771,105 @@ import Testing
     }
 }
 
+@Test func combinedQuotaRejectsOversizedNewestBoundaryButPreservesPriorFittingPrefix() async throws {
+    try await MLXMetalTestLock.withLock {
+        let sizingRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-linked-quota-sizing-\(UUID().uuidString)")
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-linked-quota-fitting-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: sizingRoot)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let modelKey = "linked-quota-fitting-model"
+        let oldTokens = [1, 2, 3, 4]
+        let newTokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        let oldKV = ["data": MLXArray.ones([16_384])]
+        let newKV = ["data": MLXArray.ones([65_536])]
+        let oldSSM = [MLXArray.ones([16_384])]
+        let newSSM = [MLXArray.ones([65_536])]
+
+        // Measure the exact safetensors + sidecar sizes first, then select a
+        // cap where the prior linked group fits, each half of the new group
+        // fits independently, but the new linked group does not. This is the
+        // geometry that previously let each standalone store evict the old
+        // prefix before combined quota also evicted the new one.
+        let sizingDisk = DiskCache(
+            cacheDir: sizingRoot, maxSizeGB: 1, modelKey: modelKey)
+        let sizingCompanion = try SSMCompanionDiskStore(
+            cacheDir: sizingRoot.appendingPathComponent("ssm_companion"),
+            modelKey: modelKey,
+            maxBytes: 1_073_741_824)
+        sizingDisk.store(tokens: oldTokens, arrays: oldKV)
+        try sizingCompanion.store(
+            ssmStates: oldSSM, tokens: oldTokens, boundary: oldTokens.count)
+        sizingDisk.store(tokens: newTokens, arrays: newKV)
+        try sizingCompanion.store(
+            ssmStates: newSSM, tokens: newTokens, boundary: newTokens.count)
+
+        let oldKVHash = DiskCache.hashTokens(oldTokens, modelKey: modelKey)
+        let newKVHash = DiskCache.hashTokens(newTokens, modelKey: modelKey)
+        let oldSSMHash = SSMCompanionDiskStore.keyFor(
+            tokens: oldTokens, boundary: oldTokens.count, modelKey: modelKey)
+        let newSSMHash = SSMCompanionDiskStore.keyFor(
+            tokens: newTokens, boundary: newTokens.count, modelKey: modelKey)
+        let oldKVBytes = try #require(
+            sizingDisk.quotaEntries().first { $0.hash == oldKVHash }).bytes
+        let newKVBytes = try #require(
+            sizingDisk.quotaEntries().first { $0.hash == newKVHash }).bytes
+        let oldSSMBytes = try #require(
+            sizingCompanion.quotaEntries().first { $0.hash == oldSSMHash }).bytes
+        let newSSMBytes = try #require(
+            sizingCompanion.quotaEntries().first { $0.hash == newSSMHash }).bytes
+
+        let lowerBound = max(
+            oldKVBytes + oldSSMBytes,
+            max(newKVBytes, newSSMBytes))
+        let upperBound = min(
+            newKVBytes + newSSMBytes,
+            min(oldKVBytes + newKVBytes, oldSSMBytes + newSSMBytes))
+        #expect(lowerBound < upperBound)
+        let capBytes = lowerBound + (upperBound - lowerBound) / 2
+
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: Float(capBytes) / 1_073_741_824,
+            diskCacheDir: root,
+            modelKey: modelKey))
+        coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
+
+        coordinator.storePersistentBoundary(
+            tokens: oldTokens,
+            diskArrays: oldKV,
+            ssmStates: oldSSM)
+        #expect(coordinator.diskCache?.fetch(tokens: oldTokens) != nil)
+        #expect(
+            coordinator.ssmStateCache.diskStore?.fetch(
+                tokens: oldTokens, boundary: oldTokens.count) != nil)
+
+        coordinator.storePersistentBoundary(
+            tokens: newTokens,
+            diskArrays: newKV,
+            ssmStates: newSSM)
+
+        let remainingKV = Set(coordinator.diskCache?.quotaEntries().map(\.hash) ?? [])
+        let remainingSSM = Set(
+            coordinator.ssmStateCache.diskStore?.quotaEntries().map(\.hash) ?? [])
+        #expect(remainingKV == Set([oldKVHash]))
+        #expect(remainingSSM == Set([oldSSMHash]))
+        #expect(coordinator.diskCache?.fetch(tokens: oldTokens) != nil)
+        #expect(coordinator.diskCache?.fetch(tokens: newTokens) == nil)
+        #expect(
+            coordinator.ssmStateCache.diskStore?.fetch(
+                tokens: oldTokens, boundary: oldTokens.count) != nil)
+        #expect(
+            coordinator.ssmStateCache.diskStore?.fetch(
+                tokens: newTokens, boundary: newTokens.count) == nil)
+    }
+}
+
 @Test func combinedQuotaRetiresUnlinkedLegacyCompanionBeforeIndexedKV() async throws {
     try await MLXMetalTestLock.withLock {
         let root = FileManager.default.temporaryDirectory
