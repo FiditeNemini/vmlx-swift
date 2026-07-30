@@ -1079,8 +1079,8 @@ struct CacheCoordinatorTopologyFocusedTests {
                 parameters: GenerateParameters()))
     }
 
-    @Test("LFM tool prompts use disk restore while the unproven Gemma MXFP4 seed exception remains")
-    func lfmToolPromptsUseDiskRestore() throws {
+    @Test("caller policy bypasses only disk-backed forced-tool restore")
+    func callerPolicyBypassesOnlyDiskBackedForcedToolRestore() throws {
         let batchSource = try String(
             contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
             encoding: .utf8)
@@ -1096,15 +1096,18 @@ struct CacheCoordinatorTopologyFocusedTests {
         #expect(batchSource.contains(#"modelName.contains("mxfp4")"#))
         #expect(batchSource.contains("!shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)"))
         #expect(!batchSource.contains("shouldDisableDiskBackedRequiredToolRestore"))
-        #expect(!batchSource.contains("disableDiskBackedRequiredToolRestore: deferredDisableRestore"))
-        #expect(!batchSource.contains("Skipped disk-backed required-tool cache restore"))
+        #expect(batchSource.contains("disableDiskBackedRequiredToolRestore: deferredDisableRestore"))
+        #expect(batchSource.contains(
+            "slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection"))
+        #expect(batchSource.contains(
+            "skipped disk-backed required-tool cache restore; caller requested fresh tool selection"))
         #expect(batchSource.contains("Skipped disk-backed tool prompt seed boundary"))
-        // Keep the explicit iterator parameter source-compatible for callers
-        // that have their own measured safety policy. BatchEngine must not set
-        // it from a model-name heuristic.
+        // Keep ordinary tool-schema requests on the normal restore path. The
+        // explicit caller policy, not a model-name heuristic, gates bypass.
         #expect(evaluateSource.contains("disableDiskBackedRequiredToolRestore"))
         #expect(evaluateSource.contains("TokenIterator: skipped disk-backed required-tool cache restore"))
-        #expect(evaluateSource.contains("requiresDiskBackedRestore && disableDiskBackedRequiredToolRestore"))
+        #expect(evaluateSource.contains(
+            "requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore"))
     }
 
     @Test("KV policy changes dynamic cache salt")

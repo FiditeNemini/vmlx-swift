@@ -1,11 +1,91 @@
 // Copyright © 2026 Osaurus AI. All rights reserved.
 
 import Foundation
+import MLX
 @testable import MLXLMCommon
 import Testing
 
 @Suite("BatchEngine growing-chat cache source coverage")
 struct BatchEngineGrowingChatCacheSourceTests {
+    @Test("reusable-prefix warmup intent survives input copies and forbids hybrid stripping")
+    func reusablePrefixWarmupIntentIsPreserved() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/LanguageModel.swift",
+            encoding: .utf8)
+
+        #expect(source.contains("public enum CachePromptIntent: Sendable, Equatable"))
+        #expect(source.contains("case reusablePrefixWarmup"))
+        #expect(source.contains("cachePromptIntent: CachePromptIntent = .generation"))
+        #expect(source.components(
+            separatedBy: "cachePromptIntent: cachePromptIntent").count - 1 == 3)
+        #expect(source.contains(
+            "guard cachePromptIntent != .reusablePrefixWarmup else { return false }"))
+    }
+
+    @Test("fresh required-tool restore policy survives input copies")
+    func freshRequiredToolRestorePolicyIsPreserved() {
+        let tokenArray = MLXArray([Int32(41), Int32(42), Int32(43)])
+            .expandedDimensions(axis: 0)
+        let input = LMInput(
+            text: LMInput.Text(tokens: tokenArray),
+            cacheRestorePolicy: .freshRequiredToolSelection)
+
+        #expect(input.cacheRestorePolicy == .freshRequiredToolSelection)
+        #expect(
+            input.withToolSchemas(nil).cacheRestorePolicy
+                == .freshRequiredToolSelection)
+        #expect(
+            input.withCacheRestorePolicy(.standard).cacheRestorePolicy
+                == .standard)
+    }
+
+    @Test("all generation paths reject unsafe exact recurrent warmups and throwaway boundaries")
+    func cacheWarmupPersistenceContractCoversAllGenerationPaths() throws {
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let batch = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let mtp = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift",
+            encoding: .utf8)
+
+        #expect(evaluate.contains(
+            "input.cachePromptIntent != .reusablePrefixWarmup"))
+        #expect(evaluate.contains(
+            "originalInput.cachePromptIntent == .reusablePrefixWarmup"))
+        #expect(batch.contains(
+            "slot.originalInput.cachePromptIntent == .reusablePrefixWarmup"))
+        #expect(mtp.contains(
+            "originalInput.cachePromptIntent == .reusablePrefixWarmup"))
+        #expect(mtp.contains("originalInput.canCaptureHybridStripBoundary("))
+        #expect(evaluate.contains("shouldPersistExactPromptBoundary("))
+        #expect(batch.contains("shouldPersistExactPromptBoundary("))
+        #expect(mtp.contains("shouldPersistExactPromptBoundary("))
+        #expect(mtp.contains(
+            "coordinator.requiresRecurrentSSMCompanion && boundary > 1"))
+
+        // Solo and batched paths each gate both their N-1/generated stores;
+        // native MTP has no N-1 writer and gates its generated store.
+        #expect(evaluate.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 2)
+        #expect(batch.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 2)
+        #expect(mtp.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 1)
+    }
+
+    @Test("exact reusable-prefix warmups remain enabled only for non-recurrent cache topologies")
+    func exactWarmupBoundaryRequiresRestorableTopology() {
+        #expect(shouldPersistExactPromptBoundary(
+            cachePromptIntent: .generation,
+            requiresRecurrentSSMCompanion: true))
+        #expect(shouldPersistExactPromptBoundary(
+            cachePromptIntent: .reusablePrefixWarmup,
+            requiresRecurrentSSMCompanion: false))
+        #expect(!shouldPersistExactPromptBoundary(
+            cachePromptIntent: .reusablePrefixWarmup,
+            requiresRecurrentSSMCompanion: true))
+    }
+
     @Test("coordinator miss resets only populated caller-owned caches")
     func coordinatorMissResetRequiresPopulatedCache() {
         let empty = KVCacheSimple()
@@ -116,8 +196,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
             encoding: .utf8)
 
         #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot)"))
-        #expect(source.contains(
-            "a coordinator\n                // miss means this request's token/scope identity did not match"))
+        #expect(source.contains("a coordinator"))
+        #expect(source.contains("miss means this request's token/scope identity did not match"))
         #expect(source.contains("self.cache = model.newCache(parameters: effectiveParameters)"))
         #expect(source.contains("inputForPrepare = input"))
         #expect(source.contains("return nil"))

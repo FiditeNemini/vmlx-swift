@@ -33,6 +33,35 @@ public struct THW: Sendable {
 /// The ``ModelContext`` holds the ``UserInputProcessor`` associated with a
 /// ``LanguageModel``.
 public struct LMInput {
+    /// How the prepared prompt participates in prefix-cache persistence.
+    ///
+    /// Ordinary generation requests may derive template-specific history
+    /// boundaries and may persist a post-generation boundary. A
+    /// ``reusablePrefixWarmup`` is different: its complete token stream has
+    /// already been proven by the caller to be an exact prefix of a future
+    /// request. Fully restorable cache topologies persist that prompt boundary
+    /// verbatim. Recurrent hybrid topologies instead persist their longest
+    /// processor-proven safe seed: a live Ornith Mamba/GDN row proved that an
+    /// exact warmup checkpoint can replay the previous tool turn after a
+    /// reasoning-mode change even though its token prefix matches. No warmup
+    /// path may cache the throwaway decoded tokens.
+    public enum CachePromptIntent: Sendable, Equatable {
+        case generation
+        case reusablePrefixWarmup
+    }
+
+    /// Correctness policy for restoring a persisted prompt prefix.
+    ///
+    /// Ordinary requests use the longest validated prefix. A caller that is
+    /// about to force a tool selection can require a fresh selection for
+    /// disk-backed cache topologies whose recurrent/path-dependent state has
+    /// not been proven safe for that boundary. Paged/full-KV restores and
+    /// ordinary continuation turns keep their normal reuse policy.
+    public enum CacheRestorePolicy: Sendable, Equatable {
+        case standard
+        case freshRequiredToolSelection
+    }
+
     public let text: Text
     public let image: ProcessedImage?
     public let video: ProcessedVideo?
@@ -78,6 +107,12 @@ public struct LMInput {
     /// deliberately persisted for reuse by unrelated new chat sessions and may
     /// require an architecture-native rederive when a cache cannot be trimmed.
     public let cacheStablePrefixTokenCounts: [Int]
+
+    /// Typed cache-persistence contract for this prepared prompt.
+    public let cachePromptIntent: CachePromptIntent
+
+    /// Typed cache-restore contract for this prepared prompt.
+    public let cacheRestorePolicy: CacheRestorePolicy
 
     /// Representation of tokenized input text.
     public struct Text {
@@ -187,6 +222,8 @@ public struct LMInput {
         cacheScopeSalt: String? = nil,
         cachePrefixTokenCounts: [Int] = [],
         cacheStablePrefixTokenCounts: [Int] = [],
+        cachePromptIntent: CachePromptIntent = .generation,
+        cacheRestorePolicy: CacheRestorePolicy = .standard,
         toolSchemas: [ToolSpec]? = nil
     ) {
         self.init(
@@ -194,6 +231,8 @@ public struct LMInput {
             cacheScopeSalt: cacheScopeSalt,
             cachePrefixTokenCounts: cachePrefixTokenCounts,
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
+            cachePromptIntent: cachePromptIntent,
+            cacheRestorePolicy: cacheRestorePolicy,
             toolSchemas: toolSchemas)
     }
 
@@ -205,6 +244,8 @@ public struct LMInput {
         cacheScopeSalt: String? = nil,
         cachePrefixTokenCounts: [Int] = [],
         cacheStablePrefixTokenCounts: [Int] = [],
+        cachePromptIntent: CachePromptIntent = .generation,
+        cacheRestorePolicy: CacheRestorePolicy = .standard,
         toolSchemas: [ToolSpec]? = nil
     ) {
         self.text = text
@@ -215,6 +256,8 @@ public struct LMInput {
         self.cacheScopeSalt = cacheScopeSalt
         self.cachePrefixTokenCounts = cachePrefixTokenCounts
         self.cacheStablePrefixTokenCounts = cacheStablePrefixTokenCounts
+        self.cachePromptIntent = cachePromptIntent
+        self.cacheRestorePolicy = cacheRestorePolicy
         self.toolSchemas = toolSchemas
     }
 
@@ -228,7 +271,25 @@ public struct LMInput {
             cacheScopeSalt: cacheScopeSalt,
             cachePrefixTokenCounts: cachePrefixTokenCounts,
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
+            cachePromptIntent: cachePromptIntent,
+            cacheRestorePolicy: cacheRestorePolicy,
             toolSchemas: schemas)
+    }
+
+    /// Return an otherwise-identical input with an explicit restore policy.
+    public func withCacheRestorePolicy(_ policy: CacheRestorePolicy) -> LMInput {
+        LMInput(
+            text: text,
+            image: image,
+            video: video,
+            audio: audio,
+            mediaTokenIds: mediaTokenIds,
+            cacheScopeSalt: cacheScopeSalt,
+            cachePrefixTokenCounts: cachePrefixTokenCounts,
+            cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
+            cachePromptIntent: cachePromptIntent,
+            cacheRestorePolicy: policy,
+            toolSchemas: toolSchemas)
     }
 }
 
@@ -256,6 +317,7 @@ public extension LMInput {
         promptTokenIds: [Int],
         boundary: Int
     ) -> Bool {
+        guard cachePromptIntent != .reusablePrefixWarmup else { return false }
         guard hasMediaContent else { return true }
         guard !requiresPostPrepareCacheKey,
               boundary > 0,

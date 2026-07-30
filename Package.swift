@@ -851,6 +851,7 @@ let package = Package(
                 "NemotronHOmniPreEncodedAudioTests.swift",
                 "NemotronHJANGTQDispatchFocusedTests.swift",
                 "MTPRuntimeFocusedTests.swift",
+                "MixedGroupSizeQuantizationFocusedTests.swift",
                 "MLXPressCLISourceContractsTests.swift",
                 "VMLXServerRuntimeSettingsTests.swift",
                 "VMLXMemorySafetySettingsTests.swift",

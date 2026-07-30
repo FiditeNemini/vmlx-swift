@@ -221,11 +221,21 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     coordinator.setPagedIncompatible(true)
                 }
             }
-            switch coordinator.fetch(
-                tokens: cacheLookupTokenIds,
-                mediaSalt: mediaSalt,
-                preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts
-            ) {
+            let requiresDiskBackedRestore =
+                cacheRequiresDiskBackedCoordinatorRestore(self.cache)
+            let result: CacheFetchResult
+            if requiresDiskBackedRestore,
+               input.cacheRestorePolicy == .freshRequiredToolSelection
+            {
+                result = .miss
+            } else {
+                result = coordinator.fetch(
+                    tokens: cacheLookupTokenIds,
+                    mediaSalt: mediaSalt,
+                    preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts
+                )
+            }
+            switch result {
             case .hit(
                 let matchedTokens, let remainingTokens, _, let blocks,
                 let ssmStates, let diskArrays):
@@ -450,14 +460,22 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let sharedPromptStripBoundary: Int? = {
                 guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
                     coordinator.isHybrid,
-                    !originalInput.hasMediaContent,
                     let turnStartToken = coordinator.genPromptSuffixTokens.first,
                     let stripAt = promptTokenIds.lastIndex(of: turnStartToken),
                     stripAt > 0,
-                    stripAt < promptTokenIds.count - 1
+                    stripAt < promptTokenIds.count - 1,
+                    originalInput.canCaptureHybridStripBoundary(
+                        promptTokenIds: promptTokenIds,
+                        boundary: stripAt)
                 else { return nil }
                 return stripAt
             }()
+            let isReusablePrefixWarmup =
+                originalInput.cachePromptIntent == .reusablePrefixWarmup
+            let shouldPersistExactWarmupPrompt = shouldPersistExactPromptBoundary(
+                cachePromptIntent: originalInput.cachePromptIntent,
+                requiresRecurrentSSMCompanion:
+                    coordinator.requiresRecurrentSSMCompanion)
             var sharedPromptRederivedStates: [Int: [MLXArray]]?
             let sharedPromptAdditionalBoundaries = Array(Set(
                 cachePrefixTokenCounts + [sharedPromptStripBoundary].compactMap { $0 }
@@ -530,17 +548,23 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     mediaSalt: mediaSalt)
             }
 
-            store(
-                tokens: promptTokenIds,
-                snapshot: promptCacheSnapshot,
-                label: "prompt-boundary")
+            if shouldPersistExactWarmupPrompt {
+                store(
+                    tokens: promptTokenIds,
+                    snapshot: promptCacheSnapshot,
+                    label: "prompt-boundary")
+            }
 
             if !originalInput.requiresPostPrepareCacheKey {
                 for boundary in Set(cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokenIds.count {
-                    let boundaryTokens = Array(promptTokenIds.prefix(boundary))
                     let isStableBoundary = originalInput
                         .cacheStablePrefixTokenCounts.contains(boundary)
+                    let storeBoundary = isStableBoundary
+                        && coordinator.requiresRecurrentSSMCompanion && boundary > 1
+                        ? boundary - 1
+                        : boundary
+                    let boundaryTokens = Array(promptTokenIds.prefix(storeBoundary))
                     if isStableBoundary,
                        coordinator.hasValidatedDiskEntry(
                         tokens: boundaryTokens,
@@ -592,7 +616,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 }
             }
 
-            if includeGeneratedBoundary,
+            if !isReusablePrefixWarmup,
+               includeGeneratedBoundary,
                !generatedTokenIds.isEmpty,
                !cache.isEmpty
             {

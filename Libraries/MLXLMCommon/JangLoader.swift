@@ -2194,36 +2194,14 @@ public struct JangLoader: Sendable {
         }
 
         func declaredQuantization(for basePath: String) -> BaseConfiguration.Quantization? {
-            func variants(_ key: String) -> [String] {
-                var out = [key]
-                if key.contains(".attn.") || key.hasSuffix(".attn") {
-                    out.append(key.replacingOccurrences(of: ".attn.", with: ".self_attn."))
-                    if key.hasSuffix(".attn") {
-                        out.append(String(key.dropLast(".attn".count)) + ".self_attn")
-                    }
-                }
-                if key.hasPrefix("language_model.model.") {
-                    out.append(String(key.dropFirst("language_model.".count)))
-                } else if key.hasPrefix("language_model.") {
-                    out.append(String(key.dropFirst("language_model.".count)))
-                } else {
-                    out.append("model.\(key)")
-                    out.append("language_model.\(key)")
-                    out.append("language_model.model.\(key)")
-                }
-                return Array(Set(out))
-            }
-
-            if let declaredPerLayerQuantization {
-                for key in variants(basePath) {
-                    if let declared = declaredPerLayerQuantization.perLayerQuantization[key] {
-                        switch declared {
-                        case .quantize(let quantization):
-                            return quantization
-                        case .skip:
-                            return nil
-                        }
-                    }
+            if let declared = declaredPerLayerQuantization?
+                .explicitQuantizationOption(layer: basePath)
+            {
+                switch declared {
+                case .quantize(let quantization):
+                    return quantization
+                case .skip:
+                    return nil
                 }
             }
             if let roleBits = declaredMXTQRoleBits(for: basePath) {
@@ -2282,6 +2260,18 @@ public struct JangLoader: Sendable {
             let packedDim = weightArray.shape.last ?? 0
             let numGroups = scalesArray.shape.last ?? 1
             let (bits, inferredGroupSize): (Int, Int)
+            let declaredForLayer = declaredQuantization(for: basePath)
+            let explicitForLayer: BaseConfiguration.Quantization? = {
+                guard let explicit = declaredPerLayerQuantization?
+                    .explicitQuantizationOption(layer: basePath)
+                else { return nil }
+                guard case .quantize(let quantization) = explicit else { return nil }
+                return quantization
+            }()
+            // A real per-module group size is authoritative for the packed
+            // width calculation. The top-level default is not: architecture
+            // dimension hints must still be able to correct stale defaults.
+            let moduleGroupSize = explicitForLayer?.groupSize ?? groupSize
 
             let isHiddenAnchor =
                 basePath.hasSuffix("embed_tokens")
@@ -2368,7 +2358,7 @@ public struct JangLoader: Sendable {
             // fails this check, and still falls through to the shape walk.
             if let manifest = manifestQuantization(for: basePath) {
                 (bits, inferredGroupSize) = (manifest.bits, manifest.groupSize)
-            } else if let dq = declaredQuantization(for: basePath),
+            } else if let dq = explicitForLayer,
                dq.bits > 0, numGroups > 0, (packedDim * 32) % dq.bits == 0,
                case let declaredInputDim = (packedDim * 32) / dq.bits,
                declaredInputDim % numGroups == 0,
@@ -2382,7 +2372,7 @@ public struct JangLoader: Sendable {
                 (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
                     packedDim: packedDim,
                     numGroups: numGroups,
-                    knownGroupSize: groupSize,
+                    knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: hiddenSize)
             } else if isMTPFusionFC,
@@ -2391,7 +2381,7 @@ public struct JangLoader: Sendable {
                 (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
                     packedDim: packedDim,
                     numGroups: numGroups,
-                    knownGroupSize: groupSize,
+                    knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: hiddenSize * 2)
             } else if isLinearAttnOutputProjection,
@@ -2400,7 +2390,7 @@ public struct JangLoader: Sendable {
                 (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
                     packedDim: packedDim,
                     numGroups: numGroups,
-                    knownGroupSize: groupSize,
+                    knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: valueDim)
             } else if isAttentionOutputProjection,
@@ -2412,7 +2402,7 @@ public struct JangLoader: Sendable {
                     let inferred = inferBitWidthAndGroupSize(
                         packedDim: packedDim,
                         numGroups: numGroups,
-                        knownGroupSize: groupSize,
+                        knownGroupSize: moduleGroupSize,
                         bitWidthsUsed: bitWidthsUsed,
                         expectedInDim: dim)
                     let inputDim = (packedDim * 32) / inferred.bits
@@ -2427,7 +2417,7 @@ public struct JangLoader: Sendable {
                     (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
                         weight: weightArray,
                         scales: scalesArray,
-                        knownGroupSize: groupSize,
+                        knownGroupSize: moduleGroupSize,
                         bitWidthsUsed: bitWidthsUsed)
                 }
             } else if isZayaCCAOutputProjection,
@@ -2442,7 +2432,7 @@ public struct JangLoader: Sendable {
                 (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
                     packedDim: packedDim,
                     numGroups: numGroups,
-                    knownGroupSize: groupSize,
+                    knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: ccaOutputDim)
             } else if isPerLayerProjection,
@@ -2452,7 +2442,7 @@ public struct JangLoader: Sendable {
                 (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
                     packedDim: packedDim,
                     numGroups: numGroups,
-                    knownGroupSize: groupSize,
+                    knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: perLayerInputDim)
             } else if isPerLayerModelProjection,
@@ -2461,7 +2451,7 @@ public struct JangLoader: Sendable {
                 (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
                     packedDim: packedDim,
                     numGroups: numGroups,
-                    knownGroupSize: groupSize,
+                    knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: hiddenSize)
             } else if isExpertDownProjection,
@@ -2471,7 +2461,7 @@ public struct JangLoader: Sendable {
                 (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
                     packedDim: packedDim,
                     numGroups: numGroups,
-                    knownGroupSize: groupSize,
+                    knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed,
                     expectedInDim: expertIntermediateSize)
             } else if let picked = inferFromUniqueValidInDim() {
@@ -2504,19 +2494,18 @@ public struct JangLoader: Sendable {
                     (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
                         weight: weightArray,
                         scales: scalesArray,
-                        knownGroupSize: groupSize,
+                        knownGroupSize: moduleGroupSize,
                         bitWidthsUsed: bitWidthsUsed)
                 }
             } else {
                 (bits, inferredGroupSize) = inferBitWidthAndGroupSize(
                     weight: weightArray,
                     scales: scalesArray,
-                    knownGroupSize: groupSize,
+                    knownGroupSize: moduleGroupSize,
                     bitWidthsUsed: bitWidthsUsed)
             }
 
             let mode = weights[basePath + ".biases"] == nil ? defaultMode : .affine
-            let declaredForLayer = declaredQuantization(for: basePath)
             let declaredMatches =
                 declaredForLayer?.bits == bits
                 && declaredForLayer?.groupSize == inferredGroupSize

@@ -937,7 +937,10 @@ public actor BatchEngine {
     }
 
     private func shouldSkipDiskBackedToolPromptSeedBoundary(for slot: BatchSlot) -> Bool {
-        shouldSkipDiskBackedToolPromptSeedBoundary(
+        if slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection {
+            return true
+        }
+        return shouldSkipDiskBackedToolPromptSeedBoundary(
             toolSchemas: slot.originalInput.toolSchemas,
             disablesGeneratedCacheBoundary: slot.disablesGeneratedCacheBoundary)
     }
@@ -986,9 +989,13 @@ public actor BatchEngine {
         let promptTokenCount = input.text.tokens.size
         let hasMediaContent = input.hasMediaContent
         let toolSchemas = input.toolSchemas
-        let skipDiskBackedToolPromptSeedBoundary = shouldSkipDiskBackedToolPromptSeedBoundary(
-            toolSchemas: toolSchemas,
-            disablesGeneratedCacheBoundary: false)
+        let requiresFreshToolSelection =
+            input.cacheRestorePolicy == .freshRequiredToolSelection
+        let skipDiskBackedToolPromptSeedBoundary =
+            requiresFreshToolSelection
+            || shouldSkipDiskBackedToolPromptSeedBoundary(
+                toolSchemas: toolSchemas,
+                disablesGeneratedCacheBoundary: false)
         let fastPathID = UUID()
         var soloParameters = parameters
         soloParameters.extraStopStrings = mergeStopStrings(
@@ -1098,6 +1105,7 @@ public actor BatchEngine {
                 // when progress frames reach the consumer changes.
                 let promptTokenIdsForTail = input.text.tokens.reshaped(-1).asArray(Int.self)
                 let deferredParameters = soloParameters
+                let deferredDisableRestore = requiresFreshToolSelection
                 let deferredSkipSeedBoundary = skipDiskBackedToolPromptSeedBoundary
                 let deferredInputs = SendableBox(
                     (input, context.model, cacheCoordinator))
@@ -1111,6 +1119,7 @@ public actor BatchEngine {
                         cache: nil,
                         parameters: deferredParameters,
                         cacheCoordinator: deferredCoordinator,
+                        disableDiskBackedRequiredToolRestore: deferredDisableRestore,
                         skipDiskBackedToolPromptSeedBoundary: deferredSkipSeedBoundary,
                         prefillProgressHandler: { progress in
                             deferredContinuation.yield(.prefillProgress(prefillGate.clamp(progress)))
@@ -1675,10 +1684,17 @@ public actor BatchEngine {
                 return stepPrefillAfterCacheLookup(slotIndex: slotIndex, inputForPrepare: inputForPrepare)
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(slot.cache)
-            // Scope the fetch result to this coordinator branch. Disk-backed
-            // topologies must all attempt restore; safety is decided by the
-            // topology-aware restore path below, not a model-name denylist.
-            do {
+            // Scope the fetch result to this coordinator branch. Ordinary
+            // requests keep longest-prefix reuse. A caller that is forcing a
+            // fresh tool selection may bypass only an unproven disk-backed
+            // topology; paged/full-KV restores remain eligible.
+            if requiresDiskBackedRestore,
+               slot.originalInput.cacheRestorePolicy == .freshRequiredToolSelection
+            {
+                Self.logger.info(
+                    "Slot \(slot.id.description, privacy: .public): skipped disk-backed required-tool cache restore; caller requested fresh tool selection"
+                )
+            } else {
                 let result = coordinator.fetch(
                     tokens: tokenIds,
                     mediaSalt: slot.mediaSalt,
@@ -2742,6 +2758,12 @@ public actor BatchEngine {
             // existing prompt/post-answer policy.
             let usesCanonicalHybridBoundary =
                 coordinator.isHybrid && sharedPromptStripBoundary != nil
+            let isReusablePrefixWarmup =
+                slot.originalInput.cachePromptIntent == .reusablePrefixWarmup
+            let shouldPersistExactWarmupPrompt = shouldPersistExactPromptBoundary(
+                cachePromptIntent: slot.originalInput.cachePromptIntent,
+                requiresRecurrentSSMCompanion:
+                    coordinator.requiresRecurrentSSMCompanion)
 
             func storeCacheEntry(tokens: [Int], snapshot: [KVCache], label: String) {
                 guard !tokens.isEmpty else { return }
@@ -2918,17 +2940,22 @@ public actor BatchEngine {
                 }
             }
 
-            if !usesCanonicalHybridBoundary {
+            if !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
                 storeCacheEntry(
                     tokens: promptTokens,
                     snapshot: promptCacheSnapshot,
                     label: "prompt-boundary")
+            } else if isReusablePrefixWarmup, !shouldPersistExactWarmupPrompt {
+                Self.logger.info(
+                    "Skipped exact recurrent warmup boundary for slot \(slot.id.description, privacy: .public); retaining processor-proven safe prefix seeds only"
+                )
             }
 
             if !slot.cachePromptUsesPostPrepareKey {
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
                 if !usesCanonicalHybridBoundary,
+                   !isReusablePrefixWarmup,
                    requiresDiskBackedRestore,
                    !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
                    promptTokens.count > 1,
@@ -3061,6 +3088,7 @@ public actor BatchEngine {
             // it covers prompt + generated tokens exactly enough to resume.
             let generatedBoundaryTokens = promptTokens + slot.generatedTokenIds
             if !usesCanonicalHybridBoundary,
+               !isReusablePrefixWarmup,
                reason == .stop,
                !slot.disablesGeneratedCacheBoundary,
                !containsUnprovenZayaTurboQuantDiskState(slot.cache),

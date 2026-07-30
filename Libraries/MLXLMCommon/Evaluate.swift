@@ -1330,8 +1330,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.model = model
         self.y = input.text
         self.cacheCoordinator = cacheCoordinator
-        self.disableDiskBackedRequiredToolRestore = disableDiskBackedRequiredToolRestore
-        self.skipDiskBackedToolPromptSeedBoundary = skipDiskBackedToolPromptSeedBoundary
+        let requiresFreshToolSelection =
+            input.cacheRestorePolicy == .freshRequiredToolSelection
+        self.disableDiskBackedRequiredToolRestore =
+            disableDiskBackedRequiredToolRestore || requiresFreshToolSelection
+        self.skipDiskBackedToolPromptSeedBoundary =
+            skipDiskBackedToolPromptSeedBoundary || requiresFreshToolSelection
         let promptTokenCount = input.text.tokens.size
         var effectiveParameters = parameters
         if let coordinator = cacheCoordinator {
@@ -1450,7 +1454,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
-            if requiresDiskBackedRestore && disableDiskBackedRequiredToolRestore {
+            if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore {
                 Self.logger.info(
                     "TokenIterator: skipped disk-backed required-tool cache restore; warm restore is not proven safe for this topology"
                 )
@@ -1845,6 +1849,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         guard let coordinator,
             coordinator.canPersistBoundaries,
             !skipBoundary,
+            input.cachePromptIntent != .reusablePrefixWarmup,
             promptTokenIds.count > 1,
             !input.hasMediaContent,
             !input.requiresPostPrepareCacheKey,
@@ -1906,6 +1911,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 audio: input.audio,
                 mediaTokenIds: input.mediaTokenIds,
                 cacheScopeSalt: input.cacheScopeSalt,
+                cachePromptIntent: input.cachePromptIntent,
                 toolSchemas: input.toolSchemas)
             : nil
         let tail = LMInput(
@@ -1914,6 +1920,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 mask: flatMask.map { slice($0[split...]) },
                 tokenIds: tailTokenIds),
             cacheScopeSalt: input.cacheScopeSalt,
+            cachePromptIntent: input.cachePromptIntent,
             toolSchemas: input.toolSchemas)
         return (head, tail)
     }
@@ -2238,6 +2245,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         // processor-proven boundary keep the existing storage policy.
         let usesCanonicalHybridBoundary =
             coordinator.isHybrid && hybridStripBoundary != nil
+        let isReusablePrefixWarmup =
+            originalInput.cachePromptIntent == .reusablePrefixWarmup
+        let shouldPersistExactWarmupPrompt = shouldPersistExactPromptBoundary(
+            cachePromptIntent: originalInput.cachePromptIntent,
+            requiresRecurrentSSMCompanion:
+                coordinator.requiresRecurrentSSMCompanion)
 
         func store(
             tokens: [Int],
@@ -2337,18 +2350,23 @@ public struct TokenIterator: TokenIteratorProtocol {
             let promptDiskKVMode = selectivePromptBoundaryDiskKVMode(
                 cache: promptCacheSnapshot,
                 requested: kvMode)
-            if !usesCanonicalHybridBoundary {
+            if !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
                 store(
                     tokens: promptTokenIds,
                     cache: promptCacheSnapshot,
                     kvBits: nil,
                     kvMode: promptDiskKVMode)
+            } else if isReusablePrefixWarmup, !shouldPersistExactWarmupPrompt {
+                Self.logger.info(
+                    "TokenIterator: skipped exact recurrent warmup boundary; retaining processor-proven safe prefix seeds only"
+                )
             }
 
             if !originalInput.requiresPostPrepareCacheKey {
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
                 if !usesCanonicalHybridBoundary,
+                   !isReusablePrefixWarmup,
                    requiresDiskBackedRestore,
                    !skipDiskBackedToolPromptSeedBoundary,
                    promptTokenIds.count > 1
@@ -2472,6 +2490,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         guard !usesCanonicalHybridBoundary,
+            !isReusablePrefixWarmup,
             includeGeneratedBoundary, !generatedTokenIds.isEmpty
         else { return }
         guard !needsCacheQuantization else { return }
