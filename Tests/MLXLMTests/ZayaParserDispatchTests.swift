@@ -14,14 +14,14 @@
 //   (whether the runtime correctly threads the stamp into the enum).
 //
 // Production claims being pinned:
-// - All 6 ZAYA bundles (text JANGTQ2/4 + ZAYA1-VL MXFP4/JANGTQ2/JANGTQ4)
+// - All available ZAYA bundles (text JANGTQ2/4 + ZAYA1-VL MXFP4/JANGTQ variants)
 //   stamp `tool_parser=zaya_xml` → resolves to `.zayaXml`.
-// - All 6 stamp `reasoning_parser=qwen3` → resolves to a non-nil
+// - All available bundles stamp `reasoning_parser=qwen3` → resolves to a non-nil
 //   `ReasoningParser` with `startInReasoning=true` (Qwen 3.x semantics).
-// - All 6 stamp `think_in_template=false` in BOTH config.json and
+// - All available bundles stamp `think_in_template=false` in BOTH config.json and
 //   jang_config.json. ZAYA capability stamps are trusted by the runtime;
 //   stale bundle metadata must be fixed at the bundle/source level.
-// - Quant variant DOES NOT change parser routing — MXFP4/JANGTQ2/JANGTQ4
+// - Quant variant DOES NOT change parser routing — MXFP4/JANGTQ2/JANGTQ4/JANGTQ_K
 //   all dispatch identically.
 
 import Foundation
@@ -59,19 +59,40 @@ struct ZayaParserDispatchTests {
         let capabilities: Caps
     }
 
-    private static let bundleRoot =
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("models")
+    private static let bundleRoot: URL = {
+        if let override = ProcessInfo.processInfo.environment["VMLX_TEST_MODEL_ROOT"],
+            !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return URL(fileURLWithPath: override)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("models")
+    }()
+
+    private static let expectedBundles = [
+        "ZAYA1-VL-8B-MXFP4",
+        "ZAYA1-VL-8B-JANGTQ2",
+        "ZAYA1-VL-8B-JANGTQ4",
+        "ZAYA1-VL-8B-JANGTQ_K",
+        "ZAYA1-8B-MXFP4",
+        "ZAYA1-8B-JANGTQ2",
+        "ZAYA1-8B-JANGTQ4",
+    ]
 
     private static func bundlePath(_ name: String) -> String? {
         let candidates = [
             bundleRoot.appendingPathComponent("Osaurus").appendingPathComponent(name),
             bundleRoot.appendingPathComponent("JANGQ").appendingPathComponent(name),
+            bundleRoot.appendingPathComponent("JANGQ-AI").appendingPathComponent(name),
             bundleRoot.appendingPathComponent("Zyphra").appendingPathComponent(name),
         ]
         for url in candidates where FileManager.default.fileExists(atPath: url.path) {
             return url.path
         }
         return nil
+    }
+
+    private static var hasAnyExpectedBundle: Bool {
+        expectedBundles.contains { bundlePath($0) != nil }
     }
 
     private static func loadCaps(_ bundle: String, _ file: String)
@@ -130,18 +151,13 @@ struct ZayaParserDispatchTests {
 
     // MARK: - Reasoning parser dispatch
 
-    @Test("All ZAYA + ZAYA1-VL bundles route reasoning_parser=qwen3 to Qwen-3.x parser")
+    @Test(
+        "All ZAYA + ZAYA1-VL bundles route reasoning_parser=qwen3 to Qwen-3.x parser",
+        .enabled(if: hasAnyExpectedBundle)
+    )
     func allBundlesDispatchQwen3Reasoning() throws {
-        let bundles = [
-            "ZAYA1-VL-8B-MXFP4",
-            "ZAYA1-VL-8B-JANGTQ2",
-            "ZAYA1-VL-8B-JANGTQ4",
-            "ZAYA1-8B-MXFP4",
-            "ZAYA1-8B-JANGTQ2",
-            "ZAYA1-8B-JANGTQ4",
-        ]
         var anyChecked = false
-        for bundle in bundles {
+        for bundle in Self.expectedBundles {
             guard Self.bundlePath(bundle) != nil else { continue }
             anyChecked = true
             for file in ["config.json", "jang_config.json"] {
@@ -164,6 +180,7 @@ struct ZayaParserDispatchTests {
             ("ZAYA1-VL-8B-MXFP4", "mxfp4"),
             ("ZAYA1-VL-8B-JANGTQ2", "mxtq2"),
             ("ZAYA1-VL-8B-JANGTQ4", "mxtq4"),
+            ("ZAYA1-VL-8B-JANGTQ_K", "jangtq_k"),
         ]
         var resolved: [(String, ToolCallFormat?, String?)] = []
         for (bundle, label) in cases {
@@ -190,15 +207,7 @@ struct ZayaParserDispatchTests {
 
     @Test("ZAYA + ZAYA1-VL bundle stamps consistent across config.json and jang_config.json")
     func stampsConsistentAcrossFiles() throws {
-        let bundles = [
-            "ZAYA1-VL-8B-MXFP4",
-            "ZAYA1-VL-8B-JANGTQ2",
-            "ZAYA1-VL-8B-JANGTQ4",
-            "ZAYA1-8B-MXFP4",
-            "ZAYA1-8B-JANGTQ2",
-            "ZAYA1-8B-JANGTQ4",
-        ]
-        for bundle in bundles {
+        for bundle in Self.expectedBundles {
             guard Self.bundlePath(bundle) != nil else { continue }
             let configCaps = try Self.loadCaps(bundle, "config.json")
             let jangCaps = try Self.loadCaps(bundle, "jang_config.json")

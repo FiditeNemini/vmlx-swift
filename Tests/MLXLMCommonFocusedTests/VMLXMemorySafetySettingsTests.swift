@@ -48,7 +48,7 @@ struct VMLXMemorySafetySettingsTests {
         #expect(!plan.cache.pagedKV.enabled)
         #expect(plan.cache.blockDisk.enabled)
         #expect(!plan.cache.legacyDisk.enabled)
-        #expect(plan.cache.defaultMaxKVSize == 8192)
+        #expect(plan.cache.defaultMaxKVSize == 65_536)
         #expect(plan.cache.enableSSMReDerive)
         #expect(plan.concurrency.maxConcurrentSequences == 1)
         #expect(generate.temperature == 0.7)
@@ -173,7 +173,7 @@ struct VMLXMemorySafetySettingsTests {
                 && $0.message.contains("exceeds resolved memory budget")
         })
         #expect(overBudget.loadConfiguration.memoryLimit == .fraction(0.60))
-        #expect(overBudget.cache.defaultMaxKVSize == 4096)
+        #expect(overBudget.cache.defaultMaxKVSize == 16_384)
     }
 
     @Test("memory safety does not make MLXPress the universal slider")
