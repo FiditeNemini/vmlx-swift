@@ -39,7 +39,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
                 == .standard)
     }
 
-    @Test("all generation paths persist the exact warmup prompt and reject throwaway boundaries")
+    @Test("all generation paths reject unsafe exact recurrent warmups and throwaway boundaries")
     func cacheWarmupPersistenceContractCoversAllGenerationPaths() throws {
         let evaluate = try String(
             contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
@@ -60,12 +60,30 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(mtp.contains(
             "originalInput.cachePromptIntent == .reusablePrefixWarmup"))
         #expect(mtp.contains("originalInput.canCaptureHybridStripBoundary("))
+        #expect(evaluate.contains("shouldPersistExactPromptBoundary("))
+        #expect(batch.contains("shouldPersistExactPromptBoundary("))
+        #expect(mtp.contains("shouldPersistExactPromptBoundary("))
+        #expect(mtp.contains(
+            "coordinator.requiresRecurrentSSMCompanion && boundary > 1"))
 
         // Solo and batched paths each gate both their N-1/generated stores;
         // native MTP has no N-1 writer and gates its generated store.
         #expect(evaluate.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 2)
         #expect(batch.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 2)
         #expect(mtp.components(separatedBy: "!isReusablePrefixWarmup").count - 1 == 1)
+    }
+
+    @Test("exact reusable-prefix warmups remain enabled only for non-recurrent cache topologies")
+    func exactWarmupBoundaryRequiresRestorableTopology() {
+        #expect(shouldPersistExactPromptBoundary(
+            cachePromptIntent: .generation,
+            requiresRecurrentSSMCompanion: true))
+        #expect(shouldPersistExactPromptBoundary(
+            cachePromptIntent: .reusablePrefixWarmup,
+            requiresRecurrentSSMCompanion: false))
+        #expect(!shouldPersistExactPromptBoundary(
+            cachePromptIntent: .reusablePrefixWarmup,
+            requiresRecurrentSSMCompanion: true))
     }
 
     @Test("coordinator miss resets only populated caller-owned caches")

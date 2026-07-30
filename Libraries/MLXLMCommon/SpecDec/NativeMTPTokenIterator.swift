@@ -472,6 +472,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }()
             let isReusablePrefixWarmup =
                 originalInput.cachePromptIntent == .reusablePrefixWarmup
+            let shouldPersistExactWarmupPrompt = shouldPersistExactPromptBoundary(
+                cachePromptIntent: originalInput.cachePromptIntent,
+                requiresRecurrentSSMCompanion:
+                    coordinator.requiresRecurrentSSMCompanion)
             var sharedPromptRederivedStates: [Int: [MLXArray]]?
             let sharedPromptAdditionalBoundaries = Array(Set(
                 cachePrefixTokenCounts + [sharedPromptStripBoundary].compactMap { $0 }
@@ -544,17 +548,23 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     mediaSalt: mediaSalt)
             }
 
-            store(
-                tokens: promptTokenIds,
-                snapshot: promptCacheSnapshot,
-                label: "prompt-boundary")
+            if shouldPersistExactWarmupPrompt {
+                store(
+                    tokens: promptTokenIds,
+                    snapshot: promptCacheSnapshot,
+                    label: "prompt-boundary")
+            }
 
             if !originalInput.requiresPostPrepareCacheKey {
                 for boundary in Set(cachePrefixTokenCounts).sorted()
                 where boundary > 0 && boundary < promptTokenIds.count {
-                    let boundaryTokens = Array(promptTokenIds.prefix(boundary))
                     let isStableBoundary = originalInput
                         .cacheStablePrefixTokenCounts.contains(boundary)
+                    let storeBoundary = isStableBoundary
+                        && coordinator.requiresRecurrentSSMCompanion && boundary > 1
+                        ? boundary - 1
+                        : boundary
+                    let boundaryTokens = Array(promptTokenIds.prefix(storeBoundary))
                     if isStableBoundary,
                        coordinator.hasValidatedDiskEntry(
                         tokens: boundaryTokens,

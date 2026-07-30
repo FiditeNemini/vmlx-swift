@@ -2247,6 +2247,10 @@ public struct TokenIterator: TokenIteratorProtocol {
             coordinator.isHybrid && hybridStripBoundary != nil
         let isReusablePrefixWarmup =
             originalInput.cachePromptIntent == .reusablePrefixWarmup
+        let shouldPersistExactWarmupPrompt = shouldPersistExactPromptBoundary(
+            cachePromptIntent: originalInput.cachePromptIntent,
+            requiresRecurrentSSMCompanion:
+                coordinator.requiresRecurrentSSMCompanion)
 
         func store(
             tokens: [Int],
@@ -2346,12 +2350,16 @@ public struct TokenIterator: TokenIteratorProtocol {
             let promptDiskKVMode = selectivePromptBoundaryDiskKVMode(
                 cache: promptCacheSnapshot,
                 requested: kvMode)
-            if !usesCanonicalHybridBoundary {
+            if !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
                 store(
                     tokens: promptTokenIds,
                     cache: promptCacheSnapshot,
                     kvBits: nil,
                     kvMode: promptDiskKVMode)
+            } else if isReusablePrefixWarmup, !shouldPersistExactWarmupPrompt {
+                Self.logger.info(
+                    "TokenIterator: skipped exact recurrent warmup boundary; retaining processor-proven safe prefix seeds only"
+                )
             }
 
             if !originalInput.requiresPostPrepareCacheKey {

@@ -153,6 +153,22 @@ public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) ->
     }
 }
 
+/// Whether the complete prompt boundary from a reusable-prefix warmup is safe
+/// to publish for later coordinator restores.
+///
+/// Recurrent hybrid caches remain path-dependent even when their token key is
+/// an exact prefix. A live Ornith reasoning Off -> On warmup restored such a
+/// checkpoint and replayed the prior tool command. The processor-proven stable
+/// seed remains reusable, but the complete warmup boundary must not become the
+/// longest candidate until that topology has byte-parity proof.
+func shouldPersistExactPromptBoundary(
+    cachePromptIntent: LMInput.CachePromptIntent,
+    requiresRecurrentSSMCompanion: Bool
+) -> Bool {
+    cachePromptIntent != .reusablePrefixWarmup
+        || !requiresRecurrentSSMCompanion
+}
+
 /// Whether paged KV blocks can safely serve this mixed rotating topology when
 /// the exact leaf also carries a typed rotating-boundary companion.
 ///

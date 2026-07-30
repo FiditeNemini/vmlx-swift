@@ -2760,6 +2760,10 @@ public actor BatchEngine {
                 coordinator.isHybrid && sharedPromptStripBoundary != nil
             let isReusablePrefixWarmup =
                 slot.originalInput.cachePromptIntent == .reusablePrefixWarmup
+            let shouldPersistExactWarmupPrompt = shouldPersistExactPromptBoundary(
+                cachePromptIntent: slot.originalInput.cachePromptIntent,
+                requiresRecurrentSSMCompanion:
+                    coordinator.requiresRecurrentSSMCompanion)
 
             func storeCacheEntry(tokens: [Int], snapshot: [KVCache], label: String) {
                 guard !tokens.isEmpty else { return }
@@ -2936,11 +2940,15 @@ public actor BatchEngine {
                 }
             }
 
-            if !usesCanonicalHybridBoundary {
+            if !usesCanonicalHybridBoundary, shouldPersistExactWarmupPrompt {
                 storeCacheEntry(
                     tokens: promptTokens,
                     snapshot: promptCacheSnapshot,
                     label: "prompt-boundary")
+            } else if isReusablePrefixWarmup, !shouldPersistExactWarmupPrompt {
+                Self.logger.info(
+                    "Skipped exact recurrent warmup boundary for slot \(slot.id.description, privacy: .public); retaining processor-proven safe prefix seeds only"
+                )
             }
 
             if !slot.cachePromptUsesPostPrepareKey {

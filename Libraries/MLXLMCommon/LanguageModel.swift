@@ -39,9 +39,12 @@ public struct LMInput {
     /// boundaries and may persist a post-generation boundary. A
     /// ``reusablePrefixWarmup`` is different: its complete token stream has
     /// already been proven by the caller to be an exact prefix of a future
-    /// request. The runtime must persist that prompt boundary verbatim, must
-    /// not strip another generation scaffold from it, and must not cache the
-    /// warmup's throwaway decoded tokens.
+    /// request. Fully restorable cache topologies persist that prompt boundary
+    /// verbatim. Recurrent hybrid topologies instead persist their longest
+    /// processor-proven safe seed: a live Ornith Mamba/GDN row proved that an
+    /// exact warmup checkpoint can replay the previous tool turn after a
+    /// reasoning-mode change even though its token prefix matches. No warmup
+    /// path may cache the throwaway decoded tokens.
     public enum CachePromptIntent: Sendable, Equatable {
         case generation
         case reusablePrefixWarmup
