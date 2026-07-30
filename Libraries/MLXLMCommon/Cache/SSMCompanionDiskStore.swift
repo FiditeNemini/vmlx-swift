@@ -158,6 +158,25 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         mediaSalt: String? = nil,
         isComplete: Bool = true
     ) throws {
+        try store(
+            ssmStates: ssmStates,
+            tokens: tokens,
+            boundary: boundary,
+            mediaSalt: mediaSalt,
+            isComplete: isComplete,
+            enforceQuota: true)
+    }
+
+    /// Coordinator-only transactional store. See ``DiskCache/store``: linked
+    /// KV + recurrent state must be admitted or evicted as one group.
+    func store(
+        ssmStates: [MLXArray],
+        tokens: [Int],
+        boundary: Int,
+        mediaSalt: String? = nil,
+        isComplete: Bool = true,
+        enforceQuota: Bool
+    ) throws {
         guard !ssmStates.isEmpty, boundary > 0, boundary <= tokens.count else { return }
         let key = Self.keyFor(
             tokens: tokens, boundary: boundary,
@@ -260,7 +279,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             validatedEntries.removeValue(forKey: key)
         }
 
-        evictIfNeededLocked()
+        if enforceQuota {
+            evictIfNeededLocked()
+        }
     }
 
     /// Look up SSM layer states for a given token prefix + boundary.

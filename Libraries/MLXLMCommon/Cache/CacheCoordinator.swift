@@ -653,12 +653,11 @@ public final class CacheCoordinator: @unchecked Sendable {
         guard let folded = TQDiskSerializer.ssmStates(from: diskArrays) else {
             return nil
         }
-        ssmStateCache.store(
-            ssmStates: folded,
+        storePersistentBoundary(
             tokens: tokens,
-            boundary: boundary,
+            diskArrays: nil,
+            ssmStates: folded,
             mediaSalt: mediaSalt)
-        enforceCombinedDiskQuota()
         return folded
     }
 
@@ -870,7 +869,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 mediaSalt: mediaSalt)
         }
 
-        // Store in disk cache.
+        // Build the disk payload before entering the linked-store transaction.
         //
         // SLIDING-1: when the raw cache is available, use the v2
         // `TQDiskSerializer.serialize(cache:)` path unconditionally. The
@@ -883,14 +882,14 @@ public final class CacheCoordinator: @unchecked Sendable {
         // disk persistence for sliding-window models (Gemma3/Gemma4
         // SWA layers, Mistral4 with maxKVSize, MiMoV2Flash, BaichuanM1,
         // Qwen3.5-VL inherited sliding layers).
-        if let diskCache {
+        var diskArrays: [String: MLXArray]?
+        if diskCache != nil {
             if let cache {
                 let arrays = TQDiskSerializer.serialize(
                     cache: cache,
                     ssmStates: isHybrid ? ssmStates : nil)
                 if !arrays.isEmpty {
-                    diskCache.store(
-                        tokens: promptTokens, arrays: arrays, mediaSalt: mediaSalt)
+                    diskArrays = arrays
                 }
             } else {
                 // Legacy fallback when the caller didn't pass the raw cache:
@@ -906,24 +905,66 @@ public final class CacheCoordinator: @unchecked Sendable {
                     }
                 }
                 if !arrays.isEmpty {
-                    diskCache.store(
-                        tokens: promptTokens, arrays: arrays, mediaSalt: mediaSalt)
+                    diskArrays = arrays
                 }
             }
         }
 
-        // Store SSM companion states for hybrid models
-        if isHybrid, let ssmStates, !ssmStates.isEmpty {
-            let boundary = totalTokens
-            ssmStateCache.store(
-                ssmStates: ssmStates,
-                tokens: promptTokens,
-                boundary: boundary,
-                mediaSalt: mediaSalt
-            )
+        storePersistentBoundary(
+            tokens: promptTokens,
+            diskArrays: diskArrays,
+            ssmStates: isHybrid ? ssmStates : nil,
+            mediaSalt: mediaSalt)
+    }
+
+    /// Persist one reusable prompt boundary as a linked transaction.
+    ///
+    /// `DiskCache` and `SSMCompanionDiskStore` remain independently usable,
+    /// but applying each store's full quota while a hybrid boundary is only
+    /// half-written can evict an older usable prefix, admit a newer KV/SSM
+    /// half, then have the combined pass evict that oversized new pair too.
+    /// Holding the cross-store lock and deferring both standalone quota passes
+    /// ensures the final eviction decision sees complete linked groups.
+    func storePersistentBoundary(
+        tokens: [Int],
+        diskArrays: [String: MLXArray]?,
+        ssmStates: [MLXArray]?,
+        mediaSalt: String? = nil
+    ) {
+        let usesCombinedQuota = config.enableDiskCache
+            && diskCache != nil
+            && ssmStateCache.diskStore != nil
+        if usesCombinedQuota {
+            CombinedDiskCacheQuotaLock.shared.lock()
+        }
+        defer {
+            if usesCombinedQuota {
+                CombinedDiskCacheQuotaLock.shared.unlock()
+            }
         }
 
-        enforceCombinedDiskQuota()
+        if let diskArrays, !diskArrays.isEmpty {
+            diskCache?.store(
+                tokens: tokens,
+                arrays: diskArrays,
+                mediaSalt: mediaSalt,
+                enforceQuota: !usesCombinedQuota)
+        }
+
+        if isHybrid, let ssmStates, !ssmStates.isEmpty {
+            ssmStateCache.store(
+                ssmStates: ssmStates,
+                tokens: tokens,
+                boundary: tokens.count,
+                mediaSalt: mediaSalt,
+                enforceDiskQuota: !usesCombinedQuota)
+        }
+
+        if usesCombinedQuota {
+            enforceCombinedDiskQuotaLocked()
+        } else {
+            enforceCombinedDiskQuota()
+        }
     }
 
     /// Enforce `diskCacheMaxGB` across the whole persistent cache root, not
@@ -936,13 +977,24 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// recorded KV payload is already gone are removed immediately.
     func enforceCombinedDiskQuota() {
         guard config.enableDiskCache,
+              diskCache != nil,
+              ssmStateCache.diskStore != nil
+        else { return }
+
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+        enforceCombinedDiskQuotaLocked()
+    }
+
+    /// Reconcile the linked KV + recurrent quota. Caller must hold
+    /// ``CombinedDiskCacheQuotaLock``.
+    private func enforceCombinedDiskQuotaLocked() {
+        guard config.enableDiskCache,
               let diskCache,
               let companionStore = ssmStateCache.diskStore
         else { return }
 
         let maxBytes = Int64(max(1, Int(config.diskCacheMaxGB * 1_073_741_824)))
-        CombinedDiskCacheQuotaLock.shared.lock()
-        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
 
         let kvEntries = diskCache.quotaEntries()
         let kvHashes = Set(kvEntries.map(\.hash))
@@ -1008,11 +1060,25 @@ public final class CacheCoordinator: @unchecked Sendable {
         var remaining = totalBefore
         var evictKV = Set<String>()
         var evictCompanion = Set<String>()
+
+        // Reject any group that can never fit before applying LRU. Stable
+        // boundaries are normally written shortest-to-longest; evicting the
+        // older fitting boundary first and only then discovering that the
+        // newest group is individually oversized leaves the cache empty.
+        // Pre-eviction preserves the best prior prefix that actually fits.
+        let oversized = groups.filter { $0.bytes > maxBytes }
+        for group in oversized {
+            evictKV.formUnion(group.kvHashes)
+            evictCompanion.formUnion(group.companionHashes)
+            remaining -= group.bytes
+        }
+        let oversizedKeys = Set(oversized.map(\.sortKey))
+
         for group in groups.sorted(by: {
             if $0.priority != $1.priority { return $0.priority < $1.priority }
             if $0.createdAt == $1.createdAt { return $0.sortKey < $1.sortKey }
             return $0.createdAt < $1.createdAt
-        }) where remaining > maxBytes {
+        }) where remaining > maxBytes && !oversizedKeys.contains(group.sortKey) {
             evictKV.formUnion(group.kvHashes)
             evictCompanion.formUnion(group.companionHashes)
             remaining -= group.bytes
