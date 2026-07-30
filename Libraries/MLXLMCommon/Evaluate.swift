@@ -1330,8 +1330,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.model = model
         self.y = input.text
         self.cacheCoordinator = cacheCoordinator
-        self.disableDiskBackedRequiredToolRestore = disableDiskBackedRequiredToolRestore
-        self.skipDiskBackedToolPromptSeedBoundary = skipDiskBackedToolPromptSeedBoundary
+        let requiresFreshToolSelection =
+            input.cacheRestorePolicy == .freshRequiredToolSelection
+        self.disableDiskBackedRequiredToolRestore =
+            disableDiskBackedRequiredToolRestore || requiresFreshToolSelection
+        self.skipDiskBackedToolPromptSeedBoundary =
+            skipDiskBackedToolPromptSeedBoundary || requiresFreshToolSelection
         let promptTokenCount = input.text.tokens.size
         var effectiveParameters = parameters
         if let coordinator = cacheCoordinator {
@@ -1450,7 +1454,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
-            if requiresDiskBackedRestore && disableDiskBackedRequiredToolRestore {
+            if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore {
                 Self.logger.info(
                     "TokenIterator: skipped disk-backed required-tool cache restore; warm restore is not proven safe for this topology"
                 )

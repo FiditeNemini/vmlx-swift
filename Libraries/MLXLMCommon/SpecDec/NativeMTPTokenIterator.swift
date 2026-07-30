@@ -221,11 +221,21 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     coordinator.setPagedIncompatible(true)
                 }
             }
-            switch coordinator.fetch(
-                tokens: cacheLookupTokenIds,
-                mediaSalt: mediaSalt,
-                preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts
-            ) {
+            let requiresDiskBackedRestore =
+                cacheRequiresDiskBackedCoordinatorRestore(self.cache)
+            let result: CacheFetchResult
+            if requiresDiskBackedRestore,
+               input.cacheRestorePolicy == .freshRequiredToolSelection
+            {
+                result = .miss
+            } else {
+                result = coordinator.fetch(
+                    tokens: cacheLookupTokenIds,
+                    mediaSalt: mediaSalt,
+                    preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts
+                )
+            }
+            switch result {
             case .hit(
                 let matchedTokens, let remainingTokens, _, let blocks,
                 let ssmStates, let diskArrays):

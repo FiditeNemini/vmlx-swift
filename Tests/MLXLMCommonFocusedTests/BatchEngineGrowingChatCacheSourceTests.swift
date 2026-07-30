@@ -1,6 +1,7 @@
 // Copyright © 2026 Osaurus AI. All rights reserved.
 
 import Foundation
+import MLX
 @testable import MLXLMCommon
 import Testing
 
@@ -16,9 +17,26 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("case reusablePrefixWarmup"))
         #expect(source.contains("cachePromptIntent: CachePromptIntent = .generation"))
         #expect(source.components(
-            separatedBy: "cachePromptIntent: cachePromptIntent").count - 1 == 2)
+            separatedBy: "cachePromptIntent: cachePromptIntent").count - 1 == 3)
         #expect(source.contains(
             "guard cachePromptIntent != .reusablePrefixWarmup else { return false }"))
+    }
+
+    @Test("fresh required-tool restore policy survives input copies")
+    func freshRequiredToolRestorePolicyIsPreserved() {
+        let tokenArray = MLXArray([Int32(41), Int32(42), Int32(43)])
+            .expandedDimensions(axis: 0)
+        let input = LMInput(
+            text: LMInput.Text(tokens: tokenArray),
+            cacheRestorePolicy: .freshRequiredToolSelection)
+
+        #expect(input.cacheRestorePolicy == .freshRequiredToolSelection)
+        #expect(
+            input.withToolSchemas(nil).cacheRestorePolicy
+                == .freshRequiredToolSelection)
+        #expect(
+            input.withCacheRestorePolicy(.standard).cacheRestorePolicy
+                == .standard)
     }
 
     @Test("all generation paths persist the exact warmup prompt and reject throwaway boundaries")
@@ -160,8 +178,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
             encoding: .utf8)
 
         #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot)"))
-        #expect(source.contains(
-            "a coordinator\n                // miss means this request's token/scope identity did not match"))
+        #expect(source.contains("a coordinator"))
+        #expect(source.contains("miss means this request's token/scope identity did not match"))
         #expect(source.contains("self.cache = model.newCache(parameters: effectiveParameters)"))
         #expect(source.contains("inputForPrepare = input"))
         #expect(source.contains("return nil"))

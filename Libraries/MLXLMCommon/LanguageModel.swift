@@ -47,6 +47,18 @@ public struct LMInput {
         case reusablePrefixWarmup
     }
 
+    /// Correctness policy for restoring a persisted prompt prefix.
+    ///
+    /// Ordinary requests use the longest validated prefix. A caller that is
+    /// about to force a tool selection can require a fresh selection for
+    /// disk-backed cache topologies whose recurrent/path-dependent state has
+    /// not been proven safe for that boundary. Paged/full-KV restores and
+    /// ordinary continuation turns keep their normal reuse policy.
+    public enum CacheRestorePolicy: Sendable, Equatable {
+        case standard
+        case freshRequiredToolSelection
+    }
+
     public let text: Text
     public let image: ProcessedImage?
     public let video: ProcessedVideo?
@@ -95,6 +107,9 @@ public struct LMInput {
 
     /// Typed cache-persistence contract for this prepared prompt.
     public let cachePromptIntent: CachePromptIntent
+
+    /// Typed cache-restore contract for this prepared prompt.
+    public let cacheRestorePolicy: CacheRestorePolicy
 
     /// Representation of tokenized input text.
     public struct Text {
@@ -205,6 +220,7 @@ public struct LMInput {
         cachePrefixTokenCounts: [Int] = [],
         cacheStablePrefixTokenCounts: [Int] = [],
         cachePromptIntent: CachePromptIntent = .generation,
+        cacheRestorePolicy: CacheRestorePolicy = .standard,
         toolSchemas: [ToolSpec]? = nil
     ) {
         self.init(
@@ -213,6 +229,7 @@ public struct LMInput {
             cachePrefixTokenCounts: cachePrefixTokenCounts,
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             cachePromptIntent: cachePromptIntent,
+            cacheRestorePolicy: cacheRestorePolicy,
             toolSchemas: toolSchemas)
     }
 
@@ -225,6 +242,7 @@ public struct LMInput {
         cachePrefixTokenCounts: [Int] = [],
         cacheStablePrefixTokenCounts: [Int] = [],
         cachePromptIntent: CachePromptIntent = .generation,
+        cacheRestorePolicy: CacheRestorePolicy = .standard,
         toolSchemas: [ToolSpec]? = nil
     ) {
         self.text = text
@@ -236,6 +254,7 @@ public struct LMInput {
         self.cachePrefixTokenCounts = cachePrefixTokenCounts
         self.cacheStablePrefixTokenCounts = cacheStablePrefixTokenCounts
         self.cachePromptIntent = cachePromptIntent
+        self.cacheRestorePolicy = cacheRestorePolicy
         self.toolSchemas = toolSchemas
     }
 
@@ -250,7 +269,24 @@ public struct LMInput {
             cachePrefixTokenCounts: cachePrefixTokenCounts,
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             cachePromptIntent: cachePromptIntent,
+            cacheRestorePolicy: cacheRestorePolicy,
             toolSchemas: schemas)
+    }
+
+    /// Return an otherwise-identical input with an explicit restore policy.
+    public func withCacheRestorePolicy(_ policy: CacheRestorePolicy) -> LMInput {
+        LMInput(
+            text: text,
+            image: image,
+            video: video,
+            audio: audio,
+            mediaTokenIds: mediaTokenIds,
+            cacheScopeSalt: cacheScopeSalt,
+            cachePrefixTokenCounts: cachePrefixTokenCounts,
+            cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
+            cachePromptIntent: cachePromptIntent,
+            cacheRestorePolicy: policy,
+            toolSchemas: toolSchemas)
     }
 }
 
