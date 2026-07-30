@@ -1084,7 +1084,16 @@ struct MTPRuntimeFocusedTests {
             #expect(source.contains("_strict"))
             #expect(source.contains("_fast"))
             #expect(source.contains("state[i] = static_cast<float>(static_cast<InT>(state[i]));"))
-            #expect(source.contains("roundStateEachStep ? newState.asType(q.dtype) : newState"))
+            #expect(source.contains("newState.asType(q.dtype).asType(.float32)"))
+            #expect(source.contains("dtype: .float32"))
+            #expect(source.contains("sigmoid(b).asType(.float32)"))
+            #expect(source.contains("return decay"))
+            #expect(!source.contains("return decay.asType(a.dtype)"))
+            #expect(source.contains("if state.dtype != .float32"))
+            #expect(source.contains("(\"StT\", stateType)"))
+            #expect(source.contains("outputDTypes: [inputType, stateType]"))
+            #expect(source.contains("o_state[s_idx] = static_cast<StT>(state[i]);"))
+            #expect(!source.contains("o_state[s_idx] = static_cast<InT>(state[i]);"))
         }
 
         let textQwen = try Self.source("Libraries/MLXLLM/Models/Qwen35.swift")

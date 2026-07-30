@@ -25,7 +25,7 @@ import MLXNN
 private let _compiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
     compile(shapeless: true) { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
         let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-        return decay.asType(a.dtype)
+        return decay
     }
 
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
@@ -102,6 +102,8 @@ private func makeGatedDeltaKernel(
                   y[dv_idx] = static_cast<InT>(out);
                 }
         \(stepRoundSource)
+              } else {
+                y[dv_idx] = static_cast<InT>(0);
               }
               // Increment data pointers to next time step
               q_ += Hk * Dk;
@@ -113,7 +115,7 @@ private func makeGatedDeltaKernel(
             }
             for (int i = 0; i < n_per_t; ++i) {
               auto s_idx = n_per_t * dk_idx + i;
-              o_state[s_idx] = static_cast<InT>(state[i]);
+              o_state[s_idx] = static_cast<StT>(state[i]);
             }
         """
 
@@ -176,6 +178,7 @@ func gatedDeltaKernel(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
     let inputType = q.dtype
+    let stateType = state.dtype
 
     let selectedKernel: MLXFast.MLXFastKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
@@ -198,6 +201,7 @@ func gatedDeltaKernel(
         inputs,
         template: [
             ("InT", inputType),
+            ("StT", stateType),
             ("Dk", Dk),
             ("Dv", Dv),
             ("Hk", Hk),
@@ -206,7 +210,7 @@ func gatedDeltaKernel(
         grid: (32, Dv, B * Hv),
         threadGroup: (32, 4, 1),
         outputShapes: [[B, T, Hv, Dv], state.shape],
-        outputDTypes: [inputType, inputType]
+        outputDTypes: [inputType, stateType]
     )
 
     return (outputs[0], outputs[1])
@@ -270,12 +274,12 @@ private func gatedDeltaStepOps(
         } else {
             fatalError("Unsupported mask shape \(mask.shape)")
         }
-        return (y, MLX.where(expandedMask, newState, oldState))
+        return (y.asType(q.dtype), MLX.where(expandedMask, newState, oldState))
     }
 
     // Decode path — compiled, fuses ~10 ops into 1 Metal dispatch
     let result = _compiledStepOps([q, k, v, g, beta, state])
-    return (result[0], result[1])
+    return (result[0].asType(q.dtype), result[1])
 }
 
 func gatedDeltaOps(
@@ -304,7 +308,7 @@ func gatedDeltaOps(
         k = repeated(k, count: repeatFactor, axis: -2)
     }
 
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
 
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
@@ -327,7 +331,9 @@ func gatedDeltaOps(
             mask: maskT
         )
         ys.append(y)
-        state = roundStateEachStep ? newState.asType(q.dtype) : newState
+        state = roundStateEachStep
+            ? newState.asType(q.dtype).asType(.float32)
+            : newState
     }
 
     let y = MLX.stacked(ys, axis: 1)
@@ -348,7 +354,7 @@ func gatedDeltaUpdate(
     mask: MLXArray? = nil,
     roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
-    let beta = sigmoid(b)
+    let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
 
     let B = q.dim(0)
@@ -356,7 +362,13 @@ func gatedDeltaUpdate(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
 
-    let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    // Keep recurrent state in float32 so a cached-prefix boundary does not
+    // introduce a BF16 rounding point that a cold full prefill never saw.
+    // This matches upstream mlx-lm / mlx-swift-lm GatedDelta semantics.
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
 
     // Mirror `MLXVLM/Models/Qwen35.swift` `gatedDeltaUpdate`:
     // (1) select the masked vs unmasked kernel by `mask` presence so a

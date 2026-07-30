@@ -66,6 +66,8 @@ struct Qwen35VLMGatedDeltaTests {
             #expect(cache.count == 4)
             #expect(cache.first is MambaCache)
             #expect(cache.first?.offset == 3)
+            let mambaCache = try #require(cache.first as? MambaCache)
+            #expect(mambaCache[1]?.dtype == .float32)
         }
     }
 }

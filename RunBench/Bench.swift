@@ -381,6 +381,18 @@ struct Bench {
                 modelPath: modelPath, maxNew: maxNew)
             return
         }
+
+        // BENCH_ORNITH_REPORTED_REPLAY=1: synthetic but structurally exact
+        // replay of the reported Ornith JANG_4M failure: long Swift file
+        // result, failed discovery calls, repeated DB calls, a long plan,
+        // then the same file result again before continuation. Two bounded
+        // precursor generations populate the production disk-prefix path so
+        // the final row also exercises hybrid companion restore/extension.
+        if (env["BENCH_ORNITH_REPORTED_REPLAY"] ?? "0") == "1" {
+            try await runOrnithReportedReplay(
+                modelPath: modelPath, maxNew: maxNew)
+            return
+        }
         // BENCH_OMNI=1 (2026-04-28): full multi-turn matrix for
         // Nemotron-3-Nano-Omni bundles. Tests text-only single, text
         // multi-turn, image single, image multi-turn, video, audio
@@ -7685,6 +7697,345 @@ func runQwenMultiturnToolCheck(modelPath: String, maxNew: Int) async throws {
     print("PASS: no non-tool reasoning-only empty-visible turns")
     print("PASS: all tool-required turns emitted structured .toolCall events")
     print("=== BENCH_QWEN_MULTITURN_TOOL: passed ===")
+}
+
+// MARK: - Ornith reported long tool-history replay
+
+/// Replays the structure and approximate payload sizes of the July 28 Ornith
+/// incident where a second `file_read` continuation emitted an unbounded run
+/// of exclamation marks. This is deliberately not a sampler workaround: it
+/// uses the bundle's generation defaults and fails on punctuation looping,
+/// parser debris, empty terminal output, or missing completion telemetry.
+func runOrnithReportedReplay(modelPath: String, maxNew: Int) async throws {
+    let modelDir = URL(fileURLWithPath: modelPath)
+    let env = ProcessInfo.processInfo.environment
+    let thinking = (env["BENCH_ORNITH_THINKING"] ?? "0") == "1"
+    let cacheDir = URL(fileURLWithPath:
+        env["BENCH_ORNITH_CACHE_DIR"]
+            ?? "/tmp/vmlx-ornith-reported-replay/\(modelDir.lastPathComponent)")
+    try? FileManager.default.removeItem(at: cacheDir)
+
+    print("\n=== BENCH_ORNITH_REPORTED_REPLAY: long tool-history continuation ===")
+    let loadStart = CFAbsoluteTimeGetCurrent()
+    let context = try await MLXLMCommon.loadModel(
+        from: modelDir, using: #huggingFaceTokenizerLoader())
+    print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
+    print("Model: \(type(of: context.model))")
+    print("Reasoning stamp: \(context.configuration.reasoningParserName ?? "nil")")
+    print("Tool format: \(context.configuration.toolCallFormat.map { "\($0)" } ?? "nil")")
+
+    nonisolated(unsafe) let ctx = context
+    var cacheConfig = CacheCoordinatorConfig()
+    cacheConfig.usePagedCache = false
+    cacheConfig.enableDiskCache = (env["BENCH_ORNITH_CACHE"] ?? "1") != "0"
+    cacheConfig.diskCacheDir = cacheDir
+    cacheConfig.diskCacheMaxGB = 1
+    cacheConfig.modelKey = "\(modelDir.lastPathComponent)|ornith-reported-replay"
+    let coordinator = CacheCoordinator(config: cacheConfig)
+    let engine = BatchEngine(
+        context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
+    defer { Task { await engine.shutdown() } }
+
+    let objectParameters: [String: any Sendable] = [
+        "type": "object",
+        "additionalProperties": true,
+    ]
+    func tool(_ name: String, _ description: String) -> ToolSpec {
+        [
+            "type": "function",
+            "function": [
+                "name": name,
+                "description": description,
+                "parameters": objectParameters,
+            ] as [String: any Sendable],
+        ]
+    }
+    let tools: [ToolSpec] = [
+        tool("file_read", "Read a UTF-8 file with numbered lines."),
+        tool("file_write", "Write an updated UTF-8 file."),
+        tool("capabilities_discover", "Discover an available capability."),
+        tool("db_query", "Run a read-only SQL query."),
+    ]
+
+    func assistantToolCall(
+        _ name: String,
+        id: String,
+        arguments: [String: any Sendable]
+    ) -> Chat.Message {
+        .assistant(
+            "",
+            toolCalls: [
+                ToolCall(
+                    function: .init(name: name, arguments: arguments),
+                    id: id)
+            ])
+    }
+
+    var swiftSource = """
+    import Foundation
+
+    final class NetworkManager: Sendable {
+        static let shared = NetworkManager()
+        static let serverURLKey = "osaurus_server_url"
+        static let apiKeyKey = "osaurus_api_key"
+
+        func fetchAvailableAgents() async throws -> [AgentModel] {
+            let endpoints = ["/v1/models", "/v1/agents", "/agents"]
+            for path in endpoints {
+                // request and decode each supported server response shape
+                struct ModelsResponse: Decodable {
+                    let data: [AgentModel]?
+                    let models: [AgentModel]?
+                    var availableModels: [AgentModel] { data ?? models ?? [] }
+                }
+            }
+            return []
+        }
+
+        func sendChatMessage(prompt: String, agentId: String? = nil) async throws -> String {
+            let selectedModel = agentId ?? "legacy-hardcoded-model"
+            return selectedModel + prompt
+        }
+    }
+    """
+    var fillerLine = 1
+    while swiftSource.utf8.count < 9_523 {
+        swiftSource += "\n// \(fillerLine)| networking fixture line: URLSession decoding, error handling, and model selection."
+        fillerLine += 1
+    }
+    if swiftSource.utf8.count > 9_523 {
+        swiftSource = String(swiftSource.prefix(9_523))
+    }
+    let fileResult = """
+    {"ok":true,"result":{"bytes_read":9523,"file_size":9523,"path":"/workspace/project/NetworkManager.swift","start_line":1,"end_line":228,"text":
+    \(swiftSource)
+    }}
+    """
+    let noCapability = """
+    {"ok":true,"result":{"text":"No capabilities found matching 'swift best practices coding'. Build it from sandbox primitives."}}
+    """
+    let dbRows = """
+    {"ok":true,"result":{"columns":["category","topic","content"],"rows":[["Swift 6.4 Updates","Asynchronous defer statements","Asynchronous cleanup is supported."],["Swift 6.4 Updates","Foundation Performance","URL parsing performance improved."]],"truncated":false}}
+    """
+
+    var history: [Chat.Message] = [
+        .system("You are a careful local coding agent. Inspect files, use tools, and make only approved changes."),
+        .user("Review the attached Swift implementation plan against best practices. Do not edit until I approve a step."),
+        assistantToolCall(
+            "file_read",
+            id: "call_file_1",
+            arguments: ["path": "/workspace/project/NetworkManager.swift"]),
+        .tool(fileResult, toolCallId: "call_file_1"),
+        assistantToolCall(
+            "capabilities_discover",
+            id: "call_cap_1",
+            arguments: ["query": "swift best practices coding"]),
+        .tool(noCapability, toolCallId: "call_cap_1"),
+        assistantToolCall(
+            "capabilities_discover",
+            id: "call_cap_2",
+            arguments: ["query": "swift coding best practices"]),
+        .tool(noCapability, toolCallId: "call_cap_2"),
+    ]
+
+    func parameters(maxTokens: Int) -> GenerateParameters {
+        let fallback = GenerateParameters(maxTokens: maxTokens, prefillStepSize: 512)
+        var result = GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: fallback)
+        result.maxTokens = maxTokens
+        result.prefillStepSize = 512
+        result.randomSeed = env["BENCH_ORNITH_SEED"].flatMap(UInt64.init)
+        return result
+    }
+
+    func run(
+        label: String,
+        history: [Chat.Message],
+        maxTokens: Int
+    ) async throws -> (
+        text: String,
+        reasoning: String,
+        toolCalls: Int,
+        info: GenerateCompletionInfo?,
+        promptTokens: Int,
+        wall: Double
+    ) {
+        let prepared = try await context.processor.prepare(input: UserInput(
+            chat: history,
+            tools: tools,
+            additionalContext: ["enable_thinking": thinking]))
+        let input = prepared.withToolSchemas(tools)
+        let promptTokens = input.text.tokenIds?.count ?? input.text.tokens.size
+        nonisolated(unsafe) let sendable = input
+        var text = ""
+        var reasoning = ""
+        var toolCallCount = 0
+        var info: GenerateCompletionInfo?
+        let start = CFAbsoluteTimeGetCurrent()
+        for await event in await engine.generate(
+            input: sendable,
+            parameters: parameters(maxTokens: maxTokens)
+        ) {
+            switch event {
+            case .chunk(let chunk): text += chunk
+            case .reasoning(let chunk): reasoning += chunk
+            case .toolCall: toolCallCount += 1
+            case .info(let completion): info = completion
+            case .toolCallProgress, .prefillProgress: break
+            }
+        }
+        let wall = CFAbsoluteTimeGetCurrent() - start
+        print(String(format:
+            "  %@ prompt=%d promptTime=%.3fs gen=%d wall=%.2fs tokps=%.2f textChars=%d reasoningChars=%d tools=%d stop=%@",
+            label,
+            promptTokens,
+            info?.promptTime ?? -1,
+            info?.generationTokenCount ?? 0,
+            wall,
+            Double(info?.generationTokenCount ?? 0) / max(wall, 0.001),
+            text.count,
+            reasoning.count,
+            toolCallCount,
+            info.map { "\($0.stopReason)" } ?? "missing"))
+        return (text, reasoning, toolCallCount, info, promptTokens, wall)
+    }
+
+    // Populate the same stable prompt-boundary path used by Osaurus's
+    // one-token hidden warm-up. The generated token is deliberately ignored;
+    // subsequent history is the recorded transcript, just like the report.
+    _ = try await run(label: "stage1-file-and-discovery", history: history, maxTokens: 1)
+
+    for index in 1 ... 8 {
+        let id = "call_db_\(index)"
+        history.append(assistantToolCall(
+            "db_query",
+            id: id,
+            arguments: [
+                "sql": "SELECT topic, content FROM swift_knowledge_base WHERE category = 'Swift 6.4 Updates' LIMIT \(index + 1)"
+            ]))
+        history.append(.tool(dbRows, toolCallId: id))
+    }
+    history.append(.assistant("""
+        The plan correctly targets the rigid model-list decoder and hardcoded fallback. Keep the flexible wrapper, accept raw arrays, log endpoint failures, avoid a guessed default model, and move any embedded credential to secure storage. For the first approved step I will only simplify availableModels to data ?? models ?? [] and preserve both response shapes.
+        """))
+    history.append(.user("Those suggestions are good. Execute only your proposed step 1."))
+    _ = try await run(label: "stage2-db-plan-user", history: history, maxTokens: 1)
+
+    history.append(.assistant("I will re-read the current file before applying the approved Step 1 change."))
+    history.append(assistantToolCall(
+        "file_read",
+        id: "call_file_2",
+        arguments: ["path": "/workspace/project/NetworkManager.swift"]))
+    history.append(.tool(fileResult, toolCallId: "call_file_2"))
+
+    let result = try await run(
+        label: "final-second-file-continuation",
+        history: history,
+        maxTokens: max(256, maxNew))
+    let visible = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let protocolMarkers = [
+        "<think>", "</think>", "<tool_call>", "</tool_call>",
+        "<|channel>", "\u{FFFE}",
+    ]
+    let leakedMarker = protocolMarkers.first { result.text.contains($0) }
+
+    var longestBangRun = 0
+    var currentBangRun = 0
+    for character in result.text {
+        if character == "!" {
+            currentBangRun += 1
+            longestBangRun = max(longestBangRun, currentBangRun)
+        } else {
+            currentBangRun = 0
+        }
+    }
+
+    print("  final sample: \(String(result.text.prefix(400)).debugDescription)")
+    print("  longestBangRun=\(longestBangRun)")
+    let snapshot = coordinator.snapshotStats()
+    if let disk = snapshot.diskStats {
+        print(
+            "  diskCache hits=\(disk.hits) misses=\(disk.misses) stores=\(disk.stores) skips=\(disk.storeSkips) maxBytes=\(disk.maxSizeBytes)"
+        )
+    }
+    print(
+        "  ssmCache hybrid=\(snapshot.isHybrid) hits=\(snapshot.ssmStats.hits) misses=\(snapshot.ssmStats.misses) reDerives=\(snapshot.ssmStats.reDerives)"
+    )
+
+    if (env["BENCH_ORNITH_RAW_DIAGNOSTIC"] ?? "0") == "1" {
+        let prepared = try await context.processor.prepare(input: UserInput(
+            chat: history,
+            tools: tools,
+            additionalContext: ["enable_thinking": thinking]))
+        let rawInput = prepared.withToolSchemas(tools)
+        nonisolated(unsafe) let rawSendable = rawInput
+        let rawBudget = min(max(256, maxNew), 512)
+        let (_, rawStream) = await engine.submit(
+            input: rawSendable,
+            parameters: parameters(maxTokens: rawBudget))
+        var tokenIDs: [Int] = []
+        var rawInfo: GenerateCompletionInfo?
+        for await event in rawStream {
+            switch event {
+            case .token(let id): tokenIDs.append(id)
+            case .info(let info): rawInfo = info
+            case .prefillProgress: break
+            }
+        }
+        let frequencies = Dictionary(grouping: tokenIDs, by: { $0 })
+            .map { (id: $0.key, count: $0.value.count) }
+            .sorted {
+                if $0.count == $1.count { return $0.id < $1.id }
+                return $0.count > $1.count
+            }
+        print(
+            "  RAW_DIAGNOSTIC tokens=\(tokenIDs.count) stop=\(rawInfo.map { "\($0.stopReason)" } ?? "missing") top=\(frequencies.prefix(12).map { "\($0.id):\($0.count)" }.joined(separator: ","))"
+        )
+        for frequency in frequencies.prefix(8) {
+            let decoded = context.tokenizer.decode(
+                tokenIds: [frequency.id], skipSpecialTokens: false)
+            print(
+                "  RAW_TOKEN id=\(frequency.id) count=\(frequency.count) decoded=\(decoded.debugDescription)"
+            )
+        }
+        let rawText = context.tokenizer.decode(
+            tokenIds: tokenIDs, skipSpecialTokens: false)
+        print("  RAW_TEXT_PREFIX \(String(rawText.prefix(600)).debugDescription)")
+        print("  RAW_TEXT_SUFFIX \(String(rawText.suffix(600)).debugDescription)")
+    }
+
+    guard result.info != nil else {
+        throw NSError(
+            domain: "BENCH_ORNITH_REPORTED_REPLAY", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "final stream emitted no completion info"])
+    }
+    guard longestBangRun < 32 else {
+        throw NSError(
+            domain: "BENCH_ORNITH_REPORTED_REPLAY", code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "reproduced punctuation loop: \(longestBangRun) consecutive exclamation marks"])
+    }
+    guard leakedMarker == nil else {
+        throw NSError(
+            domain: "BENCH_ORNITH_REPORTED_REPLAY", code: 3,
+            userInfo: [NSLocalizedDescriptionKey: "visible content leaked parser marker \(leakedMarker!)"])
+    }
+    guard !visible.isEmpty || result.toolCalls > 0 else {
+        throw NSError(
+            domain: "BENCH_ORNITH_REPORTED_REPLAY", code: 4,
+            userInfo: [NSLocalizedDescriptionKey: "final continuation was empty and emitted no structured tool call"])
+    }
+    guard result.info?.stopReason != .length else {
+        throw NSError(
+            domain: "BENCH_ORNITH_REPORTED_REPLAY", code: 5,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "final continuation exhausted \(result.info?.generationTokenCount ?? 0) tokens after only \(result.text.count) visible characters"
+            ])
+    }
+
+    await engine.shutdown()
+    print("=== BENCH_ORNITH_REPORTED_REPLAY: PASS ===")
 }
 
 // MARK: - Perf micro-bench (BENCH_PERF=1)

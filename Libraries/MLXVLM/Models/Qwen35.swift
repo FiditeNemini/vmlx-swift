@@ -39,7 +39,7 @@ private enum Qwen35VLError: Error {
 private let _vlmCompiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
         let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-        return decay.asType(a.dtype)
+        return decay
     }
     return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
@@ -127,11 +127,11 @@ private func gatedDeltaStepOps(
         } else {
             fatalError("Unsupported mask shape \(mask.shape)")
         }
-        return (y, MLX.where(expandedMask, newState, oldState))
+        return (y.asType(q.dtype), MLX.where(expandedMask, newState, oldState))
     }
 
     let result = _vlmCompiledStepOps([q, k, v, g, beta, state])
-    return (result[0], result[1])
+    return (result[0].asType(q.dtype), result[1])
 }
 
 private func gatedDeltaOps(
@@ -160,7 +160,7 @@ private func gatedDeltaOps(
         k = repeated(k, count: repeatFactor, axis: -2)
     }
 
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
 
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
@@ -183,7 +183,9 @@ private func gatedDeltaOps(
             mask: maskT
         )
         ys.append(y)
-        state = roundStateEachStep ? newState.asType(q.dtype) : newState
+        state = roundStateEachStep
+            ? newState.asType(q.dtype).asType(.float32)
+            : newState
     }
 
     let y = MLX.stacked(ys, axis: 1)
@@ -260,6 +262,8 @@ private func makeVLMGatedDeltaKernel(
                   y[dv_idx] = static_cast<InT>(out);
                 }
         \(stepRoundSource)
+              } else {
+                y[dv_idx] = static_cast<InT>(0);
               }
               q_ += Hk * Dk;
               k_ += Hk * Dk;
@@ -270,7 +274,7 @@ private func makeVLMGatedDeltaKernel(
             }
             for (int i = 0; i < n_per_t; ++i) {
               auto s_idx = n_per_t * dk_idx + i;
-              o_state[s_idx] = static_cast<InT>(state[i]);
+              o_state[s_idx] = static_cast<StT>(state[i]);
             }
         """
     var inputNames = ["q", "k", "v", "g", "beta", "state_in", "T"]
@@ -320,6 +324,7 @@ private func vlmGatedDeltaKernel(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
     let inputType = q.dtype
+    let stateType = state.dtype
 
     let selectedKernel: MLXFast.MLXFastKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
@@ -340,6 +345,7 @@ private func vlmGatedDeltaKernel(
         inputs,
         template: [
             ("InT", inputType),
+            ("StT", stateType),
             ("Dk", Dk),
             ("Dv", Dv),
             ("Hk", Hk),
@@ -348,7 +354,7 @@ private func vlmGatedDeltaKernel(
         grid: (32, Dv, B * Hv),
         threadGroup: (32, 4, 1),
         outputShapes: [[B, T, Hv, Dv], state.shape],
-        outputDTypes: [inputType, inputType]
+        outputDTypes: [inputType, stateType]
     )
     return (outputs[0], outputs[1])
 }
@@ -365,7 +371,7 @@ private func gatedDeltaUpdate(
     mask: MLXArray? = nil,
     roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
-    let beta = sigmoid(b)
+    let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
 
     let B = q.dim(0)
@@ -373,7 +379,13 @@ private func gatedDeltaUpdate(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
 
-    let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    // Keep recurrent state in float32 so cached and cold prefill partitions
+    // preserve the same GatedDelta recurrence. This mirrors the text path and
+    // upstream mlx-lm / mlx-swift-lm.
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
 
     // Prefer fused Metal kernel (Python parity, ~210 fewer dispatches per token).
     // The kernel tiles Dk in 32-wide SIMD chunks; unsupported head widths must
