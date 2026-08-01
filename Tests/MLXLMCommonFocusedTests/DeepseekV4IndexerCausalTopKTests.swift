@@ -8,6 +8,59 @@ import Testing
 @Suite("DSV4 indexer causal top-k", .serialized)
 struct DeepseekV4IndexerCausalTopKTests {
 
+    @Test("ratio-4 attention preserves indexer history across the top-k boundary")
+    func attentionAdvancesIndexerHistoryBeforeTopKSelection() {
+        FocusedMLXTestSupport.withLock {
+            var cfg = DeepseekV4Configuration()
+            cfg.hiddenSize = 8
+            cfg.numAttentionHeads = 2
+            cfg.headDim = 4
+            cfg.qkRopeHeadDim = 2
+            cfg.qLoraRank = 4
+            cfg.oGroups = 2
+            cfg.oLoraRank = 2
+            cfg.indexNHeads = 2
+            cfg.indexHeadDim = 4
+            cfg.indexTopk = 2
+            cfg.slidingWindow = 16
+            cfg.compressRatios = [4]
+
+            let attention = DeepseekV4Attention(config: cfg, layerIdx: 0)
+            let cache = DeepseekV4Cache(
+                slidingWindow: cfg.slidingWindow,
+                compressRatio: 4,
+                poolQuantizationEnabled: false)
+
+            // This is the compact state-equivalent of the production
+            // 2048 -> 2052 boundary: ratio=4 and topK=2 means eight tokens
+            // fill two rows, then token 11 completes row three. Feed every
+            // token separately so positions 0...2 also prove that the private
+            // indexer branch advances before the first pooled row exists.
+            for position in 0..<11 {
+                let token = MLXArray.zeros([1, 1, cfg.hiddenSize], dtype: .float16)
+                let output = attention(token, mask: .none, cache: cache)
+                MLX.eval(output)
+                #expect(cache.offset == position + 1)
+
+                let expectedRows = (position + 1) / 4
+                #expect((cache.getPooled(.compressor)?.dim(1) ?? 0) == expectedRows)
+                #expect((cache.getPooled(.indexer)?.dim(1) ?? 0) == expectedRows)
+                #expect(
+                    cache.getBuffers(.compressor).kv?.dim(1)
+                        == cache.getBuffers(.indexer).kv?.dim(1))
+            }
+
+            let boundaryToken = MLXArray.zeros(
+                [1, 1, cfg.hiddenSize], dtype: .float16)
+            let boundaryOutput = attention(boundaryToken, mask: .none, cache: cache)
+            MLX.eval(boundaryOutput)
+
+            #expect(cache.offset == 12)
+            #expect(cache.getPooled(.compressor)?.dim(1) == 3)
+            #expect(cache.getPooled(.indexer)?.dim(1) == 3)
+        }
+    }
+
     @Test("prefill indexer scores mask future compressed chunks before top-k")
     func prefillMasksFutureCompressedChunksBeforeTopK() {
         FocusedMLXTestSupport.withLock {

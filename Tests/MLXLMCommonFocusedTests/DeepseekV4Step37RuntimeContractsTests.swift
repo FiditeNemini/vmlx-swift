@@ -7,6 +7,21 @@ import Testing
 
 @Suite("DSV4 step 3.7 runtime contracts", .serialized)
 struct DeepseekV4Step37RuntimeContractsTests {
+    @Test("DSV4 long prefill honors the requested chunk window")
+    func longPrefillDoesNotExpandHybridPoolToOneShot() throws {
+        let evaluate = try Self.source("Libraries/MLXLMCommon/Evaluate.swift")
+        let batchEngine = try Self.source(
+            "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift")
+
+        #expect(!evaluate.contains("effectivePrefillWindow("))
+        #expect(!batchEngine.contains("effectivePrefillWindow("))
+        #expect(!evaluate.contains("Swift.max(requested, input.text.tokens.size)"))
+        #expect(!batchEngine.contains("Swift.max(requested, input.text.tokens.size)"))
+        #expect(evaluate.contains("windowSize: effectiveParameters.prefillStepSize"))
+        #expect(batchEngine.contains("windowSize: slot.prefillStepSize"))
+        #expect(evaluate.contains("cacheInitParameters?.prefillStepSize ?? 512"))
+    }
+
     @Test("DSV4 native composite cache uses disk L2 and skips generic paged KV")
     func dsv4NativeCompositeCacheUsesDiskL2AndSkipsGenericPagedKV() throws {
         let model = try Self.source("Libraries/MLXLLM/Models/DeepseekV4.swift")
@@ -32,13 +47,13 @@ struct DeepseekV4Step37RuntimeContractsTests {
         #expect(coordinator.contains("isPagedIncompatible"))
         #expect(coordinator.contains("let skipPaged = isPagedIncompatible"))
         #expect(coordinator.contains("if !skipPaged,\n           let pagedCache"))
-        #expect(coordinator.contains("if !isPagedIncompatible, let pagedCache"))
+        #expect(coordinator.contains("if !isPagedIncompatible,\n           hasPagedKVPayload,\n           hasRequiredPagedCompanion,\n           let pagedCache"))
         #expect(coordinator.contains("if config.enableDiskCache"))
         #expect(!coordinator.contains("if config.defaultKVMode"))
     }
 
-    @Test("DSV4 required tools keep ordinary assistant tail and schema-aware parser fallbacks")
-    func dsv4RequiredToolsKeepOrdinaryAssistantTailAndSchemaAwareParserFallbacks() {
+    @Test("DSV4 required tools keep ordinary assistant tail and canonical DSML parsing")
+    func dsv4RequiredToolsKeepOrdinaryAssistantTailAndCanonicalDSMLParsing() {
         let rendered = DeepseekV4ChatEncoder().encode(
             messages: [
                 .init(role: .system, content: "", tools: [Self.lineCountToolSpec()]),
@@ -67,7 +82,15 @@ struct DeepseekV4Step37RuntimeContractsTests {
         #expect(!rendered.contains("<\u{FF5C}action\u{FF5C}>"))
 
         let processor = ToolCallProcessor(format: .dsml, tools: [Self.lineCountToolSpec()])
-        let output = #"line_count("text": "one\ntwo") extra prose that must not leak"#
+        let dsml = DeepseekV4Tokens.dsml
+        let output = """
+            <\(dsml)tool_calls>
+            <\(dsml)invoke name="line_count">
+            <\(dsml)parameter name="text" string="true">one
+            two</\(dsml)parameter>
+            </\(dsml)invoke>
+            </\(dsml)tool_calls>
+            """
         var visible = ""
         for ch in output {
             visible += processor.processChunk(String(ch)) ?? ""

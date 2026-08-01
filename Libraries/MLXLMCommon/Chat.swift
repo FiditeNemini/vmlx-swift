@@ -282,6 +282,12 @@ public struct NoSystemMessageGenerator: MessageGenerator {
 
 // MARK: - Default dict construction
 
+/// Private message metadata consumed only by native history encoders that
+/// must reproduce ordering-sensitive protocol text. It intentionally lives
+/// beside (not inside) `tool_calls`, so templates serializing a tool call do
+/// not expose an implementation field to the model.
+let rawToolArgumentsJSONMessageKey = "_vmlx_raw_tool_arguments_json"
+
 /// Produce the canonical Jinja-renderer dict for a ``Chat.Message``.
 ///
 /// Shared by every generator that doesn't override the individual-
@@ -306,6 +312,10 @@ public func defaultMessageDict(for message: Chat.Message) -> Message {
     if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
         dict["tool_calls"] = toolCalls.enumerated().map { (idx, call) in
             toolCallDict(call: call, index: idx)
+        }
+        let rawArguments = toolCalls.map { $0.function.rawArgumentsJSON ?? "" }
+        if rawArguments.contains(where: { !$0.isEmpty }) {
+            dict[rawToolArgumentsJSONMessageKey] = rawArguments
         }
     }
 

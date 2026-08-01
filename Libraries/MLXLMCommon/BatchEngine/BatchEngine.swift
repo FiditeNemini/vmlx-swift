@@ -882,7 +882,8 @@ public actor BatchEngine {
                         stopReason: finalStop,
                         turboQuantCompressions: info.turboQuantCompressions,
                         turboQuantCacheTransition: info.turboQuantCacheTransition,
-                        unclosedReasoning: unclosed)
+                        unclosedReasoning: unclosed,
+                        toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
                     if info.turboQuantCompressions > 0 {
                         turboQuantCompressionCount += info.turboQuantCompressions
                     }
@@ -910,7 +911,8 @@ public actor BatchEngine {
                     promptTime: 0,
                     generationTime: elapsed,
                     stopReason: .cancelled,
-                    unclosedReasoning: unclosed)
+                    unclosedReasoning: unclosed,
+                    toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
                 continuation.yield(.info(finalInfo))
             }
             terminationState.markCompleted()
@@ -1580,21 +1582,6 @@ public actor BatchEngine {
         }
     }
 
-    /// DSV4's HybridPoolCache has mutable compressor/indexer pools that must
-    /// be built in one forward for a prompt segment. Chunked prefill is still
-    /// correct for ordinary KV and hybrid SSM models; restrict the override to
-    /// the hybrid-pool cache family.
-    private func effectivePrefillWindow(
-        requested: Int,
-        input: LMInput,
-        cache: [KVCache]
-    ) -> Int {
-        guard cache.contains(where: { $0 is HybridPoolCache }) else {
-            return requested
-        }
-        return Swift.max(requested, input.text.tokens.size)
-    }
-
     // MARK: - Step Logic
 
     /// Run one scheduling step: prefill pending slots, then batch-decode active slots.
@@ -2017,10 +2004,7 @@ public actor BatchEngine {
                 try context.model.prepare(
                     inputForPrepare,
                     cache: slot.cache,
-                    windowSize: effectivePrefillWindow(
-                        requested: slot.prefillStepSize,
-                        input: inputForPrepare,
-                        cache: slot.cache))
+                    windowSize: slot.prefillStepSize)
             }
         } catch {
             // Prefill failed (e.g., invalid input) — finish with cancellation
@@ -2909,10 +2893,7 @@ public actor BatchEngine {
                     switch try context.model.prepare(
                         boundaryInput,
                         cache: cache,
-                        windowSize: effectivePrefillWindow(
-                            requested: slot.prefillStepSize,
-                            input: boundaryInput,
-                            cache: cache))
+                        windowSize: slot.prefillStepSize)
                     {
                     case .tokens(let remaining):
                         // Match the main prefill path's batch-first shape.

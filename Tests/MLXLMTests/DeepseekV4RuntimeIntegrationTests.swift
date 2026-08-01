@@ -17,7 +17,7 @@
 //      bytes before the model's `</think>` route to `.reasoning`,
 //      after to `.chunk`.
 //   3. `max reasoning` (thinking + effort="max") — same as mode 2
-//      PLUS the REASONING_EFFORT_MAX preface is prepended at index 0.
+//      PLUS the distinct 0731 low/high/max effort prefix contract at index 0.
 //
 // Tool-call overlay: all three modes MUST route DSML tool-call blocks
 // (`<｜DSML｜tool_calls>`…) to `Generation.toolCall(ToolCall)` events
@@ -235,7 +235,7 @@ struct DeepseekV4RuntimeIntegrationTests {
             reasoningEffort: .max)
 
         // Preface IS prepended.
-        #expect(prompt.contains("Reasoning Effort: Absolute maximum"),
+        #expect(prompt.contains("Reasoning Effort: Beyond maximum"),
             "max effort must inject the preface at turn 0")
         // Tail is still open <think> — the preface changes the prefix,
         // not the tail shape.
@@ -273,7 +273,7 @@ struct DeepseekV4RuntimeIntegrationTests {
             dropEarlierReasoning: true)
 
         // Preface at turn 0.
-        #expect(prompt.contains("Reasoning Effort: Absolute maximum"))
+        #expect(prompt.contains("Reasoning Effort: Beyond maximum"))
         // Prior turn's CoT is stripped.
         #expect(!prompt.contains("Long turn 1 CoT"))
         // Prior turn's answer survives.

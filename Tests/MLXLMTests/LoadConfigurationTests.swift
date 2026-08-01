@@ -12,7 +12,10 @@ import MLX
 import Testing
 @testable import MLXLMCommon
 
-@Suite("LoadConfiguration")
+// These tests temporarily mutate process-global environment variables. Keep
+// the suite serialized so JANGPRESS=70/off/banana cases cannot race each
+// other and produce order-dependent policy results.
+@Suite("LoadConfiguration", .serialized)
 struct LoadConfigurationTests {
 
     // MARK: - JangPressPolicy.resolve precedence
@@ -212,7 +215,7 @@ struct LoadConfigurationTests {
         #expect(source.contains("let mmapSafetensorsActive = envFlag(\"MLX_SAFETENSORS_MMAP\")"))
         #expect(source.contains("let allowJANGTQMmapBFloat16 = envFlag(\"VMLINUX_JANGTQ_BF16_MMAP\")"))
         #expect(source.contains("let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)"))
-        #expect(source.contains("if !isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16"))
+        #expect(source.contains("!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16"))
         #expect(source.contains("|| autoJANGTQMmapBFloat16"))
         #expect(source.contains("private func requiresJANGTQMmapBFloat16(_ modelDirectory: URL) -> Bool"))
         #expect(source.contains("modelType == \"nemotron_h\""))
@@ -309,11 +312,12 @@ struct LoadConfigurationTests {
         #expect(facts.isRouted == false)
     }
 
-    @Test("plain DSV4 affine JANG is production-blocked")
-    func plainDSV4AffineJANGIsProductionBlocked() throws {
+    @Test("plain DSV4 affine JANG resolves mmap requests to resident weights")
+    func plainDSV4AffineJANGRequiresResidentSafetensors() throws {
         let cfg = [
             "model_type": "deepseek_v4",
             "weight_format": "affine",
+            "num_hidden_layers": 43,
             "n_routed_experts": 256,
             "num_experts_per_tok": 8,
             "moe_intermediate_size": 2048,
@@ -334,7 +338,84 @@ struct LoadConfigurationTests {
         #expect(facts.hasJangConfig)
         #expect(!facts.hasJangTQRuntime)
         #expect(facts.isPlainDeepseekV4AffineJANG)
-        #expect(facts.productionBlockReason?.contains("unsupported affine routed-MoE") == true)
+        #expect(facts.requiresResidentSafetensors)
+        #expect(!facts.resolveMmapSafetensors(requested: true))
+        #expect(!facts.resolveMmapSafetensors(requested: false))
+        #expect(facts.resolveMLXMemoryLimit(requested: .default) == .unlimited)
+        #expect(
+            facts.resolveMLXMemoryLimit(requested: .absolute(8 * 1024 * 1024 * 1024))
+                == .unlimited)
+    }
+
+    @Test("complete pre-stacked affine DSV4 index permits mmap without restoring cap")
+    func prestackedDSV4AffineJANGPermitsMmap() throws {
+        let dir = try Self.makeDeepseekV4AffineBundle(
+            layout: "prestacked_affine",
+            indexData: try Self.deepseekV4AffinePrestackedIndex())
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let facts = LoadBundleFacts.inspect(bundleURL: dir)
+        #expect(facts.routedExpertLayout == "prestacked_affine")
+        #expect(facts.hasPrestackedAffineRoutedExperts)
+        #expect(facts.isPlainDeepseekV4AffineJANG)
+        #expect(!facts.requiresResidentSafetensors)
+        #expect(facts.resolveMmapSafetensors(requested: true))
+        #expect(!facts.resolveMmapSafetensors(requested: false))
+        #expect(facts.resolveMLXMemoryLimit(requested: .default) == .unlimited)
+    }
+
+    @Test("pre-stacked affine declaration without an index fails closed")
+    func prestackedDSV4AffineMarkerOnlyFailsClosed() throws {
+        let dir = try Self.makeDeepseekV4AffineBundle(
+            layout: "prestacked_affine", indexData: nil)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let facts = LoadBundleFacts.inspect(bundleURL: dir)
+        #expect(!facts.hasPrestackedAffineRoutedExperts)
+        #expect(facts.requiresResidentSafetensors)
+        #expect(!facts.resolveMmapSafetensors(requested: true))
+    }
+
+    @Test("complete pre-stacked affine index without a declaration fails closed")
+    func prestackedDSV4AffineIndexOnlyFailsClosed() throws {
+        let dir = try Self.makeDeepseekV4AffineBundle(
+            layout: nil,
+            indexData: try Self.deepseekV4AffinePrestackedIndex())
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let facts = LoadBundleFacts.inspect(bundleURL: dir)
+        #expect(!facts.hasPrestackedAffineRoutedExperts)
+        #expect(facts.requiresResidentSafetensors)
+        #expect(!facts.resolveMmapSafetensors(requested: true))
+    }
+
+    @Test("incomplete pre-stacked affine DSV4 index fails closed")
+    func incompletePrestackedDSV4AffineIndexFailsClosed() throws {
+        let missing = "layers.42.mlp.switch_mlp.up_proj.biases"
+        let dir = try Self.makeDeepseekV4AffineBundle(
+            layout: "prestacked_affine",
+            indexData: try Self.deepseekV4AffinePrestackedIndex(
+                omitting: missing))
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let facts = LoadBundleFacts.inspect(bundleURL: dir)
+        #expect(!facts.hasPrestackedAffineRoutedExperts)
+        #expect(facts.requiresResidentSafetensors)
+        #expect(!facts.resolveMmapSafetensors(requested: true))
+    }
+
+    @Test("mixed pre-stacked and split affine DSV4 index fails closed")
+    func mixedPrestackedDSV4AffineIndexFailsClosed() throws {
+        let dir = try Self.makeDeepseekV4AffineBundle(
+            layout: "prestacked_affine",
+            indexData: try Self.deepseekV4AffinePrestackedIndex(
+                includeSplitExpert: true))
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let facts = LoadBundleFacts.inspect(bundleURL: dir)
+        #expect(!facts.hasPrestackedAffineRoutedExperts)
+        #expect(facts.requiresResidentSafetensors)
+        #expect(!facts.resolveMmapSafetensors(requested: true))
     }
 
     @Test("DSV4 JANGTQ is not blocked by the affine-JANG guard")
@@ -357,7 +438,9 @@ struct LoadConfigurationTests {
         let facts = LoadBundleFacts.inspect(bundleURL: dir)
         #expect(facts.hasJangTQRuntime)
         #expect(!facts.isPlainDeepseekV4AffineJANG)
-        #expect(facts.productionBlockReason == nil)
+        #expect(!facts.requiresResidentSafetensors)
+        #expect(facts.resolveMmapSafetensors(requested: true))
+        #expect(facts.resolveMLXMemoryLimit(requested: .default) == .default)
     }
 
     @Test("inspect on missing dir returns zeroed facts")
@@ -392,6 +475,32 @@ struct LoadConfigurationTests {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         #expect(shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: dir) == expected)
+    }
+
+    @Test("mmap dtype preservation requires validated pre-stacked affine DSV4")
+    func dsv4PrestackedAffineMmapDtypePolicy() throws {
+        let valid = try Self.makeDeepseekV4AffineBundle(
+            layout: "prestacked_affine",
+            indexData: try Self.deepseekV4AffinePrestackedIndex())
+        let split = try Self.makeDeepseekV4AffineBundle(
+            layout: nil,
+            indexData: nil)
+        let mixed = try Self.makeDeepseekV4AffineBundle(
+            layout: "prestacked_affine",
+            indexData: try Self.deepseekV4AffinePrestackedIndex(
+                includeSplitExpert: true))
+        defer {
+            try? FileManager.default.removeItem(at: valid)
+            try? FileManager.default.removeItem(at: split)
+            try? FileManager.default.removeItem(at: mixed)
+        }
+
+        #expect(shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
+            modelDirectory: valid))
+        #expect(!shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
+            modelDirectory: split))
+        #expect(!shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
+            modelDirectory: mixed))
     }
 
     // MARK: - JangPressStatus.disabled
@@ -451,6 +560,62 @@ struct LoadConfigurationTests {
             try data.write(to: dir.appendingPathComponent(name))
         }
         return dir
+    }
+
+    static func makeDeepseekV4AffineBundle(
+        layout: String?,
+        indexData: Data?
+    ) throws -> URL {
+        var config =
+            [
+                "model_type": "deepseek_v4",
+                "weight_format": "affine",
+                "num_hidden_layers": 43,
+                "n_routed_experts": 256,
+                "num_experts_per_tok": 6,
+                "moe_intermediate_size": 2048,
+            ] as [String: Any]
+        var jang = ["weight_format": "affine"] as [String: Any]
+        if let layout {
+            config["routed_expert_layout"] = layout
+            jang["routed_expert_layout"] = layout
+        }
+
+        var files = [
+            ("config.json", try JSONSerialization.data(withJSONObject: config)),
+            ("jang_config.json", try JSONSerialization.data(withJSONObject: jang)),
+            ("model-00001-of-00001.safetensors", Data(count: 1024)),
+        ]
+        if let indexData {
+            files.append(("model.safetensors.index.json", indexData))
+        }
+        return try makeBundle(files: files)
+    }
+
+    static func deepseekV4AffinePrestackedIndex(
+        omitting omittedKey: String? = nil,
+        includeSplitExpert: Bool = false
+    ) throws -> Data {
+        let shard = "model-00001-of-00001.safetensors"
+        var weightMap = [String: String]()
+        for layer in 0 ..< 43 {
+            for projection in ["gate_proj", "down_proj", "up_proj"] {
+                for suffix in ["weight", "scales", "biases"] {
+                    let key =
+                        "layers.\(layer).mlp.switch_mlp.\(projection).\(suffix)"
+                    if key != omittedKey {
+                        weightMap[key] = shard
+                    }
+                }
+            }
+        }
+        if includeSplitExpert {
+            weightMap["layers.0.ffn.experts.0.w1.weight"] = shard
+        }
+        return try JSONSerialization.data(withJSONObject: [
+            "metadata": ["rebundled_layout": "prestacked-switch_mlp-affine"],
+            "weight_map": weightMap,
+        ])
     }
 }
 

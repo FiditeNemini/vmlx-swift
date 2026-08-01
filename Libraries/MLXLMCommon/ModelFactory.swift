@@ -600,18 +600,25 @@ public func loadModel(
 ) async throws -> (ModelContext, JangPressRuntime) {
     // 1. Inspect bundle once.
     let facts = LoadBundleFacts.inspect(bundleURL: directory)
-    if let reason = facts.productionBlockReason {
-        let raw = ProcessInfo.processInfo.environment[
-            "VMLINUX_ALLOW_EXPERIMENTAL_DSV4_AFFINE_JANG"
-        ]?.lowercased()
-        let allowDiagnostic = raw == "1" || raw == "true" || raw == "on" || raw == "yes"
-        if !allowDiagnostic {
-            throw ModelFactoryError.unsupportedModelType(reason)
-        }
+    let useMmapSafetensors = facts.resolveMmapSafetensors(
+        requested: loadConfiguration.useMmapSafetensors)
+    let memoryLimit = facts.resolveMLXMemoryLimit(
+        requested: loadConfiguration.memoryLimit)
+    if loadConfiguration.useMmapSafetensors && !useMmapSafetensors {
+        FileHandle.standardError.write(Data(
+            "[Load] DeepSeek V4 affine JANG selected resident safetensors for production decode\n"
+                .utf8))
+    }
+    if loadConfiguration.memoryLimit != memoryLimit {
+        FileHandle.standardError.write(Data(
+            "[Load] DeepSeek V4 affine JANG uses RAM admission instead of the decode-throttling MLX memory limit\n"
+                .utf8))
     }
 
     // 2. Resolve JangPress policy → concrete options.
-    let resolvedOptions = loadConfiguration.jangPress.resolve(facts: facts)
+    let resolvedOptions: JangPressLoadOptions = facts.requiresResidentSafetensors
+        ? .disabled
+        : loadConfiguration.jangPress.resolve(facts: facts)
 
     // 3. Apply resident cap (allocator pool) for the duration of load.
     //    Skipped when `.unlimited` so existing iter-25 in-loader cap
@@ -642,7 +649,7 @@ public func loadModel(
     //     so we never trip Apple's "limit larger than max working set
     //     size" rejection (the original 847a8c7 crash condition). See
     //     docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md.
-    if let rawCap = loadConfiguration.memoryLimit
+    if let rawCap = memoryLimit
         .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory)
     {
         let workingSetCap = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
@@ -663,7 +670,7 @@ public func loadModel(
     //    MLXPRESS_ALIGN_* / JANGPRESS_ALIGN_*.
     let loadDirectory = try JangPressPrestacker.prepareBundleIfNeeded(
         originalURL: directory,
-        enabled: loadConfiguration.useMmapSafetensors)
+        enabled: useMmapSafetensors)
 
     // 5. Load the model normally. Patched osaurus mlx-swift pins honor
     //    MLX_SAFETENSORS_MMAP=1 inside loadArraysAndMetadata(url:),
@@ -677,12 +684,12 @@ public func loadModel(
     let tensorBuffersRaw = ProcessInfo.processInfo.environment["MLXPRESS_MMAP_TENSOR_BUFFERS"]
         ?? ProcessInfo.processInfo.environment["JANGPRESS_MMAP_TENSOR_BUFFERS"]
         ?? ""
-    let useTensorMmapBuffers = loadConfiguration.useMmapSafetensors
+    let useTensorMmapBuffers = useMmapSafetensors
         && resolvedOptions.enabled
         && resolvedOptions.backend == .mmap
         && ["1", "true", "on", "yes"].contains(tensorBuffersRaw.lowercased())
     var context = try await withMmapSafetensorsEnv(
-        enabled: loadConfiguration.useMmapSafetensors,
+        enabled: useMmapSafetensors,
         tensorBuffers: useTensorMmapBuffers,
         startColdPercent: useTensorMmapBuffers ? resolvedOptions.compressPct : nil
     ) {
@@ -697,10 +704,10 @@ public func loadModel(
     }
     _ = adviseCanonicalMmapRoutedExpertsIfAvailable(
         options: resolvedOptions,
-        mmapEnabled: loadConfiguration.useMmapSafetensors)
+        mmapEnabled: useMmapSafetensors)
     JangPressCanonicalExpertAdvisor.shared.configure(
         options: resolvedOptions,
-        mmapEnabled: loadConfiguration.useMmapSafetensors,
+        mmapEnabled: useMmapSafetensors,
         numRoutedExperts: facts.numRoutedExperts,
         topK: facts.topK)
 

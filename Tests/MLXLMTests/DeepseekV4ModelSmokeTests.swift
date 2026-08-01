@@ -79,6 +79,224 @@ struct DeepseekV4ModelSmokeTests {
 
     // MARK: - Sanitize remapping
 
+    @Test("partial RoPE preserves the activation dtype")
+    func partialRoPEPreservesActivationDType() {
+        MLXMetalTestLock.withLock {
+            let x = MLXArray([Float(1), 2, 3, 4])
+                .asType(.float16)
+                .reshaped(1, 1, 1, 4)
+            // Rotate the final adjacent pair by +90 degrees. The frequency
+            // table is fp32, as it is in the real DSV4 model.
+            let cos = MLXArray([Float(0)]).reshaped(1, 1, 1, 1)
+            let sin = MLXArray([Float(1)]).reshaped(1, 1, 1, 1)
+
+            let forward = DeepseekV4Math.applyPartialRoPE(
+                x, cos: cos, sin: sin, ropeDim: 2)
+            let inverse = DeepseekV4Math.applyPartialRoPE(
+                x, cos: cos, sin: sin, ropeDim: 2, inverse: true)
+            MLX.eval(forward, inverse)
+
+            #expect(forward.dtype == .float16)
+            #expect(inverse.dtype == .float16)
+            let expectedForward = MLXArray([Float(1), 2, -4, 3])
+                .asType(.float16)
+                .reshaped(1, 1, 1, 4)
+            let expectedInverse = MLXArray([Float(1), 2, 4, -3])
+                .asType(.float16)
+                .reshaped(1, 1, 1, 4)
+            #expect((forward - expectedForward).abs().max().item(Float.self) == 0)
+            #expect((inverse - expectedInverse).abs().max().item(Float.self) == 0)
+        }
+    }
+
+    @Test("0731 YaRN frequencies use beta-fast low and beta-slow high bounds")
+    func yarnInvFreqMatchesPinned0731CorrectionRange() {
+        MLXMetalTestLock.withLock {
+            let actual = DeepseekV4Math.yarnInvFreq(
+                dim: 64,
+                base: 160_000,
+                maxPos: 1_048_576,
+                origMaxPos: 65_536,
+                factor: 16,
+                betaFast: 32,
+                betaSlow: 1)
+            MLX.eval(actual)
+
+            // Pinned DeepSeek-V4-Flash-0731 inference/model.py computes
+            // floor(correction(beta_fast)) == 15 and
+            // ceil(correction(beta_slow)) == 25. These oracle values cover
+            // the unscaled prefix, the ten-bin transition, and scaled tail.
+            let expected: [Float] = [
+                1.0, 0.68765602, 0.4728708, 0.32517245,
+                0.2236068, 0.15376456, 0.10573713, 0.07271077,
+                0.05, 0.0343828, 0.02364354, 0.01625862,
+                0.01118034, 0.007688228, 0.005286856, 0.003635539,
+                0.002265625, 0.0013968013, 0.0008496897, 0.000508082,
+                0.0002969778, 0.00016818, 0.00009086784, 0.00004544423,
+                0.00001953125, 0.000005372313, 0.000003694303,
+                0.00000254041, 0.000001746928, 0.000001201286,
+                0.0000008260713, 0.0000005680529,
+            ]
+            let reference = MLXArray(expected)
+            let maxError = (actual - reference).abs().max().item(Float.self)
+
+            #expect(actual.shape == [32])
+            #expect(maxError < 1e-8)
+        }
+    }
+
+    @Test("0731 E4M3 KV activation round trip matches fixed block-64 goldens")
+    func e4m3KVActivationRoundTripMatchesGoldens() {
+        MLXMetalTestLock.withLock {
+            var values = [Float](repeating: 0, count: 128)
+            let firstInputs: [Float] = [
+                -448, -1.1, -0.1, 0, 0.001, 0.1,
+                1.1, 1.1875, 1.2, 3.25, 6.25, 448,
+            ]
+            let secondInputs: [Float] = [
+                -6, -0.01, 0.01, 0.03, 0.123, 0.333, 2.7, 6,
+            ]
+            values.replaceSubrange(0..<firstInputs.count, with: firstInputs)
+            values.replaceSubrange(64..<(64 + secondInputs.count), with: secondInputs)
+            let input = MLXArray(values).reshaped(2, 64)
+            let output = DeepseekV4Math.e4m3KVActivationRoundTrip(
+                input, ropeDim: 0)
+            MLX.eval(output)
+
+            let expectedFirst: [Float] = [
+                -448, -1.125, -0.1015625, 0, 0.001953125, 0.1015625,
+                1.125, 1.25, 1.25, 3.25, 6, 448,
+            ]
+            let expectedSecond: [Float] = [
+                -6, -0.009765625, 0.009765625, 0.029296875,
+                0.125, 0.34375, 2.75, 6,
+            ]
+            for (index, expected) in expectedFirst.enumerated() {
+                #expect(output[0, index].item(Float.self) == expected)
+            }
+            for (index, expected) in expectedSecond.enumerated() {
+                #expect(output[1, index].item(Float.self) == expected)
+            }
+
+            var withRope = [Float](repeating: 0, count: 128)
+            withRope[0] = 448
+            for index in 64..<128 {
+                withRope[index] = Float(index - 64) * 0.125 - 3
+            }
+            let full = MLXArray(withRope).reshaped(1, 1, 1, 128)
+            let fullOutput = DeepseekV4Math.e4m3KVActivationRoundTrip(
+                full, ropeDim: 64)
+            MLX.eval(fullOutput)
+            let suffixError = (
+                fullOutput[0..., 0..., 0..., 64...]
+                    - full[0..., 0..., 0..., 64...]
+            ).abs().max().item(Float.self)
+            #expect(suffixError == 0)
+        }
+    }
+
+    @Test("0731 indexer Hadamard-128 plus E2M1 matches basis-vector goldens")
+    func indexerActivationRoundTripMatchesBasisGoldens() {
+        MLXMetalTestLock.withLock {
+            var values = [Float](repeating: 0, count: 256)
+            values[0] = 1
+            values[128 + 1] = 1
+            let input = MLXArray(values).reshaped(2, 128)
+            let output = DeepseekV4Math.indexerActivationRoundTrip(input)
+            MLX.eval(output)
+
+            let expectedMagnitude = Float(0.09375)
+            for index in 0..<128 {
+                #expect(output[0, index].item(Float.self) == expectedMagnitude)
+                let expected = index.isMultiple(of: 2)
+                    ? expectedMagnitude : -expectedMagnitude
+                #expect(output[1, index].item(Float.self) == expected)
+            }
+        }
+    }
+
+    @Test("official mHC expansion contracts comb first axis")
+    func hcExpansionUsesOfficialTranspose() {
+        MLXMetalTestLock.withLock {
+            let comb = MLXArray([
+                Float(0), 1, 0, 0,
+                0, 0, 1, 0,
+                0, 0, 0, 1,
+                1, 0, 0, 0,
+            ]).reshaped(1, 1, 4, 4)
+            let residual = MLXArray([Float(10), 20, 30, 40])
+                .reshaped(1, 1, 4, 1)
+            let actual = DeepseekV4Math.hcExpandResidual(
+                comb: comb, residual: residual)
+            MLX.eval(actual)
+
+            let expected = MLXArray([Float(40), 10, 20, 30])
+                .reshaped(1, 1, 4, 1)
+            #expect((actual - expected).abs().max().item(Float.self) == 0)
+        }
+    }
+
+    @Test("routed and shared experts accumulate in fp32 and cast once")
+    func routedAndSharedExpertAccumulationMatches0731() {
+        MLXMetalTestLock.withLock {
+            let routed = MLXArray([Float(0.01), 0.02])
+                .asType(.float16).reshaped(1, 1, 2, 1)
+            let shared = MLXArray([Float(-0.1)])
+                .asType(.float16).reshaped(1, 1, 1)
+
+            let routedFP32 = DeepseekV4Math.reduceRoutedExpertsFP32(routed)
+            let result = DeepseekV4Math.addSharedExpertFP32(
+                routedFP32, shared: shared, outputDType: .float16)
+            MLX.eval(routedFP32, result)
+
+            #expect(routedFP32.dtype == .float32)
+            #expect(result.dtype == .float16)
+            let reference = (
+                routed.asType(.float32).sum(axis: -2)
+                    + shared.asType(.float32)
+            ).asType(.float16)
+            MLX.eval(reference)
+            #expect((result - reference).abs().max().item(Float.self) == 0)
+        }
+    }
+
+    @Test("fused mHC Sinkhorn matches the pure-op reference")
+    func fusedHCSinkhornParity() {
+        MLXMetalTestLock.withLock {
+            let hc = 4
+            let width = (2 + hc) * hc
+            let mixes = MLXArray((0..<(2 * width)).map {
+                Float(($0 % 17) - 8) * 0.125
+            }).reshaped(2, width)
+            let scale = MLXArray([Float(0.75), 1.125, 0.625])
+            let base = MLXArray((0..<width).map {
+                Float(($0 % 11) - 5) * 0.03125
+            })
+
+            let fused = DeepseekV4Math.hcSplitSinkhorn(
+                mixes: mixes, scale: scale, base: base,
+                hcMult: hc, iters: 20, eps: 1e-6)
+            let reference = DeepseekV4Math.hcSplitSinkhornOps(
+                mixes: mixes, scale: scale, base: base,
+                hcMult: hc, iters: 20, eps: 1e-6)
+            MLX.eval(
+                fused.pre, fused.post, fused.comb,
+                reference.pre, reference.post, reference.comb)
+
+            #expect(fused.pre.shape == [2, hc])
+            #expect(fused.post.shape == [2, hc])
+            #expect(fused.comb.shape == [2, hc, hc])
+            #expect((fused.pre - reference.pre).abs().max().item(Float.self) < 2e-5)
+            #expect((fused.post - reference.post).abs().max().item(Float.self) < 2e-5)
+            #expect((fused.comb - reference.comb).abs().max().item(Float.self) < 2e-5)
+
+            let rowError = (fused.comb.sum(axis: -1) - 1).abs().max().item(Float.self)
+            let columnError = (fused.comb.sum(axis: -2) - 1).abs().max().item(Float.self)
+            #expect(rowError < 2e-5)
+            #expect(columnError < 2e-5)
+        }
+    }
+
     @Test("newCache keeps DSV4 hybrid cache even when request asks for TurboQuant")
     func newCacheKeepsHybridDespiteTurboQuantRequest() throws {
         var cfg = Self.tinyConfig()

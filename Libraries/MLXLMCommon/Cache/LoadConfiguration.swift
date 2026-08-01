@@ -231,6 +231,14 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// True when the bundle has a `jangtq_runtime.safetensors` sidecar.
     public var hasJangTQRuntime: Bool
 
+    /// Declared routed-expert storage layout, normalized to lowercase.
+    public var routedExpertLayout: String?
+
+    /// True only when a plain affine DSV4 bundle declares the converter's
+    /// pre-stacked layout and its weight index proves the complete canonical
+    /// 43-layer routed bank with no split-expert tensors.
+    public private(set) var hasPrestackedAffineRoutedExperts: Bool
+
     /// Sum of `*.safetensors` byte sizes in the bundle. `0` when
     /// inspection failed (treat as unknown — `.auto` falls through to
     /// disabled in that case).
@@ -264,6 +272,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
         weightFormat: String? = nil,
         hasJangConfig: Bool = false,
         hasJangTQRuntime: Bool = false,
+        routedExpertLayout: String? = nil,
         numRoutedExperts: Int? = nil,
         topK: Int? = nil
     ) {
@@ -271,6 +280,8 @@ public struct LoadBundleFacts: Sendable, Equatable {
         self.weightFormat = weightFormat?.lowercased()
         self.hasJangConfig = hasJangConfig
         self.hasJangTQRuntime = hasJangTQRuntime
+        self.routedExpertLayout = routedExpertLayout?.lowercased()
+        self.hasPrestackedAffineRoutedExperts = false
         self.totalSafetensorsBytes = totalSafetensorsBytes
         self.isRouted = isRouted
         self.physicalMemory = physicalMemory
@@ -305,8 +316,10 @@ public struct LoadBundleFacts: Sendable, Equatable {
         var routed = false
         var numRoutedExperts: Int?
         var topK: Int?
+        var numHiddenLayers: Int?
         var modelType: String?
         var weightFormat: String?
+        var routedExpertLayout: String?
         let configURL = url.appendingPathComponent("config.json")
         if let data = try? Data(contentsOf: configURL),
             let json = try? JSONSerialization.jsonObject(with: data)
@@ -346,8 +359,11 @@ public struct LoadBundleFacts: Sendable, Equatable {
             numRoutedExperts = firstPositiveInt(
                 in: json, keys: routedExpertKeys)
             topK = firstPositiveInt(in: json, keys: topKKeys)
+            numHiddenLayers = firstPositiveInt(
+                in: json, keys: ["num_hidden_layers", "n_layers"])
             modelType = json["model_type"] as? String
             weightFormat = (json["weight_format"] as? String)?.lowercased()
+            routedExpertLayout = (json["routed_expert_layout"] as? String)?.lowercased()
             for key in routedKeys {
                 if let n = json[key] as? Int, n > 1 {
                     routed = true
@@ -372,6 +388,14 @@ public struct LoadBundleFacts: Sendable, Equatable {
                     }
                     if weightFormat == nil {
                         weightFormat = (nested["weight_format"] as? String)?.lowercased()
+                    }
+                    if numHiddenLayers == nil {
+                        numHiddenLayers = firstPositiveInt(
+                            in: nested, keys: ["num_hidden_layers", "n_layers"])
+                    }
+                    if routedExpertLayout == nil {
+                        routedExpertLayout =
+                            (nested["routed_expert_layout"] as? String)?.lowercased()
                     }
                     if !routed {
                         for key in routedKeys {
@@ -400,11 +424,20 @@ public struct LoadBundleFacts: Sendable, Equatable {
             if weightFormat == nil {
                 weightFormat = (json["weight_format"] as? String)?.lowercased()
             }
+            if routedExpertLayout == nil {
+                routedExpertLayout =
+                    (json["routed_expert_layout"] as? String)?.lowercased()
+            }
         }
         let hasJangTQRuntime = fm.fileExists(
             atPath: url.appendingPathComponent("jangtq_runtime.safetensors").path)
+        let hasPrestackedAffineRoutedExperts =
+            routedExpertLayout == "prestacked_affine"
+            && numHiddenLayers == Self.deepseekV4AffineLayerCount
+            && numRoutedExperts == 256
+            && Self.hasCompleteDeepseekV4AffinePrestackedIndex(bundleURL: url)
 
-        return LoadBundleFacts(
+        var facts = LoadBundleFacts(
             totalSafetensorsBytes: totalBytes,
             isRouted: routed,
             physicalMemory: physical,
@@ -412,8 +445,80 @@ public struct LoadBundleFacts: Sendable, Equatable {
             weightFormat: weightFormat,
             hasJangConfig: hasJangConfig,
             hasJangTQRuntime: hasJangTQRuntime,
+            routedExpertLayout: routedExpertLayout,
             numRoutedExperts: numRoutedExperts,
             topK: topK)
+        facts.hasPrestackedAffineRoutedExperts = hasPrestackedAffineRoutedExperts
+        return facts
+    }
+
+    private static let deepseekV4AffineLayerCount = 43
+    private static let deepseekV4AffineProjections = [
+        "gate_proj", "down_proj", "up_proj",
+    ]
+    private static let deepseekV4AffineQuantSuffixes = [
+        "weight", "scales", "biases",
+    ]
+
+    private static let expectedDeepseekV4AffinePrestackedKeys: Set<String> = {
+        var keys = Set<String>()
+        for layer in 0 ..< deepseekV4AffineLayerCount {
+            for projection in deepseekV4AffineProjections {
+                for suffix in deepseekV4AffineQuantSuffixes {
+                    keys.insert(
+                        "layers.\(layer).mlp.switch_mlp.\(projection).\(suffix)")
+                }
+            }
+        }
+        return keys
+    }()
+
+    private static func hasCompleteDeepseekV4AffinePrestackedIndex(
+        bundleURL: URL
+    ) -> Bool {
+        let indexURL = bundleURL.appendingPathComponent(
+            "model.safetensors.index.json")
+        guard
+            let data = try? Data(contentsOf: indexURL),
+            let json = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+            let weightMap = json["weight_map"] as? [String: Any],
+            weightMap.values.allSatisfy({ $0 is String })
+        else {
+            return false
+        }
+
+        let indexedKeys = Set(weightMap.keys)
+        guard !indexedKeys.contains(where: isDeepseekV4SplitExpertKey) else {
+            return false
+        }
+
+        let canonicalPrestackedKeys = indexedKeys.filter(
+            isDeepseekV4CanonicalPrestackedKey)
+        return canonicalPrestackedKeys.count
+            == expectedDeepseekV4AffinePrestackedKeys.count
+            && expectedDeepseekV4AffinePrestackedKeys.isSubset(of: indexedKeys)
+    }
+
+    private static func isDeepseekV4SplitExpertKey(_ key: String) -> Bool {
+        key.hasPrefix("layers.") && key.contains(".ffn.experts.")
+    }
+
+    private static func isDeepseekV4CanonicalPrestackedKey(
+        _ key: String
+    ) -> Bool {
+        let parts = key.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 6,
+            parts[0] == "layers",
+            Int(parts[1]) != nil,
+            parts[2] == "mlp",
+            parts[3] == "switch_mlp",
+            deepseekV4AffineProjections.contains(String(parts[4])),
+            deepseekV4AffineQuantSuffixes.contains(String(parts[5]))
+        else {
+            return false
+        }
+        return true
     }
 
     public var isPlainDeepseekV4AffineJANG: Bool {
@@ -428,9 +533,29 @@ public struct LoadBundleFacts: Sendable, Equatable {
             && (numRoutedExperts ?? 0) >= 128
     }
 
-    public var productionBlockReason: String? {
-        guard isPlainDeepseekV4AffineJANG else { return nil }
-        return "Plain DeepSeek V4 JANG uses the unsupported affine routed-MoE SwitchGLU path. Use a JANGTQ bundle, or set VMLX_ALLOW_EXPERIMENTAL_DSV4_AFFINE_JANG=1 for diagnostics only."
+    /// The plain affine DSV4 implementation reaches its intended decode rate
+    /// only with the routed banks resident. A file-backed active-expert path
+    /// has to synchronize 43 GPU router results with the CPU and stream the
+    /// selected banks on every token; it is an explicitly rejected production
+    /// route for split-expert bundles. Converter-prestacked affine banks avoid
+    /// that materialization and retain the existing GPU gather path. Other
+    /// families retain the caller's mmap choice.
+    public var requiresResidentSafetensors: Bool {
+        isPlainDeepseekV4AffineJANG && !hasPrestackedAffineRoutedExperts
+    }
+
+    public func resolveMmapSafetensors(requested: Bool) -> Bool {
+        requested && !requiresResidentSafetensors
+    }
+
+    /// A resident affine DSV4 load cannot use `MLX.Memory.memoryLimit` as a
+    /// RAM-safety mechanism. The allocator cap does not constrain Activity
+    /// Monitor physical footprint for this bundle, but it serializes decode
+    /// and collapses throughput. Hosts must perform their normal pre-load RAM
+    /// admission check instead of silently throttling a successfully admitted
+    /// model.
+    public func resolveMLXMemoryLimit(requested: ResidentCap) -> ResidentCap {
+        isPlainDeepseekV4AffineJANG ? .unlimited : requested
     }
 }
 

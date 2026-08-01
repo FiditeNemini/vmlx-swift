@@ -97,7 +97,10 @@ public enum CacheStoreBudget {
     /// magnitude below the copy + serialize it is deciding whether to allow.
     public static func cacheBytes(_ cache: [KVCache]) -> Int {
         cache.reduce(0) { total, layer in
-            total + layer.state.reduce(0) { $0 + $1.nbytes }
+            if let retained = layer as? CacheRetainedByteCountProviding {
+                return total + retained.retainedCacheByteCount
+            }
+            return total + layer.state.reduce(0) { $0 + $1.nbytes }
         }
     }
 

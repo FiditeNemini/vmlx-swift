@@ -4,11 +4,13 @@
 import MLXLMCommon
 import Testing
 
+@testable import MLXLLM
+
 @Suite("DeepseekV4 reasoning policy")
 struct DeepseekV4ReasoningPolicyTests {
     @Test("public max passes through without hidden downgrade")
-    func maxPassesThroughByDefault() {
-        let context = DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
+    func maxPassesThroughByDefault() throws {
+        let context = try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
             [
                 "enable_thinking": true,
                 "reasoning_effort": "max",
@@ -23,8 +25,8 @@ struct DeepseekV4ReasoningPolicyTests {
     }
 
     @Test("legacy raw max environment no longer gates max pass-through")
-    func rawMaxEnvironmentDoesNotChangeMaxPassThrough() {
-        let context = DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
+    func rawMaxEnvironmentDoesNotChangeMaxPassThrough() throws {
+        let context = try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
             ["reasoning_effort": "max"],
             modelType: "deepseek_v4",
             environment: [:]
@@ -35,10 +37,10 @@ struct DeepseekV4ReasoningPolicyTests {
         #expect(cacheScopeSalt(from: context) == "reasoning=on|effort=max")
     }
 
-    @Test("low medium high efforts are preserved instead of aliased")
-    func lowMediumHighPassThrough() {
-        for effort in ["low", "medium", "high"] {
-            let context = DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
+    @Test("0731 accepts exactly low high and max efforts")
+    func canonicalEffortsPassThrough() throws {
+        for effort in ["low", "high", "max"] {
+            let context = try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
                 ["reasoning_effort": effort],
                 modelType: "deepseek_v4",
                 environment: [:]
@@ -48,25 +50,67 @@ struct DeepseekV4ReasoningPolicyTests {
         }
     }
 
-    @Test("direct rail efforts remove reasoning effort")
-    func directRailEffortsDisableThinking() {
-        let context = DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
-            [
-                "enable_thinking": true,
-                "reasoning_effort": "instruct",
-            ],
+    @Test("invalid and legacy effort aliases fail explicitly")
+    func invalidEffortsFailExplicitly() {
+        for effort in ["medium", "maximum", "instruct", "off"] {
+            do {
+                _ = try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
+                    ["reasoning_effort": effort],
+                    modelType: "deepseek_v4",
+                    environment: [:]
+                )
+                Issue.record("Expected reasoning_effort=\(effort) to fail")
+            } catch let error as DeepseekV4ReasoningPolicyError {
+                #expect(error == .invalidReasoningEffort(effort))
+            } catch {
+                Issue.record("Unexpected error for reasoning_effort=\(effort): \(error)")
+            }
+        }
+    }
+
+    @Test("explicit thinking false overrides every valid effort")
+    func explicitFalseOverridesEffort() throws {
+        for effort in ["low", "high", "max"] {
+            let context = try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
+                [
+                    "enable_thinking": false,
+                    "reasoning_effort": effort,
+                ],
+                modelType: "deepseek_v4",
+                environment: [:]
+            )
+
+            #expect(context?["enable_thinking"] as? Bool == false)
+            #expect(context?["reasoning_effort"] == nil)
+            #expect(cacheScopeSalt(from: context) == "reasoning=off")
+        }
+    }
+
+    @Test("thinking true without effort preserves the official low rail")
+    func thinkingTrueWithoutEffortRemainsLow() throws {
+        let context = try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
+            ["enable_thinking": true],
             modelType: "deepseek_v4",
             environment: [:]
         )
 
-        #expect(context?["enable_thinking"] as? Bool == false)
+        #expect(context?["enable_thinking"] as? Bool == true)
         #expect(context?["reasoning_effort"] == nil)
-        #expect(cacheScopeSalt(from: context) == "reasoning=off")
+        #expect(cacheScopeSalt(from: context) == "reasoning=on")
+
+        let prompt = try DeepseekV4ChatEncoder.renderOpenAIChat(
+            messages: [["role": "user", "content": "hi"]],
+            tools: nil,
+            additionalContext: context,
+            addGenerationPrompt: true
+        )
+        #expect(!prompt.contains("Reasoning Effort:"))
+        #expect(prompt.hasSuffix(DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart))
     }
 
     @Test("force direct environment does not override explicit reasoning request")
-    func forceDirectRailEnvironmentDoesNotOverrideRequest() {
-        let context = DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
+    func forceDirectRailEnvironmentDoesNotOverrideRequest() throws {
+        let context = try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
             ["reasoning_effort": "max"],
             modelType: "deepseek_v4",
             environment: [DeepseekV4ReasoningPolicy.forceDirectRailEnvironmentKey: "true"]
@@ -77,8 +121,8 @@ struct DeepseekV4ReasoningPolicyTests {
     }
 
     @Test("non DSV4 context is not rewritten")
-    func nonDSV4ContextIsUnchanged() {
-        let context = DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
+    func nonDSV4ContextIsUnchanged() throws {
+        let context = try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
             ["reasoning_effort": "max"],
             modelType: "qwen3",
             environment: [:]
@@ -86,5 +130,50 @@ struct DeepseekV4ReasoningPolicyTests {
 
         #expect(context?["reasoning_effort"] as? String == "max")
         #expect(context?["enable_thinking"] == nil)
+    }
+
+    @Test("LLM processor merge preserves bundle defaults and request precedence")
+    func processorMergePreservesDefaultsAndExplicitFalse() throws {
+        let omitted = try llmMergedAdditionalContext(
+            defaultAdditionalContext: nil,
+            requestAdditionalContext: nil,
+            modelType: "deepseek_v4"
+        )
+        #expect(omitted == nil)
+
+        let requestEnabled = try llmMergedAdditionalContext(
+            defaultAdditionalContext: ["enable_thinking": false],
+            requestAdditionalContext: ["enable_thinking": true],
+            modelType: "deepseek_v4"
+        )
+        #expect(requestEnabled?["enable_thinking"] as? Bool == true)
+        #expect(requestEnabled?["reasoning_effort"] == nil)
+
+        let requestDisabled = try llmMergedAdditionalContext(
+            defaultAdditionalContext: ["enable_thinking": true],
+            requestAdditionalContext: [
+                "enable_thinking": false,
+                "reasoning_effort": "max",
+            ],
+            modelType: "deepseek_v4"
+        )
+        #expect(requestDisabled?["enable_thinking"] as? Bool == false)
+        #expect(requestDisabled?["reasoning_effort"] == nil)
+    }
+
+    @Test("LLM processor merge propagates invalid effort errors")
+    func processorMergeRejectsMedium() {
+        do {
+            _ = try llmMergedAdditionalContext(
+                defaultAdditionalContext: nil,
+                requestAdditionalContext: ["reasoning_effort": "medium"],
+                modelType: "deepseek_v4"
+            )
+            Issue.record("Expected processor merge to reject reasoning_effort=medium")
+        } catch let error as DeepseekV4ReasoningPolicyError {
+            #expect(error == .invalidReasoningEffort("medium"))
+        } catch {
+            Issue.record("Unexpected processor merge error: \(error)")
+        }
     }
 }

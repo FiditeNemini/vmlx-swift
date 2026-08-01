@@ -470,6 +470,15 @@ public final class ChatSession {
                         var pendingToolCalls: [ToolCall] = []
 
                         for await item in stream {
+                            if case .info(let info) = item,
+                                let failure = info.toolCallProtocolFailure
+                            {
+                                // A malformed protocol envelope is terminal for
+                                // this generation pass. Do not dispatch any calls
+                                // accumulated before it or let string-only callers
+                                // mistake the lack of visible chunks for success.
+                                throw ChatSessionError.toolCallProtocolFailure(failure)
+                            }
                             // collect tool calls for dispatch; if no
                             // toolDispatch the caller handles them via
                             // the transform (streamDetails path)
@@ -597,7 +606,16 @@ public enum ChatSessionError: LocalizedError {
     /// ``ChatSession/saveCache(to:)`` was called before any generation occurred.
     case noCacheAvailable
 
+    /// The model completed a committed tool-call envelope that could not be
+    /// parsed into an executable call.
+    case toolCallProtocolFailure(ToolCallProtocolFailure)
+
     public var errorDescription: String? {
-        "No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."
+        switch self {
+        case .noCacheAvailable:
+            "No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."
+        case .toolCallProtocolFailure(let failure):
+            "The model emitted a non-executable tool-call protocol failure: \(failure.rawValue)."
+        }
     }
 }

@@ -109,6 +109,11 @@ public class SwitchGLU: Module, SwitchGLULayer {
     /// express on `gate`. Every other caller passes `nil` and gets the
     /// historical bit-for-bit-identical fast paths.
     let glue: ((MLXArray, MLXArray) -> MLXArray)?
+    /// Optional model-specific activation that applies a per-route score
+    /// before the down projection. DSV4-0731 requires this ordering because
+    /// its down projection is quantized; scaling the projection output later
+    /// is not the checkpoint graph.
+    let scoredGlue: ((MLXArray, MLXArray, MLXArray) -> MLXArray)?
 
     // Lazy fused gate+up gatherQuantizedMM cache.
     //
@@ -145,13 +150,15 @@ public class SwitchGLU: Module, SwitchGLULayer {
         numExperts: Int,
         activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
         bias: Bool = false,
-        glue: ((MLXArray, MLXArray) -> MLXArray)? = nil
+        glue: ((MLXArray, MLXArray) -> MLXArray)? = nil,
+        scoredGlue: ((MLXArray, MLXArray, MLXArray) -> MLXArray)? = nil
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
         self.activation = activation
         self.glue = glue
+        self.scoredGlue = scoredGlue
         // Detect common activation types for compiled fast path.
         // Use safeGeluApproximate for comparison to avoid MLXNN's compiledGeluApproximate
         // which uses the Power primitive (x ** 3) and crashes on some Metal GPUs during
@@ -249,6 +256,17 @@ public class SwitchGLU: Module, SwitchGLULayer {
     }
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        callAsFunction(x, indices, preDownScores: nil)
+    }
+
+    /// Variant for model graphs that weight each routed activation before its
+    /// expert down projection. The score tensor has the same leading shape as
+    /// `indices`; sorting keeps scores aligned with the expert dispatch rows.
+    public func callAsFunction(
+        _ input: MLXArray,
+        _ indices: MLXArray,
+        preDownScores: MLXArray?
+    ) -> MLXArray {
         ensureFusedGateUp()
 
         // Fused gate+up is a net win for DECODE (single-token forward pass,
@@ -268,18 +286,40 @@ public class SwitchGLU: Module, SwitchGLULayer {
             (fusedGateUpWeight != nil)
             && (indices.size <= decodeThreshold)
 
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
+        let inputDType = input.dtype
+        var x = MLX.expandedDimensions(input, axes: [-2, -3])
 
         let doSort = indices.size >= 64
 
         var idx = indices
         var inverseOrder = MLXArray()
+        var alignedScores = preDownScores
 
         if doSort {
+            if let scores = alignedScores {
+                let scoreOrder = argSort(indices.flattened())
+                alignedScores = scores.flattened()[scoreOrder]
+            }
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
-        let activated: MLXArray
+        func activate(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+            if let scores = alignedScores, let scoredGlue {
+                return scoredGlue(gate, up, scores)
+            }
+            if let glue {
+                return glue(gate, up)
+            }
+            if isSiluActivation {
+                return compiledSwiGLU(gate, up)
+            }
+            if isGeluActivation {
+                return compiledGeGLU(gate, up)
+            }
+            return activation(gate) * up
+        }
+
+        var activated: MLXArray
         if useFused, let fusedW = fusedGateUpWeight, let fusedS = fusedGateUpScales {
             // FUSED PATH — single gatherQuantizedMM for gate+up, then
             // split along output axis and apply compiled SwiGLU.
@@ -293,34 +333,24 @@ public class SwitchGLU: Module, SwitchGLULayer {
             let splits = MLX.split(combined, parts: 2, axis: -1)
             let xGate = splits[0]
             let xUp = splits[1]
-            if let glue {
-                // DSV4 limited-SwiGLU and any other caller that needs to
-                // post-process BOTH gate and up symmetrically. Skips the
-                // compiled SwiGLU/GeGLU fast paths intentionally — the
-                // closure is the source of truth.
-                activated = glue(xGate, xUp)
-            } else if isSiluActivation {
-                activated = compiledSwiGLU(xGate, xUp)
-            } else if isGeluActivation {
-                activated = compiledGeGLU(xGate, xUp)
-            } else {
-                activated = activation(xGate) * xUp
-            }
+            activated = activate(xGate, xUp)
         } else {
             // FALLBACK — original two-call path for non-quantized models,
             // prefill batches (indices.size > threshold), or when the
             // feature flag is off.
             let xUp = upProj(x, idx, sortedIndices: doSort)
             let xGate = gateProj(x, idx, sortedIndices: doSort)
-            if let glue {
-                activated = glue(xGate, xUp)
-            } else if isSiluActivation {
-                activated = compiledSwiGLU(xGate, xUp)
-            } else if isGeluActivation {
-                activated = compiledGeGLU(xGate, xUp)
-            } else {
-                activated = activation(xGate) * xUp
-            }
+            activated = activate(xGate, xUp)
+        }
+
+        // Generic fallback for a caller that supplies pre-down scores without
+        // a fused scored activation. DSV4 supplies `scoredGlue`, so its clamp,
+        // SiLU, route weighting, and cast execute in the exact official order.
+        if let scores = alignedScores, scoredGlue == nil {
+            activated = (
+                activated.asType(.float32)
+                    * scores.asType(.float32)[.ellipsis, .newAxis, .newAxis]
+            ).asType(inputDType)
         }
 
         x = downProj(activated, idx, sortedIndices: doSort)
@@ -328,7 +358,6 @@ public class SwitchGLU: Module, SwitchGLULayer {
         if doSort {
             x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
         }
-
         return MLX.squeezed(x, axis: -2)
     }
 }

@@ -57,6 +57,10 @@ struct DSMLToolCallParserTests {
         let args = call.function.arguments
         #expect(args["location"] == .string("San Francisco"))
         #expect(args["units"] == .string("celsius"))
+        #expect(
+            call.function.rawArgumentsJSON
+                == "{\"location\": \"San Francisco\", \"units\": \"celsius\"}"
+        )
     }
 
     @Test("parseEOS returns the invoke in a single-call block")
@@ -100,12 +104,16 @@ struct DSMLToolCallParserTests {
             args["tags"]
                 == .array([.string("a"), .string("b"), .string("c")]))
         #expect(args["label"] == .string("ready"))
+        #expect(
+            call.function.rawArgumentsJSON
+                == "{\"enabled\": true, \"retries\": 5, \"tags\": [\"a\",\"b\",\"c\"], \"label\": \"ready\"}"
+        )
     }
 
     // MARK: - Robustness
 
-    @Test("Malformed JSON in string=\"false\" param falls back to raw string")
-    func malformedJSONFallback() throws {
+    @Test("Malformed JSON in string=\"false\" rejects the canonical envelope")
+    func malformedJSONRejectsEnvelope() {
         let body = """
             <\u{FF5C}DSML\u{FF5C}tool_calls>
             <\u{FF5C}DSML\u{FF5C}invoke name="dangerous">
@@ -114,10 +122,8 @@ struct DSMLToolCallParserTests {
             </\u{FF5C}DSML\u{FF5C}tool_calls>
             """
         let parser = DSMLToolCallParser()
-        let call = try #require(parser.parse(content: body, tools: nil))
-        #expect(call.function.name == "dangerous")
-        // Fallback preserves the raw string so the call isn't dropped.
-        #expect(call.function.arguments["payload"] == .string("{not: valid json,,}"))
+        #expect(parser.parse(content: body, tools: nil) == nil)
+        #expect(parser.parseEOS(body, tools: nil).isEmpty)
     }
 
     @Test("Input with no invoke block returns nil")

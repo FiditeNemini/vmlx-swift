@@ -9,7 +9,7 @@
 /// protocol text is still buffered and parsed as tool transport.
 public struct NemotronToolCallParser: ToolCallParser, Sendable {
     private let xml = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
-    private let dsml = DSMLToolCallParser()
+    private let dsml = DSMLToolCallParser(allowsLegacyNonDSMLFallbacks: true)
 
     public let startTag: String? = "<tool_call>"
     public let endTag: String? = "</tool_call>"

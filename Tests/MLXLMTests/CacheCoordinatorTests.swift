@@ -83,44 +83,47 @@ import Testing
     }
 }
 
-@Test func coordinatorPreferredStableBoundarySurvivesBoundedDiskIndex() throws {
+@Test func coordinatorFindsValidDiskPrefixBelowFirst128IndexedLengths() throws {
     try MLXMetalTestLock.withLock {
         let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("preferred-stable-prefix-\(UUID().uuidString)")
+            .appendingPathComponent("disk-prefix-pagination-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: tmp) }
         let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
             usePagedCache: false,
             enableDiskCache: true,
             diskCacheMaxGB: 0.1,
             diskCacheDir: tmp,
-            modelKey: "preferred-stable-prefix"))
+            modelKey: "disk-prefix-pagination"))
         let disk = try #require(coordinator.diskCache)
         let arrays = ["data": MLXArray.ones([1, 1])]
         let requestTokens = Array(0 ..< 160)
-        let stableBoundary = 8
+        let validBoundary = 8
         disk.store(
-            tokens: Array(requestTokens.prefix(stableBoundary)),
+            tokens: Array(requestTokens.prefix(validBoundary)),
             arrays: arrays)
 
-        // More than the index probe's 128 distinct larger lengths makes the
-        // stable entry disappear from the ordinary candidate-length query.
-        // None of these decoys matches the active request prefix.
+        // Exactly 129 distinct larger lengths put 137 ... 10 on page one.
+        // Count 9 and the valid count 8 require page two, and none of the
+        // decoys matches the active request prefix.
         for count in 9 ... 137 {
             disk.store(tokens: Array(repeating: -count, count: count), arrays: arrays)
         }
-        #expect(!disk.candidateTokenCounts(maxTokens: requestTokens.count)
-            .contains(stableBoundary))
+        let firstPage = disk.candidateTokenCounts(
+            maxTokens: requestTokens.count,
+            limit: 128)
+        #expect(firstPage.count == 128)
+        #expect(firstPage.first == 137)
+        #expect(firstPage.last == 10)
+        #expect(!firstPage.contains(validBoundary))
 
         guard case .hit(let matched, let remaining, let detail, _, _, _) =
-            coordinator.fetch(
-                tokens: requestTokens,
-                preferredDiskBoundaries: [stableBoundary])
+            coordinator.fetch(tokens: requestTokens)
         else {
-            Issue.record("processor-proven stable boundary should bypass the bounded index window")
+            Issue.record("disk lookup must continue beyond its first 128 candidate lengths")
             return
         }
-        #expect(matched == stableBoundary)
-        #expect(remaining == Array(requestTokens.dropFirst(stableBoundary)))
+        #expect(matched == validBoundary)
+        #expect(remaining == Array(requestTokens.dropFirst(validBoundary)))
         #expect(detail == .disk)
     }
 }

@@ -2,6 +2,35 @@ import Foundation
 
 import struct VMLXHub.Config
 
+/// Foundation's ICU-backed regular-expression entry points do not treat a
+/// literal JSON-decoded CR/LF inside a character class the same way as the
+/// Rust `regex` engine used by Hugging Face tokenizers. Tokenizer JSON stores
+/// patterns such as `[\r\n]*`; JSON decoding turns those escapes into actual
+/// control scalars. With the scalars passed through unchanged Foundation
+/// matches `.` and the following newlines as separate pre-tokens, while the
+/// canonical tokenizer keeps `.\n\n` together and permits its learned BPE
+/// merge (for DSV4, token `.ĊĊ`).
+///
+/// Re-escape literal control scalars before compiling/matching a tokenizer
+/// regex. This preserves the regex's meaning and matches the representation
+/// Foundation handles canonically. Existing textual escapes (`\\n`, `\\r`,
+/// and so on) are left untouched.
+func foundationCompatibleTokenizerRegex(_ pattern: String) -> String {
+    var result = ""
+    result.reserveCapacity(pattern.utf8.count)
+    for scalar in pattern.unicodeScalars {
+        switch scalar.value {
+        case 0x08: result += #"\x08"#
+        case 0x09: result += #"\t"#
+        case 0x0A: result += #"\n"#
+        case 0x0C: result += #"\f"#
+        case 0x0D: result += #"\r"#
+        default: result.unicodeScalars.append(scalar)
+        }
+    }
+    return result
+}
+
 enum StringSplitPattern {
     case regexp(regexp: String)
     case string(pattern: String)
@@ -20,7 +49,7 @@ enum StringSplitPattern {
             return .string(pattern: pattern)
         }
         if let pattern = config.pattern.Regex.string() {
-            return .regexp(regexp: pattern)
+            return .regexp(regexp: foundationCompatibleTokenizerRegex(pattern))
         }
         return nil
     }

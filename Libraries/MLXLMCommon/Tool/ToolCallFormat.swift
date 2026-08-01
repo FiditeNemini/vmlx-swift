@@ -71,9 +71,7 @@ public protocol ToolCallParser: Sendable {
 
     /// Whether a tagged parser should also buffer a top-level JSON object as a
     /// possible tool call. This is intentionally opt-in: most tagged formats
-    /// should leave ordinary JSON answers visible. DSV4 uses this for live
-    /// outputs that fall back from DSML to `{"tool": "name", ...}` while still
-    /// carrying a registered tool name.
+    /// should leave ordinary JSON answers visible.
     var supportsInlineJSONToolFallback: Bool { get }
 
     /// Whether a tagged parser should also buffer a bare native
@@ -193,7 +191,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     case llama3
 
     /// DSML (DeepSeek Markup Language) used by DeepSeek-V4-Flash /
-    /// -Pro per jang/research/DSV-FAMILY-RUNTIME-GUIDE.md §24.
+    /// -Pro per the official 0731 encoding contract.
     /// Example: `<｜DSML｜tool_calls><｜DSML｜invoke name="f"><｜DSML｜parameter name="k" string="true">v</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>`
     /// (markers use fullwidth vertical bar U+FF5C, not ASCII `|`).
     case dsml
@@ -266,7 +264,16 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// does not prefill a thinking rail; parsing remains safe for tagged
     /// formats because the parser only accepts explicit protocol envelopes.
     public var parsesToolCallsFromReasoningChannel: Bool {
-        true
+        switch self {
+        case .dsml:
+            // The official DSV4 contract places complete reasoning inside
+            // <think>...</think> before any tool call. Tool-shaped examples or
+            // malformed protocol text inside reasoning_content are therefore
+            // reasoning, never executable transport.
+            return false
+        default:
+            return true
+        }
     }
 
     /// Whether reasoning-channel extraction must ignore inline fallbacks and

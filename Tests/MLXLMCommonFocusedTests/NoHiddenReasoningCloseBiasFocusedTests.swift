@@ -252,7 +252,8 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(input.contains("cachePrefixTokenCounts"))
         #expect(processor.contains("addGenerationPrompt: false"))
         #expect(engine.contains("label: \"history-boundary\""))
-        #expect(engine.contains("effectivePrefillWindow("))
+        #expect(!engine.contains("effectivePrefillWindow("))
+        #expect(!evaluate.contains("effectivePrefillWindow("))
         #expect(evaluate.contains("cacheSnapshotForBoundary("))
         #expect(evaluate.contains("model.prepare("))
     }

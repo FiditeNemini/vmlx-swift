@@ -2,6 +2,16 @@
 
 import Foundation
 
+/// A non-executable failure observed while parsing a committed tool-call
+/// protocol envelope.
+///
+/// The runtime surfaces this separately from ``ToolCall`` so malformed model
+/// output can never be mistaken for an actionable call. Raw protocol bytes are
+/// intentionally not retained in this public value.
+public enum ToolCallProtocolFailure: String, Sendable, Equatable {
+    case malformedEnvelope = "malformed_tool_call_envelope"
+}
+
 /// Processes generated text to detect and extract tool calls during streaming generation.
 ///
 /// `ToolCallProcessor` handles the streaming detection of tool calls in model output,
@@ -47,6 +57,13 @@ public class ToolCallProcessor {
     /// The tool calls extracted during processing.
     public var toolCalls: [ToolCall] = []
 
+    /// Failure recorded when a committed, non-strip-only protocol envelope
+    /// completed but produced no executable tool calls.
+    ///
+    /// This remains `nil` for ambiguous tag prefixes that revert to prose and
+    /// for strip-only processors used when the request supplied no tools.
+    public private(set) var toolCallProtocolFailure: ToolCallProtocolFailure?
+
     /// Raw text of the tool-call envelope currently being collected, or `nil`
     /// when no call is committed-in-flight.
     ///
@@ -88,6 +105,11 @@ public class ToolCallProcessor {
     private func recordToolCalls(_ calls: [ToolCall]) {
         guard !stripOnly else { return }
         toolCalls.append(contentsOf: calls.map(canonicalizedToolName))
+    }
+
+    private func recordMalformedEnvelopeIfNeeded(_ calls: [ToolCall]) {
+        guard !stripOnly, calls.isEmpty else { return }
+        toolCallProtocolFailure = .malformedEnvelope
     }
 
     /// Opt-in diagnostic for attributing malformed native envelopes without
@@ -136,7 +158,11 @@ public class ToolCallProcessor {
         else { return call }
         return ToolCall(
             id: call.id,
-            function: .init(name: canonical, arguments: call.function.arguments))
+            function: .init(
+                name: canonical,
+                arguments: call.function.arguments,
+                rawArgumentsJSON: call.function.rawArgumentsJSON
+            ))
     }
 
     // MARK: - State Enum
@@ -248,10 +274,14 @@ public class ToolCallProcessor {
             return nil
         }
 
+        let wasCollectingTaggedEnvelope = state == .collectingToolCall
         let rawEnvelope = toolCallBuffer
         let parsed = parser.parseEOS(rawEnvelope, tools: tools)
         traceToolEnvelope(phase: "eos", raw: rawEnvelope, parsed: parsed)
         recordToolCalls(parsed)
+        if wasCollectingTaggedEnvelope {
+            recordMalformedEnvelopeIfNeeded(parsed)
+        }
         let suppressUnparsedInlineToolIntent =
             parsed.isEmpty
             && state == .collectingInlineToolCall
@@ -1896,6 +1926,7 @@ public class ToolCallProcessor {
                 let parsed = parser.parseEOS(rawEnvelope, tools: tools)
                 traceToolEnvelope(phase: "tagged-end", raw: rawEnvelope, parsed: parsed)
                 recordToolCalls(parsed)
+                recordMalformedEnvelopeIfNeeded(parsed)
 
                 state = .normal
                 toolCallBuffer = ""

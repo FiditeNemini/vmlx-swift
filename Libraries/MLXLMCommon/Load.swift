@@ -145,6 +145,18 @@ public func loadWeights(
         for case let url as URL in enumerator {
             guard url.pathExtension == "safetensors" else { continue }
             if url.lastPathComponent == "jangtq_runtime.safetensors" { continue }
+            // Converter calibration captures are provenance artifacts, not
+            // inference weights.  DSV4's AWQ/imatrix converter folds these
+            // statistics completely into the indexed model tensors and marks
+            // the resulting bundle as requiring no runtime sidecar.  Loading
+            // the capture alongside the 102 indexed shards injects keys such
+            // as `layers.0.experts_input` into model.update(), which correctly
+            // rejects them as unhandled parameters.
+            if isAuxiliaryCalibrationSafetensor(url.lastPathComponent) {
+                FileHandle.standardError.write(Data(
+                    "[loadWeights] skipping non-inference calibration artifact \(url.lastPathComponent)\n".utf8))
+                continue
+            }
             if skipDSV4Sidecar
                 && url.lastPathComponent == "jangtq_stacked.safetensors"
             {
@@ -787,14 +799,18 @@ public func loadWeights(
         || envFlag("MLX_JANGTQ_BF16_MMAP")
     let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)
     // Gemma 4 JANG affine bundles carry several GiB of fp16 scales, biases,
-    // and preserved multimodal weights. Recasting those file-backed arrays to
-    // bf16 defeats mmap residency even though affine matmul accepts their
-    // bundle dtype directly. Keep this exception exact: MXFP8 and non-Gemma
-    // JANG families retain their established conversion policy.
-    let preserveGemma4JANGAffineMmapDtypes = mmapSafetensorsActive
+    // and preserved multimodal weights. Validated pre-stacked DSV4 affine
+    // bundles have the same constraint at much larger scale: recasting their
+    // routed scales/biases eagerly materializes a second anonymous bank and
+    // defeats the file-backed layout. Affine matmul accepts the bundle dtype
+    // directly, so preserve it only for the two exact, fail-closed layouts.
+    // Split DSV4 bundles intentionally remain on the resident conversion path.
+    let preserveJANGAffineMmapDtypes = mmapSafetensorsActive
         && !isJANGTQNative
-        && shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)
-    if !preserveGemma4JANGAffineMmapDtypes
+        && (shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)
+            || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
+                modelDirectory: modelDirectory))
+    if !preserveJANGAffineMmapDtypes
         && (!isJANGTQNative || !mmapSafetensorsActive || allowJANGTQMmapBFloat16
             || autoJANGTQMmapBFloat16)
     {
@@ -805,6 +821,18 @@ public func loadWeights(
 
     eval(model)
     MLX.Memory.clearCache()
+}
+
+/// Safetensors files emitted or copied by converters for calibration and
+/// provenance.  Their values have already been folded into model weights and
+/// must never participate in inference weight loading.
+func isAuxiliaryCalibrationSafetensor(_ filename: String) -> Bool {
+    switch filename {
+    case "awq-calibration.safetensors", "jang_imatrix.safetensors":
+        true
+    default:
+        false
+    }
 }
 
 func shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: URL) -> Bool {
@@ -826,6 +854,14 @@ func shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: URL) -> Bool {
         ?? (object["weight_format"] as? String)
         ?? "").lowercased()
     return normalizedModelType.hasPrefix("gemma4") && weightFormat == "jang_affine"
+}
+
+func shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
+    modelDirectory: URL
+) -> Bool {
+    let facts = LoadBundleFacts.inspect(bundleURL: modelDirectory)
+    return facts.isPlainDeepseekV4AffineJANG
+        && facts.hasPrestackedAffineRoutedExperts
 }
 
 /// Convert float16/float32 model parameters to bfloat16 for MoE performance.
