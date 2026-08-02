@@ -2060,7 +2060,10 @@ public actor BatchEngine {
     /// the cache-copy high-water mark. A restored N-1 request does not retain
     /// that duplicate and is consequently much faster. The seed is already a
     /// complete, immutable prompt boundary here, so write it synchronously and
-    /// release it before the final prompt token and sampled decode run.
+    /// release it before the final prompt token and sampled decode run. This is
+    /// also the boundary a reusable-prefix warmup must publish: DSV4 deliberately
+    /// rejects an exact post-prefill restore, so excluding warmups here causes the
+    /// immediately following visible request to prefill the same prefix again.
     private func storePrefillCapturedDiskSeed(
         _ snapshot: [KVCache],
         for slot: BatchSlot
@@ -2126,7 +2129,6 @@ public actor BatchEngine {
                     cacheCoordinator?.canPersistBoundaries == true
                     && slot.diskSeedSnapshot == nil
                     && cacheRequiresPrefillCapturedDiskSeed(slot.cache)
-                    && slot.originalInput.cachePromptIntent != .reusablePrefixWarmup
                     && !slot.originalInput.hasMediaContent
                     && !slot.originalInput.requiresPostPrepareCacheKey
                     && !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)

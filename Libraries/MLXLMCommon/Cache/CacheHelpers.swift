@@ -215,11 +215,11 @@ func shouldPersistExactPromptBoundary(
 ///
 /// A reusable-prefix warmup on a non-recurrent disk-only topology (notably
 /// DeepSeek V4's SWA + compressor/indexer pools) already publishes its exact
-/// prompt checkpoint. Replaying every older stable boundary before reporting
-/// warmup completion duplicates prefill and can hold the chat UI in
-/// "Warming up" for minutes. Recurrent hybrids are different: their exact
-/// warmup boundary is intentionally rejected, so they still need the proven
-/// N-1 stable seed re-derive.
+/// prompt-minus-one checkpoint captured during prefill. Replaying every older
+/// stable boundary before reporting warmup completion duplicates prefill and
+/// can hold the chat UI in "Warming up" for minutes. Recurrent hybrids are
+/// different: their exact warmup boundary is intentionally rejected, so they
+/// still need the proven N-1 stable seed re-derive.
 func shouldForceStableBoundaryRederive(
     isStableBoundary: Bool,
     isReusablePrefixWarmup: Bool,

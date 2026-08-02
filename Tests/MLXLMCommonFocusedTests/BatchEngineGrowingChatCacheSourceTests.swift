@@ -311,6 +311,10 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("seedSnapshot = capturedDiskSeed"))
         #expect(batch.contains("splitPrefillInputBeforeFinalToken("))
         #expect(batch.contains("cacheRequiresPrefillCapturedDiskSeed(slot.cache)"))
+        #expect(!batch.contains(
+            "slot.originalInput.cachePromptIntent != .reusablePrefixWarmup"))
+        #expect(batch.contains(
+            "excluding warmups here causes the"))
         #expect(batch.contains("remainingPromptUnits > 1"))
         #expect(batch.contains("let diskSeedSnapshot = makePromptBoundaryCacheSnapshot("))
         #expect(batch.contains(
