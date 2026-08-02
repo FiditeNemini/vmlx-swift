@@ -237,11 +237,16 @@ public func canonicalChatCacheBoundaries(
     /// Fall back to the transcript without that trailing assistant turn. It is
     /// strictly shorter, and it is still proven by the same exact-token-prefix
     /// check — this does not relax token identity or admit suffix matching.
+    /// A trailing `assistant` turn is a continuation; a trailing `tool` turn is
+    /// the tool result the model is about to continue from. Both are shapes a
+    /// format may render without a generation rail, and both appear in a normal
+    /// agent loop — the post-turn re-warm after a TOOL call ends with the tool
+    /// result, which showed up live as a fixed miss pattern (stored N, the
+    /// re-warm asks N+2, MISS) on 2084→2086, 2286→2288 and 2756→2758.
     func trailingContinuationBoundary() -> Int? {
-        guard messages.count > 1,
-              let last = messages.last,
-              (last["role"] as? String) == "assistant"
-        else { return nil }
+        guard messages.count > 1, let last = messages.last else { return nil }
+        let role = last["role"] as? String
+        guard role == "assistant" || role == "tool" else { return nil }
         return exactPrefixBoundary(messages: Array(messages.dropLast()))
     }
 

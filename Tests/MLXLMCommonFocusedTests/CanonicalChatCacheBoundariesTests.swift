@@ -241,7 +241,8 @@ struct CanonicalChatCacheBoundariesTests {
                 }
             }
             // The rail exists only when an assistant turn is being OPENED.
-            if addGenerationPrompt, (messages.last?["role"] as? String) != "assistant" {
+            let lastRole = messages.last?["role"] as? String
+            if addGenerationPrompt, lastRole != "assistant", lastRole != "tool" {
                 result.append(99)
             }
             return result
@@ -285,6 +286,40 @@ struct CanonicalChatCacheBoundariesTests {
                 #expect(promptTokens.prefix(boundary).elementsEqual(rendered))
             }
         }
+    }
+
+    @Test("a transcript ending in a tool result still publishes a history boundary")
+    func trailingToolResultPublishesHistoryBoundary() {
+        // The post-turn re-warm after a TOOL call ends with the tool result,
+        // not with an assistant turn. Live DSV4 rows showed those re-warms
+        // missing in a fixed pattern — stored N, next fetch asks N+2, MISS:
+        //   store 2084 -> fetch 2086 MISS
+        //   store 2286 -> fetch 2288 MISS
+        //   store 2756 -> fetch 2758 MISS
+        // while the visible turn that followed restored the same entry fine.
+        // If a format appends no rail for this shape either, the same strict
+        // `<` drops the boundary, so the fallback must cover it.
+        let tokenizer = ContinuationRailTokenizer()
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "instructions"],
+            ["role": "user", "content": "write a file"],
+            ["role": "assistant", "content": "calling the tool"],
+            ["role": "tool", "content": "{\"ok\":true}"],
+        ]
+        let promptTokens = try! tokenizer.applyChatTemplate(
+            messages: messages, tools: tools, additionalContext: nil,
+            addGenerationPrompt: true)
+
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: tools,
+            additionalContext: nil,
+            promptTokens: promptTokens)
+
+        let history = boundaries.all.filter { !boundaries.stable.contains($0) }
+        #expect(!history.isEmpty, "history boundary was dropped for a tool-result turn")
+        for boundary in boundaries.all { #expect(boundary < promptTokens.count) }
     }
 
     @Test("stable system and tool prefix is distinct from full history")
