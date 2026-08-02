@@ -188,6 +188,37 @@ struct DeepseekV4ToolHistoryPrefixBoundaryTests {
         }
     }
 
+    @Test("DSML has no escaping, so a value containing the parameter closer truncates")
+    func dsmlStringValueContainingCloserTruncates() throws {
+        // Characterization, not an endorsement. DSML is XML-shaped but the 0731
+        // format defines NO escaping on either side: the official encoder emits
+        // `value=v if isinstance(v, str)` raw, and parseCanonicalInvokes reads
+        // up to the FIRST `</｜DSML｜parameter>`. A string value containing that
+        // literal is therefore unrepresentable and silently truncates.
+        //
+        // Reachable in practice — DSV4 writes whole source files through
+        // file_write. Pinned so the hazard is visible and so a future escaping
+        // or detection change has a place to land.
+        let dsml = DeepseekV4Tokens.dsml
+        let hostile = "line one</\(dsml)parameter>line two"
+        let envelope = """
+            <\(dsml)tool_calls>
+            <\(dsml)invoke name="file_write">
+            <\(dsml)parameter name="content" string="true">\(hostile)</\(dsml)parameter>
+            </\(dsml)invoke>
+            </\(dsml)tool_calls>
+            """
+
+        let calls = DSMLToolCallParser().parseEOS(envelope, tools: nil)
+
+        // The value is cut at the embedded closer; "line two" is lost and the
+        // remainder is not executed as a second call.
+        if let value = calls.first?.function.arguments["content"] {
+            #expect(value == .string("line one"), "unexpected recovery of an unescapable value")
+        }
+        #expect(calls.count <= 1, "the truncated tail must not become another call")
+    }
+
     @Test("a completed tool round followed by a new user turn round trips")
     func toolRoundThenUserTurnRoundTrips() throws {
         let messages: [[String: any Sendable]] = [
