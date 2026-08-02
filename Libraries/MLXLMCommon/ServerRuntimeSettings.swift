@@ -474,8 +474,12 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         let requestedFraction = memorySafety.customPhysicalMemoryFraction
             ?? profile.loadFraction
         let loadCap = ResidentCap.fraction(requestedFraction)
-        let allocatorCap = memorySafety.customAllocatorCacheBytes.map(ResidentCap.absolute)
+        let requestedAllocatorCap =
+            memorySafety.customAllocatorCacheBytes.map(ResidentCap.absolute)
             ?? profile.allocatorCap
+        let allocatorCap = bundleFacts?.resolveMLXAllocatorCacheLimit(
+            requested: requestedAllocatorCap
+        ) ?? requestedAllocatorCap
 
         var loadConfiguration = baseLoadConfiguration
         // Performance choices captured by the loaded model graph must survive

@@ -575,7 +575,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     if let boundarySnapshot = cacheSnapshotForBoundary(
                         tokens: boundaryTokens,
                         promptSnapshot: promptCacheSnapshot,
-                        allowDiskBackedRederive: isStableBoundary)
+                        allowDiskBackedRederive: shouldForceStableBoundaryRederive(
+                            isStableBoundary: isStableBoundary,
+                            isReusablePrefixWarmup: isReusablePrefixWarmup,
+                            requiresRecurrentSSMCompanion:
+                                coordinator.requiresRecurrentSSMCompanion))
                     {
                         store(
                             tokens: boundaryTokens,

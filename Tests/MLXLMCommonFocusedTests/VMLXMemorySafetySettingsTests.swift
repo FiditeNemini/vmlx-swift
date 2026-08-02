@@ -57,6 +57,29 @@ struct VMLXMemorySafetySettingsTests {
         #expect(generate.repetitionPenalty == nil)
     }
 
+    @Test("plain affine DSV4 keeps allocator reuse uncapped under Safe Auto")
+    func plainAffineDSV4KeepsAllocatorReuseUncapped() {
+        let settings = VMLXServerRuntimeSettings()
+        let facts = LoadBundleFacts(
+            totalSafetensorsBytes: 95 << 30,
+            isRouted: true,
+            physicalMemory: 128 << 30,
+            modelType: "deepseek_v4",
+            weightFormat: "affine",
+            hasJangConfig: true,
+            hasJangTQRuntime: false,
+            numRoutedExperts: 256,
+            topK: 8)
+
+        let plan = settings.resolvedMemorySafetyPlan(
+            baseLoadConfiguration: .osaurusProduction,
+            bundleFacts: facts)
+
+        #expect(plan.loadConfiguration.memoryLimit == .unlimited)
+        #expect(plan.loadConfiguration.maxResidentBytes == .unlimited)
+        #expect(!plan.loadConfiguration.useMmapSafetensors)
+    }
+
     /// The slider no longer needs validating: it is a projection of `mode` and its
     /// setter clamps into range, so an out-of-range level is not expressible. It
     /// used to be a stored field that nothing read, which is why it could be both
