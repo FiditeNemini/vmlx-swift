@@ -881,7 +881,22 @@ public struct DeepseekV4ChatEncoder: Sendable {
         // Encode each param — string params carry `string="true"` and
         // a raw value; all other JSON types serialize as JSON with
         // `string="false"`.
-        for (k, v) in params {
+        //
+        // Iterate in SORTED key order. `params` is an unordered Dictionary, so
+        // `for (k, v) in params` emitted a different parameter order in every
+        // process. The official encoder walks `json.loads(...).items()` and is
+        // therefore stable, and the ordered overload above preserves the
+        // original JSON spelling; this fallback path (reached from
+        // `renderToolCallInvoke(name:arguments:)` when the arguments string
+        // does not scan as an ordered JSON object) was the one place that did
+        // not. Re-rendering a tool call in chat history with a random parameter
+        // order changes the prompt bytes run to run, so the prefix-cache
+        // boundary for every turn after a tool call stops matching across app
+        // restarts. Deterministic order cannot recover the model's original
+        // emission order, but it makes the bytes reproducible, which is what
+        // cache reuse actually requires.
+        for k in params.keys.sorted() {
+            guard let v = params[k] else { continue }
             let isString = v is String
             let value: String
             if isString, let s = v as? String {

@@ -156,6 +156,38 @@ struct DeepseekV4ToolHistoryPrefixBoundaryTests {
         #expect(withRail.hasPrefix(dropped))
     }
 
+    @Test("tool-call re-render is byte-stable across processes")
+    func toolCallRenderIsDeterministic() throws {
+        // `renderToolCallInvoke(name:params:)` used to walk an unordered
+        // Dictionary, so chat history re-rendered a tool call with a different
+        // parameter order in every process. That changes the prompt bytes, so
+        // the prefix-cache boundary for every turn after a tool call stops
+        // matching across app restarts. Many keys, so a random order would
+        // essentially never coincide.
+        let params: [String: Any] = [
+            "path": "/tmp/m.html", "content": "<html/>", "mode": "w",
+            "encoding": "utf8", "create": true, "retries": 3,
+            "owner": "eric", "group": "staff", "backup": false,
+        ]
+        let renders = Set(
+            (0 ..< 12).map { _ in
+                DeepseekV4ChatEncoder.renderToolCallInvoke(name: "file_write", params: params)
+            })
+        #expect(renders.count == 1, "tool-call render is not byte-stable")
+
+        // And the order is the documented one, not merely self-consistent.
+        let rendered = try #require(renders.first)
+        let order = params.keys.sorted()
+        var cursor = rendered.startIndex
+        for key in order {
+            let needle = "name=\"\(key)\""
+            let found = try #require(
+                rendered.range(of: needle, range: cursor ..< rendered.endIndex),
+                "parameter \(key) missing or out of order")
+            cursor = found.upperBound
+        }
+    }
+
     @Test("a completed tool round followed by a new user turn round trips")
     func toolRoundThenUserTurnRoundTrips() throws {
         let messages: [[String: any Sendable]] = [
