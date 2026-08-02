@@ -2053,6 +2053,42 @@ public actor BatchEngine {
         return (head, tail)
     }
 
+    /// Persist DSV4's exact N-1 disk seed before decode starts.
+    ///
+    /// Keeping the fully materialized SWA + compressor/indexer pool duplicate
+    /// alive for the whole response makes an uncached DSV4 request decode from
+    /// the cache-copy high-water mark. A restored N-1 request does not retain
+    /// that duplicate and is consequently much faster. The seed is already a
+    /// complete, immutable prompt boundary here, so write it synchronously and
+    /// release it before the final prompt token and sampled decode run.
+    private func storePrefillCapturedDiskSeed(
+        _ snapshot: [KVCache],
+        for slot: BatchSlot
+    ) {
+        guard let coordinator = cacheCoordinator,
+            slot.cachePromptTokenIds.count > 1,
+            CacheStoreBudget.canStore(snapshot)
+        else { return }
+
+        let tokens = Array(slot.cachePromptTokenIds.dropLast())
+        let diskStoreCache = makeDiskStoreCache(
+            fromPromptBoundary: snapshot,
+            kvBits: slot.parameters.kvBits,
+            kvGroupSize: slot.parameters.kvGroupSize,
+            quantizedKVStart: slot.parameters.quantizedKVStart,
+            kvMode: slot.parameters.kvMode)
+        coordinator.storeAfterGeneration(
+            promptTokens: tokens,
+            perLayerData: [],
+            ssmStates: nil,
+            cache: diskStoreCache,
+            mediaSalt: slot.mediaSalt)
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/store] label=disk-backed-safe-prompt-boundary-prefill count=\(tokens.count)\n".utf8))
+        }
+    }
+
     private func stepPrefillAfterCacheLookup(
         slotIndex: Int,
         inputForPrepare: LMInput,
@@ -2113,8 +2149,12 @@ public actor BatchEngine {
                         }
                     }
                     MLX.eval(slot.cache)
-                    slot.diskSeedSnapshot = makePromptBoundaryCacheSnapshot(
+                    let diskSeedSnapshot = makePromptBoundaryCacheSnapshot(
                         from: slot.cache)
+                    storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)
+                    // The synchronous store above owns the N-1 boundary now.
+                    // Do not keep the duplicate SWA/pool state through decode.
+                    slot.diskSeedSnapshot = nil
                     progressAccumulator.report(
                         completedInPrepare: remainingPromptUnits - 1)
                     return try context.model.prepare(

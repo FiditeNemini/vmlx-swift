@@ -312,7 +312,10 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(batch.contains("splitPrefillInputBeforeFinalToken("))
         #expect(batch.contains("cacheRequiresPrefillCapturedDiskSeed(slot.cache)"))
         #expect(batch.contains("remainingPromptUnits > 1"))
-        #expect(batch.contains("slot.diskSeedSnapshot = makePromptBoundaryCacheSnapshot("))
+        #expect(batch.contains("let diskSeedSnapshot = makePromptBoundaryCacheSnapshot("))
+        #expect(batch.contains(
+            "storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)"))
+        #expect(batch.contains("slot.diskSeedSnapshot = nil"))
         #expect(batch.contains("let capturedDiskSeed = slot.diskSeedSnapshot"))
         #expect(batch.contains("capturedDiskSeed ?? boundarySnapshot("))
         #expect(batch.contains("slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot("))
@@ -397,6 +400,29 @@ struct BatchEngineGrowingChatCacheSourceTests {
 
         #expect(makeRetainedExactPromptSnapshot(from: [dsv4]) == nil)
         #expect(makeRetainedExactPromptSnapshot(from: [KVCacheSimple()]) != nil)
+    }
+
+    @Test("batch DSV4 persists its N-1 seed before decode and releases the duplicate")
+    func dsv4DiskSeedDoesNotRemainResidentThroughDecode() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+
+        #expect(source.contains("private func storePrefillCapturedDiskSeed("))
+        #expect(source.contains(
+            "storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)"))
+        #expect(source.contains(
+            "label=disk-backed-safe-prompt-boundary-prefill"))
+        let immediateStore = try #require(source.range(of:
+            "storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)"))
+        let release = try #require(source.range(
+            of: "slot.diskSeedSnapshot = nil",
+            range: immediateStore.lowerBound..<source.endIndex))
+        let tailPrefill = try #require(source.range(
+            of: "return try context.model.prepare(\n                        split.tail",
+            range: release.lowerBound..<source.endIndex))
+        #expect(immediateStore.lowerBound < release.lowerBound)
+        #expect(release.lowerBound < tailPrefill.lowerBound)
     }
 
     @Test("history-boundary rederive skips disk-backed cache topologies after trim miss")
