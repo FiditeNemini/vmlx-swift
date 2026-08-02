@@ -827,6 +827,7 @@ let package = Package(
                 "DSMLInlineJSONToolFallbackFocusedTests.swift",
                 "DSMLToolCallParserFocusedTests.swift",
                 "DeepseekV4ToolHistoryPrefixBoundaryTests.swift",
+                "DeepseekV4DropThinkingCacheTests.swift",
                 "ToolCallProgressRoutingTests.swift",
                 "FocusedMLXTestSupport.swift",
                 "CanonicalChatCacheBoundariesTests.swift",

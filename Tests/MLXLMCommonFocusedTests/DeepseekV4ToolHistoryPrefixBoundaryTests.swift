@@ -156,6 +156,69 @@ struct DeepseekV4ToolHistoryPrefixBoundaryTests {
         #expect(withRail.hasPrefix(dropped))
     }
 
+    @Test("tool-call re-render is byte-stable across processes")
+    func toolCallRenderIsDeterministic() throws {
+        // `renderToolCallInvoke(name:params:)` used to walk an unordered
+        // Dictionary, so chat history re-rendered a tool call with a different
+        // parameter order in every process. That changes the prompt bytes, so
+        // the prefix-cache boundary for every turn after a tool call stops
+        // matching across app restarts. Many keys, so a random order would
+        // essentially never coincide.
+        let params: [String: Any] = [
+            "path": "/tmp/m.html", "content": "<html/>", "mode": "w",
+            "encoding": "utf8", "create": true, "retries": 3,
+            "owner": "eric", "group": "staff", "backup": false,
+        ]
+        let renders = Set(
+            (0 ..< 12).map { _ in
+                DeepseekV4ChatEncoder.renderToolCallInvoke(name: "file_write", params: params)
+            })
+        #expect(renders.count == 1, "tool-call render is not byte-stable")
+
+        // And the order is the documented one, not merely self-consistent.
+        let rendered = try #require(renders.first)
+        let order = params.keys.sorted()
+        var cursor = rendered.startIndex
+        for key in order {
+            let needle = "name=\"\(key)\""
+            let found = try #require(
+                rendered.range(of: needle, range: cursor ..< rendered.endIndex),
+                "parameter \(key) missing or out of order")
+            cursor = found.upperBound
+        }
+    }
+
+    @Test("DSML has no escaping, so a value containing the parameter closer truncates")
+    func dsmlStringValueContainingCloserTruncates() throws {
+        // Characterization, not an endorsement. DSML is XML-shaped but the 0731
+        // format defines NO escaping on either side: the official encoder emits
+        // `value=v if isinstance(v, str)` raw, and parseCanonicalInvokes reads
+        // up to the FIRST `</｜DSML｜parameter>`. A string value containing that
+        // literal is therefore unrepresentable and silently truncates.
+        //
+        // Reachable in practice — DSV4 writes whole source files through
+        // file_write. Pinned so the hazard is visible and so a future escaping
+        // or detection change has a place to land.
+        let dsml = DeepseekV4Tokens.dsml
+        let hostile = "line one</\(dsml)parameter>line two"
+        let envelope = """
+            <\(dsml)tool_calls>
+            <\(dsml)invoke name="file_write">
+            <\(dsml)parameter name="content" string="true">\(hostile)</\(dsml)parameter>
+            </\(dsml)invoke>
+            </\(dsml)tool_calls>
+            """
+
+        let calls = DSMLToolCallParser().parseEOS(envelope, tools: nil)
+
+        // The value is cut at the embedded closer; "line two" is lost and the
+        // remainder is not executed as a second call.
+        if let value = calls.first?.function.arguments["content"] {
+            #expect(value == .string("line one"), "unexpected recovery of an unescapable value")
+        }
+        #expect(calls.count <= 1, "the truncated tail must not become another call")
+    }
+
     @Test("a completed tool round followed by a new user turn round trips")
     func toolRoundThenUserTurnRoundTrips() throws {
         let messages: [[String: any Sendable]] = [
