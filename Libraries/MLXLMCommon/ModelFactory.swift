@@ -604,6 +604,8 @@ public func loadModel(
         requested: loadConfiguration.useMmapSafetensors)
     let memoryLimit = facts.resolveMLXMemoryLimit(
         requested: loadConfiguration.memoryLimit)
+    let dsv4NativeAllocatorCeiling =
+        applyPlainDeepseekV4ProcessMemoryLimitsIfNeeded(facts: facts)
     if loadConfiguration.useMmapSafetensors && !useMmapSafetensors {
         FileHandle.standardError.write(Data(
             "[Load] DeepSeek V4 affine JANG selected resident safetensors for production decode\n"
@@ -624,7 +626,12 @@ public func loadModel(
     //    Skipped when `.unlimited` so existing iter-25 in-loader cap
     //    (1 GB during sanitize) is not overridden.
     let priorCap: Int?
-    if let cap = loadConfiguration.maxResidentBytes
+    if dsv4NativeAllocatorCeiling != nil {
+        // DSV4 needs the native freed-buffer reuse pool for decode. Keep the
+        // restored ceiling after load instead of putting a stale model-specific
+        // cap back in the defer below.
+        priorCap = nil
+    } else if let cap = loadConfiguration.maxResidentBytes
         .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory)
     {
         priorCap = MLX.Memory.cacheLimit
@@ -649,7 +656,8 @@ public func loadModel(
     //     so we never trip Apple's "limit larger than max working set
     //     size" rejection (the original 847a8c7 crash condition). See
     //     docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md.
-    if let rawCap = memoryLimit
+    if dsv4NativeAllocatorCeiling == nil,
+        let rawCap = memoryLimit
         .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory)
     {
         let workingSetCap = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
@@ -725,6 +733,36 @@ public func loadModel(
     }
     context.jangPressRuntime = runtime
     return (context, runtime)
+}
+
+/// Restore MLX's native process ceilings for plain affine DSV4.
+///
+/// `MLX.Memory.memoryLimit` is process-global and intentionally persists after
+/// a model load. A preceding Safe Auto model therefore leaves a 70%-of-RAM
+/// limit behind. DSV4 resolves its requested limit to `.unlimited`, but that
+/// produces no integer assignment and used to leave the stale cap active,
+/// collapsing decode throughput. The allocator cache has the same process-wide
+/// hazard. Reset both to MLX's native ceiling before loading DSV4; Osaurus keeps
+/// ownership of RAM admission before this point.
+@discardableResult
+func applyPlainDeepseekV4ProcessMemoryLimitsIfNeeded(
+    facts: LoadBundleFacts,
+    recommendedWorkingSetBytes: Int? = MLX.GPU.maxRecommendedWorkingSetBytes()
+) -> Int? {
+    guard facts.isPlainDeepseekV4AffineJANG else { return nil }
+
+    let physical = Int(clamping: facts.physicalMemory)
+    let physical95 = (physical / 20) * 19 + ((physical % 20) * 19) / 20
+    let recommended150: Int = {
+        guard let recommendedWorkingSetBytes else { return Int.max }
+        let half = recommendedWorkingSetBytes / 2
+        guard recommendedWorkingSetBytes <= Int.max - half else { return Int.max }
+        return recommendedWorkingSetBytes + half
+    }()
+    let nativeCeiling = max(1 << 30, min(physical95, recommended150))
+    MLX.Memory.memoryLimit = nativeCeiling
+    MLX.Memory.cacheLimit = nativeCeiling
+    return nativeCeiling
 }
 
 private func load<R>(loader: (ModelFactory) async throws -> sending R) async throws -> sending R {
