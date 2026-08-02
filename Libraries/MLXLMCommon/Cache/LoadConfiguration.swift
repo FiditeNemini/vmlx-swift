@@ -157,6 +157,18 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// loading the sidecar does not force speculative decode for every request.
     public var nativeMTP: Bool
 
+    /// Load DSV4-0731 with the checkpoint's activation-QAT simulation graph.
+    ///
+    /// `nil` preserves the headless compatibility fallback
+    /// (`VMLX_DSV4_OFFICIAL_ACTIVATION_QAT=1`). Osaurus always supplies an
+    /// explicit value from its visible Decode Performance setting, whose
+    /// product default is `false` because the current exact-bundle Release
+    /// rows show a substantial throughput cost and no completed quality gate
+    /// yet establishes activation-QAT as the better user-facing default.
+    /// This is a load-time model-graph choice; changing it requires unloading
+    /// and reloading the model.
+    public var deepseekV4ActivationQAT: Bool?
+
     /// Production default — MLXPress `.disabled` (opt-in), 70% cache +
     /// memory caps, mmap-backed safetensors enabled. Osaurus and other
     /// host integrators get spike-survival memory caps and the patched
@@ -196,20 +208,49 @@ public struct LoadConfiguration: Sendable, Equatable {
         maxResidentBytes: .unlimited,
         memoryLimit: .unlimited,
         useMmapSafetensors: false,
-        nativeMTP: false)
+        nativeMTP: false,
+        deepseekV4ActivationQAT: false)
 
     public init(
         jangPress: JangPressPolicy = .disabled,
         maxResidentBytes: ResidentCap = .default,
         memoryLimit: ResidentCap = .default,
         useMmapSafetensors: Bool = true,
-        nativeMTP: Bool = false
+        nativeMTP: Bool = false,
+        deepseekV4ActivationQAT: Bool? = nil
     ) {
         self.jangPress = jangPress
         self.maxResidentBytes = maxResidentBytes
         self.memoryLimit = memoryLimit
         self.useMmapSafetensors = useMmapSafetensors
         self.nativeMTP = nativeMTP
+        self.deepseekV4ActivationQAT = deepseekV4ActivationQAT
+    }
+}
+
+/// Per-load DSV4 activation-QAT request carried across the async model-factory
+/// boundary without process-global mutable state.
+public enum DeepseekV4ActivationQAT {
+    @TaskLocal public static var explicitRequestOverride: Bool?
+
+    /// Legacy/headless opt-in. Absence is deliberately OFF.
+    public static var environmentDefault: Bool {
+        let raw = ProcessInfo.processInfo.environment[
+            "VMLX_DSV4_OFFICIAL_ACTIVATION_QAT"]?.lowercased()
+        return raw == "1" || raw == "true" || raw == "on" || raw == "yes"
+    }
+
+    public static var enabledForCurrentLoad: Bool {
+        explicitRequestOverride ?? environmentDefault
+    }
+
+    public static func withExplicitRequest<R>(
+        _ enabled: Bool?,
+        operation: () async throws -> R
+    ) async rethrows -> R {
+        try await $explicitRequestOverride.withValue(enabled) {
+            try await operation()
+        }
     }
 }
 

@@ -105,6 +105,10 @@ public struct DeepseekV4Configuration: Codable, Sendable {
     /// ships it per layer; setting to false disables the contribution.
     public var useAttnSink: Bool = true
 
+    /// Runtime-only load policy. This is intentionally not encoded into the
+    /// model bundle: hosts choose it per load through `LoadConfiguration`.
+    public var activationQATEnabled: Bool = false
+
     // MARK: - CodingKeys
 
     enum CodingKeys: String, CodingKey {
@@ -193,6 +197,7 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         self.indexHeadDim = req(.indexHeadDim, 128)
         self.indexTopk = req(.indexTopk, 512)
         self.useAttnSink = req(.useAttnSink, true)
+        self.activationQATEnabled = false
     }
 
     public init() {}

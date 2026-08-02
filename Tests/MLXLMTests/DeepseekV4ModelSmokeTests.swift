@@ -15,7 +15,7 @@
 
 import Foundation
 import MLX
-import MLXLLM
+@testable import MLXLLM
 import MLXLMCommon
 import Testing
 
@@ -506,6 +506,62 @@ struct DeepseekV4ModelSmokeTests {
     }
 
     // MARK: - Factory dispatch
+
+    @Test("Factory stamps explicit DSV4 activation-QAT OFF and ON into the runtime config")
+    func factoryStampsActivationQATPerLoadPolicy() async throws {
+        let json = """
+            {
+              "model_type": "deepseek_v4",
+              "num_hidden_layers": 2,
+              "hidden_size": 16,
+              "num_attention_heads": 2,
+              "num_key_value_heads": 1,
+              "head_dim": 128,
+              "qk_rope_head_dim": 64,
+              "q_lora_rank": 128,
+              "o_groups": 2,
+              "o_lora_rank": 64,
+              "vocab_size": 256,
+              "n_routed_experts": 4,
+              "num_experts_per_tok": 2,
+              "n_shared_experts": 1,
+              "moe_intermediate_size": 16,
+              "hc_mult": 2,
+              "compress_ratios": [0, 4]
+            }
+            """.data(using: .utf8)!
+
+        let prior = ProcessInfo.processInfo.environment[
+            "VMLX_DSV4_OFFICIAL_ACTIVATION_QAT"]
+        setenv("VMLX_DSV4_OFFICIAL_ACTIVATION_QAT", "1", 1)
+        defer {
+            if let prior {
+                setenv("VMLX_DSV4_OFFICIAL_ACTIVATION_QAT", prior, 1)
+            } else {
+                unsetenv("VMLX_DSV4_OFFICIAL_ACTIVATION_QAT")
+            }
+        }
+
+        let explicitlyOff = try await DeepseekV4ActivationQAT.withExplicitRequest(false) {
+            try LLMTypeRegistry.decodeDeepseekV4Configuration(data: json)
+        }
+        let explicitlyOn = try await DeepseekV4ActivationQAT.withExplicitRequest(true) {
+            try LLMTypeRegistry.decodeDeepseekV4Configuration(data: json)
+        }
+
+        #expect(explicitlyOff.activationQATEnabled == false)
+        #expect(explicitlyOn.activationQATEnabled == true)
+
+        // These are the same stamped configuration values copied into the
+        // production attention, compressor, and indexer modules at init.
+        let offModel = DeepseekV4Model(explicitlyOff)
+        let onModel = DeepseekV4Model(explicitlyOn)
+        #expect(offModel.config.activationQATEnabled == false)
+        #expect(onModel.config.activationQATEnabled == true)
+        #expect(onModel.model.layers[1].selfAttn.config.activationQATEnabled == true)
+        #expect(onModel.model.layers[1].selfAttn.compressor?.activationQATEnabled == true)
+        #expect(onModel.model.layers[1].selfAttn.indexer?.activationQATEnabled == true)
+    }
 
     @Test("DSV4_FORCE_JANGTQ=1 env override routes to JANGTQ even with bf16 stamp")
     func factoryDispatchForceJANGTQEnv() throws {

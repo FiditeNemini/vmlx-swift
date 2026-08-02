@@ -686,6 +686,7 @@ public final class DeepseekV4Compressor: Module {
     let overlap: Bool
     let rmsNormEps: Float
     let qatKind: DeepseekV4CompressorQATKind
+    let activationQATEnabled: Bool
 
     @ModuleInfo(key: "wkv") var wkv: Linear
     @ModuleInfo(key: "wgate") var wgate: Linear
@@ -704,6 +705,7 @@ public final class DeepseekV4Compressor: Module {
         self.headDim = headDim
         self.rmsNormEps = config.rmsNormEps
         self.qatKind = qatKind
+        self.activationQATEnabled = config.activationQATEnabled
         self.overlap = compressRatio == 4
         self.outDim = headDim * (overlap ? 2 : 1)
         self._wkv.wrappedValue = Linear(config.hiddenSize, outDim, bias: false)
@@ -821,7 +823,7 @@ public final class DeepseekV4Compressor: Module {
         pooled = DeepseekV4Math.applyPartialRoPE(
             pooled, cos: cosP, sin: sinP, ropeDim: rope.dim)
 
-        if DeepseekV4Math.officialActivationQATEnabled {
+        if activationQATEnabled {
             switch qatKind {
             case .attentionKV:
                 let nopeDim = headDim - rope.dim
@@ -1023,6 +1025,7 @@ public final class DeepseekV4Indexer: Module {
     let topK: Int
     let compressRatio: Int
     let scale: Float
+    let activationQATEnabled: Bool
 
     @ModuleInfo(key: "wq_b") var wqB: Linear
     @ModuleInfo(key: "weights_proj") var weightsProj: Linear
@@ -1034,6 +1037,7 @@ public final class DeepseekV4Indexer: Module {
         self.topK = config.indexTopk
         self.compressRatio = compressRatio
         self.scale = 1.0 / sqrt(Float(headDim))
+        self.activationQATEnabled = config.activationQATEnabled
         self._wqB.wrappedValue = Linear(
             config.qLoraRank, nHeads * headDim, bias: false)
         self._weightsProj.wrappedValue = Linear(
@@ -1081,7 +1085,7 @@ public final class DeepseekV4Indexer: Module {
         let sinQ = sinT.expandedDimensions(axes: [0, 1])
         q = DeepseekV4Math.applyPartialRoPE(
             q, cos: cosQ, sin: sinQ, ropeDim: rope.dim)
-        if DeepseekV4Math.officialActivationQATEnabled && headDim == 128 {
+        if activationQATEnabled && headDim == 128 {
             q = DeepseekV4Math.indexerActivationRoundTrip(q)
         }
 

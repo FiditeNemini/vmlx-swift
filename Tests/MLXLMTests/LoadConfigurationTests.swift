@@ -186,6 +186,7 @@ struct LoadConfigurationTests {
         #expect(cfg.maxResidentBytes == .fraction(0.70))
         #expect(cfg.memoryLimit == .fraction(0.70))
         #expect(cfg.useMmapSafetensors == true)
+        #expect(cfg.deepseekV4ActivationQAT == nil)
     }
 
     @Test("LoadConfiguration.experimentalJangPressAuto = .auto + 70% caps + mmap on")
@@ -204,6 +205,36 @@ struct LoadConfigurationTests {
         #expect(cfg.maxResidentBytes == .unlimited)
         #expect(cfg.memoryLimit == .unlimited)
         #expect(cfg.useMmapSafetensors == false)
+        #expect(cfg.deepseekV4ActivationQAT == false)
+    }
+
+    @Test("DSV4 activation QAT defaults off and accepts only explicit opt-in env values")
+    func dsv4ActivationQATEnvironmentDefaultIsOptIn() {
+        #expect(withEnvironmentValue("VMLX_DSV4_OFFICIAL_ACTIVATION_QAT", nil) {
+            DeepseekV4ActivationQAT.environmentDefault == false
+        })
+        #expect(withEnvironmentValue("VMLX_DSV4_OFFICIAL_ACTIVATION_QAT", "0") {
+            DeepseekV4ActivationQAT.environmentDefault == false
+        })
+        #expect(withEnvironmentValue("VMLX_DSV4_OFFICIAL_ACTIVATION_QAT", "1") {
+            DeepseekV4ActivationQAT.environmentDefault == true
+        })
+        #expect(withEnvironmentValue("VMLX_DSV4_OFFICIAL_ACTIVATION_QAT", "yes") {
+            DeepseekV4ActivationQAT.environmentDefault == true
+        })
+    }
+
+    @Test("DSV4 activation QAT explicit per-load request overrides the process fallback")
+    func dsv4ActivationQATPerLoadOverride() async {
+        let explicitlyOn = await DeepseekV4ActivationQAT.withExplicitRequest(true) {
+            DeepseekV4ActivationQAT.enabledForCurrentLoad
+        }
+        let explicitlyOff = await DeepseekV4ActivationQAT.withExplicitRequest(false) {
+            DeepseekV4ActivationQAT.enabledForCurrentLoad
+        }
+
+        #expect(explicitlyOn)
+        #expect(!explicitlyOff)
     }
 
     @Test("JANGTQ load keeps tq tensors raw and protects mmap residency")

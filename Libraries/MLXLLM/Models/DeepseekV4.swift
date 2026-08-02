@@ -233,7 +233,7 @@ class DeepseekV4Attention: Module {
         // row enters any local or disk-backed cache. Tiny synthetic configs
         // use sub-64 heads and intentionally skip this production-only op.
         let nopeDim = headDim - ropeDim
-        if DeepseekV4Math.officialActivationQATEnabled && nopeDim >= 64 {
+        if config.activationQATEnabled && nopeDim >= 64 {
             kv = DeepseekV4Math.e4m3KVActivationRoundTrip(kv, ropeDim: ropeDim)
         }
 

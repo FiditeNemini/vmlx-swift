@@ -693,12 +693,16 @@ public func loadModel(
         tensorBuffers: useTensorMmapBuffers,
         startColdPercent: useTensorMmapBuffers ? resolvedOptions.compressPct : nil
     ) {
-        try await NativeMTPActivation.withExplicitRequest(loadConfiguration.nativeMTP) {
-            try await load {
-                try await $0.load(
-                    from: loadDirectory,
-                    using: tokenizerLoader,
-                    configuration: configuration)
+        try await DeepseekV4ActivationQAT.withExplicitRequest(
+            loadConfiguration.deepseekV4ActivationQAT
+        ) {
+            try await NativeMTPActivation.withExplicitRequest(loadConfiguration.nativeMTP) {
+                try await load {
+                    try await $0.load(
+                        from: loadDirectory,
+                        using: tokenizerLoader,
+                        configuration: configuration)
+                }
             }
         }
     }

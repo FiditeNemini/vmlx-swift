@@ -541,8 +541,7 @@ public enum LLMTypeRegistry {
             }
         }
 
-        let config = try JSONDecoder.json5().decode(
-            DeepseekV4Configuration.self, from: data)
+        let config = try decodeDeepseekV4Configuration(data: data)
         let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data)
         let forced = ProcessInfo.processInfo.environment["DSV4_FORCE_JANGTQ"] == "1"
         let weightFormat = check?.weightFormat?.lowercased()
@@ -626,6 +625,21 @@ public enum LLMTypeRegistry {
             return DeepseekV4JANGTQModel(config, mxtqBits: uniformBits, mxtqSeed: 42)
         }
         return DeepseekV4Model(config)
+    }
+
+    /// Decode the DSV4 bundle configuration and stamp the per-load runtime
+    /// graph policy carried by `MLXLMCommon.loadModel`. Keeping this bridge
+    /// separately testable prevents a host setting from becoming dead wiring
+    /// before the production model dispatcher constructs attention,
+    /// compressor, and indexer modules from the stamped configuration.
+    static func decodeDeepseekV4Configuration(
+        data: Data
+    ) throws -> DeepseekV4Configuration {
+        var config = try JSONDecoder.json5().decode(
+            DeepseekV4Configuration.self, from: data)
+        config.activationQATEnabled =
+            DeepseekV4ActivationQAT.enabledForCurrentLoad
+        return config
     }
 
     /// Shared dispatch for `mistral3` and `ministral3` outer model_types.

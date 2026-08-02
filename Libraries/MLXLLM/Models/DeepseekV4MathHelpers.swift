@@ -79,14 +79,6 @@ private let _compiledDeepseekV4ScoredSwiGLUUnclamped =
 
 public enum DeepseekV4Math {
 
-    // The 0731 checkpoint was activation-QAT trained. These round trips are
-    // part of the model graph, not an optional cache codec: attention KV uses
-    // block-64 E4M3FN after RoPE, while the indexer uses Hadamard-128 followed
-    // by block-32 E2M1. Keep the official graph on by default; the environment
-    // switch exists only for controlled same-binary diagnostics.
-    public static let officialActivationQATEnabled =
-        ProcessInfo.processInfo.environment["VMLX_DSV4_OFFICIAL_ACTIVATION_QAT"] != "0"
-
     private static let e4m3KVActivationRoundTripKernel = MLXFast.metalKernel(
         name: "deepseek_v4_e4m3_kv_activation_roundtrip",
         inputNames: ["x"],
