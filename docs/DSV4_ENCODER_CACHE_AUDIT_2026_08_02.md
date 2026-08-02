@@ -190,30 +190,41 @@ and the very same 1276 entry HITs for a later, larger request
 (`HIT 1276 remaining=105` at `tokens=1381`). So the entry is good; the re-warm's
 first 1276 tokens simply are not the stored ones.
 
-Cause, `BatchEngine.swift:3255`:
+**Cause: UNRESOLVED.** An earlier revision of this document asserted that the
+post-answer store (`BatchEngine.swift:3255`,
+`promptTokens + slot.generatedTokenIds`, verified arithmetic `1223 + 53 = 1276`)
+could never match because the next request carries the *re-rendered* assistant
+turn rather than the raw generated tokens. **That explanation is wrong** and is
+corrected here: the very same 1276 entry later HITs at `tokens=1381` in the same
+conversation, which is impossible if its token sequence were not a valid prefix.
 
-```swift
-let generatedBoundaryTokens = promptTokens + slot.generatedTokenIds
-```
+What is established:
 
-The post-answer entry stores **prompt + RAW generated tokens** — verified
-arithmetic: `1223 + 53 = 1276`. The next request instead carries the
-**re-rendered** assistant turn, `{reasoning}</think>{content}{tool_calls}` plus
-`<｜end▁of▁sentence｜>`, then the 2-token generation rail. The re-rendered form
-is not token-identical to the raw generation, so the stored sequence is not a
-prefix of the next prompt and the content check correctly rejects it.
+- **Not a probe-range problem.** `DiskCache.candidateTokenCounts` is unscoped —
+  `SELECT DISTINCT token_count ... WHERE token_count <= ?` — so 1276 *is*
+  returned as a candidate for a 1278-token fetch, and `skipExactDiskBoundary`
+  only excludes `boundary == tokens.count`. The entry was offered and the
+  content-addressed probe rejected it.
+- **Not a stale/missing index row**, since the `disk-store count=1276` line is
+  logged before the failing fetch.
+- Therefore the re-warm's prompt must differ from the stored entry *within the
+  first 1276 tokens*, while the later visible request does not.
 
-This is the same class the hybrid path already solved: the gen-suffix-stripped
-boundary added in vmlx#125 (`BatchEngine.swift:2891`, `promptTokens.lastIndex(of:
-turnStartToken)`), which stores back to the last turn start rather than trusting
-the generated suffix. DSV4 does not take that path — its post-answer store is
-gated on `!usesCanonicalHybridBoundary`, which is false for DSV4, so it stores
-the raw-generated boundary instead.
+The leading candidate is a **mutable system section changing between the store
+and the immediately-following re-warm**. That is directly observed in the same
+session — the todo tool moved `stable[1]` from 1160 to 1128 between consecutive
+boundary computations (finding 7). A system-region change invalidates the stored
+prefix for the re-warm, while a later turn composed against the settled system
+prompt matches again.
 
-Fix direction: store the post-answer boundary at the re-rendered history length,
-or strip the generated suffix to the last turn start as the hybrids do. Impact
-is confined to the background re-warm — visible turns hit — so this is a wasted
-prefill rather than a user-visible stall. Needs its own live visual proof.
+Confirming this needs instrumentation the current trace lacks: the boundary log
+prints token counts but not a prefix hash, so two prompts of the same length
+cannot be distinguished. Next step is to log a short prefix digest alongside
+`[vmlx][cache/boundaries]`, then compare the re-warm's digest against the stored
+entry's.
+
+Impact is confined to the background re-warm — visible turns hit — so this is
+wasted prefill rather than a user-visible stall. Needs its own live visual proof.
 
 ### 9. No partial-content validator — DELIBERATE, do not "fix" naively
 
