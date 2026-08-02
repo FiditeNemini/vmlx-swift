@@ -169,6 +169,25 @@ func shouldPersistExactPromptBoundary(
         || !requiresRecurrentSSMCompanion
 }
 
+/// Whether a processor-declared stable boundary may synchronously replay the
+/// model after a cache-trim miss.
+///
+/// A reusable-prefix warmup on a non-recurrent disk-only topology (notably
+/// DeepSeek V4's SWA + compressor/indexer pools) already publishes its exact
+/// prompt checkpoint. Replaying every older stable boundary before reporting
+/// warmup completion duplicates prefill and can hold the chat UI in
+/// "Warming up" for minutes. Recurrent hybrids are different: their exact
+/// warmup boundary is intentionally rejected, so they still need the proven
+/// N-1 stable seed re-derive.
+func shouldForceStableBoundaryRederive(
+    isStableBoundary: Bool,
+    isReusablePrefixWarmup: Bool,
+    requiresRecurrentSSMCompanion: Bool
+) -> Bool {
+    isStableBoundary
+        && (!isReusablePrefixWarmup || requiresRecurrentSSMCompanion)
+}
+
 /// Whether paged KV blocks can safely serve this mixed rotating topology when
 /// the exact leaf also carries a typed rotating-boundary companion.
 ///

@@ -3013,7 +3013,11 @@ public actor BatchEngine {
                     }
                     if let snapshot = boundarySnapshot(
                         tokens: boundaryTokens,
-                        forceRederive: isStableBoundary)
+                        forceRederive: shouldForceStableBoundaryRederive(
+                            isStableBoundary: isStableBoundary,
+                            isReusablePrefixWarmup: isReusablePrefixWarmup,
+                            requiresRecurrentSSMCompanion:
+                                coordinator.requiresRecurrentSSMCompanion))
                     {
                         storeCacheEntry(
                             tokens: boundaryTokens,

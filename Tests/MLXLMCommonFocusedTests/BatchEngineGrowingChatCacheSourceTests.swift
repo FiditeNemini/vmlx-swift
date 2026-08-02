@@ -86,6 +86,26 @@ struct BatchEngineGrowingChatCacheSourceTests {
             requiresRecurrentSSMCompanion: true))
     }
 
+    @Test("non-recurrent reusable warmups never replay stable cache boundaries")
+    func reusableWarmupStableBoundaryRederivePolicy() {
+        #expect(!shouldForceStableBoundaryRederive(
+            isStableBoundary: false,
+            isReusablePrefixWarmup: false,
+            requiresRecurrentSSMCompanion: false))
+        #expect(shouldForceStableBoundaryRederive(
+            isStableBoundary: true,
+            isReusablePrefixWarmup: false,
+            requiresRecurrentSSMCompanion: false))
+        #expect(!shouldForceStableBoundaryRederive(
+            isStableBoundary: true,
+            isReusablePrefixWarmup: true,
+            requiresRecurrentSSMCompanion: false))
+        #expect(shouldForceStableBoundaryRederive(
+            isStableBoundary: true,
+            isReusablePrefixWarmup: true,
+            requiresRecurrentSSMCompanion: true))
+    }
+
     @Test("coordinator miss resets only populated caller-owned caches")
     func coordinatorMissResetRequiresPopulatedCache() {
         let empty = KVCacheSimple()
@@ -137,7 +157,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptCacheSnapshot)"))
         #expect(source.contains("Skipped history-boundary cache rederive after trim miss for slot"))
         #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
-        #expect(source.contains("forceRederive: isStableBoundary"))
+        #expect(source.contains("forceRederive: shouldForceStableBoundaryRederive("))
         #expect(source.contains(#""stable-system-tool-boundary""#))
         #expect(source.contains("let storeBoundary = isStableBoundary"))
         #expect(source.contains(#""stable-system-tool-safe-seed""#))
@@ -183,7 +203,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot)"))
         #expect(source.contains("TokenIterator: skipped history-boundary cache rederive after trim miss"))
         #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
-        #expect(source.contains("allowDiskBackedRederive: isStableBoundary"))
+        #expect(source.contains(
+            "allowDiskBackedRederive: shouldForceStableBoundaryRederive("))
         #expect(source.contains("let storeBoundary = isStableBoundary"))
         #expect(source.contains("coordinator.hasValidatedDiskEntry("))
         #expect(!source.contains("let unsafePartial = !remainingTokens.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
@@ -209,7 +230,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("reDeriveAndStoreSSMStatesAtPromptBoundaries("))
         #expect(source.contains("persistCapturedStatesToDisk: false"))
         #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
-        #expect(source.contains("allowDiskBackedRederive: isStableBoundary"))
+        #expect(source.contains(
+            "allowDiskBackedRederive: shouldForceStableBoundaryRederive("))
         #expect(source.contains("coordinator.hasValidatedDiskEntry("))
     }
 
