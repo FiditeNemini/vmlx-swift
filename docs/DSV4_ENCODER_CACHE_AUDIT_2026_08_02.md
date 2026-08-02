@@ -110,7 +110,39 @@ Enforcement already present and verified correct:
 - a canonical envelope with a non-DSML body is quarantined and surfaced as
   `.malformedEnvelope` rather than leaked as visible text
 
-### 6. No partial-content validator — DELIBERATE, do not "fix" naively
+### 6. Reasoning enforcement is clean — and `reasoning_effort` invalidates the STABLE prefix
+
+`DeepseekV4ReasoningPolicy` satisfies the MLXPress non-negotiables. There are no
+forced thinking tags, no injected `<think>`, no decode-loop close-token bias and
+no prompt coercion. Rails are selected only by the caller's explicit controls:
+
+- an explicit `enable_thinking: false` wins and drops `reasoning_effort` — a
+  valid effort can never turn a caller's explicit `false` back on;
+- an unsupported effort throws `invalidReasoningEffort` at the processor
+  boundary rather than silently selecting another rail;
+- both process-env overrides are deprecated, with the reason stated in the
+  deprecation message ("Public request/template controls must win").
+
+The caching consequence is the part to remember. The effort preface is emitted
+at **index 0** in thinking mode:
+
+```swift
+if index == 0 && thinkingMode == .thinking { out += ...Preface }
+```
+
+so changing effort rewrites the very first bytes of the prompt. That
+invalidates not just the history boundary but the **stable** system boundary
+too (`[72, 1128]` in the live traces) — i.e. the effort chip visible in the
+chat input ("DeepSeek V4 Flash… · Low") is a full-cache-invalidation control,
+not a cheap toggle. Same for `enable_thinking`, which changes the terminal rail
+`<think>` vs `</think>` and, with tools present, whether earlier turns keep
+their reasoning at all (finding 2).
+
+This is correct behaviour — the prompt genuinely differs — but a cache
+investigation that changes effort between runs will measure a cold prefill and
+must not read it as a regression.
+
+### 7. No partial-content validator — DELIBERATE, do not "fix" naively
 
 `DSMLToolCallParser` does not override `isValidPartialContent`, so a canonical
 envelope buffers until its closer. Adding a strict grammar check there looks
