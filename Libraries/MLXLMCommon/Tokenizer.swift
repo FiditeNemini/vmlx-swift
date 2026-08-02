@@ -254,8 +254,27 @@ public func canonicalChatCacheBoundaries(
         ?? trailingContinuationBoundary()).map { [$0] } ?? []
     let all = Array(Set(stable + history)).sorted()
     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+        // Token counts alone cannot distinguish two prompts of equal length, so
+        // a boundary that is stored and then immediately missed looks identical
+        // in the trace to one that genuinely diverged. Emit a digest of the
+        // leading tokens as well: comparing `head=` across a store and the
+        // following re-warm shows directly whether the prompt changed in the
+        // system region rather than leaving it to inference.
+        //
+        // Diagnostic only — gated behind the same trace flag, never consulted
+        // by cache logic, and never used as a cache key.
+        func digest(_ ids: ArraySlice<Int>) -> String {
+            var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+            for id in ids {
+                hash = (hash ^ UInt64(bitPattern: Int64(id))) &* 0x1000_0000_01b3
+            }
+            return String(hash & 0xffff_ffff, radix: 16)
+        }
+        let headDigest = digest(promptTokens.prefix(256))
+        let stableDigest = stable.first.map { digest(promptTokens.prefix($0)) } ?? "-"
         FileHandle.standardError.write(Data(
-            "[vmlx][cache/boundaries] prompt=\(promptTokens.count) stable=\(stable) all=\(all)\n".utf8
+            ("[vmlx][cache/boundaries] prompt=\(promptTokens.count) stable=\(stable) all=\(all)"
+                + " head=\(headDigest) stable0=\(stableDigest)\n").utf8
         ))
     }
     return CanonicalChatCacheBoundaries(all: all, stable: stable)
