@@ -125,6 +125,37 @@ struct DeepseekV4ToolHistoryPrefixBoundaryTests {
         try expectPrefixRoundTrip(messages, tools: weatherTools(), label: "tool-call history")
     }
 
+    @Test("a transcript ending in an assistant turn appends no generation rail")
+    func trailingAssistantTurnAppendsNoRail() throws {
+        // Documents the encoder contract that broke boundary derivation. DSV4's
+        // official Python encoder emits `<｜Assistant｜>` only after a
+        // user/developer/latest_reminder message, so an assistant continuation
+        // renders identically with and without the generation prompt. That is
+        // CORRECT for the format — it is `canonicalChatCacheBoundaries` that
+        // must cope with it (see `trailingContinuationBoundary`).
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "You are a coding agent."],
+            ["role": "user", "content": "Build me a minesweeper game"],
+            ["role": "assistant", "content": "Working on it.", "reasoning_content": "plan"],
+        ]
+        let withRail = try DeepseekV4ChatEncoder.renderOpenAIChat(
+            messages: messages, tools: weatherTools(),
+            additionalContext: nil, addGenerationPrompt: true)
+        let withoutRail = try DeepseekV4ChatEncoder.renderOpenAIChat(
+            messages: messages, tools: weatherTools(),
+            additionalContext: nil, addGenerationPrompt: false)
+
+        #expect(withRail == withoutRail, "a continuation turn must not gain a rail")
+
+        // And the transcript WITHOUT that trailing assistant turn is the
+        // strictly shorter prefix the boundary fallback relies on.
+        let dropped = try DeepseekV4ChatEncoder.renderOpenAIChat(
+            messages: Array(messages.dropLast()), tools: weatherTools(),
+            additionalContext: nil, addGenerationPrompt: false)
+        #expect(dropped.count < withRail.count)
+        #expect(withRail.hasPrefix(dropped))
+    }
+
     @Test("a completed tool round followed by a new user turn round trips")
     func toolRoundThenUserTurnRoundTrips() throws {
         let messages: [[String: any Sendable]] = [

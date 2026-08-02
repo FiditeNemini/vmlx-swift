@@ -29,7 +29,7 @@ prefill. They are the two probe renders in
 the send-invariant prefix. Only `cache/fetch` marks real prefill work. An
 earlier diagnosis mis-read those probe lines as a second prefill.
 
-## 2. Tool turns lose the history cache boundary — OPEN
+## 2. Tool turns lose the history cache boundary — ROOT-CAUSED AND FIXED
 
 This is the defect behind "tool calls hang forever". The tool call itself is
 fine: DSML parses, the tool runs, the artifact is written
@@ -85,18 +85,51 @@ slower than the last.
   large string payload, and a completed tool round followed by a new user turn.
   All three pass, so the rail contract is intact for those shapes.
 
-### Still to isolate
+### Root cause
 
-Why `exactPrefixBoundary` returns nil for the real 7017-token tool transcript
-when the same shape round-trips in the focused tests. `promptTokens` and the
-boundary render come from the same encoder and the same message list, so the
-remaining candidates are (a) `renderOpenAIChat` throwing on the real message
-list — `try?` swallows it into a silent nil, which is also why this failed
-invisibly — or (b) the real list differing from the reconstruction (artifact
-card representation, `latest_reminder` insertion, reasoning content).
+`exactPrefixBoundary` requires the no-rail render to be **strictly shorter**
+than the real prompt:
 
-Next step: log the thrown error instead of discarding it in `exactPrefixBoundary`,
-then replay the persisted 7017-token transcript through the encoder.
+```swift
+tokens.count < promptTokens.count,
+promptTokens.prefix(tokens.count).elementsEqual(tokens)
+```
+
+DSV4 appends its `<｜Assistant｜>` rail only after a user / developer /
+latest_reminder message — `renderMessage`, mirroring `encoding_dsv4.py`:
+
+```python
+elif messages[index].get("role") in ["user", "developer"]:
+    prompt += ASSISTANT_SP_TOKEN + <think>/</think>
+```
+
+So when the transcript ends in an **assistant continuation** — the shape every
+agent-loop turn takes once the model is mid-turn — rendering with and without
+the generation prompt produces *identical* tokens. Measured on the real
+encoder: `withRail.count → 1283` == `withoutRail.count → 1283`. The strict `<`
+then rejects the boundary and `try?`/`?? []` turns that into a silent nil, so
+the history boundary disappears with no diagnostic.
+
+The encoder is correct here; the boundary derivation was not.
+
+### Fix
+
+`canonicalChatCacheBoundaries` gains `trailingContinuationBoundary()`: when the
+whole-list render yields no boundary and the last message is an assistant turn,
+retry against the transcript **without** that trailing turn. That render is
+strictly shorter and is still proven by the same exact-token-prefix check — no
+relaxation of token identity, no suffix matching.
+
+Regression cover, both sabotage-verified red:
+
+- `CanonicalChatCacheBoundariesTests."a trailing assistant continuation still publishes a history boundary"`
+  — without the fallback the published history set is `[]`.
+- `DeepseekV4ToolHistoryPrefixBoundaryTests."a transcript ending in an assistant turn appends no generation rail"`
+  — pins the encoder contract the fallback exists for.
+
+Full focused target: 22 pre-existing failures in `DeepseekV4ChatTemplateFallbackFocusedTests`
+and `VMLXMemorySafetySettingsTests` both with and without this change — this
+change adds none.
 
 ## 3. End-of-turn finalization
 

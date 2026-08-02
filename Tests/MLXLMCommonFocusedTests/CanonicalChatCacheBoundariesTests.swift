@@ -194,6 +194,99 @@ struct CanonicalChatCacheBoundariesTests {
         }
     }
 
+    /// DSV4-shaped: the generation rail is appended only after a
+    /// user/developer turn, so a transcript ending in an assistant turn (an
+    /// agent-loop continuation) renders identically with and without the
+    /// generation prompt.
+    private struct ContinuationRailTokenizer: GenerationPromptControllableTokenizer {
+        var bosToken: String? { nil }
+        var eosToken: String? { nil }
+        var unknownToken: String? { nil }
+
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+        func convertTokenToId(_ token: String) -> Int? { nil }
+        func convertIdToToken(_ id: Int) -> String? { nil }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            try applyChatTemplate(
+                messages: messages,
+                tools: tools,
+                additionalContext: additionalContext,
+                addGenerationPrompt: true)
+        }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?,
+            addGenerationPrompt: Bool
+        ) throws -> [Int] {
+            var result = [1]
+            for message in messages {
+                switch message["role"] as? String {
+                case "system":
+                    result.append(10)
+                    // Tool schemas render inside the system turn, as they do in
+                    // every real template — keeping them here is what makes an
+                    // earlier message list a true token prefix of a later one.
+                    if tools?.isEmpty == false { result.append(20) }
+                case "user": result.append(30)
+                case "assistant": result.append(40)
+                default: result.append(50)
+                }
+            }
+            // The rail exists only when an assistant turn is being OPENED.
+            if addGenerationPrompt, (messages.last?["role"] as? String) != "assistant" {
+                result.append(99)
+            }
+            return result
+        }
+    }
+
+    @Test("a trailing assistant continuation still publishes a history boundary")
+    func trailingAssistantContinuationPublishesHistoryBoundary() {
+        let tokenizer = ContinuationRailTokenizer()
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "instructions"],
+            ["role": "user", "content": "build it"],
+            ["role": "assistant", "content": "working"],
+        ]
+        let promptTokens = try! tokenizer.applyChatTemplate(
+            messages: messages, tools: tools, additionalContext: nil,
+            addGenerationPrompt: true)
+
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: tools,
+            additionalContext: nil,
+            promptTokens: promptTokens)
+
+        // Without the continuation fallback the whole-list render equals the
+        // prompt, the strict `<` rejects it, and `all` collapses to the stable
+        // prefix only — which is what made every DSV4 agent-loop turn
+        // cold-prefill the entire growing transcript.
+        let history = boundaries.all.filter { !boundaries.stable.contains($0) }
+        #expect(!history.isEmpty, "history boundary was dropped for a continuation turn")
+
+        // Whatever it published must still be a real, strictly shorter,
+        // exact token prefix of the prompt.
+        for boundary in boundaries.all {
+            #expect(boundary < promptTokens.count)
+            let rendered = try! tokenizer.applyChatTemplate(
+                messages: Array(messages.dropLast()), tools: tools,
+                additionalContext: nil, addGenerationPrompt: false)
+            if boundary == rendered.count {
+                #expect(promptTokens.prefix(boundary).elementsEqual(rendered))
+            }
+        }
+    }
+
     @Test("stable system and tool prefix is distinct from full history")
     func stableSystemToolPrefix() throws {
         let tokenizer = BoundaryTokenizer(breakStablePrefix: false)
