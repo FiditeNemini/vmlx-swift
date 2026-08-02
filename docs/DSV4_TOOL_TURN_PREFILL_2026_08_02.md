@@ -131,7 +131,34 @@ Full focused target: 22 pre-existing failures in `DeepseekV4ChatTemplateFallback
 and `VMLXMemorySafetySettingsTests` both with and without this change — this
 change adds none.
 
-## 3. End-of-turn finalization
+## 3. End-of-turn finalization — MEASURED, still OPEN
+
+Live rows on `6c936110`, fresh isolated root, comparing the app's own reported
+numbers against wall-clock time from Send until the Stop control cleared:
+
+| turn | TTFT | generate | expected | wall | unaccounted |
+|---|---|---|---|---|---|
+| tool call | 17.39s | 3.4s (18 tok @ 5.3) | 20.8s | 41s | **20.2s** |
+| follow-up | 1.91s | 29.2s (681 tok @ 23.3) | 31.1s | 45s | **13.9s** |
+
+The same 4-turn session wrote **11 cache blobs totalling 462 MB**, 26–63 MB
+each, two stores per turn (prompt boundary + post-answer). That is the work
+sitting between the last visible token and the turn finalizing, and it matches
+the ordering in `BatchEngine.swift:3264-3296` — `storeCacheEntry`, then
+`Stream().synchronize()`, then `slot.continuation.finish()`.
+
+Caveats on the numbers: the wall figure carries up to 5s of poll granularity,
+and the app's tok/s denominator is itself "honest" (it includes more than pure
+decode), so `expected` is a slight underestimate and `unaccounted` is therefore
+an upper bound. The magnitude is well outside that error, and the blob sizes
+corroborate it, but treat 14–20s as indicative rather than exact.
+
+Not fixed here. The GPU drain must stay — it is what closes the Metal
+concurrent-encoder crash class. The 25–63 MB serialization is CPU/IO only and
+is the candidate to move after `continuation.finish()`, provided the store's
+GPU eval has already drained and the snapshot is retained.
+
+## 3b. Original note on the ordering
 
 `BatchEngine.swift:3264-3296` runs the end-of-turn cache store, then
 `Stream().synchronize()`, and only then `slot.continuation.finish()`. Each DSV4
