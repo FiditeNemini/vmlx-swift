@@ -648,7 +648,15 @@ public actor BatchEngine {
             }
         }
 
-        Task {
+        // This bridge must not inherit BatchEngine actor isolation. The actor
+        // owns synchronous end-of-turn cache serialization (including hybrid
+        // prompt-boundary re-derive), which can take seconds for very large
+        // models. An actor-inherited forwarding task cannot consume tokenStream
+        // while that store is running, so already-generated tokens and terminal
+        // info remain buffered and the cache-store time is incorrectly added to
+        // user-visible TTFT. Keep the store serialized on the actor, but consume
+        // and detokenize its stream on an independent executor.
+        Task.detached {
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
             let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
             let toolCallProcessor: ToolCallProcessor? = {
@@ -884,14 +892,15 @@ public actor BatchEngine {
                         turboQuantCacheTransition: info.turboQuantCacheTransition,
                         unclosedReasoning: unclosed,
                         toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
-                    if info.turboQuantCompressions > 0 {
-                        turboQuantCompressionCount += info.turboQuantCompressions
-                    }
-                    if let transition = info.turboQuantCacheTransition {
-                        lastTurboQuantCacheTransition = transition
-                    }
                     terminationState.markCompleted()
                     continuation.yield(.info(finalInfo))
+                    // Publish the terminal event before hopping back to the
+                    // engine actor for diagnostics. If finishSlot is still
+                    // serializing a cache boundary, consumers can finish the
+                    // visible turn while this await queues safely behind it.
+                    await engineRef.recordTurboQuantDiagnostics(
+                        compressions: info.turboQuantCompressions,
+                        transition: info.turboQuantCacheTransition)
                 }
             }
             if !sawTerminalInfo {
@@ -1359,6 +1368,18 @@ public actor BatchEngine {
     /// TurboQuant transition, or `nil` when no transition has occurred.
     public var lastTurboQuantCacheTransitionForDiagnostics: TurboQuantCacheTransitionSnapshot? {
         lastTurboQuantCacheTransition
+    }
+
+    private func recordTurboQuantDiagnostics(
+        compressions: Int,
+        transition: TurboQuantCacheTransitionSnapshot?
+    ) {
+        if compressions > 0 {
+            turboQuantCompressionCount += compressions
+        }
+        if let transition {
+            lastTurboQuantCacheTransition = transition
+        }
     }
 
     /// Whether the engine is currently running (has active or pending work).

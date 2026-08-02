@@ -461,6 +461,25 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(engine.contains("path: \"BatchEngine.submit\""))
     }
 
+    @Test("batch text forwarding does not inherit cache-store actor isolation")
+    func batchTextForwardingRunsOutsideEngineActor() throws {
+        let engine = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+
+        #expect(engine.contains("Task.detached {\n            var detokenizer"))
+        #expect(engine.contains("continuation.yield(.info(finalInfo))"))
+        #expect(engine.contains("await engineRef.recordTurboQuantDiagnostics("))
+        let terminalYield = try #require(
+            engine.range(of: "continuation.yield(.info(finalInfo))"))
+        let actorHop = try #require(
+            engine.range(of: "await engineRef.recordTurboQuantDiagnostics("))
+        #expect(
+            terminalYield.lowerBound < actorHop.lowerBound,
+            "terminal info must be externally visible before diagnostics queue behind cache-store actor work"
+        )
+    }
+
     @Test("MiniMax stays off compiled decode until parity is proven")
     func minimaxCompiledDecodeIsDenied() throws {
         let evaluate = try String(
