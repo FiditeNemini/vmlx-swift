@@ -3,10 +3,117 @@
 
 import MLX
 @testable import MLXLLM
+import MLXLMCommon
 import Testing
 
 @Suite("DSV4 indexer causal top-k", .serialized)
 struct DeepseekV4IndexerCausalTopKTests {
+
+    @Test("prompt snapshot survives source rotating-ring mutation")
+    func promptSnapshotSurvivesSourceRotatingRingMutation() {
+        FocusedMLXTestSupport.withLock {
+            let source = DeepseekV4Cache(
+                slidingWindow: 8,
+                compressRatio: 4,
+                poolQuantizationEnabled: true)
+
+            func row(_ value: Float) -> MLXArray {
+                MLXArray([Float](repeating: value, count: 4))
+                    .reshaped(1, 1, 1, 4)
+            }
+
+            for value in 0..<8 {
+                _ = source.local.update(
+                    keys: row(Float(value)),
+                    values: row(Float(value + 100)))
+            }
+            let snapshot = source.copy() as! DeepseekV4Cache
+            MLX.eval(snapshot)
+            let expectedKeys = snapshot.local.state[0] * 1
+            let expectedValues = snapshot.local.state[1] * 1
+            MLX.eval(expectedKeys, expectedValues)
+
+            // Force a complete source-ring overwrite after capture. The
+            // retained checkpoint must continue to encode the original rows.
+            for value in 8..<16 {
+                _ = source.local.update(
+                    keys: row(Float(value)),
+                    values: row(Float(value + 100)))
+            }
+            MLX.eval(source, snapshot)
+
+            let keyError = (snapshot.local.state[0] - expectedKeys)
+                .abs().max().item(Float.self)
+            let valueError = (snapshot.local.state[1] - expectedValues)
+                .abs().max().item(Float.self)
+            #expect(keyError == 0)
+            #expect(valueError == 0)
+            #expect(source.offset == 16)
+            #expect(snapshot.offset == 8)
+        }
+    }
+
+    @Test("prompt-minus-one typed disk seed matches cold DSV4 chunking")
+    func promptMinusOneDiskSeedMatchesColdPrefill() {
+        FocusedMLXTestSupport.withLock {
+            var cfg = DeepseekV4Configuration()
+            cfg.hiddenSize = 8
+            cfg.numAttentionHeads = 2
+            cfg.headDim = 4
+            cfg.qkRopeHeadDim = 2
+            cfg.qLoraRank = 4
+            cfg.oGroups = 2
+            cfg.oLoraRank = 2
+            cfg.indexNHeads = 2
+            cfg.indexHeadDim = 4
+            cfg.indexTopk = 2
+            cfg.slidingWindow = 8
+            cfg.compressRatios = [4]
+
+            let attention = DeepseekV4Attention(config: cfg, layerIdx: 0)
+            let values = (0..<(25 * cfg.hiddenSize)).map {
+                Float(($0 % 29) - 14) / 32
+            }
+            let input = MLXArray(values).asType(.float16)
+                .reshaped(1, 25, cfg.hiddenSize)
+
+            func cache() -> DeepseekV4Cache {
+                DeepseekV4Cache(
+                    slidingWindow: cfg.slidingWindow,
+                    compressRatio: 4,
+                    poolQuantizationEnabled: false)
+            }
+
+            // Existing cold prefill shape for step=16: 16 tokens, then the
+            // final 9-token remainder in one forward.
+            let cold = cache()
+            _ = attention(input[0..., ..<16, 0...], mask: .none, cache: cold)
+            let coldTail = attention(
+                input[0..., 16..., 0...], mask: .none, cache: cold)
+
+            // New capture shape: the same first 16 tokens, then 8 tokens to
+            // snapshot exact N-1 state, followed by the final token.
+            let seed = cache()
+            _ = attention(input[0..., ..<16, 0...], mask: .none, cache: seed)
+            _ = attention(input[0..., 16..<24, 0...], mask: .none, cache: seed)
+            MLX.eval(seed)
+            let encoded = TQDiskSerializer.serialize(cache: [seed])
+
+            var restored: [any KVCache] = [cache()]
+            let restoredTokens = restoreFromDiskArrays(encoded, into: &restored)
+            let restoredSeed = restored[0] as! DeepseekV4Cache
+            let warmTail = attention(
+                input[0..., 24..., 0...], mask: .none, cache: restoredSeed)
+            MLX.eval(coldTail, warmTail)
+
+            let coldLast = coldTail[0, -1, 0...]
+            let warmLast = warmTail[0, -1, 0...]
+            let maxError = (coldLast - warmLast).abs().max().item(Float.self)
+            #expect(restoredTokens == 24)
+            #expect(restoredSeed.offset == 25)
+            #expect(maxError < 2e-3)
+        }
+    }
 
     @Test("ratio-4 attention preserves indexer history across the top-k boundary")
     func attentionAdvancesIndexerHistoryBeforeTopKSelection() {

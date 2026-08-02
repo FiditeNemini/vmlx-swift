@@ -1739,7 +1739,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             completedUnitCount: promptTokenCount,
             totalUnitCount: promptTokenCount,
             detail: "decode_ready"))
-        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
+        // The prefill-captured N-1 state is the only prompt checkpoint an
+        // exact DSV4 replay can consume safely. Keep one retained snapshot,
+        // not both N-1 and the deliberately skipped exact prompt boundary.
+        self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(
+            from: self.cache)
 
         if effectiveParameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model) {
             try setupCompiledDecode(
@@ -1827,7 +1831,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     /// The prompt-minus-one seed used to make an exact disk restore safe for a
-    /// standalone rotating/SWA cache.
+    /// standalone rotating/SWA cache or a typed DSV4 hybrid-pool cache.
     static func diskSeedBoundaryIndex(
         coordinator: CacheCoordinator?,
         promptTokenIds: [Int],
@@ -1842,7 +1846,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             promptTokenIds.count > 1,
             !input.hasMediaContent,
             !input.requiresPostPrepareCacheKey,
-            cacheHasStandaloneRotatingWindowState(cache)
+            (cacheHasStandaloneRotatingWindowState(cache)
+                || cacheRequiresPrefillCapturedDiskSeed(cache))
         else { return nil }
         return promptTokenIds.count - 1
     }
@@ -1861,13 +1866,15 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// already restored.
     private func boundarySplit(
         of input: LMInput,
-        at boundary: Int
+        at boundary: Int,
+        allowHybridPool: Bool = false
     ) -> (head: LMInput?, tail: LMInput)? {
         guard !input.requiresPostPrepareCacheKey,
-            // Capturing/trimming a boundary snapshot across DSV4 compressor
-            // and indexer pool state remains a separate unproven operation.
-            // Normal model prefill may still chunk at the requested window.
-            !cache.contains(where: { $0 is HybridPoolCache })
+            // A DSV4 prompt-minus-one seed must be captured before the final
+            // token because its rotating cache cannot be trimmed after the
+            // 128-token window wraps. Other structural-boundary captures keep
+            // the conservative hybrid-pool exclusion.
+            (allowHybridPool || !cache.contains(where: { $0 is HybridPoolCache }))
         else { return nil }
 
         let size = input.text.tokens.size
@@ -1926,7 +1933,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
         if let boundary = diskSeedBoundary,
            diskSeedSnapshot == nil,
-           let split = boundarySplit(of: input, at: boundary)
+           let split = boundarySplit(
+                of: input,
+                at: boundary,
+                allowHybridPool: cacheRequiresPrefillCapturedDiskSeed(cache)),
+           split.head != nil
         {
             return (.diskSeed, split.head, split.tail)
         }
@@ -2327,6 +2338,17 @@ public struct TokenIterator: TokenIteratorProtocol {
             )
         }
 
+        // Keep the sole retained prompt checkpoint available to every store
+        // decision below. For DSV4 this is the N-1 snapshot, not an unusable
+        // exact-prompt duplicate. Stores are synchronous, so release it as soon
+        // as this method returns.
+        let capturedDiskSeed = diskSeedSnapshot
+        let storageTopologySnapshot = promptCacheSnapshot ?? capturedDiskSeed
+        let storageSnapshotTokenCount = promptCacheSnapshot == nil
+            ? diskSeedBoundary ?? promptTokenIds.count
+            : promptTokenIds.count
+        defer { diskSeedSnapshot = nil }
+
         if let promptCacheSnapshot {
             // Prompt-boundary disk entries must remain raw KV even when the
             // live decode path uses TurboQuant/affine KV. Cold decode delays
@@ -2351,10 +2373,13 @@ public struct TokenIterator: TokenIteratorProtocol {
                     "TokenIterator: skipped exact recurrent warmup boundary; retaining processor-proven safe prefix seeds only"
                 )
             }
+        }
 
-            if !originalInput.requiresPostPrepareCacheKey {
+        if let storageTopologySnapshot,
+           !originalInput.requiresPostPrepareCacheKey
+        {
                 let requiresDiskBackedRestore =
-                    cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
+                    cacheRequiresDiskBackedCoordinatorRestore(storageTopologySnapshot)
                 if !usesCanonicalHybridBoundary,
                    !isReusablePrefixWarmup,
                    requiresDiskBackedRestore,
@@ -2364,11 +2389,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                     let seedTokens = Array(promptTokenIds.dropLast())
                     var seedSnapshot: [KVCache]?
                     if diskSeedBoundary == seedTokens.count {
-                        seedSnapshot = diskSeedSnapshot
+                        seedSnapshot = capturedDiskSeed
                     } else {
                         seedSnapshot = cacheSnapshotForBoundary(
                             tokens: seedTokens,
-                            promptSnapshot: promptCacheSnapshot)
+                            storageSnapshot: storageTopologySnapshot,
+                            storageSnapshotTokenCount: storageSnapshotTokenCount)
                     }
                     if let seedSnapshot {
                         store(
@@ -2380,7 +2406,6 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 requested: kvMode))
                     }
                 }
-                diskSeedSnapshot = nil
                 // Cross-turn reuse boundary for hybrid-SSM models (qwen3.5 /
                 // ornith GatedDeltaNet, Nemotron-H Mamba-2, LFM2, ZAYA CCA, …):
                 // store the generation-prompt-STRIPPED prompt, ending just before
@@ -2464,7 +2489,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                     }
                     if let boundarySnapshot = cacheSnapshotForBoundary(
                         tokens: boundaryTokens,
-                        promptSnapshot: promptCacheSnapshot,
+                        storageSnapshot: storageTopologySnapshot,
+                        storageSnapshotTokenCount: storageSnapshotTokenCount,
                         allowDiskBackedRederive: shouldForceStableBoundaryRederive(
                             isStableBoundary: isStableBoundary,
                             isReusablePrefixWarmup: isReusablePrefixWarmup,
@@ -2480,7 +2506,6 @@ public struct TokenIterator: TokenIteratorProtocol {
                                 requested: kvMode))
                     }
                 }
-            }
         }
 
         guard !usesCanonicalHybridBoundary,
@@ -2497,14 +2522,21 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     private func cacheSnapshotForBoundary(
         tokens: [Int],
-        promptSnapshot: [KVCache],
+        storageSnapshot: [KVCache],
+        storageSnapshotTokenCount: Int,
         allowDiskBackedRederive: Bool = false
     ) -> [KVCache]? {
-        guard !tokens.isEmpty, tokens.count < promptTokenIds.count else {
+        guard !tokens.isEmpty,
+            tokens.count <= storageSnapshotTokenCount,
+            storageSnapshotTokenCount <= promptTokenIds.count
+        else {
             return nil
         }
-        let trimCount = promptTokenIds.count - tokens.count
-        let trimmed = promptSnapshot.map { $0.copy() }
+        if tokens.count == storageSnapshotTokenCount {
+            return storageSnapshot.map { $0.copy() }
+        }
+        let trimCount = storageSnapshotTokenCount - tokens.count
+        let trimmed = storageSnapshot.map { $0.copy() }
         if canTrimPromptCache(trimmed),
            trimPromptCache(trimmed, numTokens: trimCount) == trimCount
         {
@@ -2513,7 +2545,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         if !allowDiskBackedRederive,
-           shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot) {
+           shouldSkipHistoryBoundaryRederiveAfterTrimMiss(storageSnapshot) {
             Self.logger.debug(
                 "TokenIterator: skipped history-boundary cache rederive after trim miss for disk-backed cache topology"
             )

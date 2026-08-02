@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 @testable import MLXLMCommon
 import Testing
 
@@ -154,7 +155,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(!source.contains("disk-backed full cache hit: re-feeding last token can corrupt path-dependent or rotating state"))
         #expect(source.contains("!slot.originalInput.requiresPostPrepareCacheKey"))
         #expect(!source.contains("let hasPathDependentLayer = slot.cache.contains"))
-        #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptCacheSnapshot)"))
+        #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(storageTopologySnapshot)"))
         #expect(source.contains("Skipped history-boundary cache rederive after trim miss for slot"))
         #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
         #expect(source.contains("forceRederive: shouldForceStableBoundaryRederive("))
@@ -200,7 +201,7 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(!source.contains("Populated-cache miss: full prefix matches cache"))
         #expect(!source.contains("Populated-cache miss: trimmed"))
         #expect(!source.contains("let hasPathDependentLayer = self.cache.contains"))
-        #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(promptSnapshot)"))
+        #expect(source.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(storageSnapshot)"))
         #expect(source.contains("TokenIterator: skipped history-boundary cache rederive after trim miss"))
         #expect(source.contains("cacheStablePrefixTokenCounts.contains(boundary)"))
         #expect(source.contains(
@@ -288,24 +289,144 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("Cache \\(detail.rawValue) hit: restored \\(diskRestored) tokens from disk"))
     }
 
-    @Test("solo rotating cache captures the prompt-minus-one disk seed during prefill")
-    func tokenIteratorCapturesRotatingDiskSeedDuringPrefill() throws {
+    @Test("solo and batched DSV4 paths capture prompt-minus-one disk seeds during prefill")
+    func generationPathsCaptureTypedDiskSeedDuringPrefill() throws {
         let source = try String(
             contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let batch = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let scheduler = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchScheduler.swift",
             encoding: .utf8)
 
         #expect(source.contains("static func diskSeedBoundaryIndex("))
         #expect(source.contains("cacheHasStandaloneRotatingWindowState(cache)"))
+        #expect(source.contains("cacheRequiresPrefillCapturedDiskSeed(cache)"))
         #expect(source.contains("case diskSeed"))
         #expect(source.contains("diskSeedSnapshot = snapshot"))
+        #expect(source.contains("split.head != nil"))
         #expect(source.contains("if diskSeedBoundary == seedTokens.count"))
-        #expect(source.contains("seedSnapshot = diskSeedSnapshot"))
+        #expect(source.contains("seedSnapshot = capturedDiskSeed"))
+        #expect(batch.contains("splitPrefillInputBeforeFinalToken("))
+        #expect(batch.contains("cacheRequiresPrefillCapturedDiskSeed(slot.cache)"))
+        #expect(!batch.contains(
+            "slot.originalInput.cachePromptIntent != .reusablePrefixWarmup"))
+        #expect(batch.contains(
+            "excluding warmups here causes the"))
+        #expect(batch.contains("remainingPromptUnits > 1"))
+        #expect(batch.contains("let diskSeedSnapshot = makePromptBoundaryCacheSnapshot("))
+        #expect(batch.contains(
+            "storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)"))
+        #expect(batch.contains("slot.diskSeedSnapshot = nil"))
+        #expect(batch.contains("let capturedDiskSeed = slot.diskSeedSnapshot"))
+        #expect(batch.contains("capturedDiskSeed ?? boundarySnapshot("))
+        #expect(batch.contains("slot.promptCacheSnapshot = makeRetainedExactPromptSnapshot("))
+        #expect(batch.contains("let storageSnapshotTokenCount = promptCacheSnapshot == nil"))
+        #expect(batch.contains("tokens.count <= storageSnapshotTokenCount"))
+        #expect(batch.contains("shouldSkipHistoryBoundaryRederiveAfterTrimMiss(storageTopologySnapshot)"))
+        #expect(batch.contains("liveSlot.diskSeedSnapshot = nil"))
+        #expect(batch.contains("liveSlot.promptCacheSnapshot = nil"))
+        #expect(source.contains("self.promptCacheSnapshot = makeRetainedExactPromptSnapshot("))
+        #expect(source.contains("diskSeedSnapshot = nil"))
+        #expect(scheduler.contains("var diskSeedSnapshot: [KVCache]?"))
 
         let prepare = try #require(source.range(of: "if let capture = prefillBoundaryCapture(of: input)"))
         let capture = try #require(source.range(of: "diskSeedSnapshot = snapshot"))
-        let store = try #require(source.range(of: "seedSnapshot = diskSeedSnapshot"))
+        let store = try #require(source.range(of: "seedSnapshot = capturedDiskSeed"))
         #expect(prepare.lowerBound < capture.lowerBound)
         #expect(capture.lowerBound < store.lowerBound)
+
+        // Scope the one-snapshot assertion to the real coordinator initializer:
+        // seed selection must precede the retained exact-snapshot decision.
+        let seedSelection = try #require(source.range(
+            of: "self.diskSeedBoundary = Self.diskSeedBoundaryIndex("))
+        let retainedSnapshot = try #require(source.range(
+            of: "self.promptCacheSnapshot = makeRetainedExactPromptSnapshot(",
+            range: seedSelection.lowerBound..<source.endIndex))
+        let compiledDecode = try #require(source.range(
+            of: "if effectiveParameters.enableCompiledDecode",
+            range: retainedSnapshot.lowerBound..<source.endIndex))
+        #expect(seedSelection.lowerBound < retainedSnapshot.lowerBound)
+        #expect(retainedSnapshot.lowerBound < compiledDecode.lowerBound)
+
+        // A seed-only DSV4 store must still reach stable system/tool prefix
+        // handling. The stable loop is a sibling of, not nested inside, the
+        // optional exact-prompt store and consumes the topology snapshot.
+        let topology = try #require(source.range(
+            of: "let storageTopologySnapshot = promptCacheSnapshot ?? capturedDiskSeed"))
+        let stableLoop = try #require(source.range(
+            of: "for boundary in Set(cachePrefixTokenCounts).sorted()",
+            range: topology.lowerBound..<source.endIndex))
+        let generatedBoundary = try #require(source.range(
+            of: "guard !usesCanonicalHybridBoundary",
+            range: stableLoop.lowerBound..<source.endIndex))
+        let storageBody = source[topology.lowerBound..<generatedBoundary.lowerBound]
+        #expect(storageBody.contains("if let storageTopologySnapshot,"))
+        #expect(storageBody.contains("storageSnapshot: storageTopologySnapshot"))
+        #expect(topology.lowerBound < stableLoop.lowerBound)
+    }
+
+    @Test("batch warm DSV4 replay skips storage without bypassing terminal drain")
+    func batchWarmDSV4ReplayPreservesTerminalDrain() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let finishStart = try #require(source.range(of: "private func finishSlot("))
+        let finishEnd = try #require(source.range(
+            of: "\n}\n\n// BatchEngine uses the shared",
+            range: finishStart.lowerBound..<source.endIndex))
+        let finishBody = String(source[finishStart.lowerBound..<finishEnd.lowerBound])
+
+        #expect(finishBody.contains(
+            "if let storageTopologySnapshot = promptCacheSnapshot ?? capturedDiskSeed"))
+        #expect(!finishBody.contains(
+            "guard let storageTopologySnapshot = promptCacheSnapshot ?? capturedDiskSeed"))
+        #expect(finishBody.contains(
+            "skipped cache store because no new prompt-boundary snapshot was retained"))
+        #expect(finishBody.components(separatedBy: "slot.continuation.finish()").count - 1 == 1)
+
+        let skip = try #require(finishBody.range(of:
+            "skipped cache store because no new prompt-boundary snapshot was retained"))
+        let drain = try #require(finishBody.range(of: "Stream().synchronize()"))
+        let finish = try #require(finishBody.range(of: "slot.continuation.finish()"))
+        #expect(skip.lowerBound < drain.lowerBound)
+        #expect(drain.lowerBound < finish.lowerBound)
+    }
+
+    @Test("only non-recurrent typed hybrid pools require prefill-captured disk seeds")
+    func dsv4DiskSeedCapturePolicyIsTopologySpecific() {
+        let dsv4 = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
+        #expect(cacheRequiresPrefillCapturedDiskSeed([dsv4]))
+        #expect(!cacheRequiresPrefillCapturedDiskSeed([KVCacheSimple()]))
+        #expect(!cacheRequiresPrefillCapturedDiskSeed([MambaCache()]))
+
+        #expect(makeRetainedExactPromptSnapshot(from: [dsv4]) == nil)
+        #expect(makeRetainedExactPromptSnapshot(from: [KVCacheSimple()]) != nil)
+    }
+
+    @Test("batch DSV4 persists its N-1 seed before decode and releases the duplicate")
+    func dsv4DiskSeedDoesNotRemainResidentThroughDecode() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+
+        #expect(source.contains("private func storePrefillCapturedDiskSeed("))
+        #expect(source.contains(
+            "storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)"))
+        #expect(source.contains(
+            "label=disk-backed-safe-prompt-boundary-prefill"))
+        let immediateStore = try #require(source.range(of:
+            "storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)"))
+        let release = try #require(source.range(
+            of: "slot.diskSeedSnapshot = nil",
+            range: immediateStore.lowerBound..<source.endIndex))
+        let tailPrefill = try #require(source.range(
+            of: "return try context.model.prepare(\n                        split.tail",
+            range: release.lowerBound..<source.endIndex))
+        #expect(immediateStore.lowerBound < release.lowerBound)
+        #expect(release.lowerBound < tailPrefill.lowerBound)
     }
 
     @Test("history-boundary rederive skips disk-backed cache topologies after trim miss")
