@@ -9,6 +9,50 @@ import Testing
 @Suite("DSV4 indexer causal top-k", .serialized)
 struct DeepseekV4IndexerCausalTopKTests {
 
+    @Test("prompt snapshot survives source rotating-ring mutation")
+    func promptSnapshotSurvivesSourceRotatingRingMutation() {
+        FocusedMLXTestSupport.withLock {
+            let source = DeepseekV4Cache(
+                slidingWindow: 8,
+                compressRatio: 4,
+                poolQuantizationEnabled: true)
+
+            func row(_ value: Float) -> MLXArray {
+                MLXArray([Float](repeating: value, count: 4))
+                    .reshaped(1, 1, 1, 4)
+            }
+
+            for value in 0..<8 {
+                _ = source.local.update(
+                    keys: row(Float(value)),
+                    values: row(Float(value + 100)))
+            }
+            let snapshot = source.copy() as! DeepseekV4Cache
+            MLX.eval(snapshot)
+            let expectedKeys = snapshot.local.state[0] * 1
+            let expectedValues = snapshot.local.state[1] * 1
+            MLX.eval(expectedKeys, expectedValues)
+
+            // Force a complete source-ring overwrite after capture. The
+            // retained checkpoint must continue to encode the original rows.
+            for value in 8..<16 {
+                _ = source.local.update(
+                    keys: row(Float(value)),
+                    values: row(Float(value + 100)))
+            }
+            MLX.eval(source, snapshot)
+
+            let keyError = (snapshot.local.state[0] - expectedKeys)
+                .abs().max().item(Float.self)
+            let valueError = (snapshot.local.state[1] - expectedValues)
+                .abs().max().item(Float.self)
+            #expect(keyError == 0)
+            #expect(valueError == 0)
+            #expect(source.offset == 16)
+            #expect(snapshot.offset == 8)
+        }
+    }
+
     @Test("prompt-minus-one typed disk seed matches cold DSV4 chunking")
     func promptMinusOneDiskSeedMatchesColdPrefill() {
         FocusedMLXTestSupport.withLock {

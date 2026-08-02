@@ -515,7 +515,12 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
             poolQuantizationEnabled: hybridPoolQuantizationEnabled)
         let localState = local.state
         if !localState.isEmpty {
-            dup.local.state = localState.map { $0[.ellipsis] }
+            // RotatingKVCache writes decode tokens into its ring in place.
+            // An ellipsis slice is only a view, so the retained prompt-minus-one
+            // checkpoint would otherwise be overwritten before the synchronous
+            // disk store at terminal state. Create independent buffers; the
+            // snapshot caller batches their materialization in one MLX.eval.
+            dup.local.state = localState.map { $0 * 1 }
         }
         dup.local.metaState = local.metaState
         dup.compPool = compPool.copy()
