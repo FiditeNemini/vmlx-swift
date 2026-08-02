@@ -63,6 +63,11 @@ struct BatchSlot {
     /// not the live decode cache, because coordinator keys are prompt-only.
     var promptCacheSnapshot: [KVCache]?
 
+    /// Exact prompt-minus-one cache state captured during prefill for typed
+    /// disk-only topologies (currently DSV4 SWA + compressor/indexer pools)
+    /// that cannot be losslessly trimmed after their rotating window wraps.
+    var diskSeedSnapshot: [KVCache]?
+
     /// Token IDs that describe the cache snapshot at the prompt boundary.
     ///
     /// Usually this is the same as `originalInput.text.tokens`. Some models
@@ -187,6 +192,7 @@ extension BatchSlot {
         self.maxTokens = request.parameters.maxTokens
         self.cache = cache
         self.promptCacheSnapshot = nil
+        self.diskSeedSnapshot = nil
         self.cachePromptTokenIds = request.input.text.tokens.reshaped(-1).asArray(Int.self)
         self.cachePromptUsesPostPrepareKey = false
         self.originalInput = request.input

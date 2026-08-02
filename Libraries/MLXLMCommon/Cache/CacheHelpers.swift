@@ -27,6 +27,22 @@ func makePromptBoundaryCacheSnapshot(from cache: [any KVCache]) -> [any KVCache]
     return snapshot
 }
 
+/// Retain the exact prompt snapshot unless the cache uses DSV4's typed pool
+/// topology, whose coordinator boundary must always be prompt-minus-one.
+///
+/// DeepSeek V4 deliberately restores N-1 and re-feeds the final prompt token.
+/// Its exact prompt snapshot is not a usable coordinator boundary. Suppress it
+/// even on a warm N-1 restore where no new seed is captured; otherwise an exact
+/// cache copy is retained through decode only to be discarded at store time.
+/// Standalone rotating/SWA caches retain their existing exact snapshot because
+/// their prompt/stable-boundary storage policy still consumes it.
+func makeRetainedExactPromptSnapshot(
+    from cache: [any KVCache]
+) -> [any KVCache]? {
+    guard !cacheRequiresPrefillCapturedDiskSeed(cache) else { return nil }
+    return makePromptBoundaryCacheSnapshot(from: cache)
+}
+
 /// Build the cache object list passed to ``TQDiskSerializer`` from a clean
 /// prompt-boundary snapshot.
 ///
@@ -151,6 +167,31 @@ public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) ->
             layer is TurboQuantKVCache ||
             layer is QuantizedKVCache
     }
+}
+
+/// True when a disk-backed prompt must publish an exact prompt-minus-one
+/// checkpoint captured while prefill crosses that boundary.
+///
+/// DeepSeek V4's typed cache is fully serialized (local SWA plus compressor
+/// and indexer pools), but its 128-token rotating window cannot be trimmed
+/// after it wraps. Exact prompt checkpoints are deliberately not consumed by
+/// the coordinator because generation needs logits from the final prompt
+/// token. Capturing N-1 before that token is evaluated gives a later request a
+/// lossless disk seed that can restore the longest valid prefix and re-feed
+/// only the final token. Recurrent Mamba/Arrays/CCA topologies keep their
+/// separate companion-state policy.
+func cacheRequiresPrefillCapturedDiskSeed(_ cache: [any KVCache]) -> Bool {
+    cache.contains { layer in
+        if layer is HybridPoolCache { return true }
+        if let cacheList = layer as? CacheList {
+            for index in 0..<cacheList.count {
+                if cacheRequiresPrefillCapturedDiskSeed([cacheList[index]]) {
+                    return true
+                }
+            }
+        }
+        return false
+    } && !cacheContainsPathDependentState(cache)
 }
 
 /// Whether the complete prompt boundary from a reusable-prefix warmup is safe
