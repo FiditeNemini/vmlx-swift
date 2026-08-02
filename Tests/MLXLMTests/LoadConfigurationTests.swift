@@ -376,6 +376,10 @@ struct LoadConfigurationTests {
         #expect(
             facts.resolveMLXMemoryLimit(requested: .absolute(8 * 1024 * 1024 * 1024))
                 == .unlimited)
+        #expect(facts.resolveMLXAllocatorCacheLimit(requested: .default) == .unlimited)
+        #expect(
+            facts.resolveMLXAllocatorCacheLimit(requested: .absolute(128 * 1024 * 1024))
+                == .unlimited)
     }
 
     @Test("complete pre-stacked affine DSV4 index permits mmap without restoring cap")
@@ -393,6 +397,7 @@ struct LoadConfigurationTests {
         #expect(facts.resolveMmapSafetensors(requested: true))
         #expect(!facts.resolveMmapSafetensors(requested: false))
         #expect(facts.resolveMLXMemoryLimit(requested: .default) == .unlimited)
+        #expect(facts.resolveMLXAllocatorCacheLimit(requested: .default) == .unlimited)
     }
 
     @Test("pre-stacked affine declaration without an index fails closed")
@@ -472,6 +477,7 @@ struct LoadConfigurationTests {
         #expect(!facts.requiresResidentSafetensors)
         #expect(facts.resolveMmapSafetensors(requested: true))
         #expect(facts.resolveMLXMemoryLimit(requested: .default) == .default)
+        #expect(facts.resolveMLXAllocatorCacheLimit(requested: .default) == .default)
     }
 
     @Test("inspect on missing dir returns zeroed facts")

@@ -598,6 +598,16 @@ public struct LoadBundleFacts: Sendable, Equatable {
     public func resolveMLXMemoryLimit(requested: ResidentCap) -> ResidentCap {
         isPlainDeepseekV4AffineJANG ? .unlimited : requested
     }
+
+    /// Plain affine DSV4 must also keep MLX's freed-buffer reuse pool
+    /// uncapped. `maxResidentBytes` controls `MLX.Memory.cacheLimit`, not the
+    /// model's physical footprint; a small profile cap forces the large routed
+    /// decode intermediates to be destroyed and rebuilt every token. That is
+    /// the same throughput-collapse mechanism as the total MLX memory limit
+    /// above, so RAM admission remains the owning safety gate for both caps.
+    public func resolveMLXAllocatorCacheLimit(requested: ResidentCap) -> ResidentCap {
+        isPlainDeepseekV4AffineJANG ? .unlimited : requested
+    }
 }
 
 extension JangPressPolicy {
