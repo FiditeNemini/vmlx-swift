@@ -27,4 +27,17 @@ struct Hy3CompiledDecodeGuardSourceTests {
         #expect(source.contains("typeName.contains(\"hy3\") || typeName.contains(\"hunyuan\")"))
         #expect(source.contains("effectiveParameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model)"))
     }
+
+    @Test("DSV4 keeps model-native compiled kernels and denies generic whole-cache compile")
+    func compiledDecodeGuardsPinDSV4() throws {
+        let batchSource = try String(contentsOf: Self.repoRoot.appendingPathComponent(
+            "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"))
+        let iteratorSource = try String(contentsOf: Self.repoRoot.appendingPathComponent(
+            "Libraries/MLXLMCommon/Evaluate.swift"))
+
+        #expect(batchSource.contains("modelTypeName.contains(\"deepseekv4\")"))
+        #expect(iteratorSource.contains("typeName.contains(\"deepseekv4\")"))
+        #expect(iteratorSource.contains("stateless gate and"))
+        #expect(iteratorSource.contains("skip the incompatible whole-cache trace"))
+    }
 }

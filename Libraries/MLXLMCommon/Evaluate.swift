@@ -1122,6 +1122,16 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     private static func compiledDecodeDenied(for model: any LanguageModel) -> Bool {
         let typeName = String(describing: type(of: model)).lowercased()
+        // DSV4 owns a composite SWA + CSA/HSA cache. Its stateless gate and
+        // SwiGLU micrographs are already compiled inside the model, while the
+        // generic whole-forward compiler cannot promote DeepseekV4Cache.
+        // Attempting that path is not a harmless no-op: an exact-bundle A/B
+        // measured 21.0 tok/s natively versus 12.7 tok/s when the generic
+        // compiled request was set. Keep the model-native compiled kernels and
+        // skip the incompatible whole-cache trace.
+        if typeName.contains("deepseekv4") {
+            return true
+        }
         if typeName.contains("hy3") || typeName.contains("hunyuan") {
             return true
         }

@@ -325,17 +325,22 @@ public actor BatchEngine {
     /// Maximum B=1 decode steps before yielding back to the actor executor.
     private let controlPlaneYieldInterval: Int = 8
 
-    /// Hy3/Hunyuan, Laguna, and MiniMax currently decode coherently on the uncompiled
-    /// path but diverge on the single-slot compiled trace. Keep compile opt-in
-    /// from silently taking those unsafe routes until each model path has a
-    /// dedicated compiled-vs-uncompiled parity test.
+    /// DSV4, Hy3/Hunyuan, Laguna, and MiniMax are denied the generic
+    /// single-slot compiled trace. DSV4 already compiles its stateless gate and
+    /// SwiGLU micrographs, but its composite SWA + CSA/HSA cache is not a
+    /// promotable whole-forward cache. Keep the native DSV4 acceleration while
+    /// avoiding the measured generic-request slowdown. The other families
+    /// decode coherently on the uncompiled path but diverge on the compiled
+    /// trace until each path has dedicated parity proof.
     private var compiledDecodeDeniedForModel: Bool {
         if context.configuration.toolCallFormat == .hunyuan {
             return true
         }
         let modelName = context.configuration.name.lowercased()
         let modelTypeName = String(describing: type(of: context.model)).lowercased()
-        return modelName.contains("hy3") || modelName.contains("hy_v3") || modelName.contains("hy-v3")
+        return modelName.contains("deepseek-v4") || modelName.contains("deepseek_v4")
+            || modelName.contains("dsv4") || modelTypeName.contains("deepseekv4")
+            || modelName.contains("hy3") || modelName.contains("hy_v3") || modelName.contains("hy-v3")
             || modelTypeName.contains("hy3") || modelTypeName.contains("hunyuan")
             || modelName.contains("laguna") || modelTypeName.contains("laguna")
             || modelName.contains("minimax") || modelTypeName.contains("minimax")
