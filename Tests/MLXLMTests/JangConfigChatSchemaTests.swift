@@ -33,6 +33,7 @@ struct JangConfigChatSchemaTests {
                     "supported": true,
                     "modes": ["chat", "thinking"],
                     "default_mode": "chat",
+                    "default_effort": "low",
                     "thinking_start": "<think>",
                     "thinking_end": "</think>",
                     "reasoning_effort_levels": ["max", "high", NSNull()],
@@ -72,6 +73,7 @@ struct JangConfigChatSchemaTests {
         #expect(reasoning.supported == true)
         #expect(reasoning.modes == ["chat", "thinking"])
         #expect(reasoning.defaultMode == "chat")
+        #expect(reasoning.defaultEffort == "low")
         #expect(reasoning.thinkingStart == "<think>")
         #expect(reasoning.thinkingEnd == "</think>")
         #expect(reasoning.dropEarlierReasoning == true)

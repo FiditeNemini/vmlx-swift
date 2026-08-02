@@ -51,22 +51,30 @@ struct DeepseekV4ChatEncoderTests {
             messages: [Msg(role: .user, content: "hi")],
             thinkingMode: .thinking,
             reasoningEffort: .max)
-        #expect(prompt.contains("Reasoning Effort: Absolute maximum"),
-            "max effort must prepend the preface at index 0")
+        #expect(prompt.contains("Reasoning Effort: Beyond maximum"),
+            "max effort must prepend the 0731 max preface at index 0")
+        #expect(!prompt.contains("Reasoning Effort: Absolute maximum"))
     }
 
-    @Test("reasoning_effort=high or nil does NOT emit the max preface")
-    func highEffortNoPreface() {
+    @Test("reasoning_effort=high uses its distinct prefix; low and nil add none")
+    func reasoningEffortHighLowAndDefaultPrefixes() {
         let encoder = DeepseekV4ChatEncoder()
         let promptHigh = encoder.encode(
             messages: [Msg(role: .user, content: "hi")],
             thinkingMode: .thinking,
             reasoningEffort: .high)
+        let promptLow = encoder.encode(
+            messages: [Msg(role: .user, content: "hi")],
+            thinkingMode: .thinking,
+            reasoningEffort: .low)
         let promptNil = encoder.encode(
             messages: [Msg(role: .user, content: "hi")],
             thinkingMode: .thinking)
-        #expect(!promptHigh.contains("Reasoning Effort: Absolute"))
+        #expect(promptHigh.contains("Reasoning Effort: Absolute maximum"))
+        #expect(!promptHigh.contains("Reasoning Effort: Beyond maximum"))
+        #expect(!promptLow.contains("Reasoning Effort:"))
         #expect(!promptNil.contains("Reasoning Effort: Absolute"))
+        #expect(!promptNil.contains("Reasoning Effort: Beyond"))
     }
 
     // MARK: - Multi-turn drop_earlier_reasoning
@@ -214,8 +222,63 @@ struct DeepseekV4ChatEncoderTests {
             "the latest user action task must survive merging a preceding tool result")
     }
 
-    @Test("required tool choice reminder stays after latest user turn without action rail")
-    func requiredToolChoiceReminderFollowsLatestUserWithoutActionRail() throws {
+    @Test("OpenAI history preserves native argument order in DSML")
+    func openAIHistoryPreservesNativeArgumentOrder() throws {
+        let raw = "{\"zeta\": 7, \"alpha\": \"ready\", \"nested\": {\"b\":2,\"a\":1}}"
+        let call = ToolCall(
+            id: "call_ordered",
+            function: .init(
+                name: "ordered",
+                arguments: [
+                    "zeta": .int(7),
+                    "alpha": .string("ready"),
+                    "nested": .object(["b": .int(2), "a": .int(1)]),
+                ],
+                rawArgumentsJSON: raw
+            )
+        )
+        let prompt = try DeepseekV4ChatEncoder.renderOpenAIChat(
+            messages: [
+                defaultMessageDict(for: .user("Run it.")),
+                defaultMessageDict(for: .assistant("", toolCalls: [call])),
+            ],
+            tools: nil,
+            additionalContext: ["enable_thinking": false],
+            addGenerationPrompt: false
+        )
+
+        let zeta = try #require(prompt.range(of: "parameter name=\"zeta\""))
+        let alpha = try #require(prompt.range(of: "parameter name=\"alpha\""))
+        let nested = try #require(prompt.range(of: "parameter name=\"nested\""))
+        #expect(zeta.lowerBound < alpha.lowerBound)
+        #expect(alpha.lowerBound < nested.lowerBound)
+        #expect(prompt.contains("string=\"false\">{\"b\":2,\"a\":1}</"))
+    }
+
+    @Test("action task rail follows the selected thinking mode")
+    func actionTaskRailFollowsThinkingMode() {
+        let encoder = DeepseekV4ChatEncoder()
+        let messages = [Msg(role: .user, content: "Read the requested file.", task: "action")]
+
+        let instruct = encoder.encode(messages: messages, thinkingMode: .chat)
+        #expect(instruct.hasSuffix(
+            DeepseekV4Tokens.assistant
+                + DeepseekV4Tokens.thinkEnd
+                + DeepseekV4Tokens.taskSPTokens["action"]!))
+        #expect(!instruct.hasSuffix(
+            DeepseekV4Tokens.assistant
+                + DeepseekV4Tokens.thinkStart
+                + DeepseekV4Tokens.taskSPTokens["action"]!))
+
+        let reasoning = encoder.encode(messages: messages, thinkingMode: .thinking)
+        #expect(reasoning.hasSuffix(
+            DeepseekV4Tokens.assistant
+                + DeepseekV4Tokens.thinkStart
+                + DeepseekV4Tokens.taskSPTokens["action"]!))
+    }
+
+    @Test("required tool choice preserves complete history and keeps an ordinary assistant rail")
+    func requiredToolChoicePreservesCompleteHistoryAndAssistantRail() throws {
         let encoder = DeepseekV4ChatEncoder()
         let finalUser = "Now use line_count on this exact text: one\ntwo"
         let prompt = encoder.encode(
@@ -253,16 +316,12 @@ struct DeepseekV4ChatEncoderTests {
         #expect(prompt.contains("Use the `line_count` function."), "Prompt: \(prompt)")
         #expect(!prompt.contains(DeepseekV4Tokens.taskSPTokens["action"]!), "Prompt: \(prompt)")
         #expect(
-            prompt.contains("<tool_result>{\"lines\":3}</tool_result>\n\n\(finalUser)"),
-            "Required DSV4 tool turns after a completed prose answer must compact back to tool_result + latest user. Prompt: \(prompt)"
+            prompt.contains("How many lines were counted? Do not call another tool."),
+            "Required tool choice must not delete a completed user turn. Prompt: \(prompt)"
         )
         #expect(
-            !prompt.contains("How many lines were counted? Do not call another tool."),
-            "Completed prose-only answer exchange should be dropped from this required tool prompt. Prompt: \(prompt)"
-        )
-        #expect(
-            !prompt.contains("Three lines were counted."),
-            "Completed prose-only assistant answer should not sit before the latest required DSML turn. Prompt: \(prompt)"
+            prompt.contains("Three lines were counted."),
+            "Required tool choice must not delete a completed assistant turn. Prompt: \(prompt)"
         )
     }
 
@@ -295,7 +354,11 @@ struct DeepseekV4ChatEncoderTests {
             ],
             thinkingMode: .chat)
         #expect(prompt.contains("## Tools"))
-        #expect(prompt.contains("\"name\": \"search\"") || prompt.contains("\"name\":\"search\""))
+        #expect(prompt.contains("\"name\": \"search\""))
+        #expect(prompt.contains(
+            #"{"name": "search", "description": "search the web", "parameters": {"q": "string"}}"#
+        ))
+        #expect(!prompt.contains("\"name\":\"search\""))
     }
 
     @Test("developer role opens with <｜User｜> like user")

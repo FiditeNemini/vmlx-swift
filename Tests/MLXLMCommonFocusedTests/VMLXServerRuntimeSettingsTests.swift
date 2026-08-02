@@ -31,6 +31,7 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.mtp.mode == .auto)
         #expect(settings.mtp.keepDraftCacheSeparate)
         #expect(settings.mtp.acceptedTokensOnlyEnterBaseCache)
+        #expect(settings.effectivePerformance.deepseekV4ActivationQAT == false)
     }
 
     @Test("Osaurus production preset keeps MLXPress opt-in while preserving MTP resolution")
@@ -48,6 +49,36 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(resolved.memoryLimit == .default)
         #expect(resolved.useMmapSafetensors)
         #expect(!resolved.nativeMTP)
+        #expect(resolved.deepseekV4ActivationQAT == false)
+    }
+
+    @Test("DSV4 activation QAT setting reaches the resolved load configuration")
+    func dsv4ActivationQATSettingReachesLoadConfiguration() {
+        var settings = VMLXServerRuntimeSettings()
+        settings.performance = VMLXServerPerformanceSettings(
+            deepseekV4ActivationQAT: true)
+
+        let resolved = settings.resolvedLoadConfiguration(
+            base: .osaurusProduction,
+            configData: nil,
+            jangConfig: nil,
+            status: nil)
+
+        #expect(resolved.deepseekV4ActivationQAT == true)
+
+        let memoryPlan = settings.resolvedMemorySafetyPlan(
+            baseLoadConfiguration: .osaurusProduction)
+        #expect(memoryPlan.loadConfiguration.deepseekV4ActivationQAT == true)
+    }
+
+    @Test("old performance JSON defaults DSV4 activation QAT off")
+    func oldPerformanceJSONDefaultsDSV4ActivationQATOff() throws {
+        let data = Data(
+            #"{"tiedHeadCodec":"fp16_passthrough","compiledDecode":false}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            VMLXServerPerformanceSettings.self, from: data)
+
+        #expect(decoded.deepseekV4ActivationQAT == false)
     }
 
     @Test("experimental MLXPress preset remains available for explicit host opt-in")

@@ -132,6 +132,74 @@ public protocol HybridPoolCache: RotatingKVCacheWrapper {
     func setHybridBuffers(branch: HybridPoolBranch, kv: MLXArray?, gate: MLXArray?)
 }
 
+/// One independently encoded row segment from a DSV4 compressor/indexer pool.
+///
+/// DSV4 pool quantization is deliberately separate from TurboQuant KV. The
+/// local sliding-window K/V remains native, while only the architecture's
+/// compressed global-context pools use affine UInt8 codes. Groups span the
+/// final feature dimension, so complete pool rows can be sliced or restored
+/// without dequantizing neighboring rows.
+public struct HybridPoolQuantizedSegment {
+    public let codes: MLXArray
+    public let scales: MLXArray
+    public let biases: MLXArray
+    public let originalShape: [Int]
+    public let groupSize: Int
+    public let bits: Int
+    public let originalDType: DType
+
+    public init(
+        codes: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        originalShape: [Int],
+        groupSize: Int,
+        bits: Int,
+        originalDType: DType
+    ) {
+        self.codes = codes
+        self.scales = scales
+        self.biases = biases
+        self.originalShape = originalShape
+        self.groupSize = groupSize
+        self.bits = bits
+        self.originalDType = originalDType
+    }
+
+    public var rowCount: Int {
+        originalShape.count > 1 ? originalShape[1] : 0
+    }
+
+    public var retainedByteCount: Int {
+        codes.nbytes + scales.nbytes + biases.nbytes
+    }
+}
+
+/// Architecture-native encoded storage for a ``HybridPoolCache``.
+///
+/// This protocol lets MLXLMCommon persist DSV4 pool segments without importing
+/// the concrete MLXLLM model. A `nil` segment list means the branch is empty or
+/// still in its small attention-ready hot tier; a non-empty list is the exact
+/// retained encoded representation and must be serialized as such.
+public protocol QuantizedHybridPoolCache: HybridPoolCache {
+    var hybridPoolQuantizationEnabled: Bool { get }
+    func hybridPoolQuantizedSegments(
+        branch: HybridPoolBranch
+    ) -> [HybridPoolQuantizedSegment]?
+    func setHybridPoolQuantizedSegments(
+        branch: HybridPoolBranch,
+        segments: [HybridPoolQuantizedSegment]
+    )
+    func hybridPoolRetainedByteCount(branch: HybridPoolBranch) -> Int
+}
+
+/// Cache implementations whose retained representation is smaller than their
+/// materialized `state` view can provide an exact byte count to admission and
+/// store-budget code. Reading this property must not materialize that view.
+public protocol CacheRetainedByteCountProviding {
+    var retainedCacheByteCount: Int { get }
+}
+
 public protocol QuantizedKVCacheProtocol: KVCache {
     /// The quantization group size used
     var groupSize: Int { get }

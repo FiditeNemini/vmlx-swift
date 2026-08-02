@@ -448,6 +448,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             configData: configData,
             jangConfig: jangConfig,
             status: status).launchMode == .speculative
+        resolved.deepseekV4ActivationQAT =
+            effectivePerformance.deepseekV4ActivationQAT
         return resolved
     }
 
@@ -476,6 +478,12 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             ?? profile.allocatorCap
 
         var loadConfiguration = baseLoadConfiguration
+        // Performance choices captured by the loaded model graph must survive
+        // every memory-safety entrypoint, including status/telemetry and
+        // fail-closed load branches that do not call
+        // `resolvedLoadConfiguration(...)` first.
+        loadConfiguration.deepseekV4ActivationQAT =
+            effectivePerformance.deepseekV4ActivationQAT
         loadConfiguration.memoryLimit = loadCap
         loadConfiguration.maxResidentBytes = allocatorCap
         loadConfiguration.useMmapSafetensors = true
@@ -984,12 +992,49 @@ public struct VMLXServerPerformanceSettings: Codable, Sendable, Equatable {
     /// hosts surface this as an explicit experimental toggle.
     public var compiledDecode: Bool
 
+    /// Execute the official DSV4-0731 activation-QAT simulation graph
+    /// (post-RoPE E4M3 KV plus Hadamard/E2M1 indexer QAT). This changes the
+    /// loaded model graph and therefore requires a model reload. Off by
+    /// default: users can opt into exact training-graph fidelity while the
+    /// runtime's QAT kernels remain materially slower in current Release
+    /// measurements.
+    public var deepseekV4ActivationQAT: Bool
+
     public init(
         tiedHeadCodec: VMLXTiedHeadCodec = .fp16Passthrough,
-        compiledDecode: Bool = false
+        compiledDecode: Bool = false,
+        deepseekV4ActivationQAT: Bool = false
     ) {
         self.tiedHeadCodec = tiedHeadCodec
         self.compiledDecode = compiledDecode
+        self.deepseekV4ActivationQAT = deepseekV4ActivationQAT
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case tiedHeadCodec
+        case compiledDecode
+        case deepseekV4ActivationQAT
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.tiedHeadCodec = try container.decodeIfPresent(
+            VMLXTiedHeadCodec.self, forKey: .tiedHeadCodec
+        ) ?? .fp16Passthrough
+        self.compiledDecode = try container.decodeIfPresent(
+            Bool.self, forKey: .compiledDecode
+        ) ?? false
+        self.deepseekV4ActivationQAT = try container.decodeIfPresent(
+            Bool.self, forKey: .deepseekV4ActivationQAT
+        ) ?? false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(tiedHeadCodec, forKey: .tiedHeadCodec)
+        try container.encode(compiledDecode, forKey: .compiledDecode)
+        try container.encode(
+            deepseekV4ActivationQAT, forKey: .deepseekV4ActivationQAT)
     }
 }
 

@@ -509,8 +509,8 @@ value_1
     /// instead. This jinja renders the same wire format the Python
     /// encoder produces (BOS / `<｜User｜>` / `<｜Assistant｜>` /
     /// closed `</think>` chat-mode tail / open `<think>` thinking-
-    /// mode tail / DSML tool calls / `enable_thinking=true` +
-    /// `reasoning_effort=max` preface).
+    /// mode tail / DSML tool calls / the distinct 0731 low, high, and max
+    /// reasoning-effort prompt contracts).
     /// Selected via the DSV4 BOS sniff in the tokenizer bridge.
     public static let dsv4Minimal: String = #"""
 {%- set bos = '<｜begin▁of▁sentence｜>' -%}
@@ -539,13 +539,7 @@ value_1
 {{- '...\n' -}}
 {{- '</' + dsml + 'invoke>\n' -}}
 {{- '</' + dsml + 'tool_calls>\n\n' -}}
-{{- 'For tools with no parameters, emit an empty invoke with no parameter lines:\n\n' -}}
-{{- '<' + dsml + 'tool_calls>\n' -}}
-{{- '<' + dsml + 'invoke name="$TOOL_NAME_WITHOUT_PARAMETERS">\n' -}}
-{{- '</' + dsml + 'invoke>\n' -}}
-{{- '</' + dsml + 'tool_calls>\n\n' -}}
-{{- 'Do not emit JSON objects for tool calls; tool calls must use DSML invoke blocks.\n\n' -}}
-{{- 'String parameters should be specified as is and set `string="true"`. For multiline strings, put real newline characters inside the parameter body; do not write backslash-n escape sequences. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.\n\n' -}}
+{{- 'String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.\n\n' -}}
 {{- 'If thinking_mode is enabled (triggered by ' + think_open + '), you MUST output your complete reasoning inside ' + think_open + '...' + think_close + ' BEFORE any tool calls or final response.\n\n' -}}
 {{- 'Otherwise, output directly after ' + think_close + ' with tool calls or final response.\n\n' -}}
 {{- '### Available Tool Schemas\n\n' -}}
@@ -586,8 +580,10 @@ value_1
 {{- '</' + dsml + 'tool_calls>' -}}
 {%- endmacro -%}
 {{- bos -}}
-{%- if enable_thinking and reasoning_effort == 'max' -%}
+{%- if enable_thinking and reasoning_effort == 'high' -%}
 {{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
+{%- elif enable_thinking and reasoning_effort == 'max' -%}
+{{- 'Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n' -}}
 {%- endif -%}
 {%- for message in messages -%}
 {%- if message['role'] == 'system' -%}

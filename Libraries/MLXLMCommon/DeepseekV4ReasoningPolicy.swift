@@ -6,9 +6,9 @@ import Foundation
 /// Runtime policy for DSV4 public reasoning controls.
 ///
 /// Public reasoning controls are passed through to the chat template after
-/// spelling/case normalization. The runtime must not silently downgrade
-/// `reasoning_effort=max` or alias low/medium to high; any model behavior at
-/// those rails is a real behavior to measure at the API boundary.
+/// spelling/case normalization. DSV4-0731 accepts exactly the canonical
+/// `low`, `high`, and `max` effort names; unsupported values fail at the
+/// processor boundary instead of silently selecting another rail.
 public enum DeepseekV4ReasoningPolicy {
     /// Deprecated compatibility key. `reasoning_effort=max` now passes through
     /// without an opt-in environment variable.
@@ -20,7 +20,8 @@ public enum DeepseekV4ReasoningPolicy {
 
     public static func isDeepseekV4(modelType: String?) -> Bool {
         guard let modelType else { return false }
-        let normalized = modelType
+        let normalized =
+            modelType
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: "-", with: "_")
@@ -36,7 +37,9 @@ public enum DeepseekV4ReasoningPolicy {
         truthy(environment[rawMaxEnvironmentKey])
     }
 
-    @available(*, deprecated, message: "Do not use process env to override explicit reasoning controls.")
+    @available(
+        *, deprecated, message: "Do not use process env to override explicit reasoning controls."
+    )
     public static func forceDirectRailEnabled(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
@@ -49,15 +52,18 @@ public enum DeepseekV4ReasoningPolicy {
     ) -> String? {
         guard let effort = normalizedString(value) else { return nil }
         switch effort {
-        case "max", "maximum":
-            return "max"
-        case "low", "medium", "high":
+        case "low", "high", "max":
             return effort
         default:
             return nil
         }
     }
 
+    @available(
+        *, deprecated,
+        message:
+            "DSV4 reasoning_effort accepts only low/high/max; use enable_thinking=false for the direct rail."
+    )
     public static func isDirectRailEffort(_ value: (any Sendable)?) -> Bool {
         guard let effort = normalizedString(value) else { return false }
         switch effort {
@@ -72,20 +78,32 @@ public enum DeepseekV4ReasoningPolicy {
         _ context: [String: any Sendable]?,
         modelType: String?,
         environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> [String: any Sendable]? {
+    ) throws -> [String: any Sendable]? {
         guard isDeepseekV4(modelType: modelType) else { return context }
 
         var normalized = context ?? [:]
 
         let rawEffort = normalized["reasoning_effort"]
-        if let effort = normalizedReasoningEffort(rawEffort) {
+        let effort: String?
+        if let rawEffort {
+            guard let canonical = normalizedReasoningEffort(rawEffort) else {
+                throw DeepseekV4ReasoningPolicyError.invalidReasoningEffort(
+                    String(describing: rawEffort)
+                )
+            }
+            effort = canonical
+        } else {
+            effort = nil
+        }
+
+        // The explicit mode switch owns chat-vs-thinking selection. A valid
+        // effort may refine thinking mode, but must never turn a caller's
+        // explicit `false` back on.
+        if normalized["enable_thinking"] as? Bool == false {
+            normalized.removeValue(forKey: "reasoning_effort")
+        } else if let effort {
             normalized["enable_thinking"] = true
             normalized["reasoning_effort"] = effort
-        } else if isDirectRailEffort(rawEffort) {
-            normalized["enable_thinking"] = false
-            normalized.removeValue(forKey: "reasoning_effort")
-        } else if normalized["enable_thinking"] as? Bool == false {
-            normalized.removeValue(forKey: "reasoning_effort")
         }
 
         return normalized.isEmpty ? nil : normalized
@@ -93,7 +111,8 @@ public enum DeepseekV4ReasoningPolicy {
 
     private static func normalizedString(_ value: (any Sendable)?) -> String? {
         if let value = value as? String {
-            let normalized = value
+            let normalized =
+                value
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
             return normalized.isEmpty ? nil : normalized
@@ -108,6 +127,18 @@ public enum DeepseekV4ReasoningPolicy {
             return true
         default:
             return false
+        }
+    }
+}
+
+public enum DeepseekV4ReasoningPolicyError: Error, LocalizedError, Sendable, Equatable {
+    case invalidReasoningEffort(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidReasoningEffort(let value):
+            return
+                "Invalid DSV4 reasoning_effort `\(value)`; expected one of: low, high, max."
         }
     }
 }

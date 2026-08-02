@@ -299,11 +299,47 @@ public final class CacheCoordinator: @unchecked Sendable {
             pagedEnabled: pagedIsEffective,
             pagedStats: pagedIsEffective ? pagedCache?.snapshotStats() : nil,
             diskEnabled: diskCache != nil,
-            diskStats: diskCache?.snapshotStats(),
+            diskStats: combinedDiskStatsSnapshot(),
             ssmStats: ssmStateCache.snapshotStats(),
             isHybrid: isHybrid,
             isPagedIncompatible: isPagedIncompatible,
             requiresPagedBoundaryCompanion: requiresPagedBoundaryCompanion)
+    }
+
+    /// Snapshot the complete L2 quota footprint. `DiskCache` owns the public
+    /// counter surface, while the coordinator folds linked recurrent sidecars
+    /// into byte usage and treats each KV + companion group as one logical
+    /// entry. Holding the combined lock keeps this view coherent with atomic
+    /// linked stores and evictions.
+    private func combinedDiskStatsSnapshot() -> DiskCacheStats? {
+        guard let diskCache else { return nil }
+
+        CombinedDiskCacheQuotaLock.shared.lock()
+        defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+
+        let base = diskCache.snapshotStats()
+        guard let companionStore = ssmStateCache.diskStore else { return base }
+
+        let kvHashes = Set(diskCache.quotaEntries().map(\.hash))
+        let companionEntries = companionStore.quotaEntries()
+        let companionBytes = companionEntries.reduce(Int64(0)) {
+            $0 + max(0, $1.bytes)
+        }
+        let unlinkedCompanionCount = companionEntries.reduce(into: 0) { count, entry in
+            if entry.kvHash.map({ !kvHashes.contains($0) }) ?? true {
+                count += 1
+            }
+        }
+
+        return DiskCacheStats(
+            hits: base.hits,
+            misses: base.misses,
+            stores: base.stores,
+            storeSkips: base.storeSkips,
+            currentPayloadBytes: base.currentPayloadBytes + Int(companionBytes),
+            currentEntryCount: base.currentEntryCount + unlinkedCompanionCount,
+            evictions: base.evictions,
+            maxSizeBytes: base.maxSizeBytes)
     }
 
     /// Release paged-cache blocks returned by ``fetch(tokens:mediaSalt:)``.
@@ -566,23 +602,46 @@ public final class CacheCoordinator: @unchecked Sendable {
                 }
             }
 
-            // Indexed lookup is intentionally bounded, so a frequently reused
-            // stable system/tool boundary can eventually fall below the 128
-            // largest historical prompt lengths. Merge processor-proven
-            // boundaries back into the probe set before sorting; each remains
-            // content-address checked against this request's exact token prefix.
+            // Read the index in bounded keyset pages, then sort the complete
+            // candidate set before probing. A single 128-length window can hide
+            // the longest valid prefix below unrelated larger entries from
+            // other prompts, models, or media. `maxTokens` is an inclusive
+            // cursor, so advancing to the smallest returned count minus one
+            // avoids OFFSET scans while guaranteeing forward progress.
+            let candidatePageSize = 128
+            var indexedBoundaries: [Int] = []
+            var candidateMaximum = tokens.count
+            while candidateMaximum > 0 {
+                let page = diskCache.candidateTokenCounts(
+                    maxTokens: candidateMaximum,
+                    limit: candidatePageSize)
+                guard !page.isEmpty else { break }
+                indexedBoundaries.append(contentsOf: page)
+
+                guard page.count == candidatePageSize,
+                      let smallest = page.last,
+                      smallest > 1
+                else { break }
+                let nextMaximum = smallest - 1
+                guard nextMaximum < candidateMaximum else { break }
+                candidateMaximum = nextMaximum
+            }
+
+            // Merge processor-proven boundaries back into the globally sorted
+            // probe set; each remains content-address checked against this
+            // request's exact model/media/token prefix.
             // A path-dependent hybrid restore cannot consume an exact prompt
             // boundary without an N-1 recurrent seed. Stable system/tool
             // checkpoints are therefore persisted one token short. Keep that
-            // processor-proven seed in the probe set even after the bounded
-            // disk index has accumulated more than 128 larger entries.
+            // processor-proven seed in the probe set even if its index row is
+            // missing or has not yet appeared to this connection.
             let preferredSafeSeeds = skipExactDiskBoundary
                 ? preferredDiskBoundaries.compactMap { boundary in
                     boundary > 1 ? boundary - 1 : nil
                 }
                 : []
             let candidateBoundaries = Set(
-                diskCache.candidateTokenCounts(maxTokens: tokens.count)
+                indexedBoundaries
                     + preferredDiskBoundaries
                     + preferredSafeSeeds
             ).sorted(by: >)
@@ -1060,6 +1119,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         var remaining = totalBefore
         var evictKV = Set<String>()
         var evictCompanion = Set<String>()
+        var evictedGroupKeys = Set<String>()
 
         // Reject any group that can never fit before applying LRU. Stable
         // boundaries are normally written shortest-to-longest; evicting the
@@ -1068,6 +1128,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         // Pre-eviction preserves the best prior prefix that actually fits.
         let oversized = groups.filter { $0.bytes > maxBytes }
         for group in oversized {
+            evictedGroupKeys.insert(group.sortKey)
             evictKV.formUnion(group.kvHashes)
             evictCompanion.formUnion(group.companionHashes)
             remaining -= group.bytes
@@ -1079,6 +1140,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             if $0.createdAt == $1.createdAt { return $0.sortKey < $1.sortKey }
             return $0.createdAt < $1.createdAt
         }) where remaining > maxBytes && !oversizedKeys.contains(group.sortKey) {
+            evictedGroupKeys.insert(group.sortKey)
             evictKV.formUnion(group.kvHashes)
             evictCompanion.formUnion(group.companionHashes)
             remaining -= group.bytes
@@ -1086,6 +1148,7 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         diskCache.removeQuotaEntries(hashes: evictKV)
         companionStore.removeQuotaEntries(hashes: evictCompanion)
+        diskCache.recordQuotaEvictions(evictedGroupKeys.count)
 
         let legacyCompanionEvicted = companionEntries.reduce(into: 0) { count, entry in
             if entry.kvHash == nil, evictCompanion.contains(entry.hash) {
@@ -1095,7 +1158,7 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
-                "[vmlx][cache/disk-quota] before=\(totalBefore) after=\(max(0, remaining)) max=\(maxBytes) kvEvicted=\(evictKV.count) companionEvicted=\(evictCompanion.count) legacyCompanionEvicted=\(legacyCompanionEvicted) orphanCompanionEvicted=\(orphaned.count)\n".utf8))
+                "[vmlx][cache/disk-quota] before=\(totalBefore) after=\(max(0, remaining)) max=\(maxBytes) logicalEvictions=\(evictedGroupKeys.count) kvEvicted=\(evictKV.count) companionEvicted=\(evictCompanion.count) legacyCompanionEvicted=\(legacyCompanionEvicted) orphanCompanionEvicted=\(orphaned.count)\n".utf8))
         }
     }
 

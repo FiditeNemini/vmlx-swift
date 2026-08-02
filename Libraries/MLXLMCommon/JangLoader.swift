@@ -631,6 +631,7 @@ public enum ParserResolution {
 ///
 ///   - `modes`: which modes the model supports (e.g. `["chat", "thinking"]`)
 ///   - `default_mode`: which mode to use if the caller doesn't pick one
+///   - `default_effort`: which reasoning-effort rail to use in thinking mode
 ///   - `thinking_start` / `thinking_end`: the envelope tags the
 ///     runtime should watch for (e.g. `<think>` / `</think>`)
 ///   - `reasoning_effort_levels`: allowed `reasoning_effort` knob
@@ -649,6 +650,7 @@ public struct JangChatReasoning: Sendable, Equatable {
     public let supported: Bool?
     public let modes: [String]?
     public let defaultMode: String?
+    public let defaultEffort: String?
     public let thinkingStart: String?
     public let thinkingEnd: String?
     public let reasoningEffortLevels: [String?]?
@@ -658,6 +660,7 @@ public struct JangChatReasoning: Sendable, Equatable {
         supported: Bool? = nil,
         modes: [String]? = nil,
         defaultMode: String? = nil,
+        defaultEffort: String? = nil,
         thinkingStart: String? = nil,
         thinkingEnd: String? = nil,
         reasoningEffortLevels: [String?]? = nil,
@@ -666,6 +669,7 @@ public struct JangChatReasoning: Sendable, Equatable {
         self.supported = supported
         self.modes = modes
         self.defaultMode = defaultMode
+        self.defaultEffort = defaultEffort
         self.thinkingStart = thinkingStart
         self.thinkingEnd = thinkingEnd
         self.reasoningEffortLevels = reasoningEffortLevels
@@ -1753,6 +1757,7 @@ public struct JangLoader: Sendable {
                     supported: rDict["supported"] as? Bool,
                     modes: rDict["modes"] as? [String],
                     defaultMode: rDict["default_mode"] as? String,
+                    defaultEffort: rDict["default_effort"] as? String,
                     thinkingStart: rDict["thinking_start"] as? String,
                     thinkingEnd: rDict["thinking_end"] as? String,
                     reasoningEffortLevels: parseEffortLevels(

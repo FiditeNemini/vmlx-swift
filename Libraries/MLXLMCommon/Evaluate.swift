@@ -1240,21 +1240,6 @@ public struct TokenIterator: TokenIteratorProtocol {
     // Internal metrics
     public var promptPrefillTime: TimeInterval = 0.0
 
-    /// DSV4's HybridPoolCache carries compressor/indexer pool state in
-    /// addition to the local sliding-window KV. Chunked prefill mutates that
-    /// pool across multiple forwards and has diverged from the Python
-    /// production path, so force a single prepare-forward for this cache
-    /// family unless the caller is only seeding a one-token cache hit.
-    private func effectivePrefillWindow(
-        requested: Int,
-        input: LMInput
-    ) -> Int {
-        guard cache.contains(where: { $0 is HybridPoolCache }) else {
-            return requested
-        }
-        return Swift.max(requested, input.text.tokens.size)
-    }
-
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
     ///
@@ -1297,9 +1282,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             let promptInput = LMInput(text: y)
             try prepare(
                 input: promptInput,
-                windowSize: effectivePrefillWindow(
-                    requested: parameters.prefillStepSize,
-                    input: promptInput))
+                windowSize: parameters.prefillStepSize)
         }
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
     }
@@ -1737,9 +1720,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 try PrefillProgressReporter.withHandler(modelPrepareProgressHandler) {
                     try prepare(
                         input: inputForPrepare,
-                        windowSize: effectivePrefillWindow(
-                            requested: effectiveParameters.prefillStepSize,
-                            input: inputForPrepare))
+                        windowSize: effectiveParameters.prefillStepSize)
                 }
             }
         }
@@ -1799,9 +1780,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
                 try prepare(
                     input: input,
-                    windowSize: effectivePrefillWindow(
-                        requested: prefillStepSize,
-                        input: input))
+                    windowSize: prefillStepSize)
             }
         }
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
@@ -1875,8 +1854,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         at boundary: Int
     ) -> (head: LMInput?, tail: LMInput)? {
         guard !input.requiresPostPrepareCacheKey,
-            // DSV4's pool cache is only correct under a single prefill forward;
-            // `effectivePrefillWindow` already forces that, so don't split it.
+            // Capturing/trimming a boundary snapshot across DSV4 compressor
+            // and indexer pool state remains a separate unproven operation.
+            // Normal model prefill may still chunk at the requested window.
             !cache.contains(where: { $0 is HybridPoolCache })
         else { return nil }
 
@@ -2544,9 +2524,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 mediaTokenIds: originalInput.mediaTokenIds,
                 cacheScopeSalt: originalInput.cacheScopeSalt)
             let cache = model.newCache(parameters: cacheInitParameters)
-            let rederiveWindow = effectivePrefillWindow(
-                requested: promptTokenIds.count,
-                input: boundaryInput)
+            let rederiveWindow = cacheInitParameters?.prefillStepSize ?? 512
             switch try model.prepare(
                 boundaryInput,
                 cache: cache,
@@ -3789,7 +3767,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     generationTokenCount: 0,
                     promptTime: 0,
                     generationTime: 0,
-                    stopReason: .cancelled
+                    stopReason: .cancelled,
+                    toolCallProtocolFailure: handler.toolCallProtocolFailure
                 )))
                 continuation.finish()
                 return
@@ -3805,7 +3784,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     generationTokenCount: 0,
                     promptTime: 0,
                     generationTime: 0,
-                    stopReason: .cancelled
+                    stopReason: .cancelled,
+                    toolCallProtocolFailure: handler.toolCallProtocolFailure
                 )))
                 continuation.finish()
                 return
@@ -3890,7 +3870,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 stopReason: stopReason ?? .cancelled,
                 turboQuantCompressions: iterator.turboQuantCompressionCount,
                 turboQuantCacheTransition: iterator.lastTurboQuantCacheTransition,
-                unclosedReasoning: unclosedReasoning
+                unclosedReasoning: unclosedReasoning,
+                toolCallProtocolFailure: handler.toolCallProtocolFailure
             )
             // Multi-tier cache: drain the final async token eval before cache
             // snapshot/store, then keep completion info behind the cache-store
@@ -4009,6 +3990,12 @@ public struct GenerateCompletionInfo: Sendable {
     /// (no behavior change on non-reasoning workloads).
     public let unclosedReasoning: Bool
 
+    /// A committed tool-call protocol envelope completed but could not be
+    /// parsed into an executable call. `nil` means no such failure was
+    /// observed. This is independent of ``stopReason``: the model may have
+    /// reached EOS normally while still producing malformed tool syntax.
+    public let toolCallProtocolFailure: ToolCallProtocolFailure?
+
     /// The number of tokens processed per second during the prompt phase.
     ///
     /// Zero when the phase did not measurably run. `promptTime` is legitimately
@@ -4038,7 +4025,8 @@ public struct GenerateCompletionInfo: Sendable {
         stopReason: GenerateStopReason = .stop,
         turboQuantCompressions: Int = 0,
         turboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? = nil,
-        unclosedReasoning: Bool = false
+        unclosedReasoning: Bool = false,
+        toolCallProtocolFailure: ToolCallProtocolFailure? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
@@ -4048,6 +4036,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.turboQuantCompressions = turboQuantCompressions
         self.turboQuantCacheTransition = turboQuantCacheTransition
         self.unclosedReasoning = unclosedReasoning
+        self.toolCallProtocolFailure = toolCallProtocolFailure
     }
 
     public func summary() -> String {
@@ -4325,12 +4314,16 @@ private protocol TokenLoopHandler: Sendable {
     /// after the assistant's tool envelope can skip the required tool-call
     /// decode on warm cache hits.
     var emittedToolCall: Bool { get }
+
+    /// Non-executable failure from a committed malformed tool envelope.
+    var toolCallProtocolFailure: ToolCallProtocolFailure? { get }
 }
 
 extension TokenLoopHandler {
     var stopSequenceHit: Bool { false }
     var unclosedReasoning: Bool { false }
     var emittedToolCall: Bool { false }
+    var toolCallProtocolFailure: ToolCallProtocolFailure? { nil }
 }
 
 // Internal (not private) so the stop-string truncation contract is unit-testable
@@ -4631,6 +4624,10 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
 
     var unclosedReasoning: Bool {
         terminalInsideReasoning ?? (reasoningParser?.isInsideReasoning ?? false)
+    }
+
+    var toolCallProtocolFailure: ToolCallProtocolFailure? {
+        toolCallProcessor?.toolCallProtocolFailure
     }
 }
 

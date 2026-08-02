@@ -158,6 +158,34 @@ struct ChatMessageToolCallTests {
         #expect(dict["tool_call_id"] as? String == "call_abc")
     }
 
+    @Test("raw argument order rides beside tool_calls without changing their wire shape")
+    func rawArgumentOrderMetadata() throws {
+        let raw = "{\"zeta\": 7, \"alpha\": \"ready\"}"
+        let call = ToolCall(
+            function: .init(
+                name: "ordered",
+                arguments: [
+                    "zeta": .int(7),
+                    "alpha": .string("ready"),
+                ],
+                rawArgumentsJSON: raw
+            )
+        )
+        let dict = defaultMessageDict(for: .assistant("", toolCalls: [call]))
+        #expect(dict[rawToolArgumentsJSONMessageKey] as? [String] == [raw])
+
+        let calls = try #require(dict["tool_calls"] as? [[String: any Sendable]])
+        let function = try #require(calls.first?["function"] as? [String: any Sendable])
+        #expect(function["rawArgumentsJSON"] == nil)
+        #expect(function[rawToolArgumentsJSONMessageKey] == nil)
+
+        let encoded = try JSONEncoder().encode(call.function)
+        let encodedObject = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        #expect(encodedObject["rawArgumentsJSON"] == nil)
+    }
+
     @Test("generator names tool replies from prior assistant tool call id")
     func generatorNamesToolRepliesFromPriorAssistantToolCallID() {
         let call = ToolCall(

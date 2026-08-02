@@ -228,6 +228,15 @@ class DeepseekV4Attention: Module {
         q = DeepseekV4Math.applyPartialRoPE(q, cos: cosQ, sin: sinQ, ropeDim: ropeDim)
         kv = DeepseekV4Math.applyPartialRoPE(kv, cos: cosQ, sin: sinQ, ropeDim: ropeDim)
 
+        // Pinned 0731 graph contract: fake-quantize the 448 non-RoPE KV
+        // dimensions in block-64 E4M3FN immediately after RoPE and before the
+        // row enters any local or disk-backed cache. Tiny synthetic configs
+        // use sub-64 heads and intentionally skip this production-only op.
+        let nopeDim = headDim - ropeDim
+        if config.activationQATEnabled && nopeDim >= 64 {
+            kv = DeepseekV4Math.e4m3KVActivationRoundTrip(kv, ropeDim: ropeDim)
+        }
+
         // --- Cache update (sliding-window local) ---
         var keys = kv
         if let cache = cache {
@@ -268,13 +277,18 @@ class DeepseekV4Attention: Module {
                     var pooled = comp(x, rope: rope, v4Cache: v4Cache, startPos: offset)
                     // pooled shape: (B, W, headDim) where W = pooled count.
                     let W = pooled.dim(1)
+                    var topK: MLXArray? = nil
+                    if compressRatio == 4, let idx = indexer {
+                        // The indexer's learned compressor owns a separate
+                        // cache branch. Advance it even before either branch
+                        // emits its first complete row, so partial windows and
+                        // all pre-topK history are present when learned
+                        // selection first activates.
+                        topK = idx(
+                            x, qResidual: qResidual, rope: rope,
+                            positionRope: rope, v4Cache: v4Cache, startPos: offset)
+                    }
                     if W > 0 {
-                        var topK: MLXArray? = nil
-                        if compressRatio == 4, let idx = indexer {
-                            topK = idx(
-                                x, qResidual: qResidual, rope: rope,
-                                positionRope: rope, v4Cache: v4Cache, startPos: offset)
-                        }
 
                         if L == 1 {
                             // DECODE FAST PATH — gather only the topk
@@ -368,7 +382,7 @@ class DeepseekV4Attention: Module {
             }
         }
 
-        // --- SDPA with attention sinks (fp32 accum for head_dim=512) ---
+        // --- SDPA with attention sinks ---
         var output = MLXFast.scaledDotProductAttention(
             queries: q, keys: fullKV, values: fullKV,
             scale: scale, mask: adjustedMask,
@@ -431,6 +445,55 @@ class DeepseekV4Attention: Module {
 
 // MARK: - MoE gate (sqrtsoftplus + hash routing)
 
+private struct DeepseekV4SelectorKey: Hashable {
+    let topK: Int
+    let normalize: Bool
+}
+
+private enum DeepseekV4CompiledSelectorCache {
+    typealias Selector = @Sendable ([MLXArray]) -> [MLXArray]
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var selectors: [DeepseekV4SelectorKey: Selector] = [:]
+
+    static func selector(topK: Int, normalize: Bool) -> Selector {
+        let key = DeepseekV4SelectorKey(topK: topK, normalize: normalize)
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = selectors[key] { return cached }
+
+        // Mirrors the authoritative global `@mx.compile`
+        // `sqrtsoftplus_select`. Parameters that alter graph structure are
+        // captured in the cache key; the scaling factor remains an array input
+        // so bundles with the same selector shape can share the safe stateless
+        // trace without sharing model or cache state.
+        let body: Selector = { args in
+            let logits = args[0]
+            let bias = args[1]
+            let scalingFactor = args[2]
+            let originalScores = sqrt(log1p(exp(logits)))
+            let biasedScores = originalScores + bias
+            let indices = argPartition(
+                -biasedScores, kth: topK - 1, axis: -1)[.ellipsis, 0..<topK]
+                .asType(.int32)
+            var weights = takeAlong(originalScores, indices, axis: -1)
+            if topK > 1 && normalize {
+                weights = weights / weights.sum(axis: -1, keepDims: true)
+            }
+            weights = weights * scalingFactor
+            return [indices, weights]
+        }
+        let compiled = compile(body)
+        let nestedSafe: Selector = { args in
+            if CompiledDecodeTrace.isActive { return body(args) }
+            let result = compiled(args)
+            return result.count == 2 ? result : body(args)
+        }
+        selectors[key] = nestedSafe
+        return nestedSafe
+    }
+}
+
 class DeepseekV4MoEGate: Module {
     let config: DeepseekV4Configuration
     let topK: Int
@@ -438,6 +501,8 @@ class DeepseekV4MoEGate: Module {
     let routedScalingFactor: Float
     let normTopkProb: Bool
     let isHashLayer: Bool
+    fileprivate let compiledSelector: DeepseekV4CompiledSelectorCache.Selector
+    let scalingFactorArray: MLXArray
     /// Gate projection weight: (nRoutedExperts, hiddenSize). Stored as a
     /// raw parameter (loaded via sanitize) rather than a Linear to allow
     /// the matmul to run in fp32 per the authoritative reference.
@@ -456,6 +521,10 @@ class DeepseekV4MoEGate: Module {
         self.routedScalingFactor = config.routedScalingFactor
         self.normTopkProb = config.normTopkProb
         self.isHashLayer = config.isHashLayer(layerIdx)
+        self.compiledSelector = DeepseekV4CompiledSelectorCache.selector(
+            topK: config.numExpertsPerTok,
+            normalize: config.normTopkProb)
+        self.scalingFactorArray = MLXArray([config.routedScalingFactor])
         self._weight.wrappedValue = zeros([nRoutedExperts, config.hiddenSize])
         self._bias.wrappedValue = zeros([nRoutedExperts])
         // Hash routing table: bundle ships (vocab, topK) — already
@@ -486,9 +555,8 @@ class DeepseekV4MoEGate: Module {
         let xF32 = x.asType(.float32)
         let wF32 = weight.asType(.float32)
         let logits = xF32.matmul(wF32.transposed())
-        let scores = DeepseekV4Math.sqrtSoftplus(logits)
-
         if isHashLayer, let ids = inputIds {
+            let scores = DeepseekV4Math.sqrtSoftplus(logits)
             // Hash routing: tid2eid is (vocab, topK) — pre-stamped at
             // convert time with which topK experts each token id
             // routes to. `tid2eid[ids]` for ids shape (B, L) returns
@@ -505,14 +573,11 @@ class DeepseekV4MoEGate: Module {
             return (indices.asType(.uint32), weights)
         }
 
-        // Non-hash: standard sqrtsoftplus + noaux-biased top-k.
-        let (indices, weights) = DeepseekV4Math.sqrtSoftplusSelect(
-            scores: scores,
-            noauxBias: bias,  // zeros-initialized — effectively no bias unless loaded
-            k: topK,
-            normalize: normTopkProb,
-            scalingFactor: routedScalingFactor
-        )
+        // Non-hash: the same stateless compiled sqrtsoftplus + noaux-biased
+        // top-k microfunction used by the authoritative affine runtime.
+        let selected = compiledSelector([logits, bias, scalingFactorArray])
+        let indices = selected[0]
+        let weights = selected[1]
         return (indices.asType(.uint32), weights)
     }
 }
@@ -530,7 +595,6 @@ class DeepseekV4MoE: Module, UnaryLayer {
     /// layer is hash-routed. Set by the outer model before each layer
     /// call when hash routing applies.
     var currentInputIds: MLXArray? = nil
-
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.config = config
         self.layerIdx = layerIdx
@@ -552,6 +616,10 @@ class DeepseekV4MoE: Module, UnaryLayer {
             activation: MLXNN.silu,
             glue: { gate, up in
                 DeepseekV4Math.dsv4SwiGLU(gate: gate, up: up, limit: limit)
+            },
+            scoredGlue: { gate, up, scores in
+                DeepseekV4Math.dsv4ScoredSwiGLU(
+                    gate: gate, up: up, scores: scores, limit: limit)
             })
         self.gate = DeepseekV4MoEGate(config: config, layerIdx: layerIdx)
         self._sharedExperts.wrappedValue = DeepseekV4MLP(
@@ -561,11 +629,32 @@ class DeepseekV4MoE: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let profileStages =
+            ProcessInfo.processInfo.environment["VMLX_DSV4_STAGE_PROFILE"] == "1"
+            && x.dim(1) == 1
+        var stageStart = profileStages ? CFAbsoluteTimeGetCurrent() : 0
+        func finishStage(_ name: String, _ arrays: [MLXArray]) {
+            guard profileStages else { return }
+            MLX.eval(arrays)
+            let now = CFAbsoluteTimeGetCurrent()
+            FileHandle.standardError.write(Data(String(format:
+                "[DSV4MoEProfile] layer=%d stage=%@ ms=%.3f\n",
+                layerIdx, name, (now - stageStart) * 1_000).utf8))
+            stageStart = now
+        }
+
         let (indices, scores) = gate(x, inputIds: currentInputIds)
+        finishStage("gate", [indices, scores])
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
-        var y = switchMLP(x, indices)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
-        y = y + sharedExperts(x)
+        let routed = switchMLP(x, indices, preDownScores: scores)
+        var y = DeepseekV4Math.reduceRoutedExpertsFP32(routed)
+        finishStage("routed", [y])
+        finishStage("route_reduce", [y])
+        let shared = sharedExperts(x)
+        finishStage("shared", [shared])
+        y = DeepseekV4Math.addSharedExpertFP32(
+            y, shared: shared, outputDType: x.dtype)
+        finishStage("add", [y])
         return y
     }
 }
@@ -607,10 +696,6 @@ class DeepseekV4HyperConnection: Module {
     @ParameterInfo(key: "scale") var scale: MLXArray
     /// `hc_{attn,ffn}_base`: shape `((2+hc)*hc,)` per-field bias.
     @ParameterInfo(key: "base") var base: MLXArray
-    /// Constant ones-vector reused as the RMSNorm weight inside the
-    /// per-block collapse (Python sets up `_hc_rms_ones = mx.ones(...)`).
-    let hcRMSOnes: MLXArray
-
     init(config: DeepseekV4Configuration) {
         self.hcMult = config.hcMult
         self.hcIters = config.hcSinkhornIters
@@ -620,10 +705,6 @@ class DeepseekV4HyperConnection: Module {
         self._fn.wrappedValue = zeros([mixHc, hcMult * hiddenSize])
         self._scale.wrappedValue = zeros([3])
         self._base.wrappedValue = zeros([mixHc])
-        // Match Python `_hc_rms_ones = mx.ones(hc_dim, dtype=mx.float16)`.
-        // This is a constant — not a learned parameter — so we keep it
-        // as a plain stored property (not @ParameterInfo).
-        self.hcRMSOnes = MLXArray.ones([config.hcMult * config.hiddenSize])
     }
 
     /// Collapse: `h` shape (B, L, hcMult, hiddenSize) → collapsed x
@@ -641,36 +722,23 @@ class DeepseekV4HyperConnection: Module {
         let B = h.dim(0)
         let L = h.dim(1)
 
-        // Flatten the (hcMult, hidden) tail into one axis.
-        let xFlat = h.reshaped(B, L, hcMult * hiddenSize)
-        // Variance-only RMS norm with weight = ones.
-        //
-        // Force fp32 internals: the reduction `mean(square(x))` runs over
-        // `hcMult * hiddenSize` (≈16384 for DSV4-Flash) elements per row
-        // and bf16 rounding compounds aggressively across that axis. On
-        // M3 Ultra this saturates and the rsqrt produces garbage logits
-        // ("17 plus plus plus" failure mode). M4 happens to keep fp32 in
-        // SIMD lanes for this reduction so MacBook tests pass — but the
-        // bug is real on Mac Studio. Mirrors the Python jang_tools fix
-        // at jang/research/JANGTQ-PROGRESS-LOG-2026-04-25.md §A.1 #50.
-        let xNormed = MLXFast.rmsNorm(
-            xFlat.asType(.float32),
-            weight: hcRMSOnes.asType(.float32),
-            eps: hcEps
-        ).asType(xFlat.dtype)
-        // mixes = x_normed @ fn.T  → (B, L, mix_hc)
-        let mixes = xNormed.asType(.float32)
-            .matmul(fn.asType(.float32).transposed())
+        // Python keeps this entire path in fp32. It also applies the scalar
+        // reciprocal RMS after the projection: `(x_flat @ fn.T) * rsqrt`.
+        // Besides preserving its operation order, that avoids materializing a
+        // normalized 16K-wide residual only to project it down to `mixHc`.
+        let xFlat = h.reshaped(B, L, hcMult * hiddenSize).asType(.float32)
+        let reciprocalRMS = rsqrt(
+            (xFlat * xFlat).mean(axis: -1, keepDims: true) + hcEps)
+        let mixes = xFlat.matmul(fn.asType(.float32).transposed()) * reciprocalRMS
 
         let (pre, post, comb) = DeepseekV4Math.hcSplitSinkhorn(
             mixes: mixes, scale: scale, base: base,
             hcMult: hcMult, iters: hcIters, eps: hcEps)
 
         // y = sum(pre[..., None] * x_flat.reshape(B, L, hc, D), axis=2)
-        let preCast = pre.asType(dtype)
         let xReshape = xFlat.reshaped(B, L, hcMult, hiddenSize)
-        let y = (preCast.expandedDimensions(axis: -1) * xReshape).sum(axis: -2)
-        return (x: y, post: post, comb: comb)
+        let y = (pre.expandedDimensions(axis: -1) * xReshape).sum(axis: -2)
+        return (x: y.asType(dtype), post: post, comb: comb)
     }
 
     /// Expand: given attn/ffn output `blockOut` (B, L, hiddenSize),
@@ -683,16 +751,14 @@ class DeepseekV4HyperConnection: Module {
         blockOut: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray
     ) -> MLXArray {
         let dtype = blockOut.dtype
-        let postCast = post.asType(dtype)
-        let combCast = comb.asType(dtype)
-        // matmul(comb, residual) — comb is (B,L,hc,hc), residual is
-        // (B,L,hc,D); broadcast over leading dims. MLX matmul handles
-        // this directly.
-        let combResid = combCast.matmul(residual)
+        // The pinned PyTorch broadcast aligns residual HC with comb's first
+        // HC axis and sums that axis: algebraically comb-transpose @ residual.
+        let combResid = DeepseekV4Math.hcExpandResidual(
+            comb: comb, residual: residual)
         // post: (B,L,hc) → (B,L,hc,1); blockOut: (B,L,D) → (B,L,1,D).
-        let y = postCast.expandedDimensions(axis: -1)
-            * blockOut.expandedDimensions(axis: -2) + combResid
-        return y
+        let y = post.expandedDimensions(axis: -1)
+            * blockOut.asType(.float32).expandedDimensions(axis: -2) + combResid
+        return y.asType(dtype)
     }
 }
 
@@ -782,23 +848,49 @@ class DeepseekV4DecoderLayer: Module {
         cache: KVCache?,
         inputIds: MLXArray?
     ) -> MLXArray {
+        // Explicit Release diagnostic only. Splitting the lazy graph at each
+        // block boundary perturbs total throughput, but attributes the
+        // remaining affine DSV4 gap without changing the production graph
+        // when the variable is absent. Restrict to single-token decode so a
+        // prompt prefill does not emit thousands of misleading stage rows.
+        let profileStages =
+            ProcessInfo.processInfo.environment["VMLX_DSV4_STAGE_PROFILE"] == "1"
+            && h.dim(1) == 1
+        var stageStart = profileStages ? CFAbsoluteTimeGetCurrent() : 0
+        func finishStage(_ name: String, _ arrays: [MLXArray]) {
+            guard profileStages else { return }
+            MLX.eval(arrays)
+            let now = CFAbsoluteTimeGetCurrent()
+            FileHandle.standardError.write(Data(String(format:
+                "[DSV4StageProfile] layer=%d stage=%@ ms=%.3f\n",
+                layerIdx, name, (now - stageStart) * 1_000).utf8))
+            stageStart = now
+        }
         // ---- Attention HC ----
         let residualA = h
         let (xA, postA, combA) = attnHC.collapse(h)
+        finishStage("attn_hc_pre", [xA, postA, combA])
         let normedA = inputLayerNorm(xA)
+        finishStage("attn_norm", [normedA])
         let attnOut = selfAttn(normedA, mask: mask, cache: cache)
+        finishStage("attention", [attnOut])
         let hA = attnHC.expand(
             blockOut: attnOut, residual: residualA, post: postA, comb: combA)
+        finishStage("attn_hc_post", [hA])
 
         // ---- FFN HC ----
         let residualF = hA
         let (xF, postF, combF) = ffnHC.collapse(hA)
+        finishStage("ffn_hc_pre", [xF, postF, combF])
         let normedF = postAttentionLayerNorm(xF)
+        finishStage("ffn_norm", [normedF])
         mlp.currentInputIds = inputIds
         let ffnOut = mlp(normedF)
         mlp.currentInputIds = nil
+        finishStage("moe", [ffnOut])
         let hF = ffnHC.expand(
             blockOut: ffnOut, residual: residualF, post: postF, comb: combF)
+        finishStage("ffn_hc_post", [hF])
         return hF
     }
 }

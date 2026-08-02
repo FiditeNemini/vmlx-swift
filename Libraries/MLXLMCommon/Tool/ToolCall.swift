@@ -11,14 +11,51 @@ public struct ToolCall: Hashable, Codable, Sendable {
         /// The arguments passed to the function
         public let arguments: [String: JSONValue]
 
-        public init(name: String, arguments: [String: JSONValue]) {
+        /// Exact JSON-object text observed at the protocol boundary, when
+        /// available. Execution always uses ``arguments``; history encoders
+        /// may reuse this only after validating that it decodes to the same
+        /// values. Keeping it out of `Codable` preserves the public wire shape.
+        public let rawArgumentsJSON: String?
+
+        public init(
+            name: String,
+            arguments: [String: JSONValue],
+            rawArgumentsJSON: String? = nil
+        ) {
             self.name = name
             self.arguments = arguments
+            self.rawArgumentsJSON = rawArgumentsJSON
         }
 
-        public init(name: String, arguments: [String: any Sendable]) {
+        public init(
+            name: String,
+            arguments: [String: any Sendable],
+            rawArgumentsJSON: String? = nil
+        ) {
             self.name = name
             self.arguments = arguments.mapValues { JSONValue.from($0) }
+            self.rawArgumentsJSON = rawArgumentsJSON
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case name
+            case arguments
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.name = try container.decode(String.self, forKey: .name)
+            self.arguments = try container.decode(
+                [String: JSONValue].self,
+                forKey: .arguments
+            )
+            self.rawArgumentsJSON = nil
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(name, forKey: .name)
+            try container.encode(arguments, forKey: .arguments)
         }
     }
 

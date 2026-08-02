@@ -326,12 +326,38 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             + "begin" + String(UnicodeScalar(0x2581)!) + "of"
                             + String(UnicodeScalar(0x2581)!) + "sentence"
                             + String(UnicodeScalar(0xFF5C)!) + ">"
+                        let dsv4Eos =
+                            "<" + String(UnicodeScalar(0xFF5C)!)
+                            + "end" + String(UnicodeScalar(0x2581)!) + "of"
+                            + String(UnicodeScalar(0x2581)!) + "sentence"
+                            + String(UnicodeScalar(0xFF5C)!) + ">"
                         var adjustedContext = mistral4AdjustedContext
                         if upstream.bosToken == dsv4Bos,
+                           upstream.eosToken == dsv4Eos,
                            let enableThinking = adjustedContext?["enable_thinking"] as? Bool,
                            enableThinking == false,
                            adjustedContext?["reasoning_effort"] != nil {
                             adjustedContext?.removeValue(forKey: "reasoning_effort")
+                        }
+                        // DSV4 ships an authoritative Python encoder rather
+                        // than a tokenizer Jinja template. Route every DSV4
+                        // chat mode through the equivalent Swift encoder so
+                        // schema JSON, reasoning rails, and multi-turn tool
+                        // history stay token-identical to the bundle contract.
+                        if upstream.bosToken == dsv4Bos,
+                           upstream.eosToken == dsv4Eos,
+                           (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                FileHandle.standardError.write(
+                                    "[vmlx] DSV4 native chat encoder engaged\\n"
+                                        .data(using: .utf8)!)
+                            }
+                            let prompt = try MLXLMCommon.DeepseekV4ChatEncoder.renderOpenAIChat(
+                                messages: messages,
+                                tools: chatTemplateTools,
+                                additionalContext: adjustedContext,
+                                addGenerationPrompt: true)
+                            return upstream.encode(text: prompt, addSpecialTokens: false)
                         }
                         if !(tools?.isEmpty ?? true),
                            upstream.bosToken == "<s>",
@@ -371,22 +397,6 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         messages: messages,
                                         chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                             MLXLMCommon.ChatTemplateFallbacks.lagunaMinimal),
-                                        addGenerationPrompt: true,
-                                        truncation: false,
-                                        maxLength: nil,
-                                        tools: chatTemplateTools,
-                                        additionalContext: adjustedContext)
-                                }
-                                if upstream.bosToken == dsv4Bos {
-                                    if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                        FileHandle.standardError.write(
-                                            "[vmlx] chat-template missing -> DSV4Minimal fallback engaged\\n"
-                                                .data(using: .utf8)!)
-                                    }
-                                    return try upstream.applyChatTemplate(
-                                        messages: messages,
-                                        chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
-                                            MLXLMCommon.ChatTemplateFallbacks.dsv4Minimal),
                                         addGenerationPrompt: true,
                                         truncation: false,
                                         maxLength: nil,
@@ -693,12 +703,28 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             + "begin" + String(UnicodeScalar(0x2581)!) + "of"
                             + String(UnicodeScalar(0x2581)!) + "sentence"
                             + String(UnicodeScalar(0xFF5C)!) + ">"
+                        let dsv4Eos =
+                            "<" + String(UnicodeScalar(0xFF5C)!)
+                            + "end" + String(UnicodeScalar(0x2581)!) + "of"
+                            + String(UnicodeScalar(0x2581)!) + "sentence"
+                            + String(UnicodeScalar(0xFF5C)!) + ">"
                         var adjustedContext = mistral4AdjustedContext
                         if upstream.bosToken == dsv4Bos,
+                           upstream.eosToken == dsv4Eos,
                            let enableThinking = adjustedContext?["enable_thinking"] as? Bool,
                            enableThinking == false,
                            adjustedContext?["reasoning_effort"] != nil {
                             adjustedContext?.removeValue(forKey: "reasoning_effort")
+                        }
+                        if upstream.bosToken == dsv4Bos,
+                           upstream.eosToken == dsv4Eos,
+                           (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                            let prompt = try MLXLMCommon.DeepseekV4ChatEncoder.renderOpenAIChat(
+                                messages: messages,
+                                tools: chatTemplateTools,
+                                additionalContext: adjustedContext,
+                                addGenerationPrompt: addGenerationPrompt)
+                            return upstream.encode(text: prompt, addSpecialTokens: false)
                         }
                         if !(tools?.isEmpty ?? true),
                            upstream.bosToken == "<s>",
@@ -730,17 +756,6 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         messages: messages,
                                         chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
                                             MLXLMCommon.ChatTemplateFallbacks.lagunaMinimal),
-                                        addGenerationPrompt: addGenerationPrompt,
-                                        truncation: false,
-                                        maxLength: nil,
-                                        tools: chatTemplateTools,
-                                        additionalContext: adjustedContext)
-                                }
-                                if upstream.bosToken == dsv4Bos {
-                                    return try upstream.applyChatTemplate(
-                                        messages: messages,
-                                        chatTemplate: VMLXTokenizers.ChatTemplateArgument.literal(
-                                            MLXLMCommon.ChatTemplateFallbacks.dsv4Minimal),
                                         addGenerationPrompt: addGenerationPrompt,
                                         truncation: false,
                                         maxLength: nil,

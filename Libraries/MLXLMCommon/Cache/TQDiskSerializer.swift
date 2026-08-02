@@ -166,6 +166,24 @@ public enum TQDiskSerializer {
         return arr[0].item(Int32.self)
     }
 
+    private static func dsv4PoolDTypeCode(_ dtype: DType) -> Int32? {
+        switch dtype {
+        case .bfloat16: 1
+        case .float16: 2
+        case .float32: 3
+        default: nil
+        }
+    }
+
+    private static func dsv4PoolDType(_ code: Int32) -> DType? {
+        switch code {
+        case 1: .bfloat16
+        case 2: .float16
+        case 3: .float32
+        default: nil
+        }
+    }
+
 
     // MARK: - Detection
 
@@ -630,8 +648,53 @@ public enum TQDiskSerializer {
             }
         }
 
-        putOptional("dsv4_\(i)_pool_comp", dsv4.hybridPool(branch: .compressor))
-        putOptional("dsv4_\(i)_pool_idx", dsv4.hybridPool(branch: .indexer))
+        func putQuantizedPool(
+            _ stem: String,
+            _ segments: [HybridPoolQuantizedSegment]
+        ) -> Bool {
+            result["__\(stem)_qcount__"] = metaInt32(Int32(segments.count))
+            for (segmentIndex, segment) in segments.enumerated() {
+                guard segment.originalShape.count == 3,
+                      segment.originalShape[1] > 0,
+                      segment.groupSize > 0,
+                      segment.bits == 8,
+                      let dtypeCode = dsv4PoolDTypeCode(segment.originalDType)
+                else { return false }
+                let prefix = "\(stem)_q_\(segmentIndex)"
+                result["\(prefix)_codes"] = segment.codes
+                result["\(prefix)_scales"] = segment.scales
+                result["\(prefix)_biases"] = segment.biases
+                result["__\(prefix)_meta__"] = MLXArray(
+                    [Int32(segment.originalShape.count)]
+                        + segment.originalShape.map(Int32.init)
+                        + [Int32(segment.groupSize), Int32(segment.bits), dtypeCode])
+            }
+            return true
+        }
+
+        if let quantized = dsv4 as? QuantizedHybridPoolCache,
+           let segments = quantized.hybridPoolQuantizedSegments(branch: .compressor)
+        {
+            putOptional("dsv4_\(i)_pool_comp", nil)
+            guard putQuantizedPool("dsv4_\(i)_pool_comp", segments) else {
+                result[kindKey(for: i)] = kindArray(.skip)
+                return
+            }
+        } else {
+            putOptional("dsv4_\(i)_pool_comp", dsv4.hybridPool(branch: .compressor))
+        }
+
+        if let quantized = dsv4 as? QuantizedHybridPoolCache,
+           let segments = quantized.hybridPoolQuantizedSegments(branch: .indexer)
+        {
+            putOptional("dsv4_\(i)_pool_idx", nil)
+            guard putQuantizedPool("dsv4_\(i)_pool_idx", segments) else {
+                result[kindKey(for: i)] = kindArray(.skip)
+                return
+            }
+        } else {
+            putOptional("dsv4_\(i)_pool_idx", dsv4.hybridPool(branch: .indexer))
+        }
         let compBuf = dsv4.hybridBuffers(branch: .compressor)
         putOptional("dsv4_\(i)_buf_comp_kv", compBuf.kv)
         putOptional("dsv4_\(i)_buf_comp_gate", compBuf.gate)
@@ -791,6 +854,10 @@ public enum TQDiskSerializer {
         /// (sentinel zero-row tensor on disk decoded back to nil).
         public let poolComp: MLXArray?
         public let poolIdx: MLXArray?
+        /// Exact architecture-native encoded pool payload. These are distinct
+        /// from TurboQuant KV and remain segmented across SSD round-trips.
+        public let quantizedPoolComp: [HybridPoolQuantizedSegment]?
+        public let quantizedPoolIdx: [HybridPoolQuantizedSegment]?
         public let bufCompKV: MLXArray?
         public let bufCompGate: MLXArray?
         public let bufIdxKV: MLXArray?
@@ -984,7 +1051,9 @@ public enum TQDiskSerializer {
                 if let comp = deserializeDeepseekV4Layer(index: i, from: arrays) {
                     out.append(IndexedLayerData(index: i, data: .deepseekV4(comp)))
                 } else {
-                    out.append(IndexedLayerData(index: i, data: .skip))
+                    // Hybrid pool state is path-dependent. A partial or
+                    // malformed encoded pool cannot degrade to a KV-only hit.
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
                 }
             case .zayaCCA:
                 if let comp = deserializeZayaCCALayer(index: i, from: arrays) {
@@ -1334,6 +1403,66 @@ public enum TQDiskSerializer {
             return arr
         }
 
+
+        func quantizedPool(_ stem: String) -> [HybridPoolQuantizedSegment]? {
+            guard let countArray = arrays["__\(stem)_qcount__"] else { return nil }
+            let count = Int(readMetaInt32(countArray))
+            guard count > 0 else { return nil }
+            var segments: [HybridPoolQuantizedSegment] = []
+            segments.reserveCapacity(count)
+            for segmentIndex in 0..<count {
+                let prefix = "\(stem)_q_\(segmentIndex)"
+                guard let codes = arrays["\(prefix)_codes"],
+                      let scales = arrays["\(prefix)_scales"],
+                      let biases = arrays["\(prefix)_biases"],
+                      let meta = arrays["__\(prefix)_meta__"]
+                else { return [] }
+                let values = meta.asArray(Int32.self)
+                guard let ndim32 = values.first else { return [] }
+                let ndim = Int(ndim32)
+                guard ndim == 3, values.count == 1 + ndim + 3 else { return [] }
+                let shape = values[1..<(1 + ndim)].map(Int.init)
+                let groupSize = Int(values[1 + ndim])
+                let bits = Int(values[2 + ndim])
+                guard let dtype = dsv4PoolDType(values[3 + ndim]),
+                      shape[0] > 0,
+                      shape[1] > 0,
+                      shape[1] <= 64,
+                      shape[2] > 0,
+                      groupSize > 0,
+                      shape[2] % groupSize == 0,
+                      bits == 8,
+                      codes.dtype == .uint8,
+                      scales.dtype == .float16,
+                      biases.dtype == .float16
+                else { return [] }
+                let groups = shape[2] / groupSize
+                guard codes.shape == [shape[0], shape[1], groups, groupSize],
+                      scales.shape == [shape[0], shape[1], groups, 1],
+                      biases.shape == scales.shape
+                else { return [] }
+                segments.append(
+                    HybridPoolQuantizedSegment(
+                        codes: codes,
+                        scales: scales,
+                        biases: biases,
+                        originalShape: shape,
+                        groupSize: groupSize,
+                        bits: bits,
+                        originalDType: dtype))
+            }
+            return segments
+        }
+
+        let quantizedComp = quantizedPool("dsv4_\(i)_pool_comp")
+        let quantizedIdx = quantizedPool("dsv4_\(i)_pool_idx")
+        if arrays["__dsv4_\(i)_pool_comp_qcount__"] != nil,
+           quantizedComp?.isEmpty == true
+        { return nil }
+        if arrays["__dsv4_\(i)_pool_idx_qcount__"] != nil,
+           quantizedIdx?.isEmpty == true
+        { return nil }
+
         return DeepseekV4LayerComponents(
             keys: keys, values: values,
             keep: Int(m[0]), maxSize: Int(m[1]), step: Int(m[2]),
@@ -1342,6 +1471,8 @@ public enum TQDiskSerializer {
             slidingWindow: Int(m[6]),
             poolComp: unsentinel("dsv4_\(i)_pool_comp", slot: 0),
             poolIdx: unsentinel("dsv4_\(i)_pool_idx", slot: 1),
+            quantizedPoolComp: quantizedComp,
+            quantizedPoolIdx: quantizedIdx,
             bufCompKV: unsentinel("dsv4_\(i)_buf_comp_kv", slot: 2),
             bufCompGate: unsentinel("dsv4_\(i)_buf_comp_gate", slot: 3),
             bufIdxKV: unsentinel("dsv4_\(i)_buf_idx_kv", slot: 4),

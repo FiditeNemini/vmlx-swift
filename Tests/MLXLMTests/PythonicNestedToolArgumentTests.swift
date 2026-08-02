@@ -108,13 +108,15 @@ struct PythonicNestedToolArgumentTests {
                 ]))
     }
 
-    @Test("DSML Pythonic fallback shares the nested typed-argument contract")
-    func dsmlFallbackPreservesNestedRows() throws {
+    @Test("Nemotron compatibility preserves Pythonic nested typed arguments")
+    func nemotronFallbackPreservesNestedRows() throws {
         let output =
             #"db_insert(rows=[{'id': 21, 'label': 'dsml-twenty-one'}], table='proof_dsml', replace=True)"#
 
         let call = try #require(
-            DSMLToolCallParser().parse(content: output, tools: databaseTools()))
+            ToolCallFormat.nemotron.createParser().parse(
+                content: output,
+                tools: databaseTools()))
 
         #expect(call.function.name == "db_insert")
         #expect(call.function.arguments["table"] == .string("proof_dsml"))
@@ -129,13 +131,15 @@ struct PythonicNestedToolArgumentTests {
                 ]))
     }
 
-    @Test("DSML keeps its observed JSON-label function fallback")
-    func dsmlJSONLabelFallbackRemainsSupported() throws {
+    @Test("Nemotron compatibility preserves JSON-label function fallback")
+    func nemotronJSONLabelFallbackRemainsSupported() throws {
         let output =
             #"db_insert("rows": [{"id": 22, "label": "colon-style"}], "table": "proof_dsml_colon", "replace": true)"#
 
         let call = try #require(
-            DSMLToolCallParser().parse(content: output, tools: databaseTools()))
+            ToolCallFormat.nemotron.createParser().parse(
+                content: output,
+                tools: databaseTools()))
 
         #expect(call.function.name == "db_insert")
         #expect(call.function.arguments["table"] == .string("proof_dsml_colon"))

@@ -79,4 +79,66 @@ struct MixedGroupSizeQuantizationFocusedTests {
 
         #expect(settings.quantization(layer: bareExpertPath) == nil)
     }
+
+    @Test("DSV4 sanitized self-attention path resolves checkpoint attention override")
+    func dsv4SanitizedAttentionPathResolvesCheckpointOverride() throws {
+        let configJSON = """
+            {
+              "model_type": "deepseek_v4",
+              "quantization": {
+                "bits": 2,
+                "group_size": 64,
+                "layers.0.attn.wq_a": {
+                  "bits": 4,
+                  "group_size": 64,
+                  "mode": "affine"
+                }
+              }
+            }
+            """
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self,
+            from: Data(configJSON.utf8))
+
+        let sanitized = config.perLayerQuantization?.quantization(
+            layer: "model.layers.0.self_attn.wq_a")
+
+        #expect(sanitized?.bits == 4)
+        #expect(sanitized?.groupSize == 64)
+    }
+
+    @Test("DSV4 sanitized shared-expert paths resolve checkpoint w1 w2 w3 overrides")
+    func dsv4SanitizedSharedExpertPathsResolveCheckpointOverrides() throws {
+        let configJSON = """
+            {
+              "model_type": "deepseek_v4",
+              "quantization": {
+                "bits": 2,
+                "group_size": 64,
+                "layers.0.ffn.shared_experts.w1": {
+                  "bits": 4,
+                  "group_size": 64
+                },
+                "layers.0.ffn.shared_experts.w2": {
+                  "bits": 4,
+                  "group_size": 64
+                },
+                "layers.0.ffn.shared_experts.w3": {
+                  "bits": 4,
+                  "group_size": 64
+                }
+              }
+            }
+            """
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self,
+            from: Data(configJSON.utf8))
+
+        for projection in ["gate_proj", "down_proj", "up_proj"] {
+            let resolved = config.perLayerQuantization?.quantization(
+                layer: "model.layers.0.mlp.shared_experts.\(projection)")
+            #expect(resolved?.bits == 4, "\(projection) must stay 4-bit")
+            #expect(resolved?.groupSize == 64, "\(projection) must stay group-64")
+        }
+    }
 }

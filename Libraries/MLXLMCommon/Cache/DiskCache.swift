@@ -12,6 +12,15 @@ public struct DiskCacheStats: Sendable {
     public let misses: Int
     public let stores: Int
     public let storeSkips: Int
+    /// Payload bytes currently counted against the configured disk quota.
+    /// SQLite/WAL bookkeeping is intentionally excluded.
+    public let currentPayloadBytes: Int
+    /// Current logical cache-boundary count. A coordinator snapshot counts a
+    /// linked KV + recurrent-companion pair as one entry.
+    public let currentEntryCount: Int
+    /// Logical cache boundaries removed by quota enforcement in this process.
+    /// A linked KV + recurrent-companion pair increments this once.
+    public let evictions: Int
     public let maxSizeBytes: Int
 }
 
@@ -105,6 +114,9 @@ public final class DiskCache: @unchecked Sendable {
     /// Number of store operations that reused an already validated file.
     public private(set) var storeSkips: Int = 0
 
+    /// Number of logical cache boundaries removed by quota enforcement.
+    public private(set) var evictions: Int = 0
+
     /// Files successfully written or deserialized in this process. A matching
     /// fingerprint lets `store` avoid realizing and rewriting the same large
     /// prompt boundary after a cache hit, while a fresh process still validates
@@ -115,11 +127,15 @@ public final class DiskCache: @unchecked Sendable {
     public func snapshotStats() -> DiskCacheStats {
         lock.lock()
         defer { lock.unlock() }
+        let usage = _payloadUsageLocked()
         return DiskCacheStats(
             hits: hits,
             misses: misses,
             stores: stores,
             storeSkips: storeSkips,
+            currentPayloadBytes: usage.bytes,
+            currentEntryCount: usage.entryCount,
+            evictions: evictions,
             maxSizeBytes: maxSizeBytes)
     }
 
@@ -130,9 +146,22 @@ public final class DiskCache: @unchecked Sendable {
     /// - Parameters:
     ///   - cacheDir: Directory where safetensors files and the SQLite index are stored.
     ///   - maxSizeGB: Maximum cache size in gigabytes. Defaults to 10 GB.
-    public init(cacheDir: URL, maxSizeGB: Float = 10.0, modelKey: String? = nil) {
+    public convenience init(
+        cacheDir: URL,
+        maxSizeGB: Float = 10.0,
+        modelKey: String? = nil
+    ) {
+        self.init(
+            cacheDir: cacheDir,
+            maxSizeBytes: Int(maxSizeGB * 1_073_741_824),
+            modelKey: modelKey)
+    }
+
+    /// Exact-byte initializer used by deterministic quota tests and callers
+    /// that already resolved a user-facing GiB limit to bytes.
+    init(cacheDir: URL, maxSizeBytes: Int, modelKey: String? = nil) {
         self.cacheDir = cacheDir
-        self.maxSizeBytes = Int(maxSizeGB * 1_073_741_824)
+        self.maxSizeBytes = maxSizeBytes
         self.modelKey = modelKey
 
         // Create cache directory if needed
@@ -156,6 +185,10 @@ public final class DiskCache: @unchecked Sendable {
                 file_size INTEGER,
                 created_at REAL DEFAULT (julianday('now'))
             )
+            """)
+        executeSQL("""
+            CREATE INDEX IF NOT EXISTS idx_cache_entries_token_count
+            ON cache_entries(token_count DESC)
             """)
     }
 
@@ -552,6 +585,7 @@ public final class DiskCache: @unchecked Sendable {
         misses = 0
         stores = 0
         storeSkips = 0
+        evictions = 0
         validatedFiles.removeAll(keepingCapacity: true)
     }
 
@@ -661,6 +695,34 @@ public final class DiskCache: @unchecked Sendable {
             fileSize: Int(sqlite3_column_int64(stmt, 1)))
     }
 
+    /// Current indexed payload usage. Caller MUST hold `lock`.
+    private func _payloadUsageLocked() -> (bytes: Int, entryCount: Int) {
+        guard let db else { return (0, 0) }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db,
+            "SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM cache_entries",
+            -1,
+            &stmt,
+            nil) == SQLITE_OK
+        else { return (0, 0) }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return (0, 0) }
+        return (
+            bytes: max(0, Int(sqlite3_column_int64(stmt, 0))),
+            entryCount: max(0, Int(sqlite3_column_int64(stmt, 1))))
+    }
+
+    /// Record logical evictions selected by the coordinator's linked KV +
+    /// recurrent-companion quota pass. The coordinator counts groups before it
+    /// removes either half, so one atomic pair increments this counter once.
+    func recordQuotaEvictions(_ count: Int) {
+        guard count > 0 else { return }
+        lock.lock()
+        evictions += count
+        lock.unlock()
+    }
+
     /// Refresh the existing eviction timestamp without replacing the row or
     /// rewriting the payload. Caller MUST hold `lock`.
     @discardableResult
@@ -754,5 +816,6 @@ public final class DiskCache: @unchecked Sendable {
                 sqlite3_finalize(stmt)
             }
         }
+        evictions += toEvict.count
     }
 }

@@ -19,6 +19,258 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - DSV4 pool storage
+
+/// Segmented affine storage for DSV4's compressor/indexer pools.
+///
+/// The first 2 MiB of each branch stays in its attention-ready dtype. Once a
+/// branch crosses that byte threshold, rows are encoded independently in
+/// bounded 64-row segments with UInt8 codes and fp16 scale/min metadata. The
+/// full pool is materialized only as a temporary attention input; it is never
+/// retained beside the encoded representation.
+private final class DeepseekV4PoolStorage {
+    static let hotByteLimit = 2 * 1024 * 1024
+    static let segmentRows = 64
+    static let groupSize = 32
+    static let bits = 8
+
+    let quantizationEnabled: Bool
+    private(set) var hotPool: MLXArray?
+    private(set) var quantizedSegments: [HybridPoolQuantizedSegment] = []
+    private var emptySpec: (shape: [Int], dtype: DType)?
+
+    init(quantizationEnabled: Bool) {
+        self.quantizationEnabled = quantizationEnabled
+    }
+
+    var rowCount: Int {
+        if let hotPool { return hotPool.dim(1) }
+        return quantizedSegments.reduce(0) { $0 + $1.rowCount }
+    }
+
+    var retainedByteCount: Int {
+        (hotPool?.nbytes ?? 0)
+            + quantizedSegments.reduce(0) { $0 + $1.retainedByteCount }
+    }
+
+    var retainedArrays: [MLXArray] {
+        if let hotPool { return [hotPool] }
+        return quantizedSegments.flatMap { [$0.codes, $0.scales, $0.biases] }
+    }
+
+    func materialized() -> MLXArray? {
+        if let hotPool { return hotPool }
+        if quantizedSegments.isEmpty {
+            if let emptySpec {
+                return MLXArray.zeros(emptySpec.shape, dtype: emptySpec.dtype)
+            }
+            return nil
+        }
+        let parts = quantizedSegments.map(Self.dequantize)
+        return parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
+    }
+
+    func replace(with value: MLXArray?) {
+        hotPool = nil
+        quantizedSegments = []
+        emptySpec = nil
+        guard let value else { return }
+        precondition(value.ndim == 3, "DSV4 pooled state must have shape [batch, rows, features]")
+        if value.dim(1) == 0 {
+            emptySpec = (value.shape, value.dtype)
+        } else if !quantizationEnabled || value.nbytes <= Self.hotByteLimit {
+            hotPool = value
+        } else {
+            replaceQuantized(with: value)
+        }
+    }
+
+    func append(_ value: MLXArray) {
+        guard value.ndim == 3, value.dim(1) > 0 else { return }
+        emptySpec = nil
+
+        if !quantizationEnabled {
+            hotPool = hotPool.map { concatenated([$0, value], axis: 1) } ?? value
+            return
+        }
+
+        if hotPool != nil || quantizedSegments.isEmpty {
+            let combined = hotPool.map { concatenated([$0, value], axis: 1) } ?? value
+            if combined.nbytes <= Self.hotByteLimit {
+                hotPool = combined
+            } else {
+                replaceQuantized(with: combined)
+            }
+            return
+        }
+
+        var offset = 0
+        let rows = value.dim(1)
+        let tail = trailingPartialSegmentRows()
+        if tail > 0 {
+            let take = min(Self.segmentRows - tail, rows)
+            quantizedSegments.append(
+                Self.quantize(value[0..., 0..<take, 0...]))
+            offset += take
+            compactCompletedTail()
+        }
+
+        while rows - offset >= Self.segmentRows {
+            quantizedSegments.append(
+                Self.quantize(value[0..., offset..<(offset + Self.segmentRows), 0...]))
+            offset += Self.segmentRows
+        }
+        if offset < rows {
+            quantizedSegments.append(
+                Self.quantize(value[0..., offset..<rows, 0...]))
+        }
+    }
+
+    func trimTrailingRows(_ count: Int) {
+        var remaining = max(0, count)
+        guard remaining > 0 else { return }
+        emptySpec = nil
+        if let hotPool {
+            let keep = max(0, hotPool.dim(1) - remaining)
+            self.hotPool = keep == 0 ? nil : hotPool[0..., 0..<keep, 0...]
+            return
+        }
+
+        while remaining > 0, let last = quantizedSegments.last {
+            if last.rowCount <= remaining {
+                quantizedSegments.removeLast()
+                remaining -= last.rowCount
+            } else {
+                quantizedSegments[quantizedSegments.count - 1] = Self.slice(
+                    last, keepingRows: last.rowCount - remaining)
+                remaining = 0
+            }
+        }
+    }
+
+    func replace(withQuantizedSegments segments: [HybridPoolQuantizedSegment]) {
+        hotPool = nil
+        emptySpec = nil
+        if quantizationEnabled {
+            quantizedSegments = segments
+        } else {
+            quantizedSegments = []
+            guard !segments.isEmpty else { return }
+            let parts = segments.map(Self.dequantize)
+            hotPool = parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
+        }
+    }
+
+    func copy() -> DeepseekV4PoolStorage {
+        let result = DeepseekV4PoolStorage(quantizationEnabled: quantizationEnabled)
+        result.hotPool = hotPool?[.ellipsis]
+        result.emptySpec = emptySpec
+        result.quantizedSegments = quantizedSegments.map { segment in
+            HybridPoolQuantizedSegment(
+                codes: segment.codes[.ellipsis],
+                scales: segment.scales[.ellipsis],
+                biases: segment.biases[.ellipsis],
+                originalShape: segment.originalShape,
+                groupSize: segment.groupSize,
+                bits: segment.bits,
+                originalDType: segment.originalDType)
+        }
+        return result
+    }
+
+    private func replaceQuantized(with value: MLXArray) {
+        hotPool = nil
+        quantizedSegments = []
+        var start = 0
+        while start < value.dim(1) {
+            let end = min(start + Self.segmentRows, value.dim(1))
+            quantizedSegments.append(Self.quantize(value[0..., start..<end, 0...]))
+            start = end
+        }
+    }
+
+    private func trailingPartialSegmentRows() -> Int {
+        var rows = 0
+        for segment in quantizedSegments.reversed() {
+            guard segment.rowCount < Self.segmentRows else { break }
+            rows += segment.rowCount
+        }
+        return rows
+    }
+
+    private func compactCompletedTail() {
+        var start = quantizedSegments.count
+        var rows = 0
+        while start > 0 {
+            let segment = quantizedSegments[start - 1]
+            guard segment.rowCount < Self.segmentRows else { break }
+            start -= 1
+            rows += segment.rowCount
+        }
+        guard rows == Self.segmentRows else { return }
+        let parts = quantizedSegments[start...].map(Self.dequantize)
+        let materialized = parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
+        quantizedSegments.replaceSubrange(start..., with: [Self.quantize(materialized)])
+    }
+
+    private static func quantize(_ value: MLXArray) -> HybridPoolQuantizedSegment {
+        let shape = value.shape
+        let featureCount = shape.last ?? 0
+        precondition(featureCount > 0, "DSV4 pool feature dimension must be non-zero")
+        let effectiveGroupSize = featureCount % groupSize == 0 ? groupSize : featureCount
+        let groupCount = featureCount / effectiveGroupSize
+        let groupedShape = Array(shape.dropLast()) + [groupCount, effectiveGroupSize]
+        let grouped = value.asType(.float32).reshaped(groupedShape)
+        let minimums = grouped.min(axis: -1, keepDims: true)
+        let maximums = grouped.max(axis: -1, keepDims: true)
+        let qmax = Float((1 << bits) - 1)
+        let rawScales = (maximums - minimums) / qmax
+        let scales32 = MLX.where(
+            rawScales .> Float(1e-8),
+            rawScales,
+            MLXArray.ones(like: rawScales))
+        let codes = clip(
+            MLX.round((grouped - minimums) / scales32),
+            min: Float(0), max: qmax).asType(.uint8)
+        let scales = scales32.asType(.float16)
+        let biases = minimums.asType(.float16)
+        MLX.eval([codes, scales, biases])
+        return HybridPoolQuantizedSegment(
+            codes: codes,
+            scales: scales,
+            biases: biases,
+            originalShape: shape,
+            groupSize: effectiveGroupSize,
+            bits: bits,
+            originalDType: value.dtype)
+    }
+
+    private static func dequantize(_ segment: HybridPoolQuantizedSegment) -> MLXArray {
+        (segment.codes.asType(.float32) * segment.scales.asType(.float32)
+            + segment.biases.asType(.float32))
+            .reshaped(segment.originalShape)
+            .asType(segment.originalDType)
+    }
+
+    private static func slice(
+        _ segment: HybridPoolQuantizedSegment,
+        keepingRows rows: Int
+    ) -> HybridPoolQuantizedSegment {
+        var shape = segment.originalShape
+        shape[1] = rows
+        let result = HybridPoolQuantizedSegment(
+            codes: segment.codes[0..., 0..<rows, 0..., 0...],
+            scales: segment.scales[0..., 0..<rows, 0..., 0...],
+            biases: segment.biases[0..., 0..<rows, 0..., 0...],
+            originalShape: shape,
+            groupSize: segment.groupSize,
+            bits: segment.bits,
+            originalDType: segment.originalDType)
+        MLX.eval([result.codes, result.scales, result.biases])
+        return result
+    }
+}
+
 // MARK: - DeepseekV4Cache
 //
 // Per-layer composite cache. Wraps a `RotatingKVCache` for the local
@@ -32,7 +284,7 @@ import MLXNN
 // attention forward takes a fast-path that skips the compressor
 // entirely (Python mirror: `if v4_cache is None and L < compress_ratio
 // → skip`).
-public final class DeepseekV4Cache: HybridPoolCache {
+public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteCountProviding {
     /// Expose the inner rotating cache so `TQDiskSerializer` and
     /// `restoreRotatingLayer` can round-trip the sliding-window state.
     /// Compressor/Indexer pool tensors and their incomplete-window
@@ -53,18 +305,85 @@ public final class DeepseekV4Cache: HybridPoolCache {
     /// and pooled summary so far.
     fileprivate var compBufferKV: MLXArray?
     fileprivate var compBufferGate: MLXArray?
-    fileprivate var compPooled: MLXArray?
+    private var compPool: DeepseekV4PoolStorage
     /// Indexer's own buffer state (separate branch — compressor inside
     /// the indexer uses its own buffers).
     fileprivate var idxBufferKV: MLXArray?
     fileprivate var idxBufferGate: MLXArray?
-    fileprivate var idxPooled: MLXArray?
+    private var idxPool: DeepseekV4PoolStorage
 
-    public init(slidingWindow: Int, compressRatio: Int) {
+    /// Family-native DSV4 pool quantization. This does not enable TurboQuant
+    /// KV: the rotating local K/V cache remains in its model-selected dtype.
+    public let hybridPoolQuantizationEnabled: Bool
+
+    public init(
+        slidingWindow: Int,
+        compressRatio: Int,
+        poolQuantizationEnabled: Bool? = nil
+    ) {
         precondition(compressRatio > 0, "DeepseekV4Cache requires compressRatio > 0; cr=0 layers should use a plain RotatingKVCache.")
+        let quantizationEnabled = poolQuantizationEnabled
+            ?? Self.resolvePoolQuantizationDefault()
         self.slidingWindow = slidingWindow
         self.compressRatio = compressRatio
+        self.hybridPoolQuantizationEnabled = quantizationEnabled
+        self.compPool = DeepseekV4PoolStorage(quantizationEnabled: quantizationEnabled)
+        self.idxPool = DeepseekV4PoolStorage(quantizationEnabled: quantizationEnabled)
         self.local = RotatingKVCache(maxSize: slidingWindow, keep: 0)
+    }
+
+    /// Pool quantization is the production default for DSV4 long context.
+    /// `DSV4_POOL_QUANT=0|false|off|no` remains an explicit diagnostic A/B.
+    public static func resolvePoolQuantizationDefault(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        guard let raw = environment["DSV4_POOL_QUANT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else { return true }
+        return !["0", "false", "off", "no"].contains(raw)
+    }
+
+    /// Conservative retained-byte projection for one batch of the complete
+    /// DSV4 hybrid cache at a requested context. It includes UInt8 pool codes,
+    /// fp16 affine metadata, every layer's bounded rotating K/V, and a full
+    /// incomplete-window buffer allowance for both compressor branches.
+    public static func projectedQuantizedCacheUpperBoundBytes(
+        contextLength: Int,
+        compressRatios: [Int],
+        headDim: Int,
+        indexerHeadDim: Int,
+        slidingWindow: Int,
+        activationBytes: Int = 2
+    ) -> Int {
+        precondition(contextLength >= 0)
+        precondition(headDim > 0 && indexerHeadDim > 0)
+        precondition(slidingWindow > 0 && activationBytes > 0)
+
+        func encodedPoolBytes(rows: Int, features: Int) -> Int {
+            guard rows > 0 else { return 0 }
+            let group = features % DeepseekV4PoolStorage.groupSize == 0
+                ? DeepseekV4PoolStorage.groupSize
+                : features
+            let elements = rows * features
+            let affineGroups = rows * (features / group)
+            // UInt8 code + fp16 scale + fp16 minimum per affine group.
+            return elements + affineGroups * 2 * MemoryLayout<Float16>.size
+        }
+
+        var total = compressRatios.count
+            * 2 * slidingWindow * headDim * activationBytes
+        for ratio in compressRatios where ratio > 0 {
+            let rows = (contextLength + ratio - 1) / ratio
+            total += encodedPoolBytes(rows: rows, features: headDim)
+            let compressorWidth = ratio == 4 ? 2 * headDim : headDim
+            total += 2 * ratio * compressorWidth * activationBytes
+            if ratio == 4 {
+                total += encodedPoolBytes(rows: rows, features: indexerHeadDim)
+                total += 2 * ratio * indexerHeadDim * activationBytes
+            }
+        }
+        return total
     }
 
     // KVCache protocol implementation — delegate everything to `local`.
@@ -90,10 +409,10 @@ public final class DeepseekV4Cache: HybridPoolCache {
         get {
             let localState = local.state
             return localState
-                + [serializableArray(compPooled),
+                + [serializableArray(compPool.materialized()),
                    serializableArray(compBufferKV),
                    serializableArray(compBufferGate),
-                   serializableArray(idxPooled),
+                   serializableArray(idxPool.materialized()),
                    serializableArray(idxBufferKV),
                    serializableArray(idxBufferGate)]
         }
@@ -104,10 +423,10 @@ public final class DeepseekV4Cache: HybridPoolCache {
                 "DeepseekV4Cache.state setter expects at least 6 trailing pool slots")
             let split = newValue.count - 6
             local.state = Array(newValue[0..<split])
-            compPooled = nullableFromArray(newValue[split + 0])
+            compPool.replace(with: nullableFromArray(newValue[split + 0]))
             compBufferKV = nullableFromArray(newValue[split + 1])
             compBufferGate = nullableFromArray(newValue[split + 2])
-            idxPooled = nullableFromArray(newValue[split + 3])
+            idxPool.replace(with: nullableFromArray(newValue[split + 3]))
             idxBufferKV = nullableFromArray(newValue[split + 4])
             idxBufferGate = nullableFromArray(newValue[split + 5])
         }
@@ -165,23 +484,17 @@ public final class DeepseekV4Cache: HybridPoolCache {
         // a window overlapping output tokens — keeping it would
         // re-introduce contamination (Python L532-537).
         let rowsToDrop = max(1, n / compressRatio)
-        compPooled = trimTrailingRows(compPooled, drop: rowsToDrop)
-        idxPooled = trimTrailingRows(idxPooled, drop: rowsToDrop)
+        compPool.trimTrailingRows(rowsToDrop)
+        idxPool.trimTrailingRows(rowsToDrop)
         return rv
     }
 
-    private func trimTrailingRows(_ pool: MLXArray?, drop: Int) -> MLXArray? {
-        guard let pool = pool else { return nil }
-        let nRows = pool.dim(1)
-        let keep = max(0, nRows - drop)
-        if keep == 0 { return nil }
-        if keep < nRows {
-            return pool[0..., 0..<keep, 0...]
-        }
-        return pool
+    public func innerState() -> [MLXArray] {
+        local.innerState()
+            + compPool.retainedArrays
+            + [compBufferKV, compBufferGate, idxBufferKV, idxBufferGate].compactMap { $0 }
+            + idxPool.retainedArrays
     }
-
-    public func innerState() -> [MLXArray] { local.innerState() }
 
     public func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
@@ -196,11 +509,31 @@ public final class DeepseekV4Cache: HybridPoolCache {
         // `state = local.state`, which silently dropped the pool
         // entirely — so any caller that relied on `copy()` to
         // checkpoint multi-turn state lost the long-context summary.
-        let dup = DeepseekV4Cache(slidingWindow: slidingWindow,
-                                   compressRatio: compressRatio)
-        dup.state = self.state.map { $0[.ellipsis] }
-        dup.metaState = self.metaState
+        let dup = DeepseekV4Cache(
+            slidingWindow: slidingWindow,
+            compressRatio: compressRatio,
+            poolQuantizationEnabled: hybridPoolQuantizationEnabled)
+        let localState = local.state
+        if !localState.isEmpty {
+            dup.local.state = localState.map { $0[.ellipsis] }
+        }
+        dup.local.metaState = local.metaState
+        dup.compPool = compPool.copy()
+        dup.idxPool = idxPool.copy()
+        dup.compBufferKV = compBufferKV?[.ellipsis]
+        dup.compBufferGate = compBufferGate?[.ellipsis]
+        dup.idxBufferKV = idxBufferKV?[.ellipsis]
+        dup.idxBufferGate = idxBufferGate?[.ellipsis]
         return dup
+    }
+
+    public var retainedCacheByteCount: Int {
+        local.state.reduce(0) { $0 + $1.nbytes }
+            + compPool.retainedByteCount
+            + idxPool.retainedByteCount
+            + [compBufferKV, compBufferGate, idxBufferKV, idxBufferGate]
+                .compactMap { $0 }
+                .reduce(0) { $0 + $1.nbytes }
     }
 
     // MARK: - State (de)serialization helpers
@@ -247,15 +580,22 @@ public final class DeepseekV4Cache: HybridPoolCache {
     }
 
     public func getPooled(_ key: BranchKey) -> MLXArray? {
-        key == .compressor ? compPooled : idxPooled
+        key == .compressor ? compPool.materialized() : idxPool.materialized()
     }
 
     public func setPooled(_ key: BranchKey, value: MLXArray) {
         if key == .compressor {
-            compPooled = value
+            compPool.replace(with: value)
         } else {
-            idxPooled = value
+            idxPool.replace(with: value)
         }
+    }
+
+    public func appendPooled(_ key: BranchKey, value: MLXArray) -> MLXArray {
+        let storage = key == .compressor ? compPool : idxPool
+        storage.append(value)
+        return storage.materialized()
+            ?? MLXArray.zeros([value.dim(0), 0, value.dim(2)], dtype: value.dtype)
     }
 
     public enum BranchKey { case compressor, indexer }
@@ -283,12 +623,9 @@ public final class DeepseekV4Cache: HybridPoolCache {
         if let value {
             setPooled(key, value: value)
         } else {
-            // Clear by setting an empty zero-row sentinel — the existing
-            // `setPooled` API requires a non-nil value, so model both
-            // branches with a small zero-row tensor.
             switch key {
-            case .compressor: compPooled = nil
-            case .indexer: idxPooled = nil
+            case .compressor: compPool.replace(with: nil)
+            case .indexer: idxPool.replace(with: nil)
             }
         }
     }
@@ -299,6 +636,32 @@ public final class DeepseekV4Cache: HybridPoolCache {
 
     public func setHybridBuffers(branch: HybridPoolBranch, kv: MLXArray?, gate: MLXArray?) {
         setBuffers(Self.bridge(branch), kv: kv, gate: gate)
+    }
+
+    public func hybridPoolQuantizedSegments(
+        branch: HybridPoolBranch
+    ) -> [HybridPoolQuantizedSegment]? {
+        let segments = branch == .compressor
+            ? compPool.quantizedSegments
+            : idxPool.quantizedSegments
+        return segments.isEmpty ? nil : segments
+    }
+
+    public func setHybridPoolQuantizedSegments(
+        branch: HybridPoolBranch,
+        segments: [HybridPoolQuantizedSegment]
+    ) {
+        if branch == .compressor {
+            compPool.replace(withQuantizedSegments: segments)
+        } else {
+            idxPool.replace(withQuantizedSegments: segments)
+        }
+    }
+
+    public func hybridPoolRetainedByteCount(branch: HybridPoolBranch) -> Int {
+        branch == .compressor
+            ? compPool.retainedByteCount
+            : idxPool.retainedByteCount
     }
 }
 
@@ -311,12 +674,19 @@ public final class DeepseekV4Cache: HybridPoolCache {
 // strictly increases context coverage. After pooling, applies the
 // absolute position embedding (APE) and partial RoPE at the chunk
 // positions. Updates the per-layer V4Cache pool if provided.
+enum DeepseekV4CompressorQATKind {
+    case attentionKV
+    case indexer
+}
+
 public final class DeepseekV4Compressor: Module {
     let compressRatio: Int
     let headDim: Int
     let outDim: Int
     let overlap: Bool
     let rmsNormEps: Float
+    let qatKind: DeepseekV4CompressorQATKind
+    let activationQATEnabled: Bool
 
     @ModuleInfo(key: "wkv") var wkv: Linear
     @ModuleInfo(key: "wgate") var wgate: Linear
@@ -325,10 +695,17 @@ public final class DeepseekV4Compressor: Module {
     @ParameterInfo(key: "ape") var ape: MLXArray
     @ModuleInfo(key: "norm") var norm: RMSNorm
 
-    init(config: DeepseekV4Configuration, compressRatio: Int, headDim: Int) {
+    init(
+        config: DeepseekV4Configuration,
+        compressRatio: Int,
+        headDim: Int,
+        qatKind: DeepseekV4CompressorQATKind = .attentionKV
+    ) {
         self.compressRatio = compressRatio
         self.headDim = headDim
         self.rmsNormEps = config.rmsNormEps
+        self.qatKind = qatKind
+        self.activationQATEnabled = config.activationQATEnabled
         self.overlap = compressRatio == 4
         self.outDim = headDim * (overlap ? 2 : 1)
         self._wkv.wrappedValue = Linear(config.hiddenSize, outDim, bias: false)
@@ -348,8 +725,11 @@ public final class DeepseekV4Compressor: Module {
         branch: DeepseekV4Cache.BranchKey = .compressor
     ) -> MLXArray {
         let B = x.dim(0)
-        var kv = wkv(x)
-        var gate = wgate(x)
+        // Official 0731 stages the compressor projections and pooling state
+        // in fp32. This must happen before the linears, not merely after them.
+        let projectionInput = x.asType(.float32)
+        var kv = wkv(projectionInput)
+        var gate = wgate(projectionInput)
 
         var poolBase = startPos
         let alreadyWindowed: Bool
@@ -443,15 +823,23 @@ public final class DeepseekV4Compressor: Module {
         pooled = DeepseekV4Math.applyPartialRoPE(
             pooled, cos: cosP, sin: sinP, ropeDim: rope.dim)
 
-        if let cache = v4Cache {
-            if let existing = cache.getPooled(branch) {
-                let merged = concatenated([existing, pooled], axis: 1)
-                cache.setPooled(branch, value: merged)
-                return merged
-            } else {
-                cache.setPooled(branch, value: pooled)
-                return pooled
+        if activationQATEnabled {
+            switch qatKind {
+            case .attentionKV:
+                let nopeDim = headDim - rope.dim
+                if nopeDim >= 64 {
+                    pooled = DeepseekV4Math.e4m3KVActivationRoundTrip(
+                        pooled, ropeDim: rope.dim)
+                }
+            case .indexer:
+                if headDim == 128 {
+                    pooled = DeepseekV4Math.indexerActivationRoundTrip(pooled)
+                }
             }
+        }
+
+        if let cache = v4Cache {
+            return cache.appendPooled(branch, value: pooled)
         }
         return pooled
     }
@@ -637,6 +1025,7 @@ public final class DeepseekV4Indexer: Module {
     let topK: Int
     let compressRatio: Int
     let scale: Float
+    let activationQATEnabled: Bool
 
     @ModuleInfo(key: "wq_b") var wqB: Linear
     @ModuleInfo(key: "weights_proj") var weightsProj: Linear
@@ -648,17 +1037,19 @@ public final class DeepseekV4Indexer: Module {
         self.topK = config.indexTopk
         self.compressRatio = compressRatio
         self.scale = 1.0 / sqrt(Float(headDim))
+        self.activationQATEnabled = config.activationQATEnabled
         self._wqB.wrappedValue = Linear(
             config.qLoraRank, nHeads * headDim, bias: false)
         self._weightsProj.wrappedValue = Linear(
             config.hiddenSize, nHeads, bias: false)
         self._compressor.wrappedValue = DeepseekV4Compressor(
-            config: config, compressRatio: compressRatio, headDim: headDim)
+            config: config, compressRatio: compressRatio, headDim: headDim,
+            qatKind: .indexer)
     }
 
-    /// Returns top-k indices shape (B, L, k) into the pooled sequence
-    /// of the attention's Compressor, or nil when there's nothing to
-    /// select (empty pool).
+    /// Always advances the indexer's private compressor branch. Returns top-k
+    /// indices shape (B, L, k) only after the pool exceeds `topK`; while every
+    /// row remains visible it returns nil without running the score path.
     func callAsFunction(
         _ x: MLXArray,
         qResidual: MLXArray,
@@ -675,23 +1066,14 @@ public final class DeepseekV4Indexer: Module {
 
         let B = x.dim(0)
         let L = x.dim(1)
-        // 2026-05-01 (A3): when the available pool is already <= topK,
-        // every score-matmul + softmax + argPartition step still ends
-        // up selecting every pool entry. Skip the score path entirely
-        // and return identity indices broadcast over (B, L). Saves the
-        // full `q @ pooled.T` matmul + weightsProj projection +
-        // arg-partition per CSA layer per step. For prompts < ~2048
-        // tokens this fires every CSA forward (compress_ratio=4 ×
-        // ~20 layers × per-token decode); reported as next-lever A3
-        // in jang/research/dsv4/DSV4-HSA-CSA-NEXT-LEVERS-2026-05-01.md.
-        // Quality unchanged — the gather downstream concatenates all
-        // selected pool entries either way; order is irrelevant when
-        // selecting all of them.
+        // Keep A3's score-path optimization without skipping the stateful
+        // compressor above. Returning nil tells attention to use every pooled
+        // row directly; no Q projection, score matmul, or arg-partition runs.
+        // This branch must occur only after `compressor(...)` so incremental
+        // 2048 -> 2052 token growth has all 512 historical index rows when row
+        // 513 first activates learned top-k selection.
         if pooledLen <= topK {
-            let identity = MLXArray(0..<pooledLen).asType(.uint32)
-            // (pooledLen,) → (1, 1, pooledLen) → broadcast (B, L, pooledLen)
-            let expanded = identity.expandedDimensions(axes: [0, 1])
-            return broadcast(expanded, to: [B, L, pooledLen])
+            return nil
         }
 
         var q = wqB(qResidual)
@@ -703,6 +1085,9 @@ public final class DeepseekV4Indexer: Module {
         let sinQ = sinT.expandedDimensions(axes: [0, 1])
         q = DeepseekV4Math.applyPartialRoPE(
             q, cos: cosQ, sin: sinQ, ropeDim: rope.dim)
+        if activationQATEnabled && headDim == 128 {
+            q = DeepseekV4Math.indexerActivationRoundTrip(q)
+        }
 
         // scores: (B, nHeads, L, pooledLen). Match Python shape.
         // q is (B, nHeads, L, headDim); pooled is (B, pooledLen, headDim).

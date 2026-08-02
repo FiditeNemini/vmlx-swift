@@ -651,13 +651,26 @@ private func restoreFromV2Arrays(
     // so a corrupt later CCA layer cannot leave the caller's cache half-seated.
     var validatedZayaIndices = Set<Int>()
     var zayaBoundary: Int?
+    var validatedDeepseekV4Indices = Set<Int>()
+    var deepseekV4Boundary: Int?
     for entry in indexed {
         guard entry.index < cache.count else {
+            if case .deepseekV4 = entry.data { return 0 }
             if case .zayaCCA = entry.data { return 0 }
             if case .zayaCCATQ = entry.data { return 0 }
             continue
         }
         switch entry.data {
+        case .deepseekV4(let comp):
+            let staged = cache[entry.index].copy()
+            guard canRestoreDeepseekV4Layer(comp, into: staged),
+                  deepseekV4Boundary == nil || deepseekV4Boundary == comp.offset,
+                  restoreDeepseekV4Layer(comp, into: staged)
+            else {
+                return 0
+            }
+            deepseekV4Boundary = comp.offset
+            validatedDeepseekV4Indices.insert(entry.index)
         case .zayaCCA(let comp):
             let staged = cache[entry.index].copy()
             guard canRestoreZayaCCALayer(comp, into: staged),
@@ -767,7 +780,9 @@ private func restoreFromV2Arrays(
             // so multi-turn /v1/chat/completions prefix-cache reuse
             // doesn't have to re-derive the long-context summary from
             // prompt tokens every turn.
-            restoreDeepseekV4Layer(comp, into: cache[i])
+            guard validatedDeepseekV4Indices.contains(i),
+                  restoreDeepseekV4Layer(comp, into: cache[i])
+            else { return 0 }
             if totalTokens == 0 {
                 totalTokens = comp.offset
             }
@@ -1182,12 +1197,43 @@ private func restoreRotatingLayer(
 /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
 /// Restore a full hybrid `DeepseekV4Cache` layer — rotating window
 /// state PLUS compressor + indexer pool tensors + per-branch
-/// incomplete-window buffer state. Silently no-ops on type mismatch.
+/// incomplete-window buffer state. Quantized pools stay encoded; they are not
+/// expanded into a duplicate BF16 payload during restore.
+private func canRestoreDeepseekV4Layer(
+    _ comp: TQDiskSerializer.DeepseekV4LayerComponents,
+    into layer: any KVCache
+) -> Bool {
+    guard let hybrid = layer as? HybridPoolCache,
+          hybrid.compressRatio == comp.compressRatio,
+          hybrid.slidingWindow == comp.slidingWindow,
+          comp.keys.ndim >= 3,
+          comp.values.ndim >= 3,
+          comp.keys.shape == comp.values.shape,
+          comp.offset >= 0,
+          comp.maxSize == hybrid.rotating.maxSize
+    else { return false }
+
+    func validPool(_ pool: MLXArray?) -> Bool {
+        guard let pool else { return true }
+        return pool.ndim == 3 && pool.dim(0) > 0 && pool.dim(1) > 0 && pool.dim(2) > 0
+    }
+    guard validPool(comp.poolComp), validPool(comp.poolIdx) else { return false }
+
+    if comp.quantizedPoolComp != nil || comp.quantizedPoolIdx != nil {
+        guard layer is QuantizedHybridPoolCache else { return false }
+    }
+    return true
+}
+
 private func restoreDeepseekV4Layer(
     _ comp: TQDiskSerializer.DeepseekV4LayerComponents,
     into layer: any KVCache
-) {
-    func apply(_ hybrid: HybridPoolCache) {
+) -> Bool {
+    guard canRestoreDeepseekV4Layer(comp, into: layer),
+          let hybrid = layer as? HybridPoolCache
+    else { return false }
+
+    func apply(_ hybrid: HybridPoolCache) -> Bool {
         hybrid.rotating.state = [comp.keys, comp.values]
         hybrid.rotating.metaState = [
             String(comp.keep),
@@ -1196,20 +1242,27 @@ private func restoreDeepseekV4Layer(
             String(comp.offset),
             String(comp.idx),
         ]
-        hybrid.setHybridPool(branch: .compressor, value: comp.poolComp)
-        hybrid.setHybridPool(branch: .indexer, value: comp.poolIdx)
+        if let segments = comp.quantizedPoolComp {
+            guard let quantized = hybrid as? QuantizedHybridPoolCache else { return false }
+            quantized.setHybridPoolQuantizedSegments(branch: .compressor, segments: segments)
+        } else {
+            hybrid.setHybridPool(branch: .compressor, value: comp.poolComp)
+        }
+        if let segments = comp.quantizedPoolIdx {
+            guard let quantized = hybrid as? QuantizedHybridPoolCache else { return false }
+            quantized.setHybridPoolQuantizedSegments(branch: .indexer, segments: segments)
+        } else {
+            hybrid.setHybridPool(branch: .indexer, value: comp.poolIdx)
+        }
         hybrid.setHybridBuffers(
             branch: .compressor,
             kv: comp.bufCompKV, gate: comp.bufCompGate)
         hybrid.setHybridBuffers(
             branch: .indexer,
             kv: comp.bufIdxKV, gate: comp.bufIdxGate)
+        return true
     }
-    if let hybrid = layer as? HybridPoolCache {
-        apply(hybrid)
-        return
-    }
-    // Type mismatch — caller will fall back to fresh prefill.
+    return apply(hybrid)
 }
 
 /// 2026-05-06 (ZAYA1 CCA-attention port):

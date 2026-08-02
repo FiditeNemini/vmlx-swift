@@ -32,20 +32,59 @@ private func repositoryFile(_ relativePath: String) throws -> String {
 
 @Suite("DeepseekV4 chat-template fallback")
 struct DeepseekV4ChatTemplateFallbackFocusedTests {
-    @Test("reasoning effort max reaches DSV4 fallback preface")
-    func reasoningEffortMaxReachesFallbackPreface() throws {
+    @Test("tokenizer bridge routes only the DSV4 BOS/EOS pair through its native encoder")
+    func tokenizerBridgeUsesNativeDSV4EncoderWithoutCatchingStep37() throws {
+        let source = try repositoryFile(
+            "Libraries/MLXHuggingFaceMacros/HuggingFaceIntegrationMacros.swift")
+        let route = "DSV4 native chat encoder engaged"
+
+        #expect(source.contains(route))
+        #expect(source.components(separatedBy: route).count - 1 == 1)
+        #expect(source.components(separatedBy:
+            "let dsv4Eos ="
+        ).count - 1 == 2)
+        #expect(source.components(separatedBy:
+            "upstream.eosToken == dsv4Eos"
+        ).count - 1 == 4)
+        #expect(source.components(separatedBy:
+            "MLXLMCommon.DeepseekV4ChatEncoder.renderOpenAIChat("
+        ).count - 1 == 2)
+
+        // Step37 intentionally shares DSV4's BOS token, but its EOS is
+        // <|im_end|>. Requiring DSV4's full BOS/EOS pair keeps no-tool
+        // thinking requests on the Step37-native template path.
+        #expect(source.contains("upstream.eosToken == \"<|im_end|>\""))
+    }
+
+    @Test("0731 low high max reasoning efforts reach distinct fallback prefixes")
+    func reasoningEffort0731Prefixes() throws {
         let template = try Template(ChatTemplateFallbacks.dsv4Minimal)
-        let rendered = try template.renderDSV4([
+        let base: [String: any Sendable] = [
             "messages": [
                 ["role": "user", "content": "Prove max reasoning reaches the template."],
             ],
             "add_generation_prompt": true,
             "enable_thinking": true,
-            "reasoning_effort": "max",
-        ])
+        ]
+        var lowContext = base
+        lowContext["reasoning_effort"] = "low"
+        var highContext = base
+        highContext["reasoning_effort"] = "high"
+        var maxContext = base
+        maxContext["reasoning_effort"] = "max"
 
-        #expect(rendered.contains("Reasoning Effort: Absolute maximum with no shortcuts permitted."))
-        #expect(rendered.hasSuffix("<\u{FF5C}Assistant\u{FF5C}><think>"))
+        let low = try template.renderDSV4(lowContext)
+        let high = try template.renderDSV4(highContext)
+        let max = try template.renderDSV4(maxContext)
+
+        #expect(!low.contains("Reasoning Effort:"))
+        #expect(high.contains("Reasoning Effort: Absolute maximum with no shortcuts permitted."))
+        #expect(!high.contains("Reasoning Effort: Beyond maximum"))
+        #expect(max.contains("Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising."))
+        #expect(!max.contains("Reasoning Effort: Absolute maximum"))
+        #expect([low, high, max].allSatisfy {
+            $0.hasSuffix("<\u{FF5C}Assistant\u{FF5C}><think>")
+        })
     }
 
     @Test("top-level OpenAI tools render in DSV4 DSML schema block")
@@ -127,8 +166,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         assertRequiredToolChoiceDirective(swiftRendered)
     }
 
-    @Test("Swift DSV4 required tool choice appends latest reminder after conflicting no-tool history")
-    func swiftDSV4RequiredToolChoiceAppendsLatestReminderAfterNoToolHistory() {
+    @Test("Swift DSV4 required tool choice preserves full history and an explicit native action task")
+    func swiftDSV4RequiredToolChoicePreservesHistoryAndExplicitActionTask() throws {
         let rendered = DeepseekV4ChatEncoder().encode(
             messages: [
                 .init(role: .system, content: "", tools: [lineCountToolSpec()]),
@@ -150,17 +189,18 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             toolChoiceRequired: true
         )
 
-        let action = "<\u{FF5C}action\u{FF5C}>"
+        let finalUser = "Now use line_count on one\ntwo."
         let reminder = "<\u{FF5C}latest_reminder\u{FF5C}>"
-        let tail = "<\u{FF5C}Assistant\u{FF5C}><think><\u{FF5C}action\u{FF5C}>"
-        let actionRange = rendered.range(of: action)
-        let reminderRange = rendered.range(of: reminder)
-        #expect(actionRange != nil)
-        #expect(reminderRange != nil)
-        #expect(reminderRange!.lowerBound < actionRange!.lowerBound)
+        let assistantTail = DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkEnd
+        let finalUserRange = try #require(rendered.range(of: finalUser))
+        let reminderRange = try #require(rendered.range(of: reminder))
+        #expect(finalUserRange.upperBound <= reminderRange.lowerBound)
         #expect(rendered.contains("The active API tool_choice is required"))
         #expect(rendered.contains("<\u{FF5C}DSML\u{FF5C}tool_calls> block"))
-        #expect(rendered.hasSuffix(tail))
+        #expect(rendered.contains(DeepseekV4Tokens.taskSPTokens["action"]!))
+        #expect(rendered.contains("How many lines? Do not call another tool."))
+        #expect(rendered.contains("Three lines were counted."))
+        #expect(rendered.hasSuffix(assistantTail))
     }
 
     @Test("Swift DSV4 required tool choice preserves assistant tail after plain no-tool history")
@@ -193,7 +233,9 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         let reminderRange = rendered.range(of: reminder)
         #expect(finalUserRange != nil)
         #expect(reminderRange != nil)
-        #expect(reminderRange!.lowerBound < finalUserRange!.lowerBound)
+        if let finalUserRange, let reminderRange {
+            #expect(finalUserRange.upperBound <= reminderRange.lowerBound)
+        }
         #expect(rendered.contains("The active API tool_choice is required"))
         #expect(rendered.contains("<\u{FF5C}DSML\u{FF5C}tool_calls> block"))
         #expect(rendered.hasSuffix(tail))
@@ -448,8 +490,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         assertNoSystemToolsRenderBetweenUserAndAssistant(rendered)
     }
 
-    @Test("DSV4 tool instructions include no-argument invoke protocol")
-    func dsv4ToolInstructionsIncludeNoArgumentInvokeProtocol() throws {
+    @Test("DSV4 no-argument tool keeps the native 0731 DSML prompt")
+    func dsv4NoArgumentToolKeepsNative0731DSMLPrompt() throws {
         let compiled = try Template(ChatTemplateFallbacks.dsv4Minimal)
             .renderDSV4(noArgumentToolProbeContext())
         assertNoArgumentToolProtocol(compiled)
@@ -486,8 +528,8 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
         assertSystemSeparatedFromUser(rendered)
     }
 
-    @Test("Swift DSV4 encoder separates system preface from first user turn")
-    func swiftDSV4EncoderSeparatesSystemFromFirstUser() {
+    @Test("Swift DSV4 encoder preserves the official system-to-user boundary")
+    func swiftDSV4EncoderUsesOfficialSystemToUserBoundary() {
         let encoder = DeepseekV4ChatEncoder()
         let rendered = encoder.encode(
             messages: [
@@ -496,7 +538,9 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
             ],
             thinkingMode: .chat)
 
-        assertSystemSeparatedFromUser(rendered)
+        let native = "You are concise.\(DeepseekV4Tokens.user)Remember sapphire-42."
+        #expect(rendered.contains(native))
+        #expect(!rendered.contains("You are concise.\n\(DeepseekV4Tokens.user)"))
     }
 
     private func noSystemToolProbeContext() -> [String: any Sendable] {
@@ -612,15 +656,13 @@ struct DeepseekV4ChatTemplateFallbackFocusedTests {
 
     private func assertNoArgumentToolProtocol(_ rendered: String) {
         #expect(rendered.contains("git_status"))
-        #expect(rendered.contains("For tools with no parameters"))
-        #expect(
-            rendered.contains(
-                "<\u{FF5C}DSML\u{FF5C}invoke name=\"$TOOL_NAME_WITHOUT_PARAMETERS\">\n</\u{FF5C}DSML\u{FF5C}invoke>"
-            )
-        )
-        #expect(rendered.contains("Do not emit JSON objects for tool calls"))
-        #expect(rendered.contains("real newline characters inside the parameter body"))
-        #expect(rendered.contains("do not write backslash-n escape sequences"))
+        #expect(rendered.contains("String parameters should be specified as is"))
+        #expect(rendered.contains("For all other types (numbers, booleans, arrays, objects)"))
+        #expect(!rendered.contains("For tools with no parameters"))
+        #expect(!rendered.contains("$TOOL_NAME_WITHOUT_PARAMETERS"))
+        #expect(!rendered.contains("Do not emit JSON objects for tool calls"))
+        #expect(!rendered.contains("real newline characters inside the parameter body"))
+        #expect(!rendered.contains("backslash-n escape sequences"))
     }
 
     private func assertRequiredToolChoiceDirective(_ rendered: String) {

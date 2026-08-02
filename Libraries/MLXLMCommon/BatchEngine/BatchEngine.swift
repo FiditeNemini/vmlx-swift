@@ -648,7 +648,15 @@ public actor BatchEngine {
             }
         }
 
-        Task {
+        // This bridge must not inherit BatchEngine actor isolation. The actor
+        // owns synchronous end-of-turn cache serialization (including hybrid
+        // prompt-boundary re-derive), which can take seconds for very large
+        // models. An actor-inherited forwarding task cannot consume tokenStream
+        // while that store is running, so already-generated tokens and terminal
+        // info remain buffered and the cache-store time is incorrectly added to
+        // user-visible TTFT. Keep the store serialized on the actor, but consume
+        // and detokenize its stream on an independent executor.
+        Task.detached {
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
             let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
             let toolCallProcessor: ToolCallProcessor? = {
@@ -882,15 +890,17 @@ public actor BatchEngine {
                         stopReason: finalStop,
                         turboQuantCompressions: info.turboQuantCompressions,
                         turboQuantCacheTransition: info.turboQuantCacheTransition,
-                        unclosedReasoning: unclosed)
-                    if info.turboQuantCompressions > 0 {
-                        turboQuantCompressionCount += info.turboQuantCompressions
-                    }
-                    if let transition = info.turboQuantCacheTransition {
-                        lastTurboQuantCacheTransition = transition
-                    }
+                        unclosedReasoning: unclosed,
+                        toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
                     terminationState.markCompleted()
                     continuation.yield(.info(finalInfo))
+                    // Publish the terminal event before hopping back to the
+                    // engine actor for diagnostics. If finishSlot is still
+                    // serializing a cache boundary, consumers can finish the
+                    // visible turn while this await queues safely behind it.
+                    await engineRef.recordTurboQuantDiagnostics(
+                        compressions: info.turboQuantCompressions,
+                        transition: info.turboQuantCacheTransition)
                 }
             }
             if !sawTerminalInfo {
@@ -910,7 +920,8 @@ public actor BatchEngine {
                     promptTime: 0,
                     generationTime: elapsed,
                     stopReason: .cancelled,
-                    unclosedReasoning: unclosed)
+                    unclosedReasoning: unclosed,
+                    toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
                 continuation.yield(.info(finalInfo))
             }
             terminationState.markCompleted()
@@ -1359,6 +1370,18 @@ public actor BatchEngine {
         lastTurboQuantCacheTransition
     }
 
+    private func recordTurboQuantDiagnostics(
+        compressions: Int,
+        transition: TurboQuantCacheTransitionSnapshot?
+    ) {
+        if compressions > 0 {
+            turboQuantCompressionCount += compressions
+        }
+        if let transition {
+            lastTurboQuantCacheTransition = transition
+        }
+    }
+
     /// Whether the engine is currently running (has active or pending work).
     public var isRunning: Bool { loopTask != nil || soloFastPathTask != nil }
 
@@ -1578,21 +1601,6 @@ public actor BatchEngine {
             activeSlots.append(slot)
             activeCountHighWatermark = max(activeCountHighWatermark, activeSlots.count)
         }
-    }
-
-    /// DSV4's HybridPoolCache has mutable compressor/indexer pools that must
-    /// be built in one forward for a prompt segment. Chunked prefill is still
-    /// correct for ordinary KV and hybrid SSM models; restrict the override to
-    /// the hybrid-pool cache family.
-    private func effectivePrefillWindow(
-        requested: Int,
-        input: LMInput,
-        cache: [KVCache]
-    ) -> Int {
-        guard cache.contains(where: { $0 is HybridPoolCache }) else {
-            return requested
-        }
-        return Swift.max(requested, input.text.tokens.size)
     }
 
     // MARK: - Step Logic
@@ -2017,10 +2025,7 @@ public actor BatchEngine {
                 try context.model.prepare(
                     inputForPrepare,
                     cache: slot.cache,
-                    windowSize: effectivePrefillWindow(
-                        requested: slot.prefillStepSize,
-                        input: inputForPrepare,
-                        cache: slot.cache))
+                    windowSize: slot.prefillStepSize)
             }
         } catch {
             // Prefill failed (e.g., invalid input) — finish with cancellation
@@ -2909,10 +2914,7 @@ public actor BatchEngine {
                     switch try context.model.prepare(
                         boundaryInput,
                         cache: cache,
-                        windowSize: effectivePrefillWindow(
-                            requested: slot.prefillStepSize,
-                            input: boundaryInput,
-                            cache: cache))
+                        windowSize: slot.prefillStepSize)
                     {
                     case .tokens(let remaining):
                         // Match the main prefill path's batch-first shape.

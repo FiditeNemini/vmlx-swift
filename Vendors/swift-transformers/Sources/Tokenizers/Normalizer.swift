@@ -359,7 +359,10 @@ extension StringReplacePattern {
             return StringReplacePattern.string(pattern: pattern, replacement: replacement)
         }
         if let pattern = config.pattern.Regex.string() {
-            guard let regexp = try? NSRegularExpression(pattern: pattern, options: []) else {
+            let compatiblePattern = foundationCompatibleTokenizerRegex(pattern)
+            guard let regexp = try? NSRegularExpression(
+                pattern: compatiblePattern, options: [])
+            else {
                 fatalError("Cannot build regexp from \(pattern)")
             }
             return StringReplacePattern.regexp(regexp: regexp, replacement: replacement)

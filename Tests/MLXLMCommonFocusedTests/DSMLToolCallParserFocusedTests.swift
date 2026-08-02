@@ -37,118 +37,288 @@ struct DSMLToolCallParserFocusedTests {
         )
     }
 
-    @Test("DSML parser accepts DSV4 abbreviated invoke close observed in live decode")
-    func parserAcceptsAbbreviatedInvokeClose() {
+    @Test("canonical DSML streams incrementally and executes exactly once")
+    func canonicalDSMLStreamsIncrementallyAndExecutesExactlyOnce() {
         let dsml = DeepseekV4Tokens.dsml
         let output = """
-            <\(dsml)tool_cals>
-            <\(dsml)invoke name="get_weather">
-            <\(dsml)parameter name="location" string="true">Tokyo</\(dsml)parameter>
-            </\(dsml)inv>
-            </\(dsml)tool_cals>
+            <\(dsml)tool_calls>
+            <\(dsml)invoke name="file_read">
+            <\(dsml)parameter name="path" string="true">mandelbrot.py</\(dsml)parameter>
+            <\(dsml)parameter name="start_line" string="false">38</\(dsml)parameter>
+            <\(dsml)parameter name="end_line" string="false">41</\(dsml)parameter>
+            </\(dsml)invoke>
+            </\(dsml)tool_calls>
             """
+        let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+        var visible = ""
+        for ch in output {
+            visible += processor.processChunk(String(ch)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
 
-        let calls = DSMLToolCallParser().parseEOS(output, tools: nil)
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "file_read")
+        #expect(processor.toolCalls.first?.function.arguments["path"] == .string("mandelbrot.py"))
+        #expect(processor.toolCalls.first?.function.arguments["start_line"] == .int(38))
+        #expect(processor.toolCalls.first?.function.arguments["end_line"] == .int(41))
+        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!visible.contains("DSML"))
+    }
+
+    @Test("native DSML accepts only canonical tags and never executes alternate syntaxes")
+    func nativeDSMLAcceptsOnlyCanonicalTags() {
+        let noncanonicalToolText = [
+            "_only:request_tool<invoke><target_name>file_read</target><params><string>mandelbrot.py</string></params></invoke>",
+            #"file_read("path": "mandelbrot.py")"#,
+            #"{"tool":"file_read","path":"mandelbrot.py"}"#,
+            "file_read\npath=mandelbrot.py",
+        ]
+
+        for (index, body) in noncanonicalToolText.enumerated() {
+            #expect(
+                DSMLToolCallParser().parse(
+                    content: body,
+                    tools: strictFileReadToolSchema()) == nil,
+                "noncanonical fixture \(index) parsed directly"
+            )
+            #expect(
+                DSMLToolCallParser().parseEOS(
+                    body,
+                    tools: strictFileReadToolSchema()).isEmpty,
+                "noncanonical fixture \(index) parsed at EOS"
+            )
+
+            let processor = ToolCallProcessor(
+                format: .dsml,
+                tools: strictFileReadToolSchema())
+            var visible = ""
+            for character in body {
+                visible += processor.processChunk(String(character)) ?? ""
+            }
+            visible += processor.processEOS() ?? ""
+            #expect(processor.toolCalls.isEmpty, "noncanonical fixture \(index) executed")
+            #expect(
+                visible == body,
+                "noncanonical fixture \(index) was not preserved as non-executable text"
+            )
+
+            expectCanonicalRejection(
+                canonicalEnvelope(body: body),
+                tools: strictFileReadToolSchema(),
+                label: "wrapped fallback \(index)"
+            )
+        }
+    }
+
+    @Test("canonical DSML rejects an unregistered invoke")
+    func canonicalDSMLRejectsUnregisteredInvoke() {
+        let dsml = DeepseekV4Tokens.dsml
+        let output = canonicalEnvelope(
+            body: """
+                <\(dsml)invoke name="not_registered">
+                <\(dsml)parameter name="path" string="true">mandelbrot.py</\(dsml)parameter>
+                </\(dsml)invoke>
+                """)
+
+        expectCanonicalRejection(
+            output,
+            tools: strictFileReadToolSchema(),
+            label: "unknown tool"
+        )
+    }
+
+    @Test("canonical DSML rejects a missing required argument")
+    func canonicalDSMLRejectsMissingRequiredArgument() {
+        let dsml = DeepseekV4Tokens.dsml
+        let output = canonicalEnvelope(
+            body: """
+                <\(dsml)invoke name="file_read">
+                <\(dsml)parameter name="start_line" string="false">38</\(dsml)parameter>
+                </\(dsml)invoke>
+                """)
+
+        expectCanonicalRejection(
+            output,
+            tools: strictFileReadToolSchema(),
+            label: "missing required path"
+        )
+    }
+
+    @Test("canonical DSML rejects an unknown argument when additional properties are disabled")
+    func canonicalDSMLRejectsDisallowedUnknownArgument() {
+        let dsml = DeepseekV4Tokens.dsml
+        let output = canonicalEnvelope(
+            body: """
+                <\(dsml)invoke name="file_read">
+                <\(dsml)parameter name="path" string="true">mandelbrot.py</\(dsml)parameter>
+                <\(dsml)parameter name="surprise" string="true">execute-me</\(dsml)parameter>
+                </\(dsml)invoke>
+                """)
+
+        expectCanonicalRejection(
+            output,
+            tools: strictFileReadToolSchema(),
+            label: "disallowed unknown argument"
+        )
+    }
+
+    @Test("canonical DSML rejects duplicate parameters")
+    func canonicalDSMLRejectsDuplicateParameters() {
+        let dsml = DeepseekV4Tokens.dsml
+        let output = canonicalEnvelope(
+            body: """
+                <\(dsml)invoke name="file_read">
+                <\(dsml)parameter name="path" string="true">first.py</\(dsml)parameter>
+                <\(dsml)parameter name="path" string="true">second.py</\(dsml)parameter>
+                </\(dsml)invoke>
+                """)
+
+        expectCanonicalRejection(
+            output,
+            tools: strictFileReadToolSchema(),
+            label: "duplicate path"
+        )
+    }
+
+    @Test("canonical DSML rejects malformed non-string JSON")
+    func canonicalDSMLRejectsMalformedNonStringJSON() {
+        let dsml = DeepseekV4Tokens.dsml
+        let output = canonicalEnvelope(
+            body: """
+                <\(dsml)invoke name="file_read">
+                <\(dsml)parameter name="path" string="true">mandelbrot.py</\(dsml)parameter>
+                <\(dsml)parameter name="start_line" string="false">{"broken":]</\(dsml)parameter>
+                </\(dsml)invoke>
+                """)
+
+        expectCanonicalRejection(
+            output,
+            tools: strictFileReadToolSchema(),
+            label: "malformed non-string JSON"
+        )
+    }
+
+    @Test("canonical DSML preserves valid nested objects arrays strings and escaping")
+    func canonicalDSMLPreservesNestedValuesAndEscaping() {
+        let dsml = DeepseekV4Tokens.dsml
+        let payload =
+            #"{"metadata":{"label":"a\"b","path":"C:\\tmp","enabled":true},"#
+            + #""items":[{"name":"alpha","values":[1,2]},{"name":"beta","values":[3]}]}"#
+        let note = "quote: \"hello\" \\\\server\\share\nsecond line"
+        let output = canonicalEnvelope(
+            body: """
+                <\(dsml)invoke name="complex_tool">
+                <\(dsml)parameter name="payload" string="false">\(payload)</\(dsml)parameter>
+                <\(dsml)parameter name="note" string="true">\(note)</\(dsml)parameter>
+                </\(dsml)invoke>
+                """)
+
+        let calls = DSMLToolCallParser().parseEOS(output, tools: complexToolSchema())
 
         #expect(calls.count == 1)
-        #expect(calls.first?.function.name == "get_weather")
-        #expect(calls.first?.function.arguments["location"] == .string("Tokyo"))
+        #expect(calls.first?.function.name == "complex_tool")
+        #expect(calls.first?.function.arguments["note"] == .string(note))
+        #expect(
+            calls.first?.function.arguments["payload"]
+                == .object([
+                    "metadata": .object([
+                        "label": .string("a\"b"),
+                        "path": .string("C:\\tmp"),
+                        "enabled": .bool(true),
+                    ]),
+                    "items": .array([
+                        .object([
+                            "name": .string("alpha"),
+                            "values": .array([.int(1), .int(2)]),
+                        ]),
+                        .object([
+                            "name": .string("beta"),
+                            "values": .array([.int(3)]),
+                        ]),
+                    ]),
+                ])
+        )
     }
 
-    @Test("DSML processor buffers observed misspelled outer block instead of leaking markup")
-    func processorBuffersObservedMisspelledOuterBlock() {
+    @Test("canonical DSML validates and preserves parallel invokes atomically")
+    func canonicalDSMLPreservesParallelInvokesAtomically() {
         let dsml = DeepseekV4Tokens.dsml
-        let output = """
-            Let me take a look.
-            <\(dsml)tool_cals>
+        let output = canonicalEnvelope(
+            body: """
+                <\(dsml)invoke name="get_weather">
+                <\(dsml)parameter name="location" string="true">Paris</\(dsml)parameter>
+                </\(dsml)invoke>
+                <\(dsml)invoke name="set_alarm">
+                <\(dsml)parameter name="enabled" string="false">true</\(dsml)parameter>
+                <\(dsml)parameter name="tags" string="false">["morning","work"]</\(dsml)parameter>
+                </\(dsml)invoke>
+                """)
+
+        let calls = DSMLToolCallParser().parseEOS(output, tools: parallelToolSchema())
+
+        #expect(calls.count == 2)
+        #expect(calls[0].function.name == "get_weather")
+        #expect(calls[0].function.arguments["location"] == .string("Paris"))
+        #expect(calls[1].function.name == "set_alarm")
+        #expect(calls[1].function.arguments["enabled"] == .bool(true))
+        #expect(
+            calls[1].function.arguments["tags"]
+                == .array([.string("morning"), .string("work")])
+        )
+
+        let invalidSecond = output.replacingOccurrences(
+            of: #"name="enabled" string="false">true"#,
+            with: #"name="enabled" string="false">not-json"#
+        )
+        expectCanonicalRejection(
+            invalidSecond,
+            tools: parallelToolSchema(),
+            label: "invalid second parallel invoke"
+        )
+    }
+
+    @Test("completed malformed DSML aliases remain non-executable")
+    func completedMalformedDSMLAliasesRemainNonExecutable() {
+        let dsml = DeepseekV4Tokens.dsml
+        let canonicalOpen = "<\(dsml)tool_calls>"
+        let invoke = """
             <\(dsml)invoke name="file_read">
-            <\(dsml)parameter name="path" string="true">/Users/eric/Desktop/testmandel/mandelbrot.py</\(dsml)parameter>
-            </\(dsml)inv>
-            </\(dsml)tool_cals>
+            <\(dsml)parameter name="path" string="true">mandelbrot.py</\(dsml)parameter>
             """
-        let processor = ToolCallProcessor(format: .dsml)
-        var visible = ""
-        for ch in output {
-            visible += processor.processChunk(String(ch)) ?? ""
-        }
-        visible += processor.processEOS() ?? ""
+        let canonicalInvokeClose = "</\(dsml)invoke>"
+        let canonicalOuterClose = "</\(dsml)tool_calls>"
+        let malformed: [String] = [
+            "\(canonicalOpen)\n\(invoke)\n</\(dsml)inv>\n\(canonicalOuterClose)",
+            "\(canonicalOpen)\n\(invoke)\n</inv>\n\(canonicalOuterClose)",
+            "\(canonicalOpen)\n\(invoke)\n\(canonicalInvokeClose)\n</\(dsml)tool_cs>",
+            "\(canonicalOpen)\n\(invoke)\n\(canonicalInvokeClose)\n</tool_cs>",
+            "<\(dsml)tool_ccalls>\n\(invoke)\n</\(dsml)inv>\n</\(dsml)tool_cs>",
+            "<\(dsml)tool_cimport>\n\(invoke)\n\(canonicalInvokeClose)\n</\(dsml)tool_cimport>",
+        ]
 
-        #expect(processor.toolCalls.count == 1)
-        #expect(processor.toolCalls.first?.function.name == "file_read")
-        #expect(
-            processor.toolCalls.first?.function.arguments["path"]
-                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
-        )
-        #expect(!visible.contains("DSML"))
-        #expect(!visible.contains("tool_cals"))
-        #expect(!visible.contains("invoke name"))
+        for (index, output) in malformed.enumerated() {
+            #expect(
+                DSMLToolCallParser().parseEOS(output, tools: fileReadToolSchema()).isEmpty,
+                "malformed fixture \(index) parsed directly"
+            )
+
+            let processor = ToolCallProcessor(format: .dsml, tools: fileReadToolSchema())
+            var visible = ""
+            for ch in output {
+                visible += processor.processChunk(String(ch)) ?? ""
+            }
+            visible += processor.processEOS() ?? ""
+
+            #expect(processor.toolCalls.isEmpty, "malformed fixture \(index) executed")
+            #expect(
+                visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "malformed fixture \(index) leaked protocol: \(visible)"
+            )
+        }
     }
 
-    @Test("DSML processor accepts live tool_ccalls/tool_cs alias without visible markup leak")
-    func processorAcceptsLiveToolCCallsToolCSAlias() {
-        let dsml = DeepseekV4Tokens.dsml
-        let output = """
-            <\(dsml)tool_ccalls>
-            <\(dsml)invoke name="file_read">
-            <\(dsml)parameter name="path" string="true">/Users/eric/Desktop/testmandel/mandelbrot.py</\(dsml)parameter>
-            </\(dsml)inv>
-            </\(dsml)tool_cs>
-            """
-        let processor = ToolCallProcessor(format: .dsml)
-        var visible = ""
-        for ch in output {
-            visible += processor.processChunk(String(ch)) ?? ""
-        }
-        visible += processor.processEOS() ?? ""
-
-        #expect(processor.toolCalls.count == 1)
-        #expect(processor.toolCalls.first?.function.name == "file_read")
-        #expect(
-            processor.toolCalls.first?.function.arguments["path"]
-                == .string("/Users/eric/Desktop/testmandel/mandelbrot.py")
-        )
-        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        #expect(!visible.contains("DSML"))
-        #expect(!visible.contains("tool_ccalls"))
-        #expect(!visible.contains("tool_cs"))
-        #expect(!visible.contains("invoke name"))
-    }
-
-    @Test("DSML processor accepts live tool_crs alias after bare tool-name marker")
-    func processorAcceptsLiveToolCRSAliasAfterBareToolNameMarker() {
-        let dsml = DeepseekV4Tokens.dsml
-        let output = """
-            -line_count
-            <\(dsml)tool_crs>
-            <\(dsml)invoke name="line_count">
-            <\(dsml)parameter name="text" string="true">alpha
-            beta
-            gamma</\(dsml)parameter>
-            </\(dsml)inv>
-            </\(dsml)tool_crs>
-            """
-        let processor = ToolCallProcessor(format: .dsml, tools: lineCountToolSchema())
-        var visible = ""
-        for ch in output {
-            visible += processor.processChunk(String(ch)) ?? ""
-        }
-        visible += processor.processEOS() ?? ""
-
-        #expect(processor.toolCalls.count == 1)
-        #expect(processor.toolCalls.first?.function.name == "line_count")
-        #expect(
-            processor.toolCalls.first?.function.arguments["text"]
-                == .string("alpha\nbeta\ngamma")
-        )
-        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        #expect(!visible.contains("DSML"))
-        #expect(!visible.contains("tool_crs"))
-        #expect(!visible.contains("invoke name"))
-        #expect(!visible.contains("line_count"))
-    }
-
-    @Test("DSV4 processor accepts live request_tool XML rail")
-    func processorAcceptsLiveRequestToolXMLRail() {
+    @Test("DSV4 processor does not execute request_tool XML")
+    func processorRejectsRequestToolXMLRail() {
         let output =
             "_only:request_tool<invoke><target_name>line_count</target><params><string>\n"
             + #"one\ntwo"#
@@ -160,17 +330,12 @@ struct DSMLToolCallParserFocusedTests {
         }
         visible += processor.processEOS() ?? ""
 
-        #expect(processor.toolCalls.count == 1)
-        #expect(processor.toolCalls.first?.function.name == "line_count")
-        #expect(processor.toolCalls.first?.function.arguments["text"] == .string("one\ntwo"))
-        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        #expect(!visible.contains("request_tool"))
-        #expect(!visible.contains("<invoke>"))
-        #expect(!visible.contains("line_count"))
+        #expect(processor.toolCalls.isEmpty)
+        #expect(visible == output)
     }
 
-    @Test("DSML processor accepts live bare-name JSON with malformed string escape")
-    func processorAcceptsLiveBareNameJSONWithMalformedStringEscape() {
+    @Test("DSML processor does not execute bare-name malformed JSON")
+    func processorRejectsBareNameJSONWithMalformedStringEscape() {
         let output = #"line_count{"text":"alpha\nbeta\gamma"}"#
         let processor = ToolCallProcessor(format: .dsml, tools: lineCountToolSchema())
         var visible = ""
@@ -179,15 +344,8 @@ struct DSMLToolCallParserFocusedTests {
         }
         visible += processor.processEOS() ?? ""
 
-        #expect(processor.toolCalls.count == 1)
-        #expect(processor.toolCalls.first?.function.name == "line_count")
-        #expect(
-            processor.toolCalls.first?.function.arguments["text"]
-                == .string("alpha\nbeta\\gamma")
-        )
-        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        #expect(!visible.contains("line_count"))
-        #expect(!visible.contains(#"{"text":"#))
+        #expect(processor.toolCalls.isEmpty)
+        #expect(visible == output)
     }
 
     @Test("DSML processor suppresses incomplete protocol opener at EOS")
@@ -207,8 +365,8 @@ struct DSMLToolCallParserFocusedTests {
         #expect(!visible.contains("tool_c"))
     }
 
-    @Test("DSML processor routes Osaurus folder and git tools through live aliases")
-    func processorRoutesOsaurusFolderAndGitToolsThroughLiveAliases() {
+    @Test("DSML processor routes Osaurus folder and git tools through canonical streaming")
+    func processorRoutesOsaurusFolderAndGitToolsThroughCanonicalStreaming() {
         let fixtures: [DSMLToolFixture] = [
             .init(
                 name: "file_tree",
@@ -274,7 +432,7 @@ struct DSMLToolCallParserFocusedTests {
         for fixture in fixtures {
             let processor = ToolCallProcessor(format: .dsml)
             var visible = ""
-            for ch in liveAliasDSML(for: fixture) {
+            for ch in canonicalDSML(for: fixture) {
                 visible += processor.processChunk(String(ch)) ?? ""
             }
             visible += processor.processEOS() ?? ""
@@ -284,8 +442,6 @@ struct DSMLToolCallParserFocusedTests {
                 "\(fixture.name) DSML leaked visible text: \(visible)"
             )
             #expect(!visible.contains("DSML"), "\(fixture.name) leaked DSML marker: \(visible)")
-            #expect(!visible.contains("tool_ccalls"), "\(fixture.name) leaked start alias: \(visible)")
-            #expect(!visible.contains("tool_cs"), "\(fixture.name) leaked end alias: \(visible)")
             #expect(processor.toolCalls.count == 1, "\(fixture.name) should emit one tool call")
 
             let call = processor.toolCalls.first
@@ -301,38 +457,8 @@ struct DSMLToolCallParserFocusedTests {
         }
     }
 
-    @Test("DSML processor treats live tool_cimport wrapper as protocol")
-    func processorAcceptsLiveToolCImportWrapper() {
-        let dsml = DeepseekV4Tokens.dsml
-        let output = """
-            <\(dsml)tool_cimport>
-            <\(dsml)invoke name="file_read">
-            <\(dsml)parameter name="path" string="true">mandelbrot.py</\(dsml)parameter>
-            <\(dsml)parameter name="start_line" string="false">1</\(dsml)parameter>
-            <\(dsml)parameter name="end_line" string="false">1</\(dsml)parameter>
-            </\(dsml)inv>
-            </\(dsml)tool_cimport>
-            """
-        let processor = ToolCallProcessor(format: .dsml)
-        var visible = ""
-        for ch in output {
-            visible += processor.processChunk(String(ch)) ?? ""
-        }
-        visible += processor.processEOS() ?? ""
-
-        #expect(processor.toolCalls.count == 1)
-        #expect(processor.toolCalls.first?.function.name == "file_read")
-        #expect(processor.toolCalls.first?.function.arguments["path"] == .string("mandelbrot.py"))
-        #expect(processor.toolCalls.first?.function.arguments["start_line"] == .int(1))
-        #expect(processor.toolCalls.first?.function.arguments["end_line"] == .int(1))
-        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        #expect(!visible.contains("DSML"))
-        #expect(!visible.contains("tool_cimport"))
-        #expect(!visible.contains("invoke name"))
-    }
-
-    @Test("DSML inline JSON fallback routes only schema-valid tool objects")
-    func inlineJSONFallbackRoutesOnlySchemaValidToolObjects() {
+    @Test("DSML does not execute schema-valid inline JSON")
+    func inlineJSONIsNotExecutableDSML() {
         let output = """
             {"tool":"file_read","path":"mandelbrot.py","start_line":38,"end_line":41}
             """
@@ -343,17 +469,12 @@ struct DSMLToolCallParserFocusedTests {
         }
         visible += processor.processEOS() ?? ""
 
-        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        #expect(processor.toolCalls.count == 1)
-        let call = processor.toolCalls.first
-        #expect(call?.function.name == "file_read")
-        #expect(call?.function.arguments["path"] == .string("mandelbrot.py"))
-        #expect(call?.function.arguments["start_line"] == .int(38))
-        #expect(call?.function.arguments["end_line"] == .int(41))
+        #expect(processor.toolCalls.isEmpty)
+        #expect(visible == output)
     }
 
-    @Test("DSML inline JSON fallback quarantines known malformed tool-shaped answers")
-    func inlineJSONFallbackQuarantinesKnownMalformedToolShapedAnswers() {
+    @Test("DSML does not execute malformed tool-shaped inline JSON")
+    func malformedInlineJSONIsNotExecutableDSML() {
         let output = """
             {"tool":"file_read","r":"np.clip(esc * 4.0 - 1.0, 0.0, 1.0)","g":"np.clip(1.0 - np.abs(esc * 2.0 - 1.0), 0.0, 1.0)","b":"np.clip(1.0 - esc * 2.0, 0.0, 1.0)"}
             """
@@ -364,16 +485,42 @@ struct DSMLToolCallParserFocusedTests {
         }
         visible += processor.processEOS() ?? ""
 
-        #expect(visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        #expect(!visible.contains("\"tool\":\"file_read\""))
-        #expect(!visible.contains("np.clip"))
-        #expect(processor.toolCalls.count == 1)
-        let call = processor.toolCalls.first
-        #expect(call?.function.name == "file_read")
-        #expect(call?.function.arguments["path"] == nil)
-        #expect(call?.function.arguments["_error"] == .string("invalid_tool_arguments"))
-        #expect(call?.function.arguments["_field"] == .string("path"))
-        #expect(call?.function.arguments["r"] == nil)
+        #expect(processor.toolCalls.isEmpty)
+        #expect(visible == output)
+    }
+
+    @Test("DSML tool-like reasoning content is never executable")
+    func toolLikeReasoningContentIsNeverExecutable() {
+        let dsml = DeepseekV4Tokens.dsml
+        let fixtures = [
+            canonicalEnvelope(
+                body: """
+                    <\(dsml)invoke name="file_read">
+                    <\(dsml)parameter name="path" string="true">mandelbrot.py</\(dsml)parameter>
+                    </\(dsml)invoke>
+                    """),
+            #"{"tool":"file_read","path":"mandelbrot.py"}"#,
+            #"file_read("path": "mandelbrot.py")"#,
+            "file_read\npath=mandelbrot.py",
+        ]
+
+        #expect(ToolCallFormat.dsml.parsesToolCallsFromReasoningChannel == false)
+        #expect(ToolCallFormat.json.parsesToolCallsFromReasoningChannel == true)
+
+        for (index, text) in fixtures.enumerated() {
+            let processor = ToolCallProcessor(
+                format: .dsml,
+                tools: strictFileReadToolSchema())
+            let events = routeGenerationText(
+                text,
+                channel: .reasoning,
+                through: processor)
+
+            #expect(processor.toolCalls.isEmpty, "reasoning fixture \(index) executed")
+            #expect(events.compactMap(\.toolCall).isEmpty)
+            #expect(events.compactMap(\.reasoning).joined() == text)
+            #expect(events.compactMap(\.chunk).isEmpty)
+        }
     }
 
     @Test("DSV4 instruct prompt routes DSML output to tool calls without reasoning leakage")
@@ -629,6 +776,43 @@ struct DSMLToolCallParserFocusedTests {
         return String(prompt[start...])
     }
 
+    private func canonicalEnvelope(body: String) -> String {
+        let dsml = DeepseekV4Tokens.dsml
+        return """
+            <\(dsml)tool_calls>
+            \(body)
+            </\(dsml)tool_calls>
+            """
+    }
+
+    private func expectCanonicalRejection(
+        _ output: String,
+        tools: [[String: any Sendable]],
+        label: String
+    ) {
+        #expect(
+            DSMLToolCallParser().parseEOS(output, tools: tools).isEmpty,
+            "\(label) parsed directly"
+        )
+
+        let processor = ToolCallProcessor(format: .dsml, tools: tools)
+        var visible = ""
+        for character in output {
+            visible += processor.processChunk(String(character)) ?? ""
+        }
+        visible += processor.processEOS() ?? ""
+
+        #expect(processor.toolCalls.isEmpty, "\(label) became executable")
+        #expect(
+            processor.toolCallProtocolFailure == .malformedEnvelope,
+            "\(label) did not surface the typed protocol failure"
+        )
+        #expect(
+            visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            "\(label) leaked protocol bytes: \(visible)"
+        )
+    }
+
     private struct DSMLToolFixture {
         let name: String
         let parameters: [DSMLParameterFixture]
@@ -647,18 +831,18 @@ struct DSMLToolCallParserFocusedTests {
         case bool(Bool)
     }
 
-    private func liveAliasDSML(for fixture: DSMLToolFixture) -> String {
+    private func canonicalDSML(for fixture: DSMLToolFixture) -> String {
         let dsml = DeepseekV4Tokens.dsml
         var lines = [
-            "<\(dsml)tool_ccalls>",
+            "<\(dsml)tool_calls>",
             "<\(dsml)invoke name=\"\(fixture.name)\">",
         ]
         lines += fixture.parameters.map { parameter in
             "<\(dsml)parameter name=\"\(parameter.name)\" string=\"\(parameter.string ? "true" : "false")\">\(parameter.value)</\(dsml)parameter>"
         }
         lines += [
-            "</\(dsml)inv>",
-            "</\(dsml)tool_cs>",
+            "</\(dsml)invoke>",
+            "</\(dsml)tool_calls>",
         ]
         return lines.joined(separator: "\n")
     }
@@ -693,6 +877,117 @@ struct DSMLToolCallParserFocusedTests {
                             "end_line": ["type": "integer"] as [String: any Sendable],
                         ] as [String: any Sendable],
                         "required": ["path"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+    }
+
+    private func strictFileReadToolSchema() -> [[String: any Sendable]] {
+        [
+            [
+                "type": "function",
+                "function": [
+                    "name": "file_read",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "path": ["type": "string"] as [String: any Sendable],
+                            "start_line": ["type": "integer"] as [String: any Sendable],
+                            "end_line": ["type": "integer"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["path"],
+                        "additionalProperties": false,
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+    }
+
+    private func complexToolSchema() -> [[String: any Sendable]] {
+        let itemSchema: [String: any Sendable] = [
+            "type": "object",
+            "properties": [
+                "name": ["type": "string"] as [String: any Sendable],
+                "values": [
+                    "type": "array",
+                    "items": ["type": "integer"] as [String: any Sendable]
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+            "required": ["name", "values"],
+            "additionalProperties": false,
+        ]
+        let payloadSchema: [String: any Sendable] = [
+            "type": "object",
+            "properties": [
+                "metadata": [
+                    "type": "object",
+                    "properties": [
+                        "label": ["type": "string"] as [String: any Sendable],
+                        "path": ["type": "string"] as [String: any Sendable],
+                        "enabled": ["type": "boolean"] as [String: any Sendable]
+                    ] as [String: any Sendable],
+                    "required": ["label", "path", "enabled"],
+                    "additionalProperties": false,
+                ] as [String: any Sendable],
+                "items": [
+                    "type": "array",
+                    "items": itemSchema
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+            "required": ["metadata", "items"],
+            "additionalProperties": false,
+        ]
+        return [
+            [
+                "type": "function",
+                "function": [
+                    "name": "complex_tool",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "payload": payloadSchema,
+                            "note": ["type": "string"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["payload", "note"],
+                        "additionalProperties": false,
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+    }
+
+    private func parallelToolSchema() -> [[String: any Sendable]] {
+        [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "location": ["type": "string"] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "required": ["location"],
+                        "additionalProperties": false,
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+            [
+                "type": "function",
+                "function": [
+                    "name": "set_alarm",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "enabled": ["type": "boolean"] as [String: any Sendable],
+                            "tags": [
+                                "type": "array",
+                                "items": ["type": "string"] as [String: any Sendable]
+                            ] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "required": ["enabled", "tags"],
+                        "additionalProperties": false,
                     ] as [String: any Sendable],
                 ] as [String: any Sendable],
             ] as [String: any Sendable],

@@ -124,10 +124,43 @@ public struct BaseConfiguration: Codable, Sendable {
 
             func addWithAttentionAlias(_ value: String) {
                 add(value)
+
+                // DeepseekV4Model.sanitize structurally renames the dense
+                // shared expert's w1/w2/w3 checkpoint leaves to the runtime's
+                // gate/down/up projections. Preserve exact quantization
+                // metadata across that rename. The exact path is still tried
+                // first, so a native gate/down/up declaration always wins.
+                let dsv4SharedExpertAliases = [
+                    (".mlp.shared_experts.gate_proj", ".ffn.shared_experts.w1"),
+                    (".mlp.shared_experts.down_proj", ".ffn.shared_experts.w2"),
+                    (".mlp.shared_experts.up_proj", ".ffn.shared_experts.w3"),
+                ]
+                for (runtimeName, checkpointName) in dsv4SharedExpertAliases {
+                    if value.contains(runtimeName) {
+                        add(value.replacingOccurrences(
+                            of: runtimeName, with: checkpointName))
+                    } else if value.contains(checkpointName) {
+                        add(value.replacingOccurrences(
+                            of: checkpointName, with: runtimeName))
+                    }
+                }
+
                 if value.contains(".attn.") {
                     add(value.replacingOccurrences(of: ".attn.", with: ".self_attn."))
                 } else if value.hasSuffix(".attn") {
                     add(String(value.dropLast(".attn".count)) + ".self_attn")
+                } else if value.contains(".self_attn.") {
+                    // DSV4 checkpoints name attention leaves `layers.N.attn.*`,
+                    // while `DeepseekV4Model.sanitize` exposes the same modules as
+                    // `model.layers.N.self_attn.*`. Quantization is resolved after
+                    // sanitization, so the alias must work in both directions or
+                    // exact 4-bit/group-64 declarations fall through to ambiguous
+                    // shape inference (512 packed columns can also look like
+                    // 8-bit/group-32) and crash the first 4096-wide projection.
+                    add(value.replacingOccurrences(
+                        of: ".self_attn.", with: ".attn."))
+                } else if value.hasSuffix(".self_attn") {
+                    add(String(value.dropLast(".self_attn".count)) + ".attn")
                 }
             }
 

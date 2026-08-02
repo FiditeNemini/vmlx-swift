@@ -15,9 +15,398 @@
 
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 
+private let _deepseekV4SwiGLUClampedBody:
+    @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+{ gate, up, limit in
+    let outputType = gate.dtype
+    let gateF32 = minimum(gate.asType(.float32), limit)
+    let upF32 = minimum(maximum(up.asType(.float32), -limit), limit)
+    return (silu(gateF32) * upF32).asType(outputType)
+}
+
+private let _deepseekV4SwiGLUUnclampedBody:
+    @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+{ gate, up, _ in
+    let outputType = gate.dtype
+    return (silu(gate.asType(.float32)) * up.asType(.float32)).asType(outputType)
+}
+
+private let _deepseekV4ScoredSwiGLUClampedBody:
+    @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+{ gate, up, scores, limit in
+    let outputType = gate.dtype
+    let gateF32 = minimum(gate.asType(.float32), limit)
+    let upF32 = minimum(maximum(up.asType(.float32), -limit), limit)
+    let scoreF32 = scores.asType(.float32)[.ellipsis, .newAxis, .newAxis]
+    return (silu(gateF32) * upF32 * scoreF32).asType(outputType)
+}
+
+private let _deepseekV4ScoredSwiGLUUnclampedBody:
+    @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+{ gate, up, scores, _ in
+    let outputType = gate.dtype
+    let scoreF32 = scores.asType(.float32)[.ellipsis, .newAxis, .newAxis]
+    return (silu(gate.asType(.float32)) * up.asType(.float32) * scoreF32)
+        .asType(outputType)
+}
+
+private let _deepseekV4ScoredSwiGLUClampedArrayBody:
+    @Sendable ([MLXArray]) -> [MLXArray] =
+{ args in
+    [_deepseekV4ScoredSwiGLUClampedBody(args[0], args[1], args[2], args[3])]
+}
+
+private let _deepseekV4ScoredSwiGLUUnclampedArrayBody:
+    @Sendable ([MLXArray]) -> [MLXArray] =
+{ args in
+    [_deepseekV4ScoredSwiGLUUnclampedBody(args[0], args[1], args[2], args[3])]
+}
+
+// The authoritative affine runtime compiles this exact stateless activation.
+// Keep it separate from whole-model compiled decode: it captures no model or
+// cache state, and the wrapper below avoids an illegal nested compile trace.
+private let _compiledDeepseekV4SwiGLUClamped =
+    compile(shapeless: true, _deepseekV4SwiGLUClampedBody)
+private let _compiledDeepseekV4SwiGLUUnclamped =
+    compile(shapeless: true, _deepseekV4SwiGLUUnclampedBody)
+private let _compiledDeepseekV4ScoredSwiGLUClamped =
+    compile(shapeless: true, _deepseekV4ScoredSwiGLUClampedArrayBody)
+private let _compiledDeepseekV4ScoredSwiGLUUnclamped =
+    compile(shapeless: true, _deepseekV4ScoredSwiGLUUnclampedArrayBody)
+
 public enum DeepseekV4Math {
+
+    private static let e4m3KVActivationRoundTripKernel = MLXFast.metalKernel(
+        name: "deepseek_v4_e4m3_kv_activation_roundtrip",
+        inputNames: ["x"],
+        outputNames: ["y"],
+        source: """
+            const uint gid = thread_position_in_grid.x;
+            const uint lane = thread_position_in_threadgroup.x;
+            const uint group = gid >> 6;
+            const uint block = group % NBT;
+            const uint row = group / NBT;
+            const uint idx = row * N + block * 64 + lane;
+
+            if (block >= NBQ) {
+                y[idx] = static_cast<outT>(x[idx]);
+            } else {
+                threadgroup float scratch[64];
+                const float input_value = static_cast<float>(x[idx]);
+                scratch[lane] = metal::abs(input_value);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint stride = 32; stride > 0; stride >>= 1) {
+                    if (lane < stride) {
+                        scratch[lane] = metal::max(
+                            scratch[lane], scratch[lane + stride]);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+
+                const float amax = metal::max(scratch[0], 1.0e-4f);
+                const float raw_scale = amax / 448.0f;
+                const uint raw_bits = as_type<uint>(raw_scale);
+                const int raw_exp = int((raw_bits >> 23) & 0xffu) - 127;
+                const bool has_mantissa = (raw_bits & 0x7fffffu) != 0u;
+                const int scale_exp = raw_exp + int(has_mantissa);
+                const float scale = as_type<float>(uint(scale_exp + 127) << 23);
+
+                const float normalized = metal::clamp(
+                    input_value / scale, -448.0f, 448.0f);
+                const float sign = normalized < 0.0f ? -1.0f : 1.0f;
+                const float absolute = metal::min(metal::abs(normalized), 448.0f);
+                int low = 0;
+                int high = 126;
+                while (low < high) {
+                    const int middle = (low + high + 1) >> 1;
+                    const int exponent = (middle >> 3) & 0x0f;
+                    const int mantissa = middle & 0x07;
+                    const float candidate = exponent == 0
+                        ? float(mantissa) * 0.001953125f
+                        : (1.0f + float(mantissa) * 0.125f)
+                            * metal::fast::exp2(float(exponent - 7));
+                    if (candidate <= absolute) low = middle;
+                    else high = middle - 1;
+                }
+
+                int best = low;
+                const int best_exponent = (best >> 3) & 0x0f;
+                const int best_mantissa = best & 0x07;
+                float best_value = best_exponent == 0
+                    ? float(best_mantissa) * 0.001953125f
+                    : (1.0f + float(best_mantissa) * 0.125f)
+                        * metal::fast::exp2(float(best_exponent - 7));
+                if (best < 126) {
+                    const int next = best + 1;
+                    const int next_exponent = (next >> 3) & 0x0f;
+                    const int next_mantissa = next & 0x07;
+                    const float next_value = next_exponent == 0
+                        ? float(next_mantissa) * 0.001953125f
+                        : (1.0f + float(next_mantissa) * 0.125f)
+                            * metal::fast::exp2(float(next_exponent - 7));
+                    const float best_diff = metal::abs(absolute - best_value);
+                    const float next_diff = metal::abs(absolute - next_value);
+                    if (next_diff < best_diff ||
+                        (next_diff == best_diff && (next & 1) == 0 && (best & 1) != 0)) {
+                        best_value = next_value;
+                    }
+                }
+                y[idx] = static_cast<outT>(sign * best_value * scale);
+            }
+        """)
+
+    private static let indexerActivationRoundTripKernel = MLXFast.metalKernel(
+        name: "deepseek_v4_indexer_hadamard128_e2m1_roundtrip",
+        inputNames: ["x"],
+        outputNames: ["y"],
+        source: """
+            const uint gid = thread_position_in_grid.x;
+            const uint lane = thread_position_in_threadgroup.x;
+            const uint row = gid >> 7;
+            const uint idx = row * 128 + lane;
+            threadgroup float values[128];
+            threadgroup float magnitudes[128];
+
+            values[lane] = static_cast<float>(x[idx]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint stride = 1; stride < 128; stride <<= 1) {
+                if (lane < 64) {
+                    const uint block = lane / stride;
+                    const uint offset = lane % stride;
+                    const uint low_idx = block * 2 * stride + offset;
+                    const uint high_idx = low_idx + stride;
+                    const float low = values[low_idx];
+                    const float high = values[high_idx];
+                    values[low_idx] = low + high;
+                    values[high_idx] = low - high;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            const float rotated = values[lane] * 0.08838834764831845f;
+            magnitudes[lane] = metal::abs(rotated);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint stride = 16; stride > 0; stride >>= 1) {
+                if ((lane & 31u) < stride) {
+                    magnitudes[lane] = metal::max(
+                        magnitudes[lane], magnitudes[lane + stride]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            const uint block_start = lane & ~31u;
+            const float amax = metal::max(
+                magnitudes[block_start], 7.052966104933725e-38f);
+            const float raw_scale = amax / 6.0f;
+            const uint raw_bits = as_type<uint>(raw_scale);
+            const int raw_exp = int((raw_bits >> 23) & 0xffu) - 127;
+            const bool has_mantissa = (raw_bits & 0x7fffffu) != 0u;
+            const int scale_exp = raw_exp + int(has_mantissa);
+            const float scale = as_type<float>(uint(scale_exp + 127) << 23);
+
+            const float normalized = metal::clamp(rotated / scale, -6.0f, 6.0f);
+            const float absolute = metal::abs(normalized);
+            constexpr float codebook[8] = {
+                0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f
+            };
+            int best = 0;
+            float best_diff = absolute;
+            for (int code = 1; code < 8; ++code) {
+                const float diff = metal::abs(absolute - codebook[code]);
+                if (diff < best_diff ||
+                    (diff == best_diff && (code & 1) == 0 && (best & 1) != 0)) {
+                    best = code;
+                    best_diff = diff;
+                }
+            }
+            const float sign = normalized < 0.0f ? -1.0f : 1.0f;
+            y[idx] = static_cast<outT>(sign * codebook[best] * scale);
+        """)
+
+    /// Apply the pinned 0731 post-RoPE KV activation-QAT graph while copying
+    /// the RoPE suffix exactly. `ropeDim` and the non-RoPE prefix are both
+    /// 64-aligned in the released model (512 = 448 + 64).
+    public static func e4m3KVActivationRoundTrip(
+        _ x: MLXArray, ropeDim: Int
+    ) -> MLXArray {
+        let width = x.dim(-1)
+        let nopeWidth = width - ropeDim
+        precondition(
+            width > 0 && ropeDim >= 0 && nopeWidth >= 0
+                && width.isMultiple(of: 64) && nopeWidth.isMultiple(of: 64),
+            "DSV4 E4M3 KV QAT requires 64-aligned full and non-RoPE widths")
+        if nopeWidth == 0 { return x }
+        let input = contiguous(x)
+        let rows = input.size / width
+        return e4m3KVActivationRoundTripKernel(
+            [input],
+            template: [
+                ("N", width),
+                ("NBQ", nopeWidth / 64),
+                ("NBT", width / 64),
+                ("outT", input.dtype),
+            ],
+            grid: (rows * width, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [input.shape],
+            outputDTypes: [input.dtype]
+        )[0]
+    }
+
+    /// Pinned 0731 indexer activation graph: normalized Hadamard-128 followed
+    /// by block-32 power-of-two E2M1 fake quantization.
+    public static func indexerActivationRoundTrip(_ x: MLXArray) -> MLXArray {
+        precondition(x.dim(-1) == 128, "DSV4 indexer QAT requires 128-wide rows")
+        let input = contiguous(x)
+        let rows = input.size / 128
+        return indexerActivationRoundTripKernel(
+            [input],
+            template: [("outT", input.dtype)],
+            grid: (rows * 128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [input.shape],
+            outputDTypes: [input.dtype]
+        )[0]
+    }
+
+    /// Routed expert outputs already include their per-route weights before
+    /// the quantized down projection. Accumulate the expert axis in fp32; the
+    /// caller adds the shared expert in fp32 and casts only once afterward.
+    public static func reduceRoutedExpertsFP32(_ routed: MLXArray) -> MLXArray {
+        routed.asType(.float32).sum(axis: -2)
+    }
+
+    public static func addSharedExpertFP32(
+        _ routed: MLXArray, shared: MLXArray, outputDType: DType
+    ) -> MLXArray {
+        (routed.asType(.float32) + shared.asType(.float32)).asType(outputDType)
+    }
+
+    /// Official hyper-connection expansion. PyTorch broadcasts the first
+    /// `comb` axis against the residual HC axis and sums that axis, which is
+    /// algebraically `combᵀ @ residual`, not `comb @ residual`.
+    public static func hcExpandResidual(
+        comb: MLXArray, residual: MLXArray
+    ) -> MLXArray {
+        comb.asType(.float32).swappedAxes(-1, -2)
+            .matmul(residual.asType(.float32))
+    }
+
+    // MARK: - Fused mHC split-Sinkhorn
+    //
+    // DSV4 executes this twice per transformer layer. Expressing twenty
+    // Sinkhorn iterations as ordinary MLX ops creates more than forty graph
+    // nodes per call (roughly 3,400 nodes per token across 43 layers). The
+    // reference DSV4 MLX runtime uses one Metal dispatch instead. Keep the
+    // same fp32 arithmetic and exact normalization order here.
+    private static let hcSplitSinkhornKernel = MLXFast.metalKernel(
+        name: "deepseek_v4_hc_split_sinkhorn",
+        inputNames: ["mixes", "scale", "base", "eps"],
+        outputNames: ["pre", "post", "comb"],
+        source: """
+            uint idx = thread_position_in_grid.x;
+            constexpr int MIX = (2 + HC) * HC;
+            float epsv = static_cast<float>(eps[0]);
+
+            auto mix = mixes + idx * MIX;
+            auto pre_out = pre + idx * HC;
+            auto post_out = post + idx * HC;
+            auto comb_out = comb + idx * HC * HC;
+
+            float pre_scale = static_cast<float>(scale[0]);
+            float post_scale = static_cast<float>(scale[1]);
+            float comb_scale = static_cast<float>(scale[2]);
+
+            for (int i = 0; i < HC; ++i) {
+                float z = static_cast<float>(mix[i]) * pre_scale
+                    + static_cast<float>(base[i]);
+                pre_out[i] = 1.0f / (1.0f + metal::fast::exp(-z)) + epsv;
+            }
+            for (int i = 0; i < HC; ++i) {
+                int off = HC + i;
+                float z = static_cast<float>(mix[off]) * post_scale
+                    + static_cast<float>(base[off]);
+                post_out[i] = 2.0f / (1.0f + metal::fast::exp(-z));
+            }
+
+            float c[HC * HC];
+            for (int i = 0; i < HC; ++i) {
+                float row_max = -INFINITY;
+                for (int j = 0; j < HC; ++j) {
+                    int cidx = i * HC + j;
+                    int off = 2 * HC + cidx;
+                    float v = static_cast<float>(mix[off]) * comb_scale
+                        + static_cast<float>(base[off]);
+                    c[cidx] = v;
+                    row_max = metal::max(row_max, v);
+                }
+                float row_sum = 0.0f;
+                for (int j = 0; j < HC; ++j) {
+                    int cidx = i * HC + j;
+                    float v = metal::fast::exp(c[cidx] - row_max);
+                    c[cidx] = v;
+                    row_sum += v;
+                }
+                float inv_sum = 1.0f / row_sum;
+                for (int j = 0; j < HC; ++j) {
+                    int cidx = i * HC + j;
+                    c[cidx] = c[cidx] * inv_sum + epsv;
+                }
+            }
+
+            for (int j = 0; j < HC; ++j) {
+                float col_sum = 0.0f;
+                for (int i = 0; i < HC; ++i) {
+                    col_sum += c[i * HC + j];
+                }
+                float inv_denom = 1.0f / (col_sum + epsv);
+                for (int i = 0; i < HC; ++i) {
+                    c[i * HC + j] *= inv_denom;
+                }
+            }
+
+            for (int iter = 1; iter < ITERS; ++iter) {
+                for (int i = 0; i < HC; ++i) {
+                    float row_sum = 0.0f;
+                    for (int j = 0; j < HC; ++j) {
+                        row_sum += c[i * HC + j];
+                    }
+                    float inv_denom = 1.0f / (row_sum + epsv);
+                    for (int j = 0; j < HC; ++j) {
+                        c[i * HC + j] *= inv_denom;
+                    }
+                }
+                for (int j = 0; j < HC; ++j) {
+                    float col_sum = 0.0f;
+                    for (int i = 0; i < HC; ++i) {
+                        col_sum += c[i * HC + j];
+                    }
+                    float inv_denom = 1.0f / (col_sum + epsv);
+                    for (int i = 0; i < HC; ++i) {
+                        c[i * HC + j] *= inv_denom;
+                    }
+                }
+            }
+
+            for (int i = 0; i < HC * HC; ++i) {
+                comb_out[i] = c[i];
+            }
+        """)
+
+    private static let scalarArrayLock = NSLock()
+    nonisolated(unsafe) private static var scalarArrays: [Float: MLXArray] = [:]
+
+    private static func scalarArray(_ value: Float) -> MLXArray {
+        scalarArrayLock.lock()
+        defer { scalarArrayLock.unlock() }
+        if let cached = scalarArrays[value] { return cached }
+        let array = MLXArray([value])
+        scalarArrays[value] = array
+        return array
+    }
 
     // MARK: - Per-head Q RMSNorm ones cache
     //
@@ -68,6 +457,40 @@ public enum DeepseekV4Math {
     //   → post: (..., hcMult)
     //   → comb: (..., hcMult, hcMult)
     public static func hcSplitSinkhorn(
+        mixes: MLXArray,
+        scale: MLXArray,
+        base: MLXArray,
+        hcMult: Int,
+        iters: Int = 20,
+        eps: Float = 1e-6
+    ) -> (pre: MLXArray, post: MLXArray, comb: MLXArray) {
+        if Device.defaultDevice().deviceType == .gpu {
+            let leadShape = Array(mixes.shape.dropLast())
+            let rows = mixes.size / ((2 + hcMult) * hcMult)
+            let outputs = hcSplitSinkhornKernel(
+                [mixes, scale, base, scalarArray(eps)],
+                template: [("HC", hcMult), ("ITERS", iters)],
+                grid: (rows, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [
+                    leadShape + [hcMult],
+                    leadShape + [hcMult],
+                    leadShape + [hcMult, hcMult],
+                ],
+                outputDTypes: [.float32, .float32, .float32])
+            return (pre: outputs[0], post: outputs[1], comb: outputs[2])
+        }
+        return hcSplitSinkhornOps(
+            mixes: mixes,
+            scale: scale,
+            base: base,
+            hcMult: hcMult,
+            iters: iters,
+            eps: eps)
+    }
+
+    /// Pure-op reference and non-Metal fallback for the fused kernel above.
+    public static func hcSplitSinkhornOps(
         mixes: MLXArray,
         scale: MLXArray,
         base: MLXArray,
@@ -178,6 +601,17 @@ public enum DeepseekV4Math {
     private static func rotateHalf(
         _ x: MLXArray, cos: MLXArray, sin: MLXArray, inverse: Bool
     ) -> MLXArray {
+        // The frequency table is intentionally built in fp32, but the
+        // authoritative DSV4 runtime casts cos/sin to the activation dtype
+        // before applying RoPE. Without this cast Swift promotes Q/K to fp32
+        // in layer 0; the fp32 attention result then promotes the entire mHC
+        // residual stream. Every later affine expert call consequently casts
+        // its 67-134 MiB fp16 scale/bias tensors to fp32 on every token.
+        // Preserve the model dtype here, matching DeepseekV4RoPE.__call__ in
+        // jang_tools/dsv4/mlx_model.py.
+        let c = cos.asType(x.dtype)
+        let sinForDirection = inverse ? -sin : sin
+        let s = sinForDirection.asType(x.dtype)
         let lastDim = x.shape.last!
         let halfDim = lastDim / 2
         // Reshape last axis from D to (D/2, 2) so the trailing pair
@@ -185,9 +619,8 @@ public enum DeepseekV4Math {
         let xPaired = x.reshaped(x.shape.dropLast() + [halfDim, 2])
         let x0 = xPaired[.ellipsis, 0]  // (..., D/2)
         let x1 = xPaired[.ellipsis, 1]  // (..., D/2)
-        let s = inverse ? -sin : sin
-        let r0 = x0 * cos - x1 * s
-        let r1 = x0 * s + x1 * cos
+        let r0 = x0 * c - x1 * s
+        let r1 = x0 * s + x1 * c
         // Stack along a new last axis (D/2, 2) then collapse → D.
         let stacked = stacked([r0, r1], axis: -1)
         return stacked.reshaped(x.shape)
@@ -195,18 +628,49 @@ public enum DeepseekV4Math {
 
     // MARK: - DSV4 SwiGLU activation with `limit`
     //
-    // silu(min(gate, limit)) * clip(up, -limit, +limit). The clamping
-    // is essential — unclipped, silu(gate)*up overflows fp16 in the
-    // MoE's down-projection matmul (same issue we hit on other MoE
-    // families; see memory `mlp_bfloat16_upcast.md`).
+    // silu(min(gate, limit)) * clip(up, -limit, +limit). The authoritative
+    // affine runtime evaluates the clamp, SiLU, and multiply in fp32 and only
+    // then casts back to the incoming dtype. This is both a precision contract
+    // across the 43-layer MoE stack and a compiled one-dispatch microkernel.
     public static func dsv4SwiGLU(
         gate: MLXArray,
         up: MLXArray,
         limit: Float
     ) -> MLXArray {
-        let gClamped = minimum(gate, MLXArray(limit))
-        let uClamped = clip(up, min: -limit, max: limit)
-        return silu(gClamped) * uClamped
+        let body = limit > 0
+            ? _deepseekV4SwiGLUClampedBody
+            : _deepseekV4SwiGLUUnclampedBody
+        let compiled = limit > 0
+            ? _compiledDeepseekV4SwiGLUClamped
+            : _compiledDeepseekV4SwiGLUUnclamped
+        let limitArray = scalarArray(limit)
+        if CompiledDecodeTrace.isActive {
+            return body(gate, up, limitArray)
+        }
+        return compiled(gate, up, limitArray)
+    }
+
+    /// Routed DSV4 expert activation. The score is multiplied while the
+    /// limited-SwiGLU result is still fp32, then cast to the expert activation
+    /// dtype immediately before the quantized down projection.
+    public static func dsv4ScoredSwiGLU(
+        gate: MLXArray,
+        up: MLXArray,
+        scores: MLXArray,
+        limit: Float
+    ) -> MLXArray {
+        let body = limit > 0
+            ? _deepseekV4ScoredSwiGLUClampedArrayBody
+            : _deepseekV4ScoredSwiGLUUnclampedArrayBody
+        let compiled = limit > 0
+            ? _compiledDeepseekV4ScoredSwiGLUClamped
+            : _compiledDeepseekV4ScoredSwiGLUUnclamped
+        let limitArray = scalarArray(limit)
+        let args = [gate, up, scores, limitArray]
+        if CompiledDecodeTrace.isActive {
+            return body(args)[0]
+        }
+        return compiled(args).first ?? body(args)[0]
     }
 
     // MARK: - sqrtsoftplus (MoE gate scoring)
@@ -291,14 +755,17 @@ public enum DeepseekV4Math {
 
         // YaRN: ramp mask smooths the transition between full and
         // scaled frequencies for dims that correspond to wavelengths
-        // between betaSlow and betaFast. `high = min(..., dim - 1)`
-        // per the §2 bug fix (the upstream MLX had `dim/2-1`).
+        // between betaFast and betaSlow. Match the pinned DSV4 source's
+        // `find_correction_range(beta_fast, beta_slow, ...)`: betaFast owns
+        // the low index and betaSlow owns the high index. Reversing them
+        // collapses the intended ramp into a clamped step for the production
+        // 0731 parameters. `high = min(..., dim - 1)` follows the source.
         let twoPi = Float.pi * 2
         func correctionDim(_ beta: Float) -> Float {
             dimF * log(Float(origMaxPos) / (beta * twoPi)) / (2.0 * log(base))
         }
-        let low = max(0.0, floor(correctionDim(betaSlow)))
-        let high = min(Float(dim - 1), ceil(correctionDim(betaFast)))
+        let low = max(0.0, floor(correctionDim(betaFast)))
+        let high = min(Float(dim - 1), ceil(correctionDim(betaSlow)))
         let rangeWidth = max(high - low, 0.001)
 
         var ramp = [Float]()

@@ -541,8 +541,7 @@ public enum LLMTypeRegistry {
             }
         }
 
-        let config = try JSONDecoder.json5().decode(
-            DeepseekV4Configuration.self, from: data)
+        let config = try decodeDeepseekV4Configuration(data: data)
         let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data)
         let forced = ProcessInfo.processInfo.environment["DSV4_FORCE_JANGTQ"] == "1"
         let weightFormat = check?.weightFormat?.lowercased()
@@ -626,6 +625,21 @@ public enum LLMTypeRegistry {
             return DeepseekV4JANGTQModel(config, mxtqBits: uniformBits, mxtqSeed: 42)
         }
         return DeepseekV4Model(config)
+    }
+
+    /// Decode the DSV4 bundle configuration and stamp the per-load runtime
+    /// graph policy carried by `MLXLMCommon.loadModel`. Keeping this bridge
+    /// separately testable prevents a host setting from becoming dead wiring
+    /// before the production model dispatcher constructs attention,
+    /// compressor, and indexer modules from the stamped configuration.
+    static func decodeDeepseekV4Configuration(
+        data: Data
+    ) throws -> DeepseekV4Configuration {
+        var config = try JSONDecoder.json5().decode(
+            DeepseekV4Configuration.self, from: data)
+        config.activationQATEnabled =
+            DeepseekV4ActivationQAT.enabledForCurrentLoad
+        return config
     }
 
     /// Shared dispatch for `mistral3` and `ministral3` outer model_types.
@@ -1166,17 +1180,60 @@ internal func llmDefaultAdditionalContext(
     // no thinking wins over stale template metadata. Otherwise use the
     // model-authored default from generation_config.json, falling back to the
     // mirrored JANG chat stamp. Request/UI context is merged later and wins.
-    if capabilities?.supportsThinking == false {
-        context["enable_thinking"] = false
-    } else if let enableThinking =
+    let declaredEnableThinking: Bool?
+    if let explicitTemplateDefault =
         generationConfig?.defaultChatTemplateKwargs?.enableThinking
             ?? chatConfig?.templateKwargsDefaults?.enableThinking
     {
+        declaredEnableThinking = explicitTemplateDefault
+    } else {
+        switch chatConfig?.reasoning?.defaultMode?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        {
+        case "thinking": declaredEnableThinking = true
+        case "chat": declaredEnableThinking = false
+        default: declaredEnableThinking = nil
+        }
+    }
+
+    if capabilities?.supportsThinking == false {
+        context["enable_thinking"] = false
+    } else if let enableThinking = declaredEnableThinking {
         context["enable_thinking"] = enableThinking
+        if enableThinking,
+           let effort = chatConfig?.reasoning?.defaultEffort?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+           !effort.isEmpty
+        {
+            context["reasoning_effort"] = effort
+        }
     }
 
     _ = modelType  // intentionally unused: no family-name coercion
     return context.isEmpty ? nil : context
+}
+
+internal func llmMergedAdditionalContext(
+    defaultAdditionalContext: [String: any Sendable]?,
+    requestAdditionalContext: [String: any Sendable]?,
+    modelType: String?
+) throws -> [String: any Sendable]? {
+    guard defaultAdditionalContext != nil || requestAdditionalContext != nil else {
+        return nil
+    }
+
+    var merged: [String: any Sendable] = defaultAdditionalContext ?? [:]
+    if let requestAdditionalContext {
+        for (key, value) in requestAdditionalContext {
+            merged[key] = value
+        }
+    }
+    return try DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
+        merged.isEmpty ? nil : merged,
+        modelType: modelType
+    )
 }
 
 private struct LLMUserInputProcessor: UserInputProcessor {
@@ -1202,7 +1259,7 @@ private struct LLMUserInputProcessor: UserInputProcessor {
 
     func prepare(input: UserInput) throws -> LMInput {
         let additionalContext = Hy3ReasoningTemplateContext.apply(
-            additionalContext: mergedAdditionalContext(input.additionalContext),
+            additionalContext: try mergedAdditionalContext(input.additionalContext),
             modelType: modelType
         )
         let bailingMessages = BailingThinkingTemplateContext.apply(
@@ -1255,18 +1312,10 @@ private struct LLMUserInputProcessor: UserInputProcessor {
 
     private func mergedAdditionalContext(
         _ requestContext: [String: any Sendable]?
-    ) -> [String: any Sendable]? {
-        guard defaultAdditionalContext != nil || requestContext != nil else {
-            return nil
-        }
-        var merged: [String: any Sendable] = defaultAdditionalContext ?? [:]
-        if let requestContext {
-            for (key, value) in requestContext {
-                merged[key] = value
-            }
-        }
-        return DeepseekV4ReasoningPolicy.normalizedAdditionalContext(
-            merged.isEmpty ? nil : merged,
+    ) throws -> [String: any Sendable]? {
+        try llmMergedAdditionalContext(
+            defaultAdditionalContext: defaultAdditionalContext,
+            requestAdditionalContext: requestContext,
             modelType: modelType
         )
     }

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 //
 // DSML (DeepSeek Markup Language) tool-call parser. Format used by
-// DeepSeek-V4-Flash / -Pro bundles per
-// `jang/research/DSV-FAMILY-RUNTIME-GUIDE.md` §24.
+// DeepSeek-V4-Flash / -Pro bundles per the official 0731
+// `encoding/README.md` and `encoding/encoding_dsv4.py` contract.
 //
 // Example model output:
 //
@@ -47,34 +47,42 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
 
     public let startTag: String? = "<\u{FF5C}DSML\u{FF5C}tool_calls>"
     public let endTag: String? = "</\u{FF5C}DSML\u{FF5C}tool_calls>"
-    public let startTagAliases: [String] = [
-        "<\u{FF5C}DSML\u{FF5C}tool_calls>",
-        // Live DeepSeek V4 Flash sometimes drops the second "l".
-        "<\u{FF5C}DSML\u{FF5C}tool_cals>",
-        // Live DSV4 JANGTQ2 app decode has also emitted an extra "c"
-        // after the underscore while preserving a valid invoke body.
-        "<\u{FF5C}DSML\u{FF5C}tool_ccalls>",
-        // Live DSV4 can also drift the suffix to "crs" while preserving
-        // the DSML invoke/parameter body.
-        "<\u{FF5C}DSML\u{FF5C}tool_crs>",
-    ]
-    public let endTagAliases: [String] = [
-        "</\u{FF5C}DSML\u{FF5C}tool_calls>",
-        "</\u{FF5C}DSML\u{FF5C}tool_cals>",
-        // Same live alias family as `tool_ccalls`, abbreviated at the
-        // suffix rather than the middle of the token.
-        "</\u{FF5C}DSML\u{FF5C}tool_cs>",
-        "</\u{FF5C}DSML\u{FF5C}tool_crs>",
-    ]
+    public let startTagAliases: [String] = ["<\u{FF5C}DSML\u{FF5C}tool_calls>"]
+    public let endTagAliases: [String] = ["</\u{FF5C}DSML\u{FF5C}tool_calls>"]
+    // Keep namespace-prefix buffering so malformed native markup remains
+    // quarantined from visible text. Parsing below still requires the exact
+    // canonical wrapper and never promotes a completed typo into a tool call.
     public let startTagPrefixes: [String] = [Self.dsmlToolStartPrefix]
     public let endTagPrefixes: [String] = [Self.dsmlToolEndPrefix]
-    public let supportsInlineJSONToolFallback = true
+    private let allowsLegacyNonDSMLFallbacks: Bool
 
-    public init() {}
+    public var supportsInlineJSONToolFallback: Bool {
+        allowsLegacyNonDSMLFallbacks
+    }
+
+    /// DeepSeek V4's native DSML parser accepts only the exact 0731 envelope.
+    public init() {
+        self.allowsLegacyNonDSMLFallbacks = false
+    }
+
+    /// Retained only for the Nemotron compatibility parser, whose independent
+    /// family contract historically included these non-DSML fallback rails.
+    init(allowsLegacyNonDSMLFallbacks: Bool) {
+        self.allowsLegacyNonDSMLFallbacks = allowsLegacyNonDSMLFallbacks
+    }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
-        // Strip outer block if present.
-        let text = strippedOuterToolTags(from: content)
+        guard let envelope = classifiedEnvelopeBody(from: content) else { return nil }
+
+        // Once the model commits to the canonical DSML outer protocol, parse
+        // it as DSML only. Falling through to a different tool syntax here
+        // turns malformed native output into an executable call and prevents
+        // ToolCallProcessor from surfacing its typed protocol failure.
+        if envelope.isCanonical {
+            return parseCanonicalInvokes(in: envelope.body, tools: tools)?.first
+        }
+        guard allowsLegacyNonDSMLFallbacks else { return nil }
+        let text = envelope.body
 
         // Find first <｜DSML｜invoke name="...">
         if let firstCall = parseFirstInvoke(in: text, tools: tools) {
@@ -116,8 +124,19 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         // block is ONE `startTag..endTag` outer envelope, split
         // internally by `<｜DSML｜invoke ...>` per call. Parse all
         // invokes in order.
-        let buffer = strippedOuterToolTags(from: toolCallBuffer)
-        let calls = parseAllInvokes(in: buffer, tools: tools, allowPartialEOF: true)
+        let envelope = classifiedEnvelopeBody(from: toolCallBuffer)
+        if let envelope, envelope.isCanonical {
+            return parseCanonicalInvokes(in: envelope.body, tools: tools) ?? []
+        }
+        guard allowsLegacyNonDSMLFallbacks else { return [] }
+        // Nemotron historically accepts a partially terminated DSML invoke at
+        // EOS. Keep that recovery behind its explicit compatibility flag; the
+        // native DSV4 parser above remains exact-envelope/all-or-nothing.
+        let buffer = envelope?.body ?? legacyStrippedOuterToolTags(from: toolCallBuffer)
+        let calls = parseAllInvokes(
+            in: buffer,
+            tools: tools,
+            allowPartialEOF: true)
         if !calls.isEmpty { return calls }
         if let requestToolXMLCall = parseRequestToolXMLFallback(in: buffer, tools: tools) {
             return [requestToolXMLCall]
@@ -150,6 +169,204 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
 
     // MARK: - Internals
 
+    /// Parse a canonical outer envelope as an all-or-nothing sequence of
+    /// canonical invokes. Every byte in the body must be either protocol
+    /// whitespace or part of a valid invoke. When tool definitions are
+    /// supplied, every invoke and argument must satisfy the selected schema.
+    /// Returning `nil` rejects the whole envelope so no prefix of a malformed
+    /// parallel call block can execute.
+    private func parseCanonicalInvokes(
+        in text: String,
+        tools: [[String: any Sendable]]?
+    ) -> [ToolCall]? {
+        let invokeOpen = "\(Self.dsmlPrefix)invoke name=\""
+        let invokeClose = "\(Self.dsmlPrefixClose)invoke>"
+        let parameterOpen = "\(Self.dsmlPrefix)parameter name=\""
+        let parameterNameSuffix = " string=\""
+        let parameterClose = "\(Self.dsmlPrefixClose)parameter>"
+
+        var calls: [ToolCall] = []
+        var cursor = text.startIndex
+        skipProtocolWhitespace(in: text, cursor: &cursor)
+
+        while cursor < text.endIndex {
+            guard consume(invokeOpen, in: text, cursor: &cursor),
+                let nameEnd = text[cursor...].firstIndex(of: "\"")
+            else { return nil }
+            let functionName = String(text[cursor ..< nameEnd])
+            guard !functionName.isEmpty else { return nil }
+            cursor = text.index(after: nameEnd)
+            guard consume(">", in: text, cursor: &cursor) else { return nil }
+
+            let resolvedFunctionSpec: [String: any Sendable]?
+            if let tools, !tools.isEmpty {
+                guard let registered = functionSpec(named: functionName, in: tools) else {
+                    return nil
+                }
+                resolvedFunctionSpec = registered
+            } else {
+                resolvedFunctionSpec = nil
+            }
+
+            var arguments: [String: JSONValue] = [:]
+            var rawArgumentMembers: [String] = []
+            skipProtocolWhitespace(in: text, cursor: &cursor)
+            while cursor < text.endIndex, !text[cursor...].hasPrefix(invokeClose) {
+                guard consume(parameterOpen, in: text, cursor: &cursor),
+                    let parameterNameEnd = text[cursor...].firstIndex(of: "\"")
+                else { return nil }
+                let parameterName = String(text[cursor ..< parameterNameEnd])
+                guard !parameterName.isEmpty, arguments[parameterName] == nil else {
+                    return nil
+                }
+                cursor = text.index(after: parameterNameEnd)
+                guard consume(parameterNameSuffix, in: text, cursor: &cursor),
+                    let stringFlagEnd = text[cursor...].firstIndex(of: "\"")
+                else { return nil }
+                let stringFlag = String(text[cursor ..< stringFlagEnd])
+                guard stringFlag == "true" || stringFlag == "false" else { return nil }
+                cursor = text.index(after: stringFlagEnd)
+                guard consume(">", in: text, cursor: &cursor),
+                    let valueEnd = text.range(
+                        of: parameterClose,
+                        range: cursor ..< text.endIndex
+                    )?.lowerBound
+                else { return nil }
+
+                let rawValue = trimBoundaryNewlines(String(text[cursor ..< valueEnd]))
+                guard let encodedName = encodeJSONString(parameterName) else { return nil }
+                if stringFlag == "true" {
+                    arguments[parameterName] = .string(rawValue)
+                    guard let encodedValue = encodeJSONString(rawValue) else { return nil }
+                    rawArgumentMembers.append("\(encodedName): \(encodedValue)")
+                } else {
+                    guard let value = decodeCanonicalJSONValue(rawValue) else { return nil }
+                    arguments[parameterName] = value
+                    rawArgumentMembers.append("\(encodedName): \(rawValue)")
+                }
+                cursor = text.index(valueEnd, offsetBy: parameterClose.count)
+                skipProtocolWhitespace(in: text, cursor: &cursor)
+            }
+
+            guard consume(invokeClose, in: text, cursor: &cursor) else { return nil }
+            if let resolvedFunctionSpec,
+                !canonicalArguments(arguments, satisfy: resolvedFunctionSpec)
+            {
+                return nil
+            }
+            calls.append(
+                ToolCall(function: .init(
+                    name: functionName,
+                    arguments: arguments,
+                    rawArgumentsJSON: "{" + rawArgumentMembers.joined(separator: ", ") + "}"
+                )))
+            skipProtocolWhitespace(in: text, cursor: &cursor)
+        }
+
+        return calls.isEmpty ? nil : calls
+    }
+
+    private func encodeJSONString(_ value: String) -> String? {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: value,
+            options: [.fragmentsAllowed, .withoutEscapingSlashes]
+        ) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func consume(
+        _ literal: String,
+        in text: String,
+        cursor: inout String.Index
+    ) -> Bool {
+        guard text[cursor...].hasPrefix(literal),
+            let end = text.index(
+                cursor,
+                offsetBy: literal.count,
+                limitedBy: text.endIndex)
+        else { return false }
+        cursor = end
+        return true
+    }
+
+    private func skipProtocolWhitespace(
+        in text: String,
+        cursor: inout String.Index
+    ) {
+        while cursor < text.endIndex, isInlineFallbackWhitespace(text[cursor]) {
+            cursor = text.index(after: cursor)
+        }
+    }
+
+    private func decodeCanonicalJSONValue(_ raw: String) -> JSONValue? {
+        guard let data = raw.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(JSONValue.self, from: data)
+    }
+
+    private func canonicalArguments(
+        _ arguments: [String: JSONValue],
+        satisfy functionSpec: [String: any Sendable]
+    ) -> Bool {
+        guard let parameters = sendableObject(functionSpec["parameters"]) else {
+            return true
+        }
+        return canonicalObject(arguments, satisfies: parameters)
+    }
+
+    private func canonicalObject(
+        _ object: [String: JSONValue],
+        satisfies schema: [String: any Sendable]
+    ) -> Bool {
+        for required in sendableStringArray(schema["required"])
+        where object[required] == nil {
+            return false
+        }
+
+        let properties = sendableObject(schema["properties"]) ?? [:]
+        if sendableBool(schema["additionalProperties"]) == false,
+            object.keys.contains(where: { properties[$0] == nil })
+        {
+            return false
+        }
+
+        for (name, value) in object {
+            guard let propertySchema = sendableObject(properties[name]) else { continue }
+            guard canonicalValue(value, satisfies: propertySchema) else { return false }
+        }
+        return true
+    }
+
+    private func canonicalValue(
+        _ value: JSONValue,
+        satisfies schema: [String: any Sendable]
+    ) -> Bool {
+        let types = normalizedTypeStrings(from: schema["type"])
+        if !types.isEmpty {
+            let matchesType: Bool
+            switch value {
+            case .null: matchesType = types.contains("null")
+            case .bool: matchesType = types.contains("boolean")
+            case .int:
+                matchesType = types.contains("integer") || types.contains("number")
+            case .double: matchesType = types.contains("number")
+            case .string: matchesType = types.contains("string")
+            case .array: matchesType = types.contains("array")
+            case .object: matchesType = types.contains("object")
+            }
+            guard matchesType else { return false }
+        }
+
+        switch value {
+        case .array(let values):
+            guard let itemSchema = sendableObject(schema["items"]) else { return true }
+            return values.allSatisfy { canonicalValue($0, satisfies: itemSchema) }
+        case .object(let object):
+            return canonicalObject(object, satisfies: schema)
+        default:
+            return true
+        }
+    }
+
     /// Parse the first `<｜DSML｜invoke name="...">...</｜DSML｜invoke>`
     /// in `text`. Returns nil when no well-formed invoke is found.
     private func parseFirstInvoke(
@@ -171,12 +388,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         allowPartialEOF: Bool = false
     ) -> [ToolCall] {
         let invokeOpen = "\(Self.dsmlPrefix)invoke name="
-        let invokeCloseTags = [
-            "\(Self.dsmlPrefixClose)invoke>",
-            // Live DSV4-Flash sometimes abbreviates the closing invoke tag
-            // while keeping the outer DSML envelope and parameters valid.
-            "\(Self.dsmlPrefixClose)inv>",
-        ]
+        let invokeClose = "\(Self.dsmlPrefixClose)invoke>"
 
         var results: [ToolCall] = []
         var cursor = text.startIndex
@@ -198,8 +410,8 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
 
             let body: String
             let nextCursor: String.Index
-            if let close = firstRange(
-                of: invokeCloseTags, in: text, range: closeAngle.upperBound ..< text.endIndex)
+            if let close = text.range(
+                of: invokeClose, range: closeAngle.upperBound ..< text.endIndex)
             {
                 body = String(text[closeAngle.upperBound ..< close.lowerBound])
                 nextCursor = close.upperBound
@@ -211,7 +423,9 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             }
             let paramConfig = parameterSchema(for: funcName, tools: tools)
             let args = parseParameters(
-                in: body, schema: paramConfig, allowPartialEOF: allowPartialEOF)
+                in: body,
+                schema: paramConfig,
+                allowPartialEOF: allowPartialEOF)
             results.append(
                 ToolCall(function: .init(name: funcName, arguments: args)))
             cursor = nextCursor
@@ -219,15 +433,51 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         return results
     }
 
-    private func firstRange(
-        of needles: [String], in text: String, range: Range<String.Index>
-    ) -> Range<String.Index>? {
-        needles
-            .compactMap { text.range(of: $0, range: range) }
-            .min { $0.lowerBound < $1.lowerBound }
+    /// Return the body of an exact canonical DSML wrapper. Bare non-DSML
+    /// fallback formats still pass through unchanged, as does the historical
+    /// bare canonical `<｜DSML｜invoke>` form. Once a `tool_*` marker appears in
+    /// the DSML namespace, however, both outer tags must be canonical and
+    /// paired. This keeps typoed completed markup non-executable while the
+    /// streaming processor continues to quarantine it.
+    private func classifiedEnvelopeBody(
+        from content: String
+    ) -> (body: String, isCanonical: Bool)? {
+        let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let noncanonicalClosers = [
+            "\(Self.dsmlPrefixClose)inv>",
+            "</inv>",
+            "</tool_cs>",
+        ]
+        guard !noncanonicalClosers.contains(where: { text.contains($0) }) else {
+            return nil
+        }
+        let hasOuterMarker =
+            text.contains(Self.dsmlToolStartPrefix)
+            || text.contains(Self.dsmlToolEndPrefix)
+        guard hasOuterMarker else {
+            return (text, false)
+        }
+
+        guard let startTag, let endTag,
+            let start = text.range(of: startTag),
+            let end = text.range(of: endTag, range: start.upperBound ..< text.endIndex)
+        else { return nil }
+
+        let before = text[..<start.lowerBound]
+        let body = text[start.upperBound ..< end.lowerBound]
+        let after = text[end.upperBound...]
+        let residue = String(before) + String(body) + String(after)
+        guard !residue.contains(Self.dsmlToolStartPrefix),
+            !residue.contains(Self.dsmlToolEndPrefix)
+        else { return nil }
+        return (body.trimmingCharacters(in: .whitespacesAndNewlines), true)
     }
 
-    private func strippedOuterToolTags(from content: String) -> String {
+    /// Legacy envelope stripping is reachable only through the Nemotron-only
+    /// compatibility flag. It deliberately tolerates a damaged/missing outer
+    /// closer so Nemotron can recover the explicitly named partial invoke at
+    /// EOS without weakening DSV4's canonical parser.
+    private func legacyStrippedOuterToolTags(from content: String) -> String {
         var text = content
         for start in startTagAliases {
             text = text.replacingOccurrences(of: start, with: "")
@@ -286,10 +536,7 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
                 continue
             }
 
-            // Body up to </｜DSML｜parameter>. At EOS, live Omni/DSV4
-            // generations can length-stop after a clearly named parameter
-            // value but before a valid closing tag; keep the protocol hidden
-            // and recover the value up to the next DSML-like close marker.
+            // Body up to the exact canonical parameter close.
             let valueEnd: String.Index
             let nextCursor: String.Index
             if let paramEnd = body.range(
@@ -324,6 +571,16 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
         return args
     }
 
+    private func partialParameterValueEnd(
+        in body: String,
+        range: Range<String.Index>
+    ) -> String.Index {
+        let markers = ["</", Self.dsmlPrefix, Self.dsmlPrefixClose]
+        return markers
+            .compactMap { body.range(of: $0, range: range)?.lowerBound }
+            .min() ?? range.upperBound
+    }
+
     private func trimBoundaryNewlines(_ value: String) -> String {
         var result = value
         while result.hasPrefix("\n") || result.hasPrefix("\r") {
@@ -333,17 +590,6 @@ public struct DSMLToolCallParser: ToolCallParser, Sendable {
             result = String(result.dropLast())
         }
         return result
-    }
-
-    private func partialParameterValueEnd(
-        in body: String,
-        range: Range<String.Index>
-    ) -> String.Index {
-        let markers = ["</", Self.dsmlPrefix, Self.dsmlPrefixClose]
-        return
-            markers
-            .compactMap { body.range(of: $0, range: range)?.lowerBound }
-            .min() ?? range.upperBound
     }
 
     /// DSV4 live rows have occasionally fallen back from DSML to a top-level

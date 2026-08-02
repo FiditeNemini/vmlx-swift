@@ -72,6 +72,66 @@ import Testing
     }
 }
 
+@Test func diskCacheExactQuotaEvictsOldestAccessedEntryAndReportsUsage() async throws {
+    try await MLXMetalTestLock.withLock {
+        let sizingDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-disk-stats-sizing-\(UUID())")
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-disk-stats-exact-quota-\(UUID())")
+        defer {
+            try? FileManager.default.removeItem(at: sizingDir)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let modelKey = "disk-stats-exact-quota-model"
+        let first = [1, 2, 3, 4]
+        let oldest = [5, 6, 7, 8]
+        let newest = [9, 10, 11, 12]
+        let arrays = ["data": MLXArray.ones([64], dtype: .float32)]
+
+        let payloadBytes: Int
+        do {
+            let sizing = DiskCache(
+                cacheDir: sizingDir, maxSizeBytes: Int.max, modelKey: modelKey)
+            sizing.store(tokens: first, arrays: arrays)
+            payloadBytes = Int(try #require(sizing.quotaEntries().first).bytes)
+        }
+        #expect(payloadBytes > 0)
+
+        let exactQuota = payloadBytes * 2
+        let cache = DiskCache(
+            cacheDir: root, maxSizeBytes: exactQuota, modelKey: modelKey)
+        cache.store(tokens: first, arrays: arrays)
+        cache.store(tokens: oldest, arrays: arrays)
+
+        let before = cache.snapshotStats()
+        #expect(before.currentPayloadBytes == exactQuota)
+        #expect(before.currentEntryCount == 2)
+        #expect(before.evictions == 0)
+        #expect(before.maxSizeBytes == exactQuota)
+
+        // Use explicit, widely separated timestamps instead of sleeps. The
+        // second entry is now the oldest even though it was stored later.
+        #expect(cache.touchRecency(
+            tokens: first, at: Date(timeIntervalSince1970: 20_000)))
+        #expect(cache.touchRecency(
+            tokens: oldest, at: Date(timeIntervalSince1970: 10_000)))
+
+        cache.store(tokens: newest, arrays: arrays)
+
+        let remaining = Set(cache.quotaEntries().map(\.hash))
+        #expect(remaining == Set([
+            DiskCache.hashTokens(first, modelKey: modelKey),
+            DiskCache.hashTokens(newest, modelKey: modelKey),
+        ]))
+        let after = cache.snapshotStats()
+        #expect(after.currentPayloadBytes == exactQuota)
+        #expect(after.currentEntryCount == 2)
+        #expect(after.evictions == 1)
+        #expect(after.maxSizeBytes == exactQuota)
+    }
+}
+
 @Test func rejectedHybridDiskRestoreWithMissingCompanionDoesNotTouchKVRecency() async throws {
     try await MLXMetalTestLock.withLock {
         let root = FileManager.default.temporaryDirectory
@@ -708,6 +768,11 @@ import Testing
 
         let limited = cache.candidateTokenCounts(maxTokens: 10, limit: 2)
         #expect(limited == [7, 5])
+
+        let secondPage = cache.candidateTokenCounts(
+            maxTokens: try #require(limited.last) - 1,
+            limit: 2)
+        #expect(secondPage == [3])
     }
 }
 
@@ -768,6 +833,93 @@ import Testing
         #expect(coordinator.ssmStateCache.diskStore?.quotaEntries().isEmpty == true)
         #expect(disk.fetch(tokens: tokens) == nil)
         #expect(companion.fetch(tokens: tokens, boundary: tokens.count) == nil)
+    }
+}
+
+@Test func linkedExactQuotaEvictsOneOldGroupAtomicallyAndReportsCombinedUsage() async throws {
+    try await MLXMetalTestLock.withLock {
+        let sizingRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-linked-stats-sizing-\(UUID().uuidString)")
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx-linked-stats-exact-quota-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: sizingRoot)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let modelKey = "linked-stats-exact-quota-model"
+        let first = [1, 2, 3, 4]
+        let second = [5, 6, 7, 8]
+        let kv = ["data": MLXArray.ones([64], dtype: .float32)]
+        let recurrent = [MLXArray.ones([64], dtype: .float32)]
+
+        let groupBytes: Int
+        do {
+            let sizing = CacheCoordinator(config: CacheCoordinatorConfig(
+                usePagedCache: false,
+                enableDiskCache: true,
+                diskCacheMaxGB: 1,
+                diskCacheDir: sizingRoot,
+                modelKey: modelKey))
+            sizing.setHybrid(true, requiresRecurrentSSMCompanion: true)
+            sizing.storePersistentBoundary(
+                tokens: first, diskArrays: kv, ssmStates: recurrent)
+            let kvBytes = try #require(sizing.diskCache?.quotaEntries().first).bytes
+            let companionBytes = try #require(
+                sizing.ssmStateCache.diskStore?.quotaEntries().first).bytes
+            groupBytes = Int(kvBytes + companionBytes)
+        }
+        #expect(groupBytes > 0)
+
+        // The GiB value is an exact power-of-two scaling for this small integer,
+        // so the coordinator resolves back to precisely one linked group.
+        let exactQuotaGB = Float(groupBytes) / 1_073_741_824
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheMaxGB: exactQuotaGB,
+            diskCacheDir: root,
+            modelKey: modelKey))
+        coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true)
+        let disk = try #require(coordinator.diskCache)
+        let companion = try #require(coordinator.ssmStateCache.diskStore)
+        #expect(disk.maxSizeBytes == groupBytes)
+
+        coordinator.storePersistentBoundary(
+            tokens: first, diskArrays: kv, ssmStates: recurrent)
+        let afterFirst = try #require(coordinator.snapshotStats().diskStats)
+        #expect(afterFirst.currentPayloadBytes == groupBytes)
+        #expect(afterFirst.currentEntryCount == 1)
+        #expect(afterFirst.evictions == 0)
+
+        // Make the whole first group deterministically old. The quota pass must
+        // remove both its KV payload and companion while admitting the second.
+        let oldDate = Date(timeIntervalSince1970: 10_000)
+        #expect(disk.touchRecency(tokens: first, at: oldDate))
+        #expect(companion.touchRecency(
+            tokens: first, boundary: first.count, at: oldDate))
+
+        coordinator.storePersistentBoundary(
+            tokens: second, diskArrays: kv, ssmStates: recurrent)
+
+        let firstKVHash = DiskCache.hashTokens(first, modelKey: modelKey)
+        let secondKVHash = DiskCache.hashTokens(second, modelKey: modelKey)
+        let firstCompanionHash = SSMCompanionDiskStore.keyFor(
+            tokens: first, boundary: first.count, modelKey: modelKey)
+        let secondCompanionHash = SSMCompanionDiskStore.keyFor(
+            tokens: second, boundary: second.count, modelKey: modelKey)
+        let remainingKV = Set(disk.quotaEntries().map(\.hash))
+        let remainingCompanions = Set(companion.quotaEntries().map(\.hash))
+        #expect(!remainingKV.contains(firstKVHash))
+        #expect(!remainingCompanions.contains(firstCompanionHash))
+        #expect(remainingKV == Set([secondKVHash]))
+        #expect(remainingCompanions == Set([secondCompanionHash]))
+
+        let afterSecond = try #require(coordinator.snapshotStats().diskStats)
+        #expect(afterSecond.currentPayloadBytes == groupBytes)
+        #expect(afterSecond.currentEntryCount == 1)
+        #expect(afterSecond.evictions == 1)
+        #expect(afterSecond.maxSizeBytes == groupBytes)
     }
 }
 

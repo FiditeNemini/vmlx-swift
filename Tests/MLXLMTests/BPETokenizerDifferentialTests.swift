@@ -111,6 +111,34 @@ final class BPETokenizerDifferentialTests: XCTestCase {
             addedTokens: [:])
     }
 
+    private func loadDSV4Tokenizer() throws -> (PreTrainedTokenizer, BPETokenizer)? {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("models/DeepSeek-V4-Flash-0731-JANG")
+        guard FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("tokenizer.json").path)
+        else { return nil }
+
+        func config(_ name: String) throws -> Config {
+            let url = directory.appendingPathComponent(name)
+            let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
+            guard let dict = obj as? [NSString: Any] else {
+                throw XCTSkip("\(name) is not a JSON object")
+            }
+            return Config(dict)
+        }
+
+        let tokenizerData = try config("tokenizer.json")
+        let tokenizerConfig = try config("tokenizer_config.json")
+        let model = try BPETokenizer(
+            tokenizerConfig: tokenizerConfig,
+            tokenizerData: tokenizerData,
+            addedTokens: [:])
+        let tokenizer = try PreTrainedTokenizer(
+            tokenizerConfig: tokenizerConfig,
+            tokenizerData: tokenizerData)
+        return (tokenizer, model)
+    }
+
     /// Single-character symbols that actually appear in the merge table — the
     /// atomic alphabet `bpe()` operates on, so random words over it fire real
     /// merges.
@@ -208,5 +236,39 @@ final class BPETokenizerDifferentialTests: XCTestCase {
             + "quadratic may have regressed")
         print("[BPEDifferential] 11k-char pre-token: optimized bpe in "
             + String(format: "%.1f ms", elapsed * 1000))
+    }
+
+    /// DSV4's tokenizer deliberately keeps punctuation plus trailing newlines
+    /// in one pre-token. The canonical Rust/Python tokenizer therefore merges
+    /// `.\n\n` to vocab token 339 (`.ĊĊ`). Losing that boundary changes every
+    /// native DSML prompt and was observed live as corrupted tool names.
+    func testDSV4PunctuationNewlinePreTokenMatchesCanonicalIDs() throws {
+        guard let (tokenizer, model) = try loadDSV4Tokenizer() else {
+            throw XCTSkip("Local DSV4 0731 tokenizer is unavailable.")
+        }
+        XCTAssertEqual(model.bpe(token: ".ĊĊ"), referenceBpe(".ĊĊ", model.bpeRanks))
+        XCTAssertEqual(model.bpe(token: ".ĊĊ"), ".ĊĊ")
+        XCTAssertEqual(tokenizer.encode(text: ".\n\n", addSpecialTokens: false), [339])
+        XCTAssertEqual(tokenizer.tokenize(text: ".\n\n"), [".ĊĊ"])
+    }
+
+    /// JSON decoding materializes `\\r` / `\\n` regex escapes as control
+    /// scalars. Foundation needs them re-escaped to retain Hugging Face's
+    /// greedy punctuation-plus-newline pre-token boundary.
+    func testJSONDecodedControlScalarsKeepCanonicalPreTokenBoundary() {
+        let rawPattern =
+            #" ?[\p{P}\p{S}]+["# + "\r\n" + #"]*|\s*["# + "\r\n" + #"]+|\s+"#
+        let config = Config([
+            "type": "Split",
+            "pattern": ["Regex": rawPattern],
+            "behavior": "Isolated",
+            "invert": false,
+        ] as [NSString: Any])
+        let tokenizer = SplitPreTokenizer(config: config)
+
+        XCTAssertEqual(
+            foundationCompatibleTokenizerRegex(rawPattern),
+            #" ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+"#)
+        XCTAssertEqual(tokenizer.preTokenize(text: ".\n\n", options: []), [".\n\n"])
     }
 }

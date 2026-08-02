@@ -62,6 +62,7 @@ public enum DeepseekV4ThinkingMode: String, Sendable {
 }
 
 public enum DeepseekV4ReasoningEffort: String, Sendable {
+    case low
     case high
     case max
 }
@@ -72,14 +73,21 @@ public struct DeepseekV4ChatEncoder: Sendable {
 
     public init() {}
 
-    // The REASONING_EFFORT_MAX system-level preface is a verbatim port
-    // of `REASONING_EFFORT_MAX` in encoding_dsv4.py — changing the
-    // string would shift prompt distribution and degrade thinking-mode
-    // quality.
-    static let reasoningEffortMaxPreface = """
+    // Verbatim 0731 `REASONING_EFFORT_PROMPTS` values. `low` is the
+    // default and intentionally adds no prefix. These strings are part of
+    // the model's prompt contract and must not be reworded or interchanged.
+    static let reasoningEffortHighPreface = """
         Reasoning Effort: Absolute maximum with no shortcuts permitted.
         You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.
         Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.
+
+
+        """
+
+    static let reasoningEffortMaxPreface = """
+        Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.
+        You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.
+        Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.
 
 
         """
@@ -110,10 +118,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
     ) -> String {
         // Preprocess: merge tool messages into user, sort tool_result
         // blocks by the order they were called in the prior assistant.
-        let compactedMessages = toolChoiceRequired
-            ? Self.compactRequiredToolChoiceHistory(messages)
-            : messages
-        var processedMessages = Self.mergeToolMessages(compactedMessages)
+        var processedMessages = Self.mergeToolMessages(messages)
         var processedContext = Self.mergeToolMessages(context)
         let merged = Self.sortToolResultsByCallOrder(processedContext + processedMessages)
         processedMessages = Array(merged[processedContext.count...])
@@ -152,7 +157,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
             if let tailIndex = finalRendered.lastIndex(where: {
                 $0.role == .user || $0.role == .developer
             }), tailIndex >= contextLen {
-                finalRendered.insert(reminder, at: tailIndex)
+                finalRendered.insert(reminder, at: finalRendered.index(after: tailIndex))
             } else {
                 finalRendered.append(reminder)
             }
@@ -173,6 +178,262 @@ public struct DeepseekV4ChatEncoder: Sendable {
         return prompt
     }
 
+    /// Render OpenAI-style chat dictionaries through DSV4's native encoder.
+    ///
+    /// DSV4 bundles intentionally ship `encoding/encoding_dsv4.py` instead of
+    /// a tokenizer Jinja template.  Tokenizer bridges receive the generic
+    /// OpenAI dictionary surface, so this adapter mirrors the Python runtime's
+    /// boundary before calling the strongly typed encoder above:
+    ///
+    /// - tool schemas are attached to the leading system message (or an empty
+    ///   system message is inserted), exactly like the Python adapter;
+    /// - tool-call argument dictionaries are serialized to the JSON string
+    ///   consumed by the official encoder;
+    /// - `enable_thinking` and the 0731 low/high/max effort values select the
+    ///   native chat/thinking rails;
+    /// - `addGenerationPrompt=false` removes only the terminal assistant rail.
+    ///
+    /// Keeping this conversion in MLXLMCommon avoids a second, subtly different
+    /// DSV4 prompt implementation in the Hugging Face tokenizer bridge.
+    public static func renderOpenAIChat(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?,
+        addGenerationPrompt: Bool
+    ) throws -> String {
+        var nativeMessages = try messages.map(Self.messageFromOpenAI)
+
+        if let tools, !tools.isEmpty {
+            let systemWithTools = nativeMessages.contains {
+                $0.role == .system && !($0.tools?.isEmpty ?? true)
+            }
+            if !systemWithTools {
+                if nativeMessages.first?.role == .system {
+                    nativeMessages[0].tools = tools
+                } else {
+                    nativeMessages.insert(
+                        Message(role: .system, content: "", tools: tools),
+                        at: 0
+                    )
+                }
+            }
+        }
+
+        let effort = Self.reasoningEffort(from: additionalContext)
+        let explicitlyEnabled = additionalContext?["enable_thinking"] as? Bool
+        let thinkingMode: DeepseekV4ThinkingMode
+        if explicitlyEnabled == false {
+            thinkingMode = .chat
+        } else if explicitlyEnabled == true || effort != nil {
+            thinkingMode = .thinking
+        } else {
+            thinkingMode = .chat
+        }
+        let dropEarlierReasoning =
+            (additionalContext?["drop_earlier_reasoning"] as? Bool) ?? true
+        let (toolChoiceRequired, toolChoiceName) = Self.toolChoice(
+            from: additionalContext?["tool_choice"])
+
+        var prompt = DeepseekV4ChatEncoder().encode(
+            messages: nativeMessages,
+            thinkingMode: thinkingMode,
+            reasoningEffort: thinkingMode == .thinking ? effort : nil,
+            dropEarlierReasoning: dropEarlierReasoning,
+            toolChoiceRequired: toolChoiceRequired,
+            toolChoiceName: toolChoiceName
+        )
+        if !addGenerationPrompt {
+            prompt = Self.removingTerminalGenerationRail(from: prompt)
+        }
+        return prompt
+    }
+
+    private static func messageFromOpenAI(
+        _ raw: [String: any Sendable]
+    ) throws -> Message {
+        guard let roleText = raw["role"] as? String,
+            let role = MessageRole(rawValue: roleText)
+        else {
+            throw OpenAIAdapterError.unsupportedRole(
+                raw["role"].map(String.init(describing:)) ?? "nil")
+        }
+
+        let toolCalls: [ToolCall]?
+        if let rawCalls = raw["tool_calls"] as? [[String: any Sendable]] {
+            let rawArguments = raw[rawToolArgumentsJSONMessageKey] as? [String]
+            toolCalls = try rawCalls.enumerated().map { index, call in
+                let preserved = rawArguments.flatMap { values in
+                    index < values.count ? values[index] : nil
+                }
+                return try Self.toolCallFromOpenAI(
+                    call,
+                    rawArgumentsJSON: preserved
+                )
+            }
+        } else {
+            toolCalls = nil
+        }
+
+        return Message(
+            role: role,
+            content: Self.textContent(raw["content"]),
+            contentBlocks: Self.contentBlocks(raw["content_blocks"]),
+            reasoningContent: raw["reasoning_content"] as? String,
+            toolCalls: toolCalls,
+            toolCallId: raw["tool_call_id"] as? String,
+            tools: raw["tools"] as? [[String: any Sendable]],
+            responseFormat: raw["response_format"] as? [String: any Sendable],
+            task: raw["task"] as? String,
+            woEOS: (raw["wo_eos"] as? Bool) ?? false
+        )
+    }
+
+    private static func toolCallFromOpenAI(
+        _ raw: [String: any Sendable],
+        rawArgumentsJSON: String? = nil
+    ) throws -> ToolCall {
+        let function = (raw["function"] as? [String: any Sendable]) ?? raw
+        guard let name = function["name"] as? String, !name.isEmpty else {
+            throw OpenAIAdapterError.missingToolName
+        }
+        let arguments: String
+        if let preserved = validatedRawArgumentsJSON(
+            rawArgumentsJSON,
+            matching: function["arguments"]
+        ) {
+            arguments = preserved
+        } else if let string = function["arguments"] as? String {
+            arguments = string
+        } else if let dictionary = function["arguments"] as? [String: any Sendable] {
+            arguments = dictionary.jsonSerialized()
+        } else if let value = function["arguments"],
+            let data = try? JSONSerialization.data(
+                withJSONObject: value, options: [.withoutEscapingSlashes])
+        {
+            arguments = String(data: data, encoding: .utf8) ?? "{}"
+        } else {
+            arguments = "{}"
+        }
+        return ToolCall(id: raw["id"] as? String, name: name, arguments: arguments)
+    }
+
+    private static func validatedRawArgumentsJSON(
+        _ candidate: String?,
+        matching value: (any Sendable)?
+    ) -> String? {
+        guard let candidate, !candidate.isEmpty,
+            let data = candidate.data(using: .utf8),
+            let decoded = try? JSONDecoder().decode(
+                [String: JSONValue].self,
+                from: data
+            )
+        else { return nil }
+
+        if let dictionary = value as? [String: any Sendable] {
+            guard decoded == dictionary.mapValues({ JSONValue.from($0) }) else {
+                return nil
+            }
+        } else if let string = value as? String,
+            let expectedData = string.data(using: .utf8),
+            let expected = try? JSONDecoder().decode(
+                [String: JSONValue].self,
+                from: expectedData
+            )
+        {
+            guard decoded == expected else { return nil }
+        } else {
+            return nil
+        }
+        return candidate
+    }
+
+    private static func textContent(_ value: (any Sendable)?) -> String? {
+        if let string = value as? String { return string }
+        guard let parts = value as? [[String: any Sendable]] else { return nil }
+        let text = parts.compactMap { part -> String? in
+            guard let type = part["type"] as? String,
+                ["text", "input_text", "output_text"].contains(type)
+            else { return nil }
+            return (part["text"] as? String) ?? (part["content"] as? String)
+        }.joined(separator: "\n\n")
+        return text.isEmpty ? nil : text
+    }
+
+    private static func contentBlocks(
+        _ value: (any Sendable)?
+    ) -> [MessageContentBlock]? {
+        guard let blocks = value as? [[String: any Sendable]] else { return nil }
+        let converted = blocks.compactMap { block -> MessageContentBlock? in
+            switch block["type"] as? String {
+            case "text":
+                return .text((block["text"] as? String) ?? "")
+            case "tool_result":
+                return .toolResult(
+                    toolUseId: (block["tool_use_id"] as? String) ?? "",
+                    content: Self.textContent(block["content"]) ?? ""
+                )
+            default:
+                return nil
+            }
+        }
+        return converted.isEmpty ? nil : converted
+    }
+
+    private static func reasoningEffort(
+        from context: [String: any Sendable]?
+    ) -> DeepseekV4ReasoningEffort? {
+        guard let raw = context?["reasoning_effort"] as? String else { return nil }
+        switch raw.lowercased() {
+        case "low": return .low
+        case "high": return .high
+        case "max": return .max
+        default: return nil
+        }
+    }
+
+    private static func toolChoice(
+        from raw: (any Sendable)?
+    ) -> (required: Bool, name: String?) {
+        if let string = raw as? String {
+            return (string == "required", nil)
+        }
+        guard let object = raw as? [String: any Sendable] else {
+            return (false, nil)
+        }
+        let function = object["function"] as? [String: any Sendable]
+        if (object["type"] as? String) == "function",
+            let name = function?["name"] as? String
+        {
+            return (true, name)
+        }
+        return (false, nil)
+    }
+
+    private static func removingTerminalGenerationRail(from prompt: String) -> String {
+        let rails = [
+            DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart,
+            DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkEnd,
+        ]
+        for rail in rails where prompt.hasSuffix(rail) {
+            return String(prompt.dropLast(rail.count))
+        }
+        return prompt
+    }
+
+    public enum OpenAIAdapterError: Error, CustomStringConvertible {
+        case unsupportedRole(String)
+        case missingToolName
+
+        public var description: String {
+            switch self {
+            case .unsupportedRole(let role):
+                return "Unsupported DSV4 chat role: \(role)"
+            case .missingToolName:
+                return "DSV4 tool call is missing function.name"
+            }
+        }
+    }
+
     // MARK: - Message rendering
 
     func renderMessage(
@@ -188,9 +449,17 @@ public struct DeepseekV4ChatEncoder: Sendable {
         let lastUserIdx = Self.findLastUserIndex(messages)
         var out = ""
 
-        // Reasoning-effort preface only at index 0 in thinking mode.
-        if index == 0 && thinkingMode == .thinking && reasoningEffort == .max {
-            out += Self.reasoningEffortMaxPreface
+        // Reasoning-effort preface only at index 0 in thinking mode. Nil is
+        // the official low/default rail and therefore adds no text.
+        if index == 0 && thinkingMode == .thinking {
+            switch reasoningEffort ?? .low {
+            case .low:
+                break
+            case .high:
+                out += Self.reasoningEffortHighPreface
+            case .max:
+                out += Self.reasoningEffortMaxPreface
+            }
         }
 
         switch msg.role {
@@ -205,9 +474,6 @@ public struct DeepseekV4ChatEncoder: Sendable {
             }
             if let rf = msg.responseFormat {
                 out += "\n\n" + Self.renderResponseFormat(rf)
-            }
-            if index + 1 < messages.count {
-                out += "\n"
             }
 
         case .developer:
@@ -289,7 +555,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
         // of a user/developer turn OR there's a following assistant.
         let nextRole: MessageRole? =
             (index + 1 < messages.count) ? messages[index + 1].role : nil
-        if nextRole != nil && nextRole != .assistant {
+        if nextRole != nil && nextRole != .assistant && nextRole != .latestReminder {
             return out
         }
 
@@ -299,7 +565,9 @@ public struct DeepseekV4ChatEncoder: Sendable {
                 out += taskSP
             } else {
                 out += DeepseekV4Tokens.assistant
-                out += DeepseekV4Tokens.thinkStart
+                out += thinkingMode == .thinking
+                    ? DeepseekV4Tokens.thinkStart
+                    : DeepseekV4Tokens.thinkEnd
                 out += taskSP
             }
         } else if msg.role == .user || msg.role == .developer || msg.role == .latestReminder {
@@ -337,16 +605,7 @@ public struct DeepseekV4ChatEncoder: Sendable {
         </\(DeepseekV4Tokens.dsml)invoke>
         </\(DeepseekV4Tokens.dsml)tool_calls>
 
-        For tools with no parameters, emit an empty invoke with no parameter lines:
-
-        <\(DeepseekV4Tokens.dsml)tool_calls>
-        <\(DeepseekV4Tokens.dsml)invoke name="$TOOL_NAME_WITHOUT_PARAMETERS">
-        </\(DeepseekV4Tokens.dsml)invoke>
-        </\(DeepseekV4Tokens.dsml)tool_calls>
-
-        Do not emit JSON objects for tool calls; tool calls must use DSML invoke blocks.
-
-        String parameters should be specified as is and set `string="true"`. For multiline strings, put real newline characters inside the parameter body; do not write backslash-n escape sequences. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+        String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
 
         If thinking_mode is enabled (triggered by \(DeepseekV4Tokens.thinkStart)), you MUST output your complete reasoning inside \(DeepseekV4Tokens.thinkStart)...\(DeepseekV4Tokens.thinkEnd) BEFORE any tool calls or final response.
 
@@ -367,7 +626,9 @@ public struct DeepseekV4ChatEncoder: Sendable {
         let schemas = tools.map { Self.functionSpec(from: $0) }
         let schemaJson = schemas.map { $0.jsonSerialized() }
         let schemasBlock = schemaJson.joined(separator: "\n")
-        var rendered = toolsTemplate.replacingOccurrences(of: "%@", with: schemasBlock)
+        // Python's triple-quoted TOOLS_TEMPLATE includes a terminal newline.
+        // Preserve it: it is the native separator before the next User token.
+        var rendered = toolsTemplate.replacingOccurrences(of: "%@", with: schemasBlock) + "\n"
         if toolChoiceRequired {
             let requiredToolName =
                 Self.normalizedToolChoiceName(toolChoiceName)
@@ -454,6 +715,9 @@ public struct DeepseekV4ChatEncoder: Sendable {
     /// `arguments` is a JSON string (OpenAI convention) or already-decoded
     /// dict. Python reference accepts either.
     public static func renderToolCallInvoke(name: String, arguments: String) -> String {
+        if let ordered = orderedJSONParameters(arguments) {
+            return renderToolCallInvoke(name: name, orderedParameters: ordered)
+        }
         let params: [String: Any]
         if let data = arguments.data(using: .utf8),
             let parsed = try? JSONSerialization.jsonObject(with: data, options: [])
@@ -466,6 +730,150 @@ public struct DeepseekV4ChatEncoder: Sendable {
             params = ["arguments": arguments]
         }
         return renderToolCallInvoke(name: name, params: params)
+    }
+
+    private struct OrderedJSONParameter {
+        let name: String
+        let value: String
+        let isString: Bool
+    }
+
+    /// Decode a JSON object without discarding top-level member order or the
+    /// original JSON spelling of non-string values. The official 0731 Python
+    /// encoder iterates `json.loads(...).items()`, so this order determines
+    /// the exact DSML history bytes and therefore the reusable KV prefix.
+    private static func orderedJSONParameters(
+        _ arguments: String
+    ) -> [OrderedJSONParameter]? {
+        guard let data = arguments.data(using: .utf8),
+            (try? JSONSerialization.jsonObject(with: data)) is [String: Any]
+        else { return nil }
+
+        let text = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.first == "{", text.last == "}" else { return nil }
+
+        var cursor = text.index(after: text.startIndex)
+        let objectEnd = text.index(before: text.endIndex)
+        var parameters: [OrderedJSONParameter] = []
+
+        func skipWhitespace(_ index: inout String.Index) {
+            while index < objectEnd, text[index].isWhitespace {
+                index = text.index(after: index)
+            }
+        }
+
+        func scanString(_ index: inout String.Index) -> Bool {
+            guard index < text.endIndex, text[index] == "\"" else { return false }
+            index = text.index(after: index)
+            var escaped = false
+            while index < text.endIndex {
+                let character = text[index]
+                index = text.index(after: index)
+                if escaped {
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    return true
+                }
+            }
+            return false
+        }
+
+        func scanValue(_ index: inout String.Index) -> Bool {
+            guard index < objectEnd else { return false }
+            if text[index] == "\"" {
+                return scanString(&index)
+            }
+            if text[index] == "{" || text[index] == "[" {
+                var stack: [Character] = []
+                var inString = false
+                var escaped = false
+                while index < text.endIndex {
+                    let character = text[index]
+                    index = text.index(after: index)
+                    if inString {
+                        if escaped {
+                            escaped = false
+                        } else if character == "\\" {
+                            escaped = true
+                        } else if character == "\"" {
+                            inString = false
+                        }
+                        continue
+                    }
+                    if character == "\"" {
+                        inString = true
+                    } else if character == "{" {
+                        stack.append("}")
+                    } else if character == "[" {
+                        stack.append("]")
+                    } else if character == stack.last {
+                        stack.removeLast()
+                        if stack.isEmpty { return true }
+                    }
+                }
+                return false
+            }
+            while index < objectEnd, text[index] != "," {
+                index = text.index(after: index)
+            }
+            return true
+        }
+
+        skipWhitespace(&cursor)
+        if cursor == objectEnd { return [] }
+        while cursor < objectEnd {
+            let keyStart = cursor
+            guard scanString(&cursor) else { return nil }
+            let keyJSON = String(text[keyStart ..< cursor])
+            guard let keyData = keyJSON.data(using: .utf8),
+                let key = try? JSONDecoder().decode(String.self, from: keyData)
+            else { return nil }
+
+            skipWhitespace(&cursor)
+            guard cursor < objectEnd, text[cursor] == ":" else { return nil }
+            cursor = text.index(after: cursor)
+            skipWhitespace(&cursor)
+
+            let valueStart = cursor
+            guard scanValue(&cursor) else { return nil }
+            let rawValue = String(text[valueStart ..< cursor])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !rawValue.isEmpty else { return nil }
+
+            let isString = rawValue.first == "\""
+            let renderedValue: String
+            if isString {
+                guard let valueData = rawValue.data(using: .utf8),
+                    let decoded = try? JSONDecoder().decode(String.self, from: valueData)
+                else { return nil }
+                renderedValue = decoded
+            } else {
+                renderedValue = rawValue
+            }
+            parameters.append(
+                OrderedJSONParameter(name: key, value: renderedValue, isString: isString)
+            )
+
+            skipWhitespace(&cursor)
+            if cursor == objectEnd { break }
+            guard text[cursor] == "," else { return nil }
+            cursor = text.index(after: cursor)
+            skipWhitespace(&cursor)
+        }
+        return parameters
+    }
+
+    private static func renderToolCallInvoke(
+        name: String,
+        orderedParameters: [OrderedJSONParameter]
+    ) -> String {
+        let inner = orderedParameters.map { parameter in
+            "<\(DeepseekV4Tokens.dsml)parameter name=\"\(parameter.name)\" string=\"\(parameter.isString ? "true" : "false")\">\(parameter.value)</\(DeepseekV4Tokens.dsml)parameter>"
+        }.joined(separator: "\n")
+        return
+            "<\(DeepseekV4Tokens.dsml)invoke name=\"\(name)\">\n\(inner)\n</\(DeepseekV4Tokens.dsml)invoke>"
     }
 
     public static func renderToolCallInvoke(name: String, params: [String: Any]) -> String {
@@ -608,39 +1016,6 @@ public struct DeepseekV4ChatEncoder: Sendable {
         return out
     }
 
-    /// DSV4's required-tool template is sensitive to an ordinary prose
-    /// assistant answer sitting between a previous tool result and the next
-    /// required tool turn: live rows showed it can terminate with a blank
-    /// assistant response instead of entering DSML. For required tool-choice
-    /// turns, collapse that completed prose exchange so the prior tool result
-    /// merges directly with the latest user request. The final required turn
-    /// keeps the ordinary assistant chat tail; opening DSV4's internal action
-    /// task rail here can leak `<｜action｜>` as visible text after tool-result
-    /// history. This preserves the actual tool result and latest user
-    /// instruction; it does not synthesize a tool call or alter sampler
-    /// behavior.
-    static func compactRequiredToolChoiceHistory(_ messages: [Message]) -> [Message] {
-        guard
-            let finalUserIndex = messages.indices.last(where: {
-                messages[$0].role == .user || messages[$0].role == .developer
-            }),
-            finalUserIndex == messages.indices.last,
-            let lastToolIndex = messages[..<finalUserIndex].indices.last(where: {
-                messages[$0].role == .tool
-            }),
-            finalUserIndex > lastToolIndex + 1,
-            messages[(lastToolIndex + 1)..<finalUserIndex].contains(where: {
-                $0.role == .assistant && ($0.toolCalls?.isEmpty ?? true)
-            })
-        else {
-            return messages
-        }
-
-        var compacted = Array(messages[...lastToolIndex])
-        compacted.append(messages[finalUserIndex])
-        return compacted
-    }
-
     static func findLastUserIndex(_ messages: [Message]) -> Int {
         for idx in (0..<messages.count).reversed() {
             let r = messages[idx].role
@@ -739,8 +1114,61 @@ private extension Dictionary where Key == String, Value == any Sendable {
     func jsonSerialized() -> String {
         guard
             let data = try? JSONSerialization.data(
-                withJSONObject: self, options: [.withoutEscapingSlashes])
+                withJSONObject: self, options: [.withoutEscapingSlashes]),
+            let object = try? JSONSerialization.jsonObject(with: data)
         else { return "{}" }
-        return String(data: data, encoding: .utf8) ?? "{}"
+        return Self.pythonStyleJSON(object)
+    }
+
+    /// Match `json.dumps(...)` as used by the official 0731
+    /// `encoding_dsv4.py` tool-schema renderer. Foundation's compact JSON
+    /// removes the spaces after `:`/`,` and emits hash-order dictionaries;
+    /// both change the model's prompt tokens even though the JSON is
+    /// semantically equivalent. DSV4's low-bit affine bundles are
+    /// particularly sensitive to exact identifier-copy prompts, so keep a
+    /// deterministic, native-shaped representation here.
+    static func pythonStyleJSON(_ value: Any) -> String {
+        if let dictionary = value as? [String: Any] {
+            let keys = orderedJSONKeys(in: dictionary)
+            return "{" + keys.map { key in
+                "\(pythonStyleJSON(key)): \(pythonStyleJSON(dictionary[key]!))"
+            }.joined(separator: ", ") + "}"
+        }
+        if let array = value as? [Any] {
+            return "[" + array.map(Self.pythonStyleJSON).joined(separator: ", ") + "]"
+        }
+        guard let scalar = try? JSONSerialization.data(
+            withJSONObject: value,
+            options: [.fragmentsAllowed, .withoutEscapingSlashes]
+        ) else { return "null" }
+        return String(data: scalar, encoding: .utf8) ?? "null"
+    }
+
+    static func orderedJSONKeys(in dictionary: [String: Any]) -> [String] {
+        let preferred: [String]
+        if dictionary["name"] != nil, dictionary["parameters"] != nil {
+            preferred = ["name", "description", "parameters", "strict"]
+        } else if dictionary["type"] != nil, dictionary["properties"] != nil {
+            preferred = [
+                "type", "properties", "required", "additionalProperties",
+                "description", "title", "$defs",
+            ]
+        } else if dictionary["type"] != nil {
+            preferred = [
+                "type", "enum", "items", "description", "default", "examples",
+                "minimum", "maximum", "minLength", "maxLength", "pattern",
+            ]
+        } else {
+            preferred = []
+        }
+        var rank: [String: Int] = [:]
+        for (index, key) in preferred.enumerated() {
+            rank[key] = index
+        }
+        return dictionary.keys.sorted { lhs, rhs in
+            let leftRank = rank[lhs] ?? Int.max
+            let rightRank = rank[rhs] ?? Int.max
+            return leftRank == rightRank ? lhs < rhs : leftRank < rightRank
+        }
     }
 }
