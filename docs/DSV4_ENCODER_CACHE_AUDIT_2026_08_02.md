@@ -142,7 +142,80 @@ This is correct behaviour — the prompt genuinely differs — but a cache
 investigation that changes effort between runs will measure a cold prefill and
 must not read it as a regression.
 
-### 7. No partial-content validator — DELIBERATE, do not "fix" naively
+### 7. Tool matrix, live on `db9250c2`
+
+Driven through the real chat UI, isolated root, Sandbox on, no folder attached.
+
+| tool | result | cache |
+|---|---|---|
+| artifact / file write | card started AND finished ("Wrote a file · 2.7s"), diff card, coherent answer | `HIT 1231 remaining=435` |
+| file read | correctly reported it has no file-reading tool in this session (no folder attached) — honest refusal, no hallucinated envelope, no hang | 4 consecutive HITs across a 4-step agent loop: 1276 → 1380 → 2417 → 3433, **zero misses** |
+| task tracking / todo | "Todo 0/3" panel rendered, all three items named back | `HIT 4515 remaining=295` |
+
+The file-read row is worth keeping: the model had no matching tool and said so
+in prose instead of emitting a malformed DSML envelope. That is the behaviour
+the strict canonical parser is supposed to encourage, and it did not produce the
+"Preparing tool call" stall.
+
+**Mutable system sections move the whole-system boundary, by design.** The todo
+tool writes a section into the system prompt, and the stable set shifted between
+consecutive computations in the same session:
+
+```
+prompt=2596 stable=[72, 1160] all=[72, 1160, 2594]
+prompt=4810 stable=[72, 1128] all=[72, 1128, 4714]
+```
+
+`1160 → 1128` as the todo section changed, while the **static** boundary `72`
+held. That is exactly what `hintedStaticSystemBoundary` exists for, and it is
+why the static hint must keep working: without it, every todo mutation would
+cost the entire system prefix rather than just its mutable tail.
+
+### 8. The `stored+2` re-warm miss — ROOT-CAUSED, still OPEN
+
+vmlx#201 made this much rarer (warm-fetch miss rate 43% → 20%) by publishing
+boundaries for continuation shapes, but the underlying gap is separate and
+unfixed. Signature, seen on both pins:
+
+```
+store 1276 -> boundaries all=[72, 1128, 1279] -> fetch tokens=1278 MISS
+store 2084 -> fetch 2086 MISS
+store 2286 -> fetch 2288 MISS
+store 2756 -> fetch 2758 MISS
+```
+
+It is **not** a probe-range problem. `CacheCoordinator` pages the whole index
+for every stored entry `<= tokens.count` and content-address checks each one,
+and the very same 1276 entry HITs for a later, larger request
+(`HIT 1276 remaining=105` at `tokens=1381`). So the entry is good; the re-warm's
+first 1276 tokens simply are not the stored ones.
+
+Cause, `BatchEngine.swift:3255`:
+
+```swift
+let generatedBoundaryTokens = promptTokens + slot.generatedTokenIds
+```
+
+The post-answer entry stores **prompt + RAW generated tokens** — verified
+arithmetic: `1223 + 53 = 1276`. The next request instead carries the
+**re-rendered** assistant turn, `{reasoning}</think>{content}{tool_calls}` plus
+`<｜end▁of▁sentence｜>`, then the 2-token generation rail. The re-rendered form
+is not token-identical to the raw generation, so the stored sequence is not a
+prefix of the next prompt and the content check correctly rejects it.
+
+This is the same class the hybrid path already solved: the gen-suffix-stripped
+boundary added in vmlx#125 (`BatchEngine.swift:2891`, `promptTokens.lastIndex(of:
+turnStartToken)`), which stores back to the last turn start rather than trusting
+the generated suffix. DSV4 does not take that path — its post-answer store is
+gated on `!usesCanonicalHybridBoundary`, which is false for DSV4, so it stores
+the raw-generated boundary instead.
+
+Fix direction: store the post-answer boundary at the re-rendered history length,
+or strip the generated suffix to the last turn start as the hybrids do. Impact
+is confined to the background re-warm — visible turns hit — so this is a wasted
+prefill rather than a user-visible stall. Needs its own live visual proof.
+
+### 9. No partial-content validator — DELIBERATE, do not "fix" naively
 
 `DSMLToolCallParser` does not override `isValidPartialContent`, so a canonical
 envelope buffers until its closer. Adding a strict grammar check there looks
