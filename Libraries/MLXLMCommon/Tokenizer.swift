@@ -218,7 +218,35 @@ public func canonicalChatCacheBoundaries(
                 .compactMap { $0 }
         )
     ).sorted()
-    let history = exactPrefixBoundary(messages: messages).map { [$0] } ?? []
+    /// A transcript ending in an assistant turn is a CONTINUATION, and formats
+    /// that model that faithfully append no generation rail for it — DSV4's
+    /// official encoder only emits `<｜Assistant｜>` after a user/developer/
+    /// latest_reminder message. Rendering with and without the generation
+    /// prompt then produces identical tokens, so `exactPrefixBoundary`'s strict
+    /// `tokens.count < promptTokens.count` rejects it and the history boundary
+    /// disappears entirely.
+    ///
+    /// That silently killed prefix reuse for exactly the agent-loop turns that
+    /// need it most. Live DSV4 row: a plain turn published
+    /// `all=[72, 1128, 1456]`, but the first turn carrying a completed tool call
+    /// and its artifact published only `all=[72, 1128]` and cold-prefilled 5560
+    /// tokens — and because entries are stored AT published boundaries, the next
+    /// iteration had nothing to reuse either, so every round re-prefilled the
+    /// whole growing transcript.
+    ///
+    /// Fall back to the transcript without that trailing assistant turn. It is
+    /// strictly shorter, and it is still proven by the same exact-token-prefix
+    /// check — this does not relax token identity or admit suffix matching.
+    func trailingContinuationBoundary() -> Int? {
+        guard messages.count > 1,
+              let last = messages.last,
+              (last["role"] as? String) == "assistant"
+        else { return nil }
+        return exactPrefixBoundary(messages: Array(messages.dropLast()))
+    }
+
+    let history = (exactPrefixBoundary(messages: messages)
+        ?? trailingContinuationBoundary()).map { [$0] } ?? []
     let all = Array(Set(stable + history)).sorted()
     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
         FileHandle.standardError.write(Data(
