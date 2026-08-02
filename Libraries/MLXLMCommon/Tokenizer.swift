@@ -272,9 +272,16 @@ public func canonicalChatCacheBoundaries(
         }
         let headDigest = digest(promptTokens.prefix(256))
         let stableDigest = stable.first.map { digest(promptTokens.prefix($0)) } ?? "-"
+        // `head`/`stable0` both sit inside the system prefix, so when they match
+        // across a store and a failing re-warm they only prove the system region
+        // is stable — the first live capture showed exactly that, and the
+        // divergence has to be further in. `hist` covers the conversation span
+        // up to the history boundary, which is where the remaining `stored+2`
+        // miss must originate.
+        let historyDigest = all.last.map { digest(promptTokens.prefix($0)) } ?? "-"
         FileHandle.standardError.write(Data(
             ("[vmlx][cache/boundaries] prompt=\(promptTokens.count) stable=\(stable) all=\(all)"
-                + " head=\(headDigest) stable0=\(stableDigest)\n").utf8
+                + " head=\(headDigest) stable0=\(stableDigest) hist=\(historyDigest)\n").utf8
         ))
     }
     return CanonicalChatCacheBoundaries(all: all, stable: stable)
