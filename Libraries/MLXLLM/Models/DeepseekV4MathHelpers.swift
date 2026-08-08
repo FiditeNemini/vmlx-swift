@@ -788,14 +788,35 @@ public enum DeepseekV4Math {
     // in fp32 — the weights are stored as fp32 and the activations are
     // cast to fp32 before `F.linear`. Hidden contraction is 4096 wide,
     // and bf16/fp16 accumulation drops ~0.5 ULP per logit which
-    // empirically flips arithmetic-style next-token answers. Mirror
-    // that here: dequantize quantized lm_heads to fp32, cast `h` to
-    // fp32, then matmul.
+    // empirically flips arithmetic-style next-token answers.
+    //
+    // Default path is now the fused quantized matmul with fp32
+    // activations: the kernel dequantizes per-group in-registers, so
+    // per token it reads only the packed weights (~0.55 GB vs ~1.97 GB
+    // for a materialized fp32 head at 4096×vocab), while accumulation
+    // stays fp32. Python vmlx (23d2ac294) measured greedy-identical
+    // outputs over 160 steps, logits rel diff 4.8e-04, −0.62 ms/tok.
+    // VMLX_DSV4_LM_HEAD_MODE=exact restores the materialized path.
+    static let lmHeadMode: String =
+        (ProcessInfo.processInfo.environment["VMLX_DSV4_LM_HEAD_MODE"] ?? "qmm").lowercased()
+
     public static func lmHeadFp32(_ h: MLXArray, lmHead: Linear) -> MLXArray {
         if let q = lmHead as? QuantizedLinear {
+            if lmHeadMode != "exact" {
+                let hF32 = h.asType(.float32)
+                var out = MLX.quantizedMM(
+                    hF32, q.weight, scales: q.scales, biases: q.biases,
+                    transpose: true,
+                    groupSize: q.groupSize, bits: q.bits, mode: q.mode
+                )
+                if let b = q.bias {
+                    out = out + b.asType(.float32)
+                }
+                return out
+            }
             let wF32 = MLX.dequantized(
                 q.weight, scales: q.scales, biases: q.biases,
-                groupSize: q.groupSize, bits: q.bits
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode
             ).asType(.float32)
             let hF32 = h.asType(.float32)
             var out = hF32.matmul(wF32.transposed())

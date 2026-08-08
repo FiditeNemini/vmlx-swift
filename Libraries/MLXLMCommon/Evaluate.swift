@@ -1355,7 +1355,8 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.processor = effectiveParameters.processor()
         self.sampler = effectiveParameters.sampler()
-        self.maxTokens = effectiveParameters.maxTokens
+        self.maxTokens = MetalLiveBufferGuard.clampedMaxTokens(
+            requested: effectiveParameters.maxTokens, cache: self.cache)
 
         self.kvBits = effectiveParameters.kvBits
         self.kvGroupSize = effectiveParameters.kvGroupSize

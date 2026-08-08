@@ -1124,3 +1124,10 @@ public final class DeepseekV4Indexer: Module {
         return topIdx
     }
 }
+
+extension DeepseekV4Cache: MetalBufferRetainingCache {
+    /// Measured on DSV4-Flash (Python vMLX R21-13): the cumulative
+    /// compressor/indexer pool state retains ~one live Metal buffer per
+    /// layer per decode token, and `clear_cache` frees none of it.
+    public var retainedBuffersPerDecodeToken: Double { 1.0 }
+}

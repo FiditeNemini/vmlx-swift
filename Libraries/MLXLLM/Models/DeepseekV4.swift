@@ -74,11 +74,49 @@ class DeepseekV4RoPE: Module {
 
     /// Compute cos/sin tables for positions `[offset, offset+L)`.
     /// Returned shape: `(L, dim/2)`.
+    ///
+    /// Memoized across equal-frequency instances: every layer with the
+    /// same (dim, base, factor, origMaxPos, betaFast, betaSlow) asks for
+    /// the same (offset, length) within a forward pass, but each call
+    /// would otherwise build its own positions→angles→cos/sin subgraph
+    /// (~61 identical subgraphs per decode token). The shared single-entry
+    /// table collapses them to one (Python vmlx 4472fe876).
     func cosSin(offset: Int, length: Int) -> (cos: MLXArray, sin: MLXArray) {
+        let key = DeepseekV4RoPE.TableKey(
+            dim: dim, base: base, factor: factor, origMaxPos: origMaxPos,
+            betaFast: betaFast, betaSlow: betaSlow)
+        return DeepseekV4RoPE.sharedCosSin(
+            key: key, invFreq: invFreq, offset: offset, length: length)
+    }
+
+    struct TableKey: Hashable {
+        let dim: Int
+        let base: Float
+        let factor: Float
+        let origMaxPos: Int
+        let betaFast: Float
+        let betaSlow: Float
+    }
+
+    private static let tableLock = NSLock()
+    nonisolated(unsafe) private static var tables:
+        [TableKey: (offset: Int, length: Int, cos: MLXArray, sin: MLXArray)] = [:]
+
+    private static func sharedCosSin(
+        key: TableKey, invFreq: MLXArray, offset: Int, length: Int
+    ) -> (cos: MLXArray, sin: MLXArray) {
+        tableLock.lock()
+        defer { tableLock.unlock() }
+        if let e = tables[key], e.offset == offset, e.length == length {
+            return (e.cos, e.sin)
+        }
         let positions = MLXArray(Int32(offset)..<Int32(offset + length)).asType(.float32)
         // positions: (L,), invFreq: (dim/2,) → angles: (L, dim/2)
         let angles = positions.expandedDimensions(axis: -1) * invFreq.expandedDimensions(axis: 0)
-        return (cos: cos(angles), sin: sin(angles))
+        let c = cos(angles)
+        let s = sin(angles)
+        tables[key] = (offset, length, c, s)
+        return (c, s)
     }
 }
 
