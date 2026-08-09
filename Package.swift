@@ -863,6 +863,7 @@ let package = Package(
                 "VMLXMemorySafetySettingsTests.swift",
                 "DSV4AgenticToolSourceTests.swift",
                 "NoHiddenReasoningCloseBiasFocusedTests.swift",
+                "MinimumReasoningFloorFocusedTests.swift",
                 "TokenizerAddedTokenRegexFocusedTests.swift",
                 "LFM2ShortConvCacheRestoreFocusedTests.swift",
                 "LFM25ChatTemplateRenderFocusedTests.swift",
