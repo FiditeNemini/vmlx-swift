@@ -98,9 +98,29 @@ class DeepseekV4RoPE: Module {
         let betaSlow: Float
     }
 
+    /// Strided variant for the compressor's pooled-row positions
+    /// (`base + k*stride`, k in 0..<count). Every same-ratio compressor
+    /// instance asks for the identical strided window within a forward
+    /// pass, so the memo collapses ~dozens of angle→cos/sin subgraphs per
+    /// prefill chunk to one per (rope key, stride).
+    func cosSin(base: Int, count: Int, stride: Int) -> (cos: MLXArray, sin: MLXArray) {
+        let key = DeepseekV4RoPE.TableKey(
+            dim: dim, base: self.base, factor: factor, origMaxPos: origMaxPos,
+            betaFast: betaFast, betaSlow: betaSlow)
+        return DeepseekV4RoPE.sharedStridedCosSin(
+            key: key, invFreq: invFreq, base: base, count: count, stride: stride)
+    }
+
     private static let tableLock = NSLock()
     nonisolated(unsafe) private static var tables:
         [TableKey: (offset: Int, length: Int, cos: MLXArray, sin: MLXArray)] = [:]
+
+    private struct StridedKey: Hashable {
+        let table: TableKey
+        let stride: Int
+    }
+    nonisolated(unsafe) private static var stridedTables:
+        [StridedKey: (base: Int, count: Int, cos: MLXArray, sin: MLXArray)] = [:]
 
     private static func sharedCosSin(
         key: TableKey, invFreq: MLXArray, offset: Int, length: Int
@@ -116,6 +136,25 @@ class DeepseekV4RoPE: Module {
         let c = cos(angles)
         let s = sin(angles)
         tables[key] = (offset, length, c, s)
+        return (c, s)
+    }
+
+    private static func sharedStridedCosSin(
+        key: TableKey, invFreq: MLXArray, base: Int, count: Int, stride: Int
+    ) -> (cos: MLXArray, sin: MLXArray) {
+        tableLock.lock()
+        defer { tableLock.unlock() }
+        let sKey = StridedKey(table: key, stride: stride)
+        if let e = stridedTables[sKey], e.base == base, e.count == count {
+            return (e.cos, e.sin)
+        }
+        let positions =
+            MLXArray(Int32(0)..<Int32(count)).asType(.float32) * Float(stride)
+            + Float(base)
+        let angles = positions.expandedDimensions(axis: -1) * invFreq.expandedDimensions(axis: 0)
+        let c = cos(angles)
+        let s = sin(angles)
+        stridedTables[sKey] = (base, count, c, s)
         return (c, s)
     }
 }
@@ -362,13 +401,15 @@ class DeepseekV4Attention: Module {
         //     rows into query `j`'s attention.
         var dsv4PrefillMask: MLXArray? = nil
         var poolEntries: Int = 0
+        var tiledPoolOut: MLXArray? = nil
         if compressRatio > 0 {
             let v4Cache = cache as? DeepseekV4Cache
             if v4Cache != nil || L >= compressRatio {
                 if let comp = compressor {
-                    var pooled = comp(x, rope: rope, v4Cache: v4Cache, startPos: offset)
+                    let pooledView = comp(
+                        x, rope: rope, v4Cache: v4Cache, startPos: offset)
                     // pooled shape: (B, W, headDim) where W = pooled count.
-                    let W = pooled.dim(1)
+                    let W = pooledView.rowCount
                     var topK: MLXArray? = nil
                     if compressRatio == 4, let idx = indexer {
                         // The indexer's learned compressor owns a separate
@@ -380,7 +421,23 @@ class DeepseekV4Attention: Module {
                             x, qResidual: qResidual, rope: rope,
                             positionRope: rope, v4Cache: v4Cache, startPos: offset)
                     }
-                    if W > 0 {
+                    if W > 0, pooledView.denseArray == nil {
+                        // Segmented q8 pool, or an oversized BF16 hot tier
+                        // during prefill: tiled online-softmax attention
+                        // replaces SDPA entirely for this layer, so the
+                        // pool is never materialized (Python mirror:
+                        // `_dsv4_tiled_pool_attention`).
+                        tiledPoolOut = DeepseekV4Math.tiledPoolAttention(
+                            queries: q,
+                            localKV: fullKV,
+                            pooled: pooledView,
+                            offset: offset,
+                            window: config.slidingWindow,
+                            ratio: compressRatio,
+                            scale: scale,
+                            sinks: config.useAttnSink ? attnSink : nil,
+                            topK: topK)
+                    } else if W > 0, var pooled = pooledView.denseArray {
 
                         if L == 1 {
                             // DECODE FAST PATH — gather only the topk
@@ -405,31 +462,60 @@ class DeepseekV4Attention: Module {
                                 pooled = pooled.expandedDimensions(axis: 1)
                             }
                         } else {
-                            // PREFILL PATH — flat pool, mask carries
-                            // visibility.
-                            pooled = pooled.expandedDimensions(axis: 1)
-                            // local sliding-window visibility (B,1,L,windowLen)
-                            let localMask = DeepseekV4Math.buildWindowMask(
-                                batch: B, queryLen: L, offset: offset,
-                                window: config.slidingWindow,
-                                windowLen: windowLen)
-                            // compressed-pool causal visibility (B,1,L,W)
-                            var compMask = DeepseekV4Math.compressedVisibility(
-                                batch: B, queryLen: L, offset: offset,
-                                compressedLen: W, ratio: compressRatio)
+                            // PREFILL PATH — with indexer topk, the
+                            // heads-16 Metal kernel attends each query to
+                            // only its window + selected pool rows and
+                            // bypasses SDPA entirely (Python
+                            // `dsv4_heads16_prefill_attention`). Otherwise
+                            // flat pool, mask carries visibility.
+                            var heads16Out: MLXArray? = nil
                             if let tk = topK {
-                                let sel = DeepseekV4Math.indexerSelectionMask(
-                                    topk: tk, compressedLen: W)
-                                compMask = MLX.logicalAnd(compMask, sel)
+                                heads16Out =
+                                    DeepseekV4Math.heads16PrefillAttention(
+                                        queries: q,
+                                        localKV: fullKV,
+                                        pooled: pooled,
+                                        topK: tk,
+                                        offset: offset,
+                                        window: config.slidingWindow,
+                                        ratio: compressRatio,
+                                        scale: scale,
+                                        sinks: config.useAttnSink
+                                            ? attnSink : nil)
                             }
-                            // Pre-broadcast both halves to the same query
-                            // dim (already done by helpers); concat along
-                            // last axis.
-                            dsv4PrefillMask = concatenated(
-                                [localMask, compMask], axis: -1)
+                            if let heads16Out {
+                                tiledPoolOut = heads16Out
+                            } else {
+                                pooled = pooled.expandedDimensions(axis: 1)
+                                // local sliding-window visibility
+                                // (B,1,L,windowLen)
+                                let localMask = DeepseekV4Math.buildWindowMask(
+                                    batch: B, queryLen: L, offset: offset,
+                                    window: config.slidingWindow,
+                                    windowLen: windowLen)
+                                // compressed-pool causal visibility (B,1,L,W)
+                                var compMask =
+                                    DeepseekV4Math.compressedVisibility(
+                                        batch: B, queryLen: L, offset: offset,
+                                        compressedLen: W, ratio: compressRatio)
+                                if let tk = topK {
+                                    let sel =
+                                        DeepseekV4Math.indexerSelectionMask(
+                                            topk: tk, compressedLen: W)
+                                    compMask = MLX.logicalAnd(compMask, sel)
+                                }
+                                // Pre-broadcast both halves to the same query
+                                // dim (already done by helpers); concat along
+                                // last axis.
+                                dsv4PrefillMask = concatenated(
+                                    [localMask, compMask], axis: -1)
+                            }
                         }
 
-                        if pooled.dim(2) > 0 {
+                        // Kernel path already consumed the pool; `pooled`
+                        // is still (B, W, D) there, so dim(2) would be the
+                        // head dim — the tiledPoolOut guard is load-bearing.
+                        if tiledPoolOut == nil, pooled.dim(2) > 0 {
                             poolEntries = pooled.dim(2)
                             fullKV = concatenated([fullKV, pooled], axis: 2)
                         }
@@ -475,10 +561,18 @@ class DeepseekV4Attention: Module {
         }
 
         // --- SDPA with attention sinks ---
-        let sdpaOut = MLXFast.scaledDotProductAttention(
-            queries: q, keys: fullKV, values: fullKV,
-            scale: scale, mask: adjustedMask,
-            sinks: config.useAttnSink ? attnSink.asType(q.dtype) : nil)
+        // Pool-view layers already produced the full local+pool attention
+        // output via the tiled online softmax; everything else runs the
+        // fused SDPA over `fullKV`.
+        let sdpaOut: MLXArray
+        if let tiled = tiledPoolOut {
+            sdpaOut = tiled
+        } else {
+            sdpaOut = MLXFast.scaledDotProductAttention(
+                queries: q, keys: fullKV, values: fullKV,
+                scale: scale, mask: adjustedMask,
+                sinks: config.useAttnSink ? attnSink.asType(q.dtype) : nil)
+        }
         // sdpaOut shape: (B, numHeads, L, headDim)
 
         if useRegions {
@@ -1043,7 +1137,32 @@ class DeepseekV4DecoderLayer: Module {
         finishStage("attn_hc_pre", [xA, postA, combA])
         let normedA = inputLayerNorm(xA)
         finishStage("attn_norm", [normedA])
-        let attnOut = selfAttn(normedA, mask: mask, cache: cache)
+        // Python parity (mlx_model.py:3613-3628): sub-chunked attention.
+        // Each 512-token slice sees the cache offset advanced by the previous
+        // slice's update, so the per-slice mask from the layer's own cache is
+        // exact — numerically identical to top-level 512-chunk prefill. MoE
+        // below still consumes the full chunk for gather_qmm batch throughput.
+        let attnOut: MLXArray
+        let sub = DeepseekV4Math.attnSubchunkTokens
+        if let cache, sub > 0, normedA.dim(1) >= 2 * sub {
+            var outs: [MLXArray] = []
+            var s = 0
+            let chunkLen = normedA.dim(1)
+            while s < chunkLen {
+                let e = min(s + sub, chunkLen)
+                let xs = normedA[0..., s ..< e]
+                // Same mask construction as the proven top-level 512-chunk
+                // path: RotatingKVCache.makeMask defaults its window to
+                // maxCacheSize (the sliding window), from THIS layer's own
+                // advanced offset.
+                let subMask = createAttentionMask(h: xs, cache: cache)
+                outs.append(selfAttn(xs, mask: subMask, cache: cache))
+                s = e
+            }
+            attnOut = concatenated(outs, axis: 1)
+        } else {
+            attnOut = selfAttn(normedA, mask: mask, cache: cache)
+        }
         finishStage("attention", [attnOut])
 
         // Decode tail region (Python `_decode_tail_region`): everything after
@@ -1147,12 +1266,26 @@ public class DeepseekV4ModelInner: Module {
         let hFlat2 = h.reshaped(h.dim(0), h.dim(1), -1)  // for createAttentionMask
         let mask = createAttentionMask(h: hFlat2, cache: firstCache)
 
+        // Python `_layerwise_prefill_materialization_enabled` parity: bound
+        // the lazy cross-layer CSA/HCA graph on deep-context prefill. The
+        // barrier costs 25-30% prefill throughput, so it engages only once
+        // final context exceeds the safe curve (default 24,576 tokens).
+        let chunkTokens = h.dim(1)
+        let layerwisePrefill =
+            chunkTokens > 1
+            && DeepseekV4Math.layerwisePrefillEnabled(
+                chunkTokens: chunkTokens,
+                finalContextTokens: (firstCache?.offset ?? 0) + chunkTokens)
+
         for (i, layer) in layers.enumerated() {
             h = layer(
                 h,
                 mask: mask,
                 cache: cache?[i],
                 inputIds: inputs)
+            if layerwisePrefill {
+                MLX.eval(h)
+            }
         }
 
         // HyperHead reduce: (B, L, hcMult, H) → (B, L, H)
@@ -1249,6 +1382,58 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let h = model(inputs, cache: cache)
         return DeepseekV4Math.lmHeadFp32(h, lmHead: lmHead)
+    }
+
+    /// DSV4 prefill has opposed optima (Python `_dsv4_attn_subchunk_tokens`):
+    /// MoE gather_qmm throughput grows with chunk width while attention cost
+    /// grows super-linearly. With in-layer 512-token attention sub-chunking
+    /// bounding the attention side, the OUTER chunk can widen to 2048 so MoE
+    /// sees 4x the batch (Python reference: 319 → 452 pp/s at 8k). Without
+    /// sub-chunking the default 512 outer chunk is preserved.
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        let prefillStepSize = windowSize ?? 512
+        let sub = DeepseekV4Math.attnSubchunkTokens
+        let outerStep: Int
+        if sub > 0 {
+            let env = ProcessInfo.processInfo.environment
+            let requested = env["DSV4_PREFILL_OUTER_CHUNK"].flatMap(Int.init) ?? 2048
+            outerStep = max(prefillStepSize, requested)
+        } else {
+            outerStep = prefillStepSize
+        }
+
+        let tokensShape = input.text.tokens.shape
+        if tokensShape.count >= 2 && tokensShape[0] != 1 {
+            fatalError(
+                "DeepseekV4Model.prepare expects single-sequence input (batch=1), "
+                    + "got shape \(tokensShape).")
+        }
+
+        var flatTokens = input.text.tokens.reshaped([-1])
+        var flatMask: MLXArray? = nil
+        if let m = input.text.mask {
+            flatMask = m.ndim >= 2 ? m.reshaped([-1]) : m
+        }
+
+        while flatTokens.size > prefillStepSize {
+            try Task.checkCancellation()
+            // Always leave >= 1 token so the caller's final forward yields
+            // the sampling logits (same contract as the LLMModel default).
+            let step = min(outerStep, flatTokens.size - 1)
+            let chunkTokens = flatTokens[..<step][.newAxis, 0...]
+            let chunkMask = flatMask.map { $0[..<step] }
+            let chunkText = LMInput.Text(tokens: chunkTokens, mask: chunkMask)
+            _ = self(chunkText, cache: cache.isEmpty ? nil : cache, state: nil)
+            MLX.eval(cache)
+            flatTokens = flatTokens[step...]
+            if let m = flatMask { flatMask = m[step...] }
+            PrefillProgressReporter.reportCompletedUnits(input.text.tokens.size - flatTokens.size)
+            Memory.clearCache()
+        }
+
+        return .tokens(LMInput.Text(tokens: flatTokens, mask: flatMask))
     }
 
     /// Weight sanitize — remap DSV4 bundle key names to match module

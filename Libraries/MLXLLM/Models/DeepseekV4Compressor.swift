@@ -30,7 +30,7 @@ import MLXNN
 /// traverse thousands of tiny 64-row objects. The full pool is materialized
 /// only as a temporary compatibility input; it is never retained beside the
 /// encoded representation.
-private final class DeepseekV4PoolStorage {
+final class DeepseekV4PoolStorage {
     static let segmentRows = 64
     static let slabMaxRows = 16 * 1024
     static let groupSize = 32
@@ -62,6 +62,20 @@ private final class DeepseekV4PoolStorage {
         return quantizedSegments.flatMap { [$0.codes, $0.scales, $0.biases] }
     }
 
+    var featureDim: Int? {
+        if let hotPool { return hotPool.dim(2) }
+        if let first = quantizedSegments.first { return first.originalShape.last }
+        if let emptySpec { return emptySpec.shape.last }
+        return nil
+    }
+
+    var poolDType: DType? {
+        if let hotPool { return hotPool.dtype }
+        if let first = quantizedSegments.first { return first.originalDType }
+        if let emptySpec { return emptySpec.dtype }
+        return nil
+    }
+
     func materialized() -> MLXArray? {
         if let hotPool { return hotPool }
         if quantizedSegments.isEmpty {
@@ -72,6 +86,143 @@ private final class DeepseekV4PoolStorage {
         }
         let parts = quantizedSegments.map(Self.dequantize)
         return parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
+    }
+
+    /// Visit `(globalRowStart, dequantized tile)` pairs under a strict row
+    /// bound. Only one bounded tile's graph is handed out per callback so
+    /// attention/top-k consumers never materialize the complete pool
+    /// (Python mirror: `_StateProxy.iter_dequantized_tiles`). BF16 hot
+    /// pools are sliced without any quantization round-trip.
+    func forEachDequantizedTile(maxRows: Int, _ body: (Int, MLXArray) -> Void) {
+        let maxRows = max(1, maxRows)
+        if let hotPool {
+            let rows = hotPool.dim(1)
+            var start = 0
+            while start < rows {
+                let end = min(start + maxRows, rows)
+                body(start, hotPool[0..., start ..< end, 0...])
+                start = end
+            }
+            return
+        }
+
+        var cursor = 0
+        var pending: [HybridPoolQuantizedSegment] = []
+        var pendingStart = 0
+        var pendingRows = 0
+
+        func flush() {
+            guard !pending.isEmpty else { return }
+            let parts = pending.map(Self.dequantize)
+            let tile = parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
+            pending = []
+            pendingRows = 0
+            body(pendingStart, tile)
+        }
+
+        for segment in quantizedSegments {
+            let segmentRows = segment.rowCount
+            var segmentOffset = 0
+            while segmentOffset < segmentRows {
+                let take = min(maxRows - pendingRows, segmentRows - segmentOffset)
+                let piece =
+                    (segmentOffset == 0 && take == segmentRows)
+                    ? segment
+                    : Self.sliceRows(
+                        segment, from: segmentOffset, to: segmentOffset + take)
+                if pending.isEmpty { pendingStart = cursor + segmentOffset }
+                pending.append(piece)
+                pendingRows += take
+                segmentOffset += take
+                if pendingRows == maxRows { flush() }
+            }
+            cursor += segmentRows
+        }
+        flush()
+    }
+
+    /// Gather CSA-selected rows without decoding a single unselected pool
+    /// row. `indices` holds global pool-row indices with shape `(B, ..., K)`;
+    /// the result is `(*indices.shape, D)`. Selected indices are already
+    /// materialized at the top-k boundary, so one small device-to-host copy
+    /// maps each occurrence to its owning q8 segment (Python mirror:
+    /// `_StateProxy.gather_dequantized_rows`).
+    func gatherDequantizedRows(_ indices: MLXArray) -> MLXArray {
+        precondition(
+            indices.ndim >= 2,
+            "DSV4 pool gather indices must include batch and row axes")
+        let outShape = indices.shape
+        let width = featureDim ?? 0
+        let dtype = poolDType ?? .float32
+
+        if let hotPool {
+            let B = hotPool.dim(0)
+            let D = hotPool.dim(2)
+            let flat = indices.reshaped(B, -1).asType(.int32)
+            let idxBroad = broadcast(
+                flat.expandedDimensions(axis: -1), to: [B, flat.dim(1), D])
+            return takeAlong(hotPool, idxBroad, axis: 1)
+                .reshaped(outShape + [D])
+        }
+
+        let rows = rowCount
+        let B = indices.dim(0)
+        let hostIndices = indices.asType(.int32).asArray(Int32.self)
+        if hostIndices.isEmpty || rows == 0 {
+            return MLXArray.zeros(outShape + [width], dtype: dtype)
+        }
+        let perBatch = hostIndices.count / B
+
+        var segmentEnds: [Int] = []
+        var acc = 0
+        for segment in quantizedSegments {
+            acc += segment.rowCount
+            segmentEnds.append(acc)
+        }
+        let segmentStarts = [0] + segmentEnds.dropLast()
+
+        var batchBySegment: [Int: [Int32]] = [:]
+        var rowsBySegment: [Int: [Int32]] = [:]
+        var positionsBySegment: [Int: [Int]] = [:]
+        for (position, rawIndex) in hostIndices.enumerated() {
+            let global = Int(rawIndex)
+            precondition(
+                global >= 0 && global < rows,
+                "DSV4 pool gather index outside retained rows: \(global) of \(rows)")
+            var lo = 0
+            var hi = segmentEnds.count - 1
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if segmentEnds[mid] > global { hi = mid } else { lo = mid + 1 }
+            }
+            batchBySegment[lo, default: []].append(Int32(position / perBatch))
+            rowsBySegment[lo, default: []].append(Int32(global - segmentStarts[lo]))
+            positionsBySegment[lo, default: []].append(position)
+        }
+
+        var decodedParts: [MLXArray] = []
+        var positions: [Int] = []
+        for segmentId in batchBySegment.keys.sorted() {
+            decodedParts.append(
+                Self.dequantizeSelected(
+                    quantizedSegments[segmentId],
+                    batchIndices: batchBySegment[segmentId]!,
+                    rowIndices: rowsBySegment[segmentId]!))
+            positions.append(contentsOf: positionsBySegment[segmentId]!)
+        }
+        var decoded =
+            decodedParts.count == 1
+            ? decodedParts[0] : concatenated(decodedParts, axis: 0)
+        if positions.count > 1 {
+            // positions is a permutation of 0..<N: restore[j] = decoded row
+            // holding output occurrence j.
+            var restore = [Int32](repeating: 0, count: positions.count)
+            for (decodedRow, position) in positions.enumerated() {
+                restore[position] = Int32(decodedRow)
+            }
+            decoded = take(decoded, MLXArray(restore), axis: 0)
+        }
+        return decoded.reshaped(outShape + [width])
     }
 
     func replace(with value: MLXArray?) {
@@ -265,8 +416,16 @@ private final class DeepseekV4PoolStorage {
 
         func flushPending() {
             guard !pending.isEmpty else { return }
-            regrouped.append(
-                pending.count == 1 ? pending[0] : Self.concatenate(pending))
+            if pending.count == 1 {
+                regrouped.append(pending[0])
+            } else {
+                let slab = Self.concatenate(pending)
+                // Concatenate only async-schedules; a near-1M restore would
+                // otherwise push the whole regroup into the Metal stream with
+                // no sync, which can exhaust device memory beside the weights.
+                MLX.eval([slab.codes, slab.scales, slab.biases])
+                regrouped.append(slab)
+            }
             pending = []
             pendingRows = 0
         }
@@ -306,7 +465,7 @@ private final class DeepseekV4PoolStorage {
             min: Float(0), max: qmax).asType(.uint8)
         let scales = scales32.asType(.float16)
         let biases = minimums.asType(.float16)
-        MLX.eval([codes, scales, biases])
+        asyncEval([codes, scales, biases])
         return HybridPoolQuantizedSegment(
             codes: codes,
             scales: scales,
@@ -321,6 +480,49 @@ private final class DeepseekV4PoolStorage {
         (segment.codes.asType(.float32) * segment.scales.asType(.float32)
             + segment.biases.asType(.float32))
             .reshaped(segment.originalShape)
+            .asType(segment.originalDType)
+    }
+
+    /// Lazy row-range view of a segment for bounded tile iteration. No eval:
+    /// the slices are transient graph nodes consumed by one dequantize.
+    private static func sliceRows(
+        _ segment: HybridPoolQuantizedSegment, from start: Int, to end: Int
+    ) -> HybridPoolQuantizedSegment {
+        var shape = segment.originalShape
+        shape[1] = end - start
+        return HybridPoolQuantizedSegment(
+            codes: segment.codes[0..., start ..< end, 0..., 0...],
+            scales: segment.scales[0..., start ..< end, 0..., 0...],
+            biases: segment.biases[0..., start ..< end, 0..., 0...],
+            originalShape: shape,
+            groupSize: segment.groupSize,
+            bits: segment.bits,
+            originalDType: segment.originalDType)
+    }
+
+    /// Decode exactly the requested `(batch, row)` occurrences of one q8
+    /// segment. Returns `(N, D)` in occurrence order (Python mirror:
+    /// `_dequant_qpool_selected`).
+    private static func dequantizeSelected(
+        _ segment: HybridPoolQuantizedSegment,
+        batchIndices: [Int32],
+        rowIndices: [Int32]
+    ) -> MLXArray {
+        let rows = segment.rowCount
+        let linear = MLXArray(
+            zip(batchIndices, rowIndices).map { $0 * Int32(rows) + $1 })
+
+        func flatten(_ arr: MLXArray) -> MLXArray {
+            let shape = arr.shape
+            return arr.reshaped([shape[0] * shape[1]] + Array(shape.dropFirst(2)))
+        }
+        let codes = take(flatten(segment.codes), linear, axis: 0)
+        let scales = take(flatten(segment.scales), linear, axis: 0)
+        let biases = take(flatten(segment.biases), linear, axis: 0)
+        let width = segment.originalShape.last ?? 0
+        return (codes.asType(.float32) * scales.asType(.float32)
+            + biases.asType(.float32))
+            .reshaped(batchIndices.count, width)
             .asType(segment.originalDType)
     }
 
@@ -354,7 +556,7 @@ private final class DeepseekV4PoolStorage {
             groupSize: first.groupSize,
             bits: first.bits,
             originalDType: first.originalDType)
-        MLX.eval([result.codes, result.scales, result.biases])
+        asyncEval([result.codes, result.scales, result.biases])
         return result
     }
 
@@ -372,8 +574,107 @@ private final class DeepseekV4PoolStorage {
             groupSize: segment.groupSize,
             bits: segment.bits,
             originalDType: segment.originalDType)
-        MLX.eval([result.codes, result.scales, result.biases])
+        asyncEval([result.codes, result.scales, result.biases])
         return result
+    }
+}
+
+// MARK: - DSV4 pool view
+
+/// Attention-facing representation of a compressor/indexer pool.
+///
+/// Python mirror: `_QuantizedPoolView` + `update_pool_view`. A pool stays a
+/// dense array while its BF16 hot tier is small — decode keeps the fused-SDPA
+/// fast path, prefill keeps dense masks. Once the branch promotes to
+/// segmented q8 storage, or a prefill's hot tier crosses the dense-row cap,
+/// attention receives the bounded form instead and must iterate tiles or
+/// gather selected rows — the complete historical pool is never materialized
+/// on the token path.
+public struct DeepseekV4PoolView {
+    private enum Backing {
+        case dense(MLXArray)
+        case storage(DeepseekV4PoolStorage)
+    }
+
+    private let backing: Backing
+
+    init(dense: MLXArray) {
+        self.backing = .dense(dense)
+    }
+
+    init(storage: DeepseekV4PoolStorage) {
+        self.backing = .storage(storage)
+    }
+
+    /// Non-nil when attention may use the dense fused-SDPA / dense-mask path.
+    public var denseArray: MLXArray? {
+        if case .dense(let array) = backing { return array }
+        return nil
+    }
+
+    public var rowCount: Int {
+        switch backing {
+        case .dense(let array): return array.dim(1)
+        case .storage(let storage): return storage.rowCount
+        }
+    }
+
+    public var featureDim: Int {
+        switch backing {
+        case .dense(let array): return array.dim(2)
+        case .storage(let storage): return storage.featureDim ?? 0
+        }
+    }
+
+    public var dtype: DType {
+        switch backing {
+        case .dense(let array): return array.dtype
+        case .storage(let storage): return storage.poolDType ?? .float32
+        }
+    }
+
+    public func forEachDequantizedTile(
+        maxRows: Int, _ body: (Int, MLXArray) -> Void
+    ) {
+        switch backing {
+        case .dense(let array):
+            let rows = array.dim(1)
+            let maxRows = max(1, maxRows)
+            var start = 0
+            while start < rows {
+                let end = min(start + maxRows, rows)
+                body(start, array[0..., start ..< end, 0...])
+                start = end
+            }
+        case .storage(let storage):
+            storage.forEachDequantizedTile(maxRows: maxRows, body)
+        }
+    }
+
+    public func gatherDequantizedRows(_ indices: MLXArray) -> MLXArray {
+        switch backing {
+        case .dense(let array):
+            let B = array.dim(0)
+            let D = array.dim(2)
+            let flat = indices.reshaped(B, -1).asType(.int32)
+            let idxBroad = broadcast(
+                flat.expandedDimensions(axis: -1), to: [B, flat.dim(1), D])
+            return takeAlong(array, idxBroad, axis: 1)
+                .reshaped(indices.shape + [D])
+        case .storage(let storage):
+            return storage.gatherDequantizedRows(indices)
+        }
+    }
+
+    /// Compatibility-only full materialization; never used on the token path.
+    public func materialized() -> MLXArray {
+        switch backing {
+        case .dense(let array):
+            return array
+        case .storage(let storage):
+            return storage.materialized()
+                ?? MLXArray.zeros([1, 0, 1], dtype: .float32)
+        }
     }
 }
 
@@ -432,8 +733,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
     private final class PendingPoolSlot {
         var inputs: [MLXArray] = []
         var basePosition = 0
-        var lastPool: MLXArray?
-        var flush: ((MLXArray, Int) -> MLXArray)?
+        var lastPool: DeepseekV4PoolView?
+        var flush: ((MLXArray, Int) -> DeepseekV4PoolView)?
     }
     private let compPending = PendingPoolSlot()
     private let idxPending = PendingPoolSlot()
@@ -768,11 +1069,48 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         }
     }
 
-    public func appendPooled(_ key: BranchKey, value: MLXArray) -> MLXArray {
+    /// Prefill keys-per-query transients scale with pool rows on the dense
+    /// path and Metal-OOM past ~180K tokens even while the hot tier is BF16.
+    /// Above this row cap prefill gets the bounded tiled view instead; decode
+    /// keeps its dense hot tier. Rows, not bytes, so the 512-wide compressor
+    /// and 128-wide indexer branches flip together (Python mirror:
+    /// `_POOL_PREFILL_DENSE_MAX_ROWS`).
+    public static let poolPrefillDenseMaxRows: Int = {
+        if let raw = ProcessInfo.processInfo.environment[
+            "DSV4_POOL_PREFILL_DENSE_MAX_ROWS"],
+            let parsed = Int(raw)
+        {
+            return max(0, parsed)
+        }
+        return 16384
+    }()
+
+    /// Active attention representation for one branch (Python mirror:
+    /// `update_pool_view` return rules).
+    func poolView(
+        _ key: BranchKey, isPrefill: Bool, emptyLike: MLXArray
+    ) -> DeepseekV4PoolView {
+        let storage = key == .compressor ? compPool : idxPool
+        if let hot = storage.hotPool {
+            if !isPrefill || hot.dim(1) <= Self.poolPrefillDenseMaxRows {
+                return DeepseekV4PoolView(dense: hot)
+            }
+            return DeepseekV4PoolView(storage: storage)
+        }
+        if !storage.quantizedSegments.isEmpty {
+            return DeepseekV4PoolView(storage: storage)
+        }
+        return DeepseekV4PoolView(
+            dense: MLXArray.zeros(
+                [emptyLike.dim(0), 0, emptyLike.dim(2)], dtype: emptyLike.dtype))
+    }
+
+    public func appendPooled(
+        _ key: BranchKey, value: MLXArray, isPrefill: Bool
+    ) -> DeepseekV4PoolView {
         let storage = key == .compressor ? compPool : idxPool
         storage.append(value)
-        return storage.materialized()
-            ?? MLXArray.zeros([value.dim(0), 0, value.dim(2)], dtype: value.dtype)
+        return poolView(key, isPrefill: isPrefill, emptyLike: value)
     }
 
     public enum BranchKey: Hashable { case compressor, indexer }
@@ -790,8 +1128,8 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         startPos: Int,
         ratio: Int,
         overlap: Bool,
-        flush: @escaping (MLXArray, Int) -> MLXArray
-    ) -> MLXArray {
+        flush: @escaping (MLXArray, Int) -> DeepseekV4PoolView
+    ) -> DeepseekV4PoolView {
         let slot = pendingSlot(branch)
         if slot.inputs.isEmpty {
             slot.basePosition = startPos
@@ -807,17 +1145,19 @@ public final class DeepseekV4Cache: QuantizedHybridPoolCache, CacheRetainedByteC
         }
         if slot.lastPool == nil || bufferedRows + slot.inputs.count >= ratio {
             return flushPoolPending(branch: branch)
-                ?? MLXArray.zeros([x.dim(0), 0, x.dim(2)], dtype: x.dtype)
+                ?? DeepseekV4PoolView(
+                    dense: MLXArray.zeros(
+                        [x.dim(0), 0, x.dim(2)], dtype: x.dtype))
         }
         return slot.lastPool!
     }
 
-    func notePoolResult(_ value: MLXArray, branch: BranchKey) {
+    func notePoolResult(_ value: DeepseekV4PoolView, branch: BranchKey) {
         pendingSlot(branch).lastPool = value
     }
 
     @discardableResult
-    func flushPoolPending(branch: BranchKey) -> MLXArray? {
+    func flushPoolPending(branch: BranchKey) -> DeepseekV4PoolView? {
         let slot = pendingSlot(branch)
         guard !slot.inputs.isEmpty else { return slot.lastPool }
         let inputs = slot.inputs
@@ -942,6 +1282,8 @@ public final class DeepseekV4Compressor: Module {
 
     @ModuleInfo(key: "wkv") var wkv: Linear
     @ModuleInfo(key: "wgate") var wgate: Linear
+    private var frontOverlapRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+    private var frontRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
     /// APE: (compress_ratio, out_dim) learned positional bias inside
     /// each pool window.
     @ParameterInfo(key: "ape") var ape: MLXArray
@@ -979,16 +1321,16 @@ public final class DeepseekV4Compressor: Module {
         return !["0", "false", "off", "no"].contains(raw)
     }
 
-    /// Forward. Returns pooled summary of shape (B, pooled_count, headDim).
-    /// When `v4Cache` is provided, pooled is appended to the cache pool
-    /// and the full cached pool is returned.
+    /// Forward. Returns the branch's active pool representation (dense while
+    /// small, bounded view once promoted). When `v4Cache` is provided, newly
+    /// completed windows are appended to the cache pool first.
     func callAsFunction(
         _ x: MLXArray,
         rope: DeepseekV4RoPE,
         v4Cache: DeepseekV4Cache?,
         startPos: Int,
         branch: DeepseekV4Cache.BranchKey = .compressor
-    ) -> MLXArray {
+    ) -> DeepseekV4PoolView {
         if deferPoolDuringDecode,
            x.dim(0) == 1,
            x.dim(1) == 1,
@@ -1004,12 +1346,16 @@ public final class DeepseekV4Compressor: Module {
                 guard let cache else {
                     fatalError("DSV4 cache released while flushing deferred pool state")
                 }
+                // Deferred tokens are decode tokens: the flush may carry up
+                // to `ratio` of them, but the consuming forward has L == 1,
+                // so the view decision must stay on the decode rules.
                 return self.advance(
                     pending,
                     rope: rope,
                     v4Cache: cache,
                     startPos: basePosition,
-                    branch: branch)
+                    branch: branch,
+                    isPrefill: false)
             }
         }
 
@@ -1018,7 +1364,8 @@ public final class DeepseekV4Compressor: Module {
         v4Cache?.flushPoolPending()
         let result = advance(
             x, rope: rope, v4Cache: v4Cache,
-            startPos: startPos, branch: branch)
+            startPos: startPos, branch: branch,
+            isPrefill: x.dim(1) > 1)
         v4Cache?.notePoolResult(result, branch: branch)
         return result
     }
@@ -1030,22 +1377,95 @@ public final class DeepseekV4Compressor: Module {
         rope: DeepseekV4RoPE,
         v4Cache: DeepseekV4Cache?,
         startPos: Int,
-        branch: DeepseekV4Cache.BranchKey
-    ) -> MLXArray {
+        branch: DeepseekV4Cache.BranchKey,
+        isPrefill: Bool
+    ) -> DeepseekV4PoolView {
         let B = x.dim(0)
-        // Official 0731 stages the compressor projections and pooling state
-        // in fp32. This must happen before the linears, not merely after them.
-        let projectionInput = x.asType(.float32)
-        var kv = wkv(projectionInput)
-        var gate = wgate(projectionInput)
+        let L = x.dim(1)
+        // Python `_decode_front(_overlap)` parity: compiled wkv/wgate front
+        // (+ APE fold for overlap) for single-token decode and the small
+        // ≤ratio flushes pool deferral emits. Each distinct flush length adds
+        // one trace (k ≤ 4 for overlap); ratio-128 flushes stay eager — up to
+        // 128 distinct shapes would each retrace.
+        let useCompiledFront =
+            DeepseekV4Math.compileRegionsEnabled
+            && v4Cache != nil
+            && (L == 1 || (overlap && L <= compressRatio))
+            && !CompiledDecodeTrace.isActive
+
+        var kv: MLXArray
+        var gate: MLXArray
+        var apeFolded = false
+        if useCompiledFront, overlap {
+            let region: @Sendable ([MLXArray]) -> [MLXArray]
+            if let cached = frontOverlapRegion {
+                region = cached
+            } else {
+                let ratio = Int32(compressRatio)
+                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+                    CompiledDecodeTrace.withActive {
+                        // Official 0731 stages the compressor projections in
+                        // fp32 — the cast must precede the linears.
+                        let x32 = args[0].asType(.float32)
+                        let kvOut = self.wkv(x32)
+                        let gateOut = self.wgate(x32)
+                        let apeRows = self.ape.asType(gateOut.dtype)[args[1] % ratio]
+                        return [kvOut, gateOut + apeRows.expandedDimensions(axis: 0)]
+                    }
+                }
+                frontOverlapRegion = region
+            }
+            let pos = MLXArray(Int32(startPos)..<Int32(startPos + L))
+            let outs = region([x, pos])
+            if outs.count == 2 {
+                kv = outs[0]
+                gate = outs[1]
+                apeFolded = true
+            } else {
+                let projectionInput = x.asType(.float32)
+                kv = wkv(projectionInput)
+                gate = wgate(projectionInput)
+            }
+        } else if useCompiledFront {
+            let region: @Sendable ([MLXArray]) -> [MLXArray]
+            if let cached = frontRegion {
+                region = cached
+            } else {
+                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+                    CompiledDecodeTrace.withActive {
+                        let x32 = args[0].asType(.float32)
+                        return [self.wkv(x32), self.wgate(x32)]
+                    }
+                }
+                frontRegion = region
+            }
+            let outs = region([x])
+            if outs.count == 2 {
+                kv = outs[0]
+                gate = outs[1]
+            } else {
+                let projectionInput = x.asType(.float32)
+                kv = wkv(projectionInput)
+                gate = wgate(projectionInput)
+            }
+        } else {
+            // Official 0731 stages the compressor projections and pooling
+            // state in fp32. This must happen before the linears, not merely
+            // after them.
+            let projectionInput = x.asType(.float32)
+            kv = wkv(projectionInput)
+            gate = wgate(projectionInput)
+        }
 
         var poolBase = startPos
         let alreadyWindowed: Bool
         if let cache = v4Cache, overlap {
-            let positions = MLXArray(
-                Int32(startPos)..<Int32(startPos + gate.dim(1)))
-            let apeRows = ape.asType(gate.dtype)[positions % Int32(compressRatio)]
-            gate = gate + apeRows.expandedDimensions(axis: 0)
+            if !apeFolded {
+                let positions = MLXArray(
+                    Int32(startPos)..<Int32(startPos + gate.dim(1)))
+                let apeRows = ape.asType(gate.dtype)[positions % Int32(compressRatio)]
+                gate = gate + apeRows.expandedDimensions(axis: 0)
+            }
             let accumulated = accumulateOverlapWindows(
                 kv: kv, gate: gate, cache: cache, branch: branch,
                 ratio: compressRatio, startPos: startPos)
@@ -1083,9 +1503,9 @@ public final class DeepseekV4Compressor: Module {
         if kv.dim(1) == 0 {
             let empty = MLXArray.zeros([B, 0, headDim], dtype: x.dtype)
             if let cache = v4Cache {
-                return cache.getPooled(branch) ?? empty
+                return cache.poolView(branch, isPrefill: isPrefill, emptyLike: empty)
             }
-            return empty
+            return DeepseekV4PoolView(dense: empty)
         }
 
         let W: Int
@@ -1117,17 +1537,12 @@ public final class DeepseekV4Compressor: Module {
         pooled = norm(pooled.asType(x.dtype))
 
         // Apply RoPE at the chunk centers (position = chunk_idx * ratio
-        // + pool_base).
-        let positions =
-            MLXArray(
-                Int32(0)..<Int32(pooled.dim(1))
-            ).asType(.float32) * Float(compressRatio) + Float(poolBase)
-        // Build cos/sin at those positions.
-        let angles =
-            positions.expandedDimensions(axis: -1)
-            * rope.invFreq.expandedDimensions(axis: 0)
-        let cosP = cos(angles).expandedDimensions(axes: [0])
-        let sinP = sin(angles).expandedDimensions(axes: [0])
+        // + pool_base). Shared strided table: same-ratio compressor
+        // instances all ask for the identical window per forward pass.
+        let (cosT, sinT) = rope.cosSin(
+            base: poolBase, count: pooled.dim(1), stride: compressRatio)
+        let cosP = cosT.expandedDimensions(axes: [0])
+        let sinP = sinT.expandedDimensions(axes: [0])
         pooled = DeepseekV4Math.applyPartialRoPE(
             pooled, cos: cosP, sin: sinP, ropeDim: rope.dim)
 
@@ -1147,9 +1562,9 @@ public final class DeepseekV4Compressor: Module {
         }
 
         if let cache = v4Cache {
-            return cache.appendPooled(branch, value: pooled)
+            return cache.appendPooled(branch, value: pooled, isPrefill: isPrefill)
         }
-        return pooled
+        return DeepseekV4PoolView(dense: pooled)
     }
 
     /// Ratio-4 overlap accumulation for the stateful decode path.
@@ -1366,10 +1781,10 @@ public final class DeepseekV4Indexer: Module {
         v4Cache: DeepseekV4Cache?,
         startPos: Int
     ) -> MLXArray? {
-        let pooled = compressor(
+        let pooledView = compressor(
             x, rope: rope, v4Cache: v4Cache,
             startPos: startPos, branch: .indexer)
-        let pooledLen = pooled.dim(1)
+        let pooledLen = pooledView.rowCount
         if pooledLen == 0 { return nil }
 
         let B = x.dim(0)
@@ -1397,6 +1812,25 @@ public final class DeepseekV4Indexer: Module {
             q = DeepseekV4Math.indexerActivationRoundTrip(q)
         }
 
+        // weights: (B, L, nHeads) * n_heads^-0.5.
+        let wRaw = weightsProj(x).asType(.float32)
+            * MLXArray(1.0 / sqrt(Float(nHeads)))
+
+        guard let pooled = pooledView.denseArray else {
+            // Segmented q8 pool, or an oversized BF16 hot tier during
+            // prefill: exact global top-k over bounded dequantized tiles so
+            // the fp32 score matrix never spans the whole pool (Python
+            // mirror: `_dsv4_tiled_index_topk`).
+            return DeepseekV4Math.tiledIndexTopk(
+                queries: q,
+                headWeights: wRaw,
+                pooled: pooledView,
+                scale: scale,
+                topK: topK,
+                offset: startPos,
+                ratio: compressRatio)
+        }
+
         // scores: (B, nHeads, L, pooledLen). Match Python shape.
         // q is (B, nHeads, L, headDim); pooled is (B, pooledLen, headDim).
         // Expand pooled to (B, 1, pooledLen, headDim) for broadcast.
@@ -1405,10 +1839,6 @@ public final class DeepseekV4Indexer: Module {
             pooledBroad.asType(.float32).swappedAxes(-1, -2))
         scores = maximum(scores, MLXArray(0.0)) * MLXArray(scale)
 
-        // weights: (B, L, nHeads) * n_heads^-0.5. Broadcast over the
-        // pooled axis and sum over heads.
-        let wRaw = weightsProj(x).asType(.float32)
-            * MLXArray(1.0 / sqrt(Float(nHeads)))
         // Reshape scores sum axis: (B, 1, L, nHeads) multiply → sum.
         let wExpanded = wRaw.swappedAxes(-1, -2).expandedDimensions(axis: -1)
         scores = (scores * wExpanded).sum(axis: 1)  // (B, L, pooledLen)
