@@ -928,7 +928,18 @@ public struct SuppressTokensProcessor: LogitProcessor {
 /// capped thinking by forcing the close after a budget): a leading-window
 /// mask can only DELAY a token. It never forces, biases toward, or injects
 /// one — see `NoHiddenReasoningCloseBiasFocusedTests`.
+///
+/// Logit processors run before the sampler's `top_p`, so banning a token that
+/// holds nearly all the probability mass renormalizes a nearly flat residual
+/// and nucleus sampling then admits the whole vocabulary tail — live DSV4 runs
+/// turned into token soup from the first reasoning token. The window therefore
+/// also drops survivors that fall below ``survivorRelativeFloor`` of the best
+/// remaining token, which keeps the nucleus as narrow as it was before the ban.
 public struct InitialSuppressTokensProcessor: LogitProcessor {
+    /// Minimum probability a survivor may hold relative to the best remaining
+    /// token while the ban is active. Standard `min_p` territory.
+    static let survivorRelativeFloor: Float = 0.05
+
     private let tokens: [Int]
     private var remaining: Int
     private let negInf = MLXArray(-Float.infinity)
@@ -958,7 +969,9 @@ public struct InitialSuppressTokensProcessor: LogitProcessor {
             FileHandle.standardError.write(Data(line.utf8))
         }
         logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
-        return logits
+        let bestSurvivor = MLX.max(logits, axis: -1, keepDims: true)
+        let cutoff = bestSurvivor + Float(log(Self.survivorRelativeFloor))
+        return MLX.where(logits .< cutoff, negInf, logits)
     }
 
     mutating public func didSample(token: MLXArray) {
