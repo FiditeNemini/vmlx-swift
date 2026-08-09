@@ -585,7 +585,7 @@ value_1
 {%- elif enable_thinking and reasoning_effort == 'max' -%}
 {{- 'Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n' -}}
 {%- elif enable_thinking -%}
-{{- 'Reasoning Effort: Low — minimal thinking only.\nYou MUST do all of your reasoning inside your thinking block, keeping it to at most a few short sentences to confirm the approach.\nThen close your thinking and give only the final answer — clean and direct, without restating any of your reasoning.\n\n' -}}
+{{- 'Reasoning Effort: Low — minimal thinking only.\nBegin with a very short thinking block: one or two sentences confirming your approach, never more.\nThen close your thinking and give only the final answer — clean and direct, without restating your reasoning.\n\n' -}}
 {%- endif -%}
 {%- for message in messages -%}
 {%- if message['role'] == 'system' -%}

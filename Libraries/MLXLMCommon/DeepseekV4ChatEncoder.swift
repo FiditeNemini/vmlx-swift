@@ -86,8 +86,8 @@ public struct DeepseekV4ChatEncoder: Sendable {
     // renders can never diverge.
     static let reasoningEffortLowPreface = """
         Reasoning Effort: Low — minimal thinking only.
-        You MUST do all of your reasoning inside your thinking block, keeping it to at most a few short sentences to confirm the approach.
-        Then close your thinking and give only the final answer — clean and direct, without restating any of your reasoning.
+        Begin with a very short thinking block: one or two sentences confirming your approach, never more.
+        Then close your thinking and give only the final answer — clean and direct, without restating your reasoning.
 
 
         """
