@@ -44,11 +44,16 @@ struct MinimumReasoningFloorFocusedTests {
     @Test("masking a near-certain token must not open the nucleus to the vocab tail")
     func maskedWindowKeepsNucleusClosed() throws {
         try FocusedMLXTestSupport.withLock {
-            // Reproduces the live DSV4 token soup: on the enforced-low rail the
-            // model puts ~97% of its mass on `</think>`. Logit processors run
-            // BEFORE the sampler's top_p, so banning that token renormalizes a
-            // nearly flat residual and nucleus sampling then admits thousands of
-            // junk tokens. Unmasked, top_p would have kept the close token alone.
+            // Logit processors run BEFORE the sampler's top_p, so banning a token
+            // that holds most of the mass renormalizes a nearly flat residual and
+            // nucleus sampling then admits thousands of junk tokens. Unmasked,
+            // top_p would have kept the close token alone.
+            //
+            // This is a property of the processor, not an explanation of the live
+            // DSV4 token soup — that reproduces at temperature 0, where this whole
+            // path is argmax and the min_p floor cannot matter. The commit that
+            // added this test claimed otherwise; see
+            // Docs/Internal/DSV4-TOKEN-SOUP-ROOT-CAUSE-2026-08-09.md.
             let vocab = 4000
             let banned = 7
             let plausible: Set<Int> = [1, 2, 3]
