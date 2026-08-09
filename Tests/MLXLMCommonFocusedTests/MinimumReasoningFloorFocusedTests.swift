@@ -41,18 +41,24 @@ struct MinimumReasoningFloorFocusedTests {
         }
     }
 
-    @Test("floor arms only on the enforced-low thinking rail")
+    @Test("floor arms on every enforced-effort thinking rail and nowhere else")
     func railMatchingIsExact() {
         let lowHead = DeepseekV4ChatEncoder.reasoningEffortLowPreface + "You are helpful."
         let highHead = DeepseekV4ChatEncoder.reasoningEffortHighPreface + "You are helpful."
+        let maxHead = DeepseekV4ChatEncoder.reasoningEffortMaxPreface + "You are helpful."
+        let bareHead = "You are helpful."
         let thinkTail = "<｜Assistant｜><think>"
         let chatTail = "<｜Assistant｜><think></think>"
 
         #expect(
             MinimumReasoningFloor.railRequiresFloor(promptHead: lowHead, promptTail: thinkTail))
         #expect(
-            !MinimumReasoningFloor.railRequiresFloor(promptHead: highHead, promptTail: thinkTail),
-            "high/max rails must never be floored")
+            MinimumReasoningFloor.railRequiresFloor(promptHead: highHead, promptTail: thinkTail))
+        #expect(
+            MinimumReasoningFloor.railRequiresFloor(promptHead: maxHead, promptTail: thinkTail))
+        #expect(
+            !MinimumReasoningFloor.railRequiresFloor(promptHead: bareHead, promptTail: thinkTail),
+            "thinking rails without an effort preface must never be floored")
         #expect(
             !MinimumReasoningFloor.railRequiresFloor(promptHead: lowHead, promptTail: chatTail),
             "the chat rail (closed think) must never be floored")
@@ -60,15 +66,23 @@ struct MinimumReasoningFloorFocusedTests {
         #expect(!MinimumReasoningFloor.railRequiresFloor(promptHead: lowHead, promptTail: nil))
     }
 
-    @Test("arming marker is the first line of the enforced-low preface")
-    func markerDerivesFromEncoderPreface() {
-        let marker = MinimumReasoningFloor.enforcedLowMarker
-        #expect(!marker.isEmpty)
-        #expect(
-            DeepseekV4ChatEncoder.reasoningEffortLowPreface.hasPrefix(marker + "\n"),
-            "marker must stay in lockstep with the encoder preface")
-        #expect(!DeepseekV4ChatEncoder.reasoningEffortHighPreface.contains(marker))
-        #expect(!DeepseekV4ChatEncoder.reasoningEffortMaxPreface.contains(marker))
+    @Test("arming markers are the first lines of the enforced-effort prefaces")
+    func markersDeriveFromEncoderPrefaces() {
+        let markers = MinimumReasoningFloor.enforcedEffortMarkers
+        #expect(markers.count == 3)
+        for (marker, preface) in zip(
+            markers,
+            [
+                DeepseekV4ChatEncoder.reasoningEffortLowPreface,
+                DeepseekV4ChatEncoder.reasoningEffortHighPreface,
+                DeepseekV4ChatEncoder.reasoningEffortMaxPreface,
+            ])
+        {
+            #expect(!marker.isEmpty)
+            #expect(
+                preface.hasPrefix(marker + "\n"),
+                "markers must stay in lockstep with the encoder prefaces")
+        }
     }
 
     @Test("armed floor disqualifies native MTP lossless greedy")

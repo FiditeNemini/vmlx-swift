@@ -25,8 +25,13 @@ import MLX
 /// hold:
 ///  - the prompt tail ends inside a freshly opened think block (`…<think>`),
 ///    which the chat rail (`…</think>` tail) never matches, and
-///  - the prompt head carries the enforced-low marker line, which the High
-///    and Max prefaces never match.
+///  - the prompt head carries one of the enforced-effort marker lines
+///    (Low, High, or Max preface), which no other model family renders.
+///
+/// High and Max are floored too: their prefaces make instant close unlikely,
+/// but the trained bigram prior is rail-independent and the mask costs
+/// nothing when the model was going to think anyway — every effort level is
+/// guaranteed a visible think block.
 enum MinimumReasoningFloor {
 
     struct Armed {
@@ -37,18 +42,21 @@ enum MinimumReasoningFloor {
     /// Leading sampled-token window during which `</think>` stays masked.
     static let tokenCount = 16
 
-    /// First line of the enforced-low preface — the arming marker. Derived
-    /// from the encoder constant so a preface reword can never desync the
-    /// floor from the rail that requires it.
-    static var enforcedLowMarker: String {
-        DeepseekV4ChatEncoder.reasoningEffortLowPreface
-            .components(separatedBy: "\n").first ?? ""
+    /// First lines of the enforced-effort prefaces — the arming markers.
+    /// Derived from the encoder constants so a preface reword can never
+    /// desync the floor from the rails that require it.
+    static var enforcedEffortMarkers: [String] {
+        [
+            DeepseekV4ChatEncoder.reasoningEffortLowPreface,
+            DeepseekV4ChatEncoder.reasoningEffortHighPreface,
+            DeepseekV4ChatEncoder.reasoningEffortMaxPreface,
+        ].compactMap { $0.components(separatedBy: "\n").first }
     }
 
     static func railRequiresFloor(promptHead: String?, promptTail: String?) -> Bool {
         guard let promptTail, promptTail.hasSuffix("<think>") else { return false }
-        guard let promptHead, promptHead.contains(enforcedLowMarker) else { return false }
-        return true
+        guard let promptHead else { return false }
+        return enforcedEffortMarkers.contains { promptHead.contains($0) }
     }
 
     static func armIfNeeded(
