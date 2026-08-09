@@ -1273,7 +1273,8 @@ public class DeepseekV4ModelInner: Module {
                 chunkTokens: chunkTokens,
                 finalContextTokens: (firstCache?.offset ?? 0) + chunkTokens)
 
-        DeepseekV4Math.traceLayer("embed", h)
+        var layerStats: [(String, MLXArray)] = []
+        layerStats.append(contentsOf: DeepseekV4Math.layerStat("embed", h).map { [$0] } ?? [])
         for (i, layer) in layers.enumerated() {
             h = layer(
                 h,
@@ -1283,14 +1284,16 @@ public class DeepseekV4ModelInner: Module {
             if layerwisePrefill {
                 MLX.eval(h)
             }
-            DeepseekV4Math.traceLayer("layer\(i)", h)
+            layerStats.append(
+                contentsOf: DeepseekV4Math.layerStat("layer\(i)", h).map { [$0] } ?? [])
         }
 
         // HyperHead reduce: (B, L, hcMult, H) → (B, L, H)
         var out = hcHead.reduce(h)
-        DeepseekV4Math.traceLayer("hcReduce", out)
+        layerStats.append(contentsOf: DeepseekV4Math.layerStat("hcReduce", out).map { [$0] } ?? [])
         out = norm(out)
-        DeepseekV4Math.traceLayer("norm", out)
+        layerStats.append(contentsOf: DeepseekV4Math.layerStat("norm", out).map { [$0] } ?? [])
+        DeepseekV4Math.flushLayerStats(layerStats, length: out.dim(1))
         return out
     }
 }
@@ -1381,7 +1384,14 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let h = model(inputs, cache: cache)
-        return DeepseekV4Math.lmHeadFp32(h, lmHead: lmHead)
+        let logits = DeepseekV4Math.lmHeadFp32(h, lmHead: lmHead)
+        // Separated from the hidden-state stats on purpose: a normal `norm`
+        // followed by an abnormal `logits` isolates the fused quantized head
+        // (VMLX_DSV4_LM_HEAD_MODE) rather than the transformer stack.
+        DeepseekV4Math.flushLayerStats(
+            [DeepseekV4Math.layerStat("logits", logits)].compactMap { $0 },
+            length: logits.dim(1))
+        return logits
     }
 
     /// DSV4 prefill has opposed optima (Python `_dsv4_attn_subchunk_tokens`):

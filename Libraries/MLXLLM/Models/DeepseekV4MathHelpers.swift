@@ -377,23 +377,35 @@ public enum DeepseekV4Math {
         return raw != "0" && raw != "false" && raw != "off" && raw != "no"
     }()
 
-    /// `VMLX_DSV4_LAYER_TRACE=1` prints the last position's magnitude after
-    /// every decoder layer. Diagnostic only: it forces a per-layer eval, which
-    /// serialises the lazy graph and costs most of prefill throughput.
+    /// `VMLX_DSV4_LAYER_TRACE=1` reports the last position's magnitude after
+    /// every decoder layer. Diagnostic only.
     public static let layerTraceEnabled: Bool = {
         ProcessInfo.processInfo.environment["VMLX_DSV4_LAYER_TRACE"] == "1"
     }()
 
-    /// Print `absmax`/`absmean` of the final position of `h`. Both statistics
-    /// are needed: a NaN/Inf blowup moves `absmax` alone, while a routing or
-    /// weight fault that keeps the state finite but wrong moves `absmean`.
-    public static func traceLayer(_ tag: String, _ h: MLXArray) {
-        guard layerTraceEnabled, h.ndim >= 2 else { return }
+    /// `absmax`/`absmean` of the final position of `h`, as an *unevaluated*
+    /// scalar pair. Both statistics are needed: a NaN/Inf blowup moves `absmax`
+    /// alone, while a routing or weight fault that keeps the state finite but
+    /// wrong moves `absmean`.
+    ///
+    /// Deliberately lazy. Reading these per layer would insert a barrier into
+    /// exactly the lazy cross-layer graph under suspicion, so a laziness or
+    /// concurrency fault could vanish under its own instrumentation. Collect
+    /// here; evaluate once at the end of the forward pass.
+    public static func layerStat(_ tag: String, _ h: MLXArray) -> (String, MLXArray)? {
+        guard layerTraceEnabled, h.ndim >= 2 else { return nil }
         let last = MLX.take(h, MLXArray([Int32(h.dim(1) - 1)]), axis: 1)
         let a = MLX.abs(last.asType(.float32))
-        print(
-            "[vmlx][dsv4/layer] \(tag) L=\(h.dim(1)) "
-                + "absmax=\(a.max().item(Float.self)) absmean=\(a.mean().item(Float.self))")
+        return (tag, MLX.stacked([a.max(), a.mean()]))
+    }
+
+    public static func flushLayerStats(_ stats: [(String, MLXArray)], length: Int) {
+        guard layerTraceEnabled, !stats.isEmpty else { return }
+        MLX.eval(stats.map(\.1))
+        for (tag, stat) in stats {
+            let v = stat.asArray(Float.self)
+            print("[vmlx][dsv4/layer] \(tag) L=\(length) absmax=\(v[0]) absmean=\(v[1])")
+        }
     }
 
     /// Python `_dsv4_attn_subchunk_tokens` parity: attention sub-chunk length
