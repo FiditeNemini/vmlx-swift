@@ -467,6 +467,13 @@ public actor BatchEngine {
             tokenizer: context.tokenizer,
             modelName: context.configuration.name,
             path: "BatchEngine.submit")
+        var parameters = parameters
+        if let floor = MinimumReasoningFloor.armIfNeeded(
+            input: input, tokenizer: context.tokenizer, promptTail: promptTail)
+        {
+            parameters.initialSuppressTokens = [floor.closeTokenID]
+            parameters.initialSuppressCount = floor.tokenCount
+        }
         let request = BatchPendingRequest(
             input: input,
             parameters: parameters,
@@ -573,6 +580,13 @@ public actor BatchEngine {
             tokenizer: tokenizer,
             modelName: context.configuration.name,
             path: "BatchEngine.generate")
+        var parameters = parameters
+        if let floor = MinimumReasoningFloor.armIfNeeded(
+            input: input, tokenizer: tokenizer, promptTail: promptTail)
+        {
+            parameters.initialSuppressTokens = [floor.closeTokenID]
+            parameters.initialSuppressCount = floor.tokenCount
+        }
         if parameters.draftStrategy?.usesNativeMTP == true {
             guard canStartExclusiveSoloPath else {
                 Self.logger.error(
