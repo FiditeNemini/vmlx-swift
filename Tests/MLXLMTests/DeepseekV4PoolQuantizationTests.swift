@@ -20,6 +20,11 @@ struct DeepseekV4PoolQuantizationTests {
             environment: ["DSV4_POOL_QUANT": "0"]))
         #expect(!DeepseekV4Cache.resolvePoolQuantizationDefault(
             environment: ["DSV4_POOL_QUANT": "off"]))
+        #expect(DeepseekV4Cache.resolvePoolBF16HotByteLimit(environment: [:])
+            == 64 * 1024 * 1024)
+        #expect(DeepseekV4Cache.resolvePoolBF16HotByteLimit(
+            environment: ["DSV4_POOL_BF16_MAX_BYTES": "1048576"])
+            == 1024 * 1024)
 
         let cache = DeepseekV4Cache(slidingWindow: 128, compressRatio: 4)
         #expect(cache.hybridPoolQuantizationEnabled)
@@ -34,7 +39,9 @@ struct DeepseekV4PoolQuantizationTests {
         defer { mlxLock.unlock() }
 
         let cache = DeepseekV4Cache(
-            slidingWindow: 128, compressRatio: 4, poolQuantizationEnabled: true)
+            slidingWindow: 128, compressRatio: 4,
+            poolQuantizationEnabled: true,
+            poolBF16HotByteLimit: Self.hotLimit)
         let short = Self.signal(rows: 1024, features: 512)
         #expect(short.nbytes < Self.hotLimit)
         cache.setPooled(.compressor, value: short)
@@ -51,8 +58,9 @@ struct DeepseekV4PoolQuantizationTests {
             return
         }
         MLX.eval(restored)
-        #expect(segments.count == 33)
-        #expect(segments.allSatisfy { $0.rowCount > 0 && $0.rowCount <= 64 })
+        #expect(segments.count == 2)
+        #expect(segments.map(\.rowCount) == [2048, 1])
+        #expect(segments.allSatisfy { $0.rowCount > 0 && $0.rowCount <= 16 * 1024 })
         #expect(segments.allSatisfy { $0.bits == 8 && $0.groupSize == 32 })
         #expect(segments.allSatisfy { $0.codes.dtype == .uint8 })
         let retainedBefore = cache.hybridPoolRetainedByteCount(branch: .compressor)
@@ -73,7 +81,9 @@ struct DeepseekV4PoolQuantizationTests {
 
         let raw = Self.signal(rows: 2075, features: 512)
         let cache = DeepseekV4Cache(
-            slidingWindow: 128, compressRatio: 4, poolQuantizationEnabled: true)
+            slidingWindow: 128, compressRatio: 4,
+            poolQuantizationEnabled: true,
+            poolBF16HotByteLimit: Self.hotLimit)
         cache.setPooled(.compressor, value: raw)
         #expect(cache.hybridPoolQuantizedSegments(branch: .compressor) != nil)
         _ = cache.trim(68) // max(1, 68 / 4) == 17 pool rows
@@ -96,7 +106,9 @@ struct DeepseekV4PoolQuantizationTests {
 
         let raw = Self.signal(rows: 2049, features: 512)
         let source = DeepseekV4Cache(
-            slidingWindow: 128, compressRatio: 4, poolQuantizationEnabled: true)
+            slidingWindow: 128, compressRatio: 4,
+            poolQuantizationEnabled: true,
+            poolBF16HotByteLimit: Self.hotLimit)
         Self.fillRotating(source.local)
         source.setPooled(.compressor, value: raw)
         let sourceRetained = source.hybridPoolRetainedByteCount(branch: .compressor)
@@ -108,7 +120,9 @@ struct DeepseekV4PoolQuantizationTests {
         #expect(encoded["dsv4_0_pool_comp_q_0_biases"] != nil)
 
         let target = DeepseekV4Cache(
-            slidingWindow: 128, compressRatio: 4, poolQuantizationEnabled: true)
+            slidingWindow: 128, compressRatio: 4,
+            poolQuantizationEnabled: true,
+            poolBF16HotByteLimit: Self.hotLimit)
         var targetLayers: [any KVCache] = [target]
         let restoredTokens = restoreFromDiskArrays(encoded, into: &targetLayers)
         #expect(restoredTokens == source.offset)
@@ -119,7 +133,8 @@ struct DeepseekV4PoolQuantizationTests {
             return
         }
         MLX.eval(restored)
-        #expect(segments.count == 33)
+        #expect(segments.count == 1)
+        #expect(segments[0].rowCount == 2049)
         #expect(target.hybridPoolRetainedByteCount(branch: .compressor) == sourceRetained)
         #expect(Self.cosine(raw, restored) >= 0.999)
     }
@@ -132,7 +147,8 @@ struct DeepseekV4PoolQuantizationTests {
             compressRatios: ratios,
             headDim: 512,
             indexerHeadDim: 128,
-            slidingWindow: 128)
+            slidingWindow: 128,
+            poolBF16HotByteLimit: 64 * 1024 * 1024)
         #expect(ratios.count == 43)
         #expect(ratios.filter { $0 == 4 }.count == 21)
         #expect(ratios.filter { $0 == 128 }.count == 20)

@@ -153,6 +153,13 @@ class DeepseekV4Attention: Module {
 
     let rope: DeepseekV4RoPE
 
+    /// Python `_decode_pre_compiled`/`_decode_out_compiled` parity: per-layer
+    /// compiled regions for the decode projections (3 qmm + norms + RoPE +
+    /// KV QAT kernel in one dispatch) and the decode output path (inverse
+    /// RoPE + grouped o-proj + wo_b). Weights are trace constants.
+    private var preDecodeRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+    private var outDecodeRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+
     // Compressor + Indexer (instantiated only when compressRatio > 0).
     // Swift can't have conditionally-present @ModuleInfo properties
     // cleanly, so we instantiate always and null the pooled path inside
@@ -230,12 +237,15 @@ class DeepseekV4Attention: Module {
         }
     }
 
-    func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
-    ) -> MLXArray {
+    /// Python `_decode_pre_region` math: 3 projections + norms + partial
+    /// RoPE + KV QAT kernel. Traced into the compiled pre region at decode;
+    /// called raw at prefill. `cosT`/`sinT` arrive as arrays so per-token
+    /// position changes never retrace.
+    private func preMath(
+        _ x: MLXArray, cosT: MLXArray, sinT: MLXArray
+    ) -> (qResidual: MLXArray, q: MLXArray, kv: MLXArray) {
         let B = x.dim(0)
         let L = x.dim(1)
-        let offset = cache?.offset ?? 0
 
         // --- Q projection ---
         // wq_a(x): (B, L, qLoraRank) → q_norm on qLoraRank → wq_b:
@@ -260,7 +270,6 @@ class DeepseekV4Attention: Module {
         kv = kv.reshaped(B, L, 1, headDim).transposed(0, 2, 1, 3)
 
         // --- Partial RoPE on last ropeDim dims of Q and K ---
-        let (cosT, sinT) = rope.cosSin(offset: offset, length: L)
         let cosQ = cosT.expandedDimensions(axes: [0, 1])
         let sinQ = sinT.expandedDimensions(axes: [0, 1])
         q = DeepseekV4Math.applyPartialRoPE(q, cos: cosQ, sin: sinQ, ropeDim: ropeDim)
@@ -273,6 +282,51 @@ class DeepseekV4Attention: Module {
         let nopeDim = headDim - ropeDim
         if config.activationQATEnabled && nopeDim >= 64 {
             kv = DeepseekV4Math.e4m3KVActivationRoundTrip(kv, ropeDim: ropeDim)
+        }
+        return (qResidual, q, kv)
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let offset = cache?.offset ?? 0
+
+        let (cosT, sinT) = rope.cosSin(offset: offset, length: L)
+        // Python `_decode_pre_region`/`_decode_out_region` parity gates:
+        // decode-only, off under the stage profiler (which wants eager
+        // stage boundaries), never nested inside another region's trace.
+        let useRegions =
+            DeepseekV4Math.compileRegionsEnabled && L == 1
+            && !deepseekV4StageProfileEnabled && !CompiledDecodeTrace.isActive
+
+        var qResidual: MLXArray
+        var q: MLXArray
+        var kv: MLXArray
+        if useRegions {
+            let region: @Sendable ([MLXArray]) -> [MLXArray]
+            if let cached = preDecodeRegion {
+                region = cached
+            } else {
+                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+                    CompiledDecodeTrace.withActive {
+                        let out = self.preMath(args[0], cosT: args[1], sinT: args[2])
+                        return [out.qResidual, out.q, out.kv]
+                    }
+                }
+                preDecodeRegion = region
+            }
+            let outs = region([x, cosT, sinT])
+            if outs.count == 3 {
+                qResidual = outs[0]
+                q = outs[1]
+                kv = outs[2]
+            } else {
+                (qResidual, q, kv) = preMath(x, cosT: cosT, sinT: sinT)
+            }
+        } else {
+            (qResidual, q, kv) = preMath(x, cosT: cosT, sinT: sinT)
         }
 
         // --- Cache update (sliding-window local) ---
@@ -421,11 +475,40 @@ class DeepseekV4Attention: Module {
         }
 
         // --- SDPA with attention sinks ---
-        var output = MLXFast.scaledDotProductAttention(
+        let sdpaOut = MLXFast.scaledDotProductAttention(
             queries: q, keys: fullKV, values: fullKV,
             scale: scale, mask: adjustedMask,
             sinks: config.useAttnSink ? attnSink.asType(q.dtype) : nil)
-        // output shape: (B, numHeads, L, headDim)
+        // sdpaOut shape: (B, numHeads, L, headDim)
+
+        if useRegions {
+            let region: @Sendable ([MLXArray]) -> [MLXArray]
+            if let cached = outDecodeRegion {
+                region = cached
+            } else {
+                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+                    CompiledDecodeTrace.withActive {
+                        [self.outMath(args[0], cosT: args[1], sinT: args[2])]
+                    }
+                }
+                outDecodeRegion = region
+            }
+            if let out = region([sdpaOut, cosT, sinT]).first {
+                return out
+            }
+            // Failed compiled evaluation — fall through to eager.
+        }
+        return outMath(sdpaOut, cosT: cosT, sinT: sinT)
+    }
+
+    /// Python `_decode_out_math`: inverse RoPE + grouped o-proj + wo_b.
+    /// Traced into the compiled out region at decode; raw at prefill.
+    private func outMath(
+        _ sdpaOut: MLXArray, cosT: MLXArray, sinT: MLXArray
+    ) -> MLXArray {
+        let B = sdpaOut.dim(0)
+        let L = sdpaOut.dim(2)
+        var output = sdpaOut
 
         // --- Inverse RoPE on the output's head-major layout ---
         let cosI = cosT.expandedDimensions(axes: [0, 1])
@@ -481,6 +564,12 @@ class DeepseekV4Attention: Module {
     }
 }
 
+// `ProcessInfo.environment` rebuilds the whole dictionary per access; reading
+// it inside per-layer forward paths costs milliseconds per token across 43
+// layers. The flag is a process-lifetime constant.
+private let deepseekV4StageProfileEnabled =
+    ProcessInfo.processInfo.environment["VMLX_DSV4_STAGE_PROFILE"] == "1"
+
 // MARK: - MoE gate (sqrtsoftplus + hash routing)
 
 private struct DeepseekV4SelectorKey: Hashable {
@@ -521,7 +610,7 @@ private enum DeepseekV4CompiledSelectorCache {
             weights = weights * scalingFactor
             return [indices, weights]
         }
-        let compiled = compile(body)
+        let compiled = vmlxTrustedCompile(body)
         let nestedSafe: Selector = { args in
             if CompiledDecodeTrace.isActive { return body(args) }
             let result = compiled(args)
@@ -633,6 +722,15 @@ class DeepseekV4MoE: Module, UnaryLayer {
     /// layer is hash-routed. Set by the outer model before each layer
     /// call when hash routing applies.
     var currentInputIds: MLXArray? = nil
+    /// Python `_decode_moe_region` parity: one compiled region per layer
+    /// covering gate → routed experts → shared expert → fp32 accumulate,
+    /// with weights riding as trace constants. Returns `[y, indices]` so
+    /// expert-advisor observation sees real (non-tracer) indices outside
+    /// the trace. The first forward stays eager (`moeRegionWarm`) so
+    /// SwitchGLU's fused gate+up cache — which evals — materializes
+    /// before any trace records.
+    private var moeDecodeRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+    fileprivate var moeRegionWarm = false
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.config = config
         self.layerIdx = layerIdx
@@ -666,10 +764,50 @@ class DeepseekV4MoE: Module, UnaryLayer {
             swigluLimit: limit)
     }
 
+    fileprivate func moeMath(_ x: MLXArray, inputIds: MLXArray?) -> (y: MLXArray, indices: MLXArray) {
+        let (indices, scores) = gate(x, inputIds: inputIds)
+        let routed = switchMLP(x, indices, preDownScores: scores)
+        let y = DeepseekV4Math.addSharedExpertFP32(
+            DeepseekV4Math.reduceRoutedExpertsFP32(routed),
+            shared: sharedExperts(x), outputDType: x.dtype)
+        return (y, indices)
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let profileStages =
-            ProcessInfo.processInfo.environment["VMLX_DSV4_STAGE_PROFILE"] == "1"
-            && x.dim(1) == 1
+        let profileStages = deepseekV4StageProfileEnabled && x.dim(1) == 1
+
+        // Decode (L==1) routes through the per-layer compiled MoE region.
+        // Hash layers without threaded ids fall back to eager (mirrors the
+        // Python guard) so the trace never bakes the wrong gate variant.
+        let ids = gate.isHashLayer ? currentInputIds : nil
+        if DeepseekV4Math.compileRegionsEnabled, !profileStages,
+            x.dim(1) == 1, moeRegionWarm, !(gate.isHashLayer && ids == nil)
+        {
+            let region: @Sendable ([MLXArray]) -> [MLXArray]
+            if let cached = moeDecodeRegion {
+                region = cached
+            } else {
+                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+                    // Nested-compile guard: inner compiled microfunctions
+                    // (selector, SwiGLU) inline their raw bodies while this
+                    // region traces — and on every retrace.
+                    CompiledDecodeTrace.withActive {
+                        let out = self.moeMath(
+                            args[0], inputIds: args.count > 1 ? args[1] : nil)
+                        return [out.y, out.indices]
+                    }
+                }
+                moeDecodeRegion = region
+            }
+            let outs = ids.map { region([x, $0]) } ?? region([x])
+            if outs.count == 2 {
+                JangPressCanonicalExpertAdvisor.shared.observe(
+                    layer: layerIdx, indices: outs[1])
+                return outs[0]
+            }
+            // Failed compiled evaluation returns empty — fall through to eager.
+        }
+
         var stageStart = profileStages ? CFAbsoluteTimeGetCurrent() : 0
         func finishStage(_ name: String, _ arrays: [MLXArray]) {
             guard profileStages else { return }
@@ -693,6 +831,7 @@ class DeepseekV4MoE: Module, UnaryLayer {
         y = DeepseekV4Math.addSharedExpertFP32(
             y, shared: shared, outputDType: x.dtype)
         finishStage("add", [y])
+        moeRegionWarm = true
         return y
     }
 }
@@ -756,27 +895,20 @@ class DeepseekV4HyperConnection: Module {
     ///   pre, post, comb = hc_split_sinkhorn(mixes, scale, base, hc, iters, eps)
     ///   y = sum(pre[..., None] * x_flat.reshape(B,L,hc,D), axis=2)
     func collapse(_ h: MLXArray) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
-        let dtype = h.dtype
-        let B = h.dim(0)
-        let L = h.dim(1)
-
-        // Python keeps this entire path in fp32. It also applies the scalar
-        // reciprocal RMS after the projection: `(x_flat @ fn.T) * rsqrt`.
-        // Besides preserving its operation order, that avoids materializing a
-        // normalized 16K-wide residual only to project it down to `mixHc`.
-        let xFlat = h.reshaped(B, L, hcMult * hiddenSize).asType(.float32)
-        let reciprocalRMS = rsqrt(
-            (xFlat * xFlat).mean(axis: -1, keepDims: true) + hcEps)
-        let mixes = xFlat.matmul(fn.asType(.float32).transposed()) * reciprocalRMS
-
-        let (pre, post, comb) = DeepseekV4Math.hcSplitSinkhorn(
-            mixes: mixes, scale: scale, base: base,
-            hcMult: hcMult, iters: hcIters, eps: hcEps)
-
-        // y = sum(pre[..., None] * x_flat.reshape(B, L, hc, D), axis=2)
-        let xReshape = xFlat.reshaped(B, L, hcMult, hiddenSize)
-        let y = (pre.expandedDimensions(axis: -1) * xReshape).sum(axis: -2)
-        return (x: y.asType(dtype), post: post, comb: comb)
+        // Decode (L==1) routes through a shared compiled region — the graph is
+        // identical for every layer/step, so weights ride along as inputs and
+        // the host-side graph build is amortized (Python `_get_hc_pre_compiled`).
+        // Inside another region's trace, inline the raw graph instead.
+        if DeepseekV4Math.compileRegionsEnabled, h.dim(1) == 1,
+            !CompiledDecodeTrace.isActive
+        {
+            return DeepseekV4Math.hcPreCompiled(
+                h, fn: fn, scale: scale, base: base,
+                hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps)
+        }
+        return DeepseekV4Math.hcPreGraph(
+            h, fn: fn, scale: scale, base: base,
+            hcMult: hcMult, hiddenSize: hiddenSize, iters: hcIters, eps: hcEps)
     }
 
     /// Expand: given attn/ffn output `blockOut` (B, L, hiddenSize),
@@ -788,15 +920,8 @@ class DeepseekV4HyperConnection: Module {
     func expand(
         blockOut: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray
     ) -> MLXArray {
-        let dtype = blockOut.dtype
-        // The pinned PyTorch broadcast aligns residual HC with comb's first
-        // HC axis and sums that axis: algebraically comb-transpose @ residual.
-        let combResid = DeepseekV4Math.hcExpandResidual(
-            comb: comb, residual: residual)
-        // post: (B,L,hc) → (B,L,hc,1); blockOut: (B,L,D) → (B,L,1,D).
-        let y = post.expandedDimensions(axis: -1)
-            * blockOut.asType(.float32).expandedDimensions(axis: -2) + combResid
-        return y.asType(dtype)
+        DeepseekV4Math.hcPost(
+            blockOut: blockOut, residual: residual, post: post, comb: comb)
     }
 }
 
@@ -867,6 +992,16 @@ class DeepseekV4DecoderLayer: Module {
 
     let layerIdx: Int
 
+    /// Python `_decode_tail_region` parity: one compiled region per layer for
+    /// the whole decode tail — hc_post(attn) + hc_pre(ffn) + post-LN + MoE +
+    /// hc_post(ffn). Merging these compiled calls + raw norms into a single
+    /// region removes the per-call host dispatch floors between them. Weights
+    /// ride as trace constants (per-layer closure). The attention output
+    /// projection stays outside (Swift attention does not defer it).
+    /// Returns `[hF, indices]` so expert-advisor observation runs on real
+    /// arrays outside the trace.
+    private var tailDecodeRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.layerIdx = layerIdx
         self._selfAttn.wrappedValue = DeepseekV4Attention(config: config, layerIdx: layerIdx)
@@ -891,9 +1026,7 @@ class DeepseekV4DecoderLayer: Module {
         // remaining affine DSV4 gap without changing the production graph
         // when the variable is absent. Restrict to single-token decode so a
         // prompt prefill does not emit thousands of misleading stage rows.
-        let profileStages =
-            ProcessInfo.processInfo.environment["VMLX_DSV4_STAGE_PROFILE"] == "1"
-            && h.dim(1) == 1
+        let profileStages = deepseekV4StageProfileEnabled && h.dim(1) == 1
         var stageStart = profileStages ? CFAbsoluteTimeGetCurrent() : 0
         func finishStage(_ name: String, _ arrays: [MLXArray]) {
             guard profileStages else { return }
@@ -912,6 +1045,54 @@ class DeepseekV4DecoderLayer: Module {
         finishStage("attn_norm", [normedA])
         let attnOut = selfAttn(normedA, mask: mask, cache: cache)
         finishStage("attention", [attnOut])
+
+        // Decode tail region (Python `_decode_tail_region`): everything after
+        // SDPA fuses into one compiled dispatch per layer. Gated on the MoE
+        // having run eager once (`moeRegionWarm`) so SwitchGLU's fused
+        // gate+up cache — which evals — materializes before any trace.
+        let ids = mlp.gate.isHashLayer ? inputIds : nil
+        if DeepseekV4Math.compileRegionsEnabled, !profileStages,
+            h.dim(1) == 1, mlp.moeRegionWarm,
+            !(mlp.gate.isHashLayer && ids == nil)
+        {
+            let region: @Sendable ([MLXArray]) -> [MLXArray]
+            if let cached = tailDecodeRegion {
+                region = cached
+            } else {
+                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+                    // Nested-compile guard: inner compiled microfunctions
+                    // (hcPre region, selector, SwiGLU) inline raw bodies
+                    // while this region traces — and on every retrace.
+                    CompiledDecodeTrace.withActive {
+                        let hA = self.attnHC.expand(
+                            blockOut: args[0], residual: args[1],
+                            post: args[2], comb: args[3])
+                        let (xF, postF, combF) = DeepseekV4Math.hcPreGraph(
+                            hA, fn: self.ffnHC.fn, scale: self.ffnHC.scale,
+                            base: self.ffnHC.base, hcMult: self.ffnHC.hcMult,
+                            hiddenSize: self.ffnHC.hiddenSize,
+                            iters: self.ffnHC.hcIters, eps: self.ffnHC.hcEps)
+                        let normedF = self.postAttentionLayerNorm(xF)
+                        let out = self.mlp.moeMath(
+                            normedF, inputIds: args.count > 4 ? args[4] : nil)
+                        let hF = self.ffnHC.expand(
+                            blockOut: out.y, residual: hA,
+                            post: postF, comb: combF)
+                        return [hF, out.indices]
+                    }
+                }
+                tailDecodeRegion = region
+            }
+            let regionArgs = [attnOut, residualA, postA, combA] + (ids.map { [$0] } ?? [])
+            let outs = region(regionArgs)
+            if outs.count == 2 {
+                JangPressCanonicalExpertAdvisor.shared.observe(
+                    layer: layerIdx, indices: outs[1])
+                return outs[0]
+            }
+            // Failed compiled evaluation returns empty — fall through to eager.
+        }
+
         let hA = attnHC.expand(
             blockOut: attnOut, residual: residualA, post: postA, comb: combA)
         finishStage("attn_hc_post", [hA])

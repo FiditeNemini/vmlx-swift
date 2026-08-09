@@ -69,13 +69,17 @@ private let _deepseekV4ScoredSwiGLUUnclampedArrayBody:
 // Keep it separate from whole-model compiled decode: it captures no model or
 // cache state, and the wrapper below avoids an illegal nested compile trace.
 private let _compiledDeepseekV4SwiGLUClamped =
-    compile(shapeless: true, _deepseekV4SwiGLUClampedBody)
+    vmlxTrustedCompile(shapeless: true, _deepseekV4SwiGLUClampedBody)
 private let _compiledDeepseekV4SwiGLUUnclamped =
-    compile(shapeless: true, _deepseekV4SwiGLUUnclampedBody)
+    vmlxTrustedCompile(shapeless: true, _deepseekV4SwiGLUUnclampedBody)
+// NOT shapeless: the `[.ellipsis, .newAxis, .newAxis]` score expansion bakes a
+// concrete reshape target into the trace, so a shapeless trace recorded at one
+// L fatals ("[reshape] cannot reshape…") when a different L arrives. Per-shape
+// retrace is cached by signature and decode always re-hits the L==1 trace.
 private let _compiledDeepseekV4ScoredSwiGLUClamped =
-    compile(shapeless: true, _deepseekV4ScoredSwiGLUClampedArrayBody)
+    vmlxTrustedCompile(_deepseekV4ScoredSwiGLUClampedArrayBody)
 private let _compiledDeepseekV4ScoredSwiGLUUnclamped =
-    compile(shapeless: true, _deepseekV4ScoredSwiGLUUnclampedArrayBody)
+    vmlxTrustedCompile(_deepseekV4ScoredSwiGLUUnclampedArrayBody)
 
 public enum DeepseekV4Math {
 
@@ -295,6 +299,123 @@ public enum DeepseekV4Math {
             .matmul(residual.asType(.float32))
     }
 
+    /// Apply DSV4's official mHC post contraction. Single-token GPU decode
+    /// uses the fused Metal kernel; multi-token prefill retains the batched
+    /// MLX path where large matrix operations have better throughput.
+    public static func hcPost(
+        blockOut: MLXArray,
+        residual: MLXArray,
+        post: MLXArray,
+        comb: MLXArray
+    ) -> MLXArray {
+        let hcMult = comb.dim(-1)
+        let hiddenSize = blockOut.dim(-1)
+        let isSingleTokenDecode =
+            blockOut.ndim >= 3 && blockOut.dim(-2) == 1
+                && residual.dim(-2) == hcMult
+                && comb.dim(-2) == hcMult
+                && blockOut.size > 0
+        if Device.defaultDevice().deviceType == .gpu && isSingleTokenDecode {
+            let x = contiguous(blockOut)
+            let residual = contiguous(residual)
+            let post = contiguous(post)
+            let comb = contiguous(comb)
+            let outputShape = Array(x.shape.dropLast()) + [hcMult, hiddenSize]
+            return hcPostDecodeKernel(
+                [x, residual, post, comb],
+                template: [
+                    ("HC", hcMult),
+                    ("D", hiddenSize),
+                    ("outT", x.dtype),
+                ],
+                grid: (x.size * hcMult, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [outputShape],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
+
+        let combResid = hcExpandResidual(comb: comb, residual: residual)
+        return (
+            post.asType(.float32).expandedDimensions(axis: -1)
+                * blockOut.asType(.float32).expandedDimensions(axis: -2)
+                + combResid
+        ).asType(blockOut.dtype)
+    }
+
+    /// Python `_DSV4_COMPILE_REGIONS` parity gate. Decode-only compiled
+    /// regions collapse per-token host graph construction; prefill keeps the
+    /// raw graph so trace count stays bounded.
+    public static let compileRegionsEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["DSV4_COMPILE_REGIONS"]?
+            .lowercased()
+        return raw != "0" && raw != "false" && raw != "off" && raw != "no"
+    }()
+
+    /// Raw mHC-pre math (Python `_hc_pre_impl`): fp32 flatten, scalar
+    /// reciprocal RMS applied after the projection, split-Sinkhorn, four-way
+    /// residual mix. Shared by the eager path and the compiled decode region.
+    public static func hcPreGraph(
+        _ h: MLXArray,
+        fn: MLXArray,
+        scale: MLXArray,
+        base: MLXArray,
+        hcMult: Int,
+        hiddenSize: Int,
+        iters: Int,
+        eps: Float
+    ) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
+        let B = h.dim(0)
+        let L = h.dim(1)
+        let xFlat = h.reshaped(B, L, hcMult * hiddenSize).asType(.float32)
+        let reciprocalRMS = rsqrt(
+            (xFlat * xFlat).mean(axis: -1, keepDims: true) + eps)
+        let mixes = xFlat.matmul(fn.asType(.float32).transposed()) * reciprocalRMS
+        let (pre, post, comb) = hcSplitSinkhorn(
+            mixes: mixes, scale: scale, base: base,
+            hcMult: hcMult, iters: iters, eps: eps)
+        let xReshape = xFlat.reshaped(B, L, hcMult, hiddenSize)
+        let y = (pre.expandedDimensions(axis: -1) * xReshape).sum(axis: -2)
+        return (x: y.asType(h.dtype), post: post, comb: comb)
+    }
+
+    private static let hcPreCompiledLock = NSLock()
+    nonisolated(unsafe) private static var hcPreCompiledCache:
+        [String: ([MLXArray]) -> [MLXArray]] = [:]
+
+    /// Python `_get_hc_pre_compiled` parity: ONE compiled mHC-pre region
+    /// shared by every layer, with weights as inputs. The Sinkhorn Metal
+    /// kernel traces cleanly inside the region; fusing the surrounding
+    /// cast/RMS/mix/reduce glue collapses ~10 host dispatches per call
+    /// (86 calls per generated token) into one.
+    public static func hcPreCompiled(
+        _ h: MLXArray,
+        fn: MLXArray,
+        scale: MLXArray,
+        base: MLXArray,
+        hcMult: Int,
+        hiddenSize: Int,
+        iters: Int,
+        eps: Float
+    ) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
+        let key = "\(hcMult)|\(hiddenSize)|\(iters)|\(eps)"
+        hcPreCompiledLock.lock()
+        var region = hcPreCompiledCache[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let out = hcPreGraph(
+                    args[0], fn: args[1], scale: args[2], base: args[3],
+                    hcMult: hcMult, hiddenSize: hiddenSize,
+                    iters: iters, eps: eps)
+                return [out.x, out.post, out.comb]
+            }
+            hcPreCompiledCache[key] = region
+        }
+        hcPreCompiledLock.unlock()
+        let outs = region!([h, fn, scale, base])
+        return (x: outs[0], post: outs[1], comb: outs[2])
+    }
+
     // MARK: - Fused mHC split-Sinkhorn
     //
     // DSV4 executes this twice per transformer layer. Expressing twenty
@@ -302,6 +423,35 @@ public enum DeepseekV4Math {
     // nodes per call (roughly 3,400 nodes per token across 43 layers). The
     // reference DSV4 MLX runtime uses one Metal dispatch instead. Keep the
     // same fp32 arithmetic and exact normalization order here.
+    private static let hcPostDecodeKernel = MLXFast.metalKernel(
+        name: "deepseek_v4_hc_post_decode",
+        inputNames: ["x", "residual", "post", "comb"],
+        outputNames: ["y"],
+        source: """
+            const uint gid = thread_position_in_grid.x;
+            const uint d = gid % D;
+            const uint residual_row = gid / D;
+            const uint target_hc = residual_row % HC;
+            const uint batch_row = residual_row / HC;
+
+            float residual_mix =
+                static_cast<float>(comb[batch_row * HC * HC + target_hc])
+                * static_cast<float>(residual[batch_row * HC * D + d]);
+            for (uint source_hc = 1; source_hc < HC; ++source_hc) {
+                const float term =
+                    static_cast<float>(
+                        comb[batch_row * HC * HC + source_hc * HC + target_hc])
+                    * static_cast<float>(
+                        residual[batch_row * HC * D + source_hc * D + d]);
+                residual_mix = residual_mix + term;
+            }
+
+            const float direct =
+                static_cast<float>(post[batch_row * HC + target_hc])
+                * static_cast<float>(x[batch_row * D + d]);
+            y[gid] = static_cast<outT>(direct + residual_mix);
+        """)
+
     private static let hcSplitSinkhornKernel = MLXFast.metalKernel(
         name: "deepseek_v4_hc_split_sinkhorn",
         inputNames: ["mixes", "scale", "base", "eps"],
