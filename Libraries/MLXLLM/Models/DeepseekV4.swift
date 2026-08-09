@@ -202,8 +202,9 @@ class DeepseekV4Attention: Module {
     /// compiled regions for the decode projections (3 qmm + norms + RoPE +
     /// KV QAT kernel in one dispatch) and the decode output path (inverse
     /// RoPE + grouped o-proj + wo_b). Weights are trace constants.
-    private var preDecodeRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
-    private var outDecodeRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+    private let regionLock = NSLock()
+    private var preDecodeRegion: DeepseekV4CompiledRegion? = nil
+    private var outDecodeRegion: DeepseekV4CompiledRegion? = nil
 
     // Compressor + Indexer (instantiated only when compressRatio > 0).
     // Swift can't have conditionally-present @ModuleInfo properties
@@ -350,17 +351,13 @@ class DeepseekV4Attention: Module {
         var q: MLXArray
         var kv: MLXArray
         if useRegions {
-            let region: @Sendable ([MLXArray]) -> [MLXArray]
-            if let cached = preDecodeRegion {
-                region = cached
-            } else {
-                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+            let region = deepseekV4CachedRegion(regionLock, &preDecodeRegion) {
+                vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
                     CompiledDecodeTrace.withActive {
                         let out = self.preMath(args[0], cosT: args[1], sinT: args[2])
                         return [out.qResidual, out.q, out.kv]
                     }
                 }
-                preDecodeRegion = region
             }
             let outs = region([x, cosT, sinT])
             if outs.count == 3 {
@@ -582,16 +579,12 @@ class DeepseekV4Attention: Module {
         // sdpaOut shape: (B, numHeads, L, headDim)
 
         if useRegions {
-            let region: @Sendable ([MLXArray]) -> [MLXArray]
-            if let cached = outDecodeRegion {
-                region = cached
-            } else {
-                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+            let region = deepseekV4CachedRegion(regionLock, &outDecodeRegion) {
+                vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
                     CompiledDecodeTrace.withActive {
                         [self.outMath(args[0], cosT: args[1], sinT: args[2])]
                     }
                 }
-                outDecodeRegion = region
             }
             if let out = region([sdpaOut, cosT, sinT]).first {
                 return out
@@ -825,7 +818,8 @@ class DeepseekV4MoE: Module, UnaryLayer {
     /// the trace. The first forward stays eager (`moeRegionWarm`) so
     /// SwitchGLU's fused gate+up cache — which evals — materializes
     /// before any trace records.
-    private var moeDecodeRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+    private let regionLock = NSLock()
+    private var moeDecodeRegion: DeepseekV4CompiledRegion? = nil
     fileprivate var moeRegionWarm = false
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.config = config
@@ -888,11 +882,8 @@ class DeepseekV4MoE: Module, UnaryLayer {
         if DeepseekV4Math.compileRegionsEnabled, !profileStages,
             x.dim(1) == 1, moeRegionWarm, !(gate.isHashLayer && ids == nil)
         {
-            let region: @Sendable ([MLXArray]) -> [MLXArray]
-            if let cached = moeDecodeRegion {
-                region = cached
-            } else {
-                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+            let region = deepseekV4CachedRegion(regionLock, &moeDecodeRegion) {
+                vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
                     // Nested-compile guard: inner compiled microfunctions
                     // (selector, SwiGLU) inline their raw bodies while this
                     // region traces — and on every retrace.
@@ -902,7 +893,6 @@ class DeepseekV4MoE: Module, UnaryLayer {
                         return [out.y, out.indices]
                     }
                 }
-                moeDecodeRegion = region
             }
             let outs = ids.map { region([x, $0]) } ?? region([x])
             if outs.count == 2 {
@@ -1105,7 +1095,8 @@ class DeepseekV4DecoderLayer: Module {
     /// projection stays outside (Swift attention does not defer it).
     /// Returns `[hF, indices]` so expert-advisor observation runs on real
     /// arrays outside the trace.
-    private var tailDecodeRegion: (@Sendable ([MLXArray]) -> [MLXArray])? = nil
+    private let regionLock = NSLock()
+    private var tailDecodeRegion: DeepseekV4CompiledRegion? = nil
 
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.layerIdx = layerIdx
@@ -1185,11 +1176,8 @@ class DeepseekV4DecoderLayer: Module {
             h.dim(1) == 1, mlp.moeRegionWarm,
             !(mlp.gate.isHashLayer && ids == nil)
         {
-            let region: @Sendable ([MLXArray]) -> [MLXArray]
-            if let cached = tailDecodeRegion {
-                region = cached
-            } else {
-                region = vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
+            let region = deepseekV4CachedRegion(regionLock, &tailDecodeRegion) {
+                vmlxTrustedCompile { [unowned self] (args: [MLXArray]) -> [MLXArray] in
                     // Nested-compile guard: inner compiled microfunctions
                     // (hcPre region, selector, SwiGLU) inline raw bodies
                     // while this region traces — and on every retrace.
@@ -1211,7 +1199,6 @@ class DeepseekV4DecoderLayer: Module {
                         return [hF, out.indices]
                     }
                 }
-                tailDecodeRegion = region
             }
             let regionArgs = [attnOut, residualA, postA, combA] + (ids.map { [$0] } ?? [])
             let outs = region(regionArgs)
@@ -1286,6 +1273,7 @@ public class DeepseekV4ModelInner: Module {
                 chunkTokens: chunkTokens,
                 finalContextTokens: (firstCache?.offset ?? 0) + chunkTokens)
 
+        DeepseekV4Math.traceLayer("embed", h)
         for (i, layer) in layers.enumerated() {
             h = layer(
                 h,
@@ -1295,11 +1283,14 @@ public class DeepseekV4ModelInner: Module {
             if layerwisePrefill {
                 MLX.eval(h)
             }
+            DeepseekV4Math.traceLayer("layer\(i)", h)
         }
 
         // HyperHead reduce: (B, L, hcMult, H) → (B, L, H)
         var out = hcHead.reduce(h)
+        DeepseekV4Math.traceLayer("hcReduce", out)
         out = norm(out)
+        DeepseekV4Math.traceLayer("norm", out)
         return out
     }
 }

@@ -81,6 +81,31 @@ private let _compiledDeepseekV4ScoredSwiGLUClamped =
 private let _compiledDeepseekV4ScoredSwiGLUUnclamped =
     vmlxTrustedCompile(_deepseekV4ScoredSwiGLUUnclampedArrayBody)
 
+typealias DeepseekV4CompiledRegion = @Sendable ([MLXArray]) -> [MLXArray]
+
+/// Resolve a per-instance compiled decode region, building it once.
+///
+/// The modules holding these caches live on the shared model object, so two
+/// concurrent requests reach the same uninitialised slot together. Without the
+/// lock both threads write the property at once; a closure is a (function,
+/// context) pair, and a torn read pairs one thread's function with the other's
+/// context. The lock is held across the build so the region is compiled once —
+/// that happens on the first decode step of a layer and never again, while the
+/// *call* stays outside the lock so decode is never serialised.
+@inline(__always)
+func deepseekV4CachedRegion(
+    _ lock: NSLock,
+    _ storage: inout DeepseekV4CompiledRegion?,
+    build: () -> DeepseekV4CompiledRegion
+) -> DeepseekV4CompiledRegion {
+    lock.lock()
+    defer { lock.unlock() }
+    if let cached = storage { return cached }
+    let built = build()
+    storage = built
+    return built
+}
+
 public enum DeepseekV4Math {
 
     private static let e4m3KVActivationRoundTripKernel = MLXFast.metalKernel(
@@ -351,6 +376,25 @@ public enum DeepseekV4Math {
             .lowercased()
         return raw != "0" && raw != "false" && raw != "off" && raw != "no"
     }()
+
+    /// `VMLX_DSV4_LAYER_TRACE=1` prints the last position's magnitude after
+    /// every decoder layer. Diagnostic only: it forces a per-layer eval, which
+    /// serialises the lazy graph and costs most of prefill throughput.
+    public static let layerTraceEnabled: Bool = {
+        ProcessInfo.processInfo.environment["VMLX_DSV4_LAYER_TRACE"] == "1"
+    }()
+
+    /// Print `absmax`/`absmean` of the final position of `h`. Both statistics
+    /// are needed: a NaN/Inf blowup moves `absmax` alone, while a routing or
+    /// weight fault that keeps the state finite but wrong moves `absmean`.
+    public static func traceLayer(_ tag: String, _ h: MLXArray) {
+        guard layerTraceEnabled, h.ndim >= 2 else { return }
+        let last = MLX.take(h, MLXArray([Int32(h.dim(1) - 1)]), axis: 1)
+        let a = MLX.abs(last.asType(.float32))
+        print(
+            "[vmlx][dsv4/layer] \(tag) L=\(h.dim(1)) "
+                + "absmax=\(a.max().item(Float.self)) absmean=\(a.mean().item(Float.self))")
+    }
 
     /// Python `_dsv4_attn_subchunk_tokens` parity: attention sub-chunk length
     /// for wide-chunk prefill. SWA/CSA attention cost grows super-linearly
