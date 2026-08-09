@@ -422,6 +422,38 @@ public func loadWeights(
             FileHandle.standardError.write(
                 Data("[Load] JANG shape walk produced \(inferred.perLayerQuantization.count) per-layer quant override(s) over default (bits=\(b), gs=\(g))\n".utf8))
         }
+        if ProcessInfo.processInfo.environment["VMLX_LOAD_QUANT_TRACE"] == "1" {
+            // DSV4-Flash boots read `layers.15.ffn.shared_experts.*` and
+            // `layers.16.attn.indexer.wq_b.*` as all-zero (~80% of boots) or
+            // garbage (~20%) in module space, while the bundle holds sane
+            // values — so either the resolved (bits, gs) for exactly these
+            // tensors is wrong, or their load is dropped. Print what THIS
+            // boot resolved and what the source tensors look like, per
+            // suspect path, so one boot names the failing step.
+            for probe in [
+                "layers.14.ffn.shared_experts.w1", "layers.15.ffn.shared_experts.w1",
+                "layers.15.ffn.shared_experts.w2", "layers.16.attn.indexer.wq_b",
+                "layers.14.attn.indexer.wq_b",
+            ] {
+                let scales = weights[probe + ".scales"]
+                let weightArr = weights[probe + ".weight"]
+                let override = inferred.perLayerQuantization[probe]
+                let desc: String
+                if let scales, let weightArr {
+                    let s = MLX.abs(scales.asType(.float32)).mean()
+                    MLX.eval(s)
+                    desc =
+                        "present wShape=\(weightArr.shape) sShape=\(scales.shape) "
+                        + "sAbsmean=\(s.item(Float.self)) override=\(String(describing: override))"
+                } else {
+                    desc =
+                        "MISSING (weight=\(weightArr != nil) scales=\(scales != nil)) "
+                        + "override=\(String(describing: override))"
+                }
+                FileHandle.standardError.write(
+                    Data("[Load][quant-trace] \(probe): \(desc)\n".utf8))
+            }
+        }
         func variants(_ key: String) -> [String] {
             var seen = Set<String>()
             var out: [String] = []
