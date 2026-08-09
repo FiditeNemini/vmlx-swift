@@ -95,6 +95,14 @@ final class CompiledFunction: @unchecked (Sendable) {
     }
 
     func innerCall(_ arguments: [MLXArray]) -> [MLXArray] {
+        // Bind properties to locals so `inner` captures values, never `self`.
+        // The trampoline below is stored in `cachedInnerClosure`/
+        // `cachedCompiledClosure` (via the C closure payload): an implicit
+        // `self` capture there forms a self-retain cycle, `deinit` never runs,
+        // and `mlx_detail_compile_erase` never frees the backend cache entry —
+        // which retains every traced constant (model weights) forever.
+        let f = self.f
+        let outputs = self.outputs
         let stateInputs = inputs.flatMap { $0.innerState() }
         let argumentsCount = arguments.count
         let stateFree = stateInputs.isEmpty && outputs.isEmpty
