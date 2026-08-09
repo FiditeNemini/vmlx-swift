@@ -611,6 +611,9 @@ public enum DeepseekV4Math {
         qNormOnesLock.lock(); defer { qNormOnesLock.unlock() }
         if let w = qNormOnesCache[key] { return w }
         let w = MLXArray.ones([headDim], dtype: dtype)
+        // `ones` is a pending `full` node; publishing it unevaluated would let
+        // two concurrent requests drive `eval` on the same array_desc.
+        w.eval()
         qNormOnesCache[key] = w
         return w
     }

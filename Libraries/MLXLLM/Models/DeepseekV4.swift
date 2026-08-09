@@ -135,6 +135,11 @@ class DeepseekV4RoPE: Module {
         let angles = positions.expandedDimensions(axis: -1) * invFreq.expandedDimensions(axis: 0)
         let c = cos(angles)
         let s = sin(angles)
+        // Materialize before publishing. A pending graph node handed to two
+        // requests lets both drive `eval` on one array_desc, and a half-written
+        // position table destroys the model's positional geometry rather than
+        // crashing (Osaurus dispatches chat warmup alongside the visible turn).
+        MLX.eval(c, s)
         tables[key] = (offset, length, c, s)
         return (c, s)
     }
@@ -154,6 +159,7 @@ class DeepseekV4RoPE: Module {
         let angles = positions.expandedDimensions(axis: -1) * invFreq.expandedDimensions(axis: 0)
         let c = cos(angles)
         let s = sin(angles)
+        MLX.eval(c, s)
         stridedTables[sKey] = (base, count, c, s)
         return (c, s)
     }
