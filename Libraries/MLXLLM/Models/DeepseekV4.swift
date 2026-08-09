@@ -818,10 +818,6 @@ class DeepseekV4MoE: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     var gate: DeepseekV4MoEGate
     @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV4MLP
-    /// Hack to thread the input token ids down into the gate when this
-    /// layer is hash-routed. Set by the outer model before each layer
-    /// call when hash routing applies.
-    var currentInputIds: MLXArray? = nil
     /// Python `_decode_moe_region` parity: one compiled region per layer
     /// covering gate → routed experts → shared expert → fp32 accumulate,
     /// with weights riding as trace constants. Returns `[y, indices]` so
@@ -873,13 +869,22 @@ class DeepseekV4MoE: Module, UnaryLayer {
         return (y, indices)
     }
 
+    // `UnaryLayer` conformance. Hash layers need the token ids, so anything
+    // routed through this shim gets the non-hash gate.
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        callAsFunction(x, inputIds: nil)
+    }
+
+    // `inputIds` is request-scoped and MUST stay an argument: this module is
+    // shared across every concurrent request through the model, so parking the
+    // ids on `self` lets one request route another's tokens.
+    func callAsFunction(_ x: MLXArray, inputIds: MLXArray?) -> MLXArray {
         let profileStages = deepseekV4StageProfileEnabled && x.dim(1) == 1
 
         // Decode (L==1) routes through the per-layer compiled MoE region.
         // Hash layers without threaded ids fall back to eager (mirrors the
         // Python guard) so the trace never bakes the wrong gate variant.
-        let ids = gate.isHashLayer ? currentInputIds : nil
+        let ids = gate.isHashLayer ? inputIds : nil
         if DeepseekV4Math.compileRegionsEnabled, !profileStages,
             x.dim(1) == 1, moeRegionWarm, !(gate.isHashLayer && ids == nil)
         {
@@ -919,7 +924,7 @@ class DeepseekV4MoE: Module, UnaryLayer {
             stageStart = now
         }
 
-        let (indices, scores) = gate(x, inputIds: currentInputIds)
+        let (indices, scores) = gate(x, inputIds: ids)
         finishStage("gate", [indices, scores])
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         let routed = switchMLP(x, indices, preDownScores: scores)
@@ -1228,9 +1233,7 @@ class DeepseekV4DecoderLayer: Module {
         finishStage("ffn_hc_pre", [xF, postF, combF])
         let normedF = postAttentionLayerNorm(xF)
         finishStage("ffn_norm", [normedF])
-        mlp.currentInputIds = inputIds
-        let ffnOut = mlp(normedF)
-        mlp.currentInputIds = nil
+        let ffnOut = mlp(normedF, inputIds: inputIds)
         finishStage("moe", [ffnOut])
         let hF = ffnHC.expand(
             blockOut: ffnOut, residual: residualF, post: postF, comb: combF)
