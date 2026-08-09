@@ -408,6 +408,24 @@ public enum DeepseekV4Math {
         }
     }
 
+    /// `VMLX_DSV4_WEIGHT_CHECKSUM=1` fingerprints layers 14-16 weight tensors
+    /// once per process, after the first forward. Separates "weights corrupted
+    /// at load" from "weights fine, compute path corrupted" on a souped boot.
+    public static let weightChecksumEnabled: Bool = {
+        ProcessInfo.processInfo.environment["VMLX_DSV4_WEIGHT_CHECKSUM"] == "1"
+    }()
+
+    private static let weightChecksumOnceLock = NSLock()
+    nonisolated(unsafe) private static var weightChecksumDone = false
+
+    public static func runWeightChecksumOnce(_ body: () -> Void) {
+        weightChecksumOnceLock.lock()
+        let shouldRun = !weightChecksumDone
+        weightChecksumDone = true
+        weightChecksumOnceLock.unlock()
+        if shouldRun { body() }
+    }
+
     /// Python `_dsv4_attn_subchunk_tokens` parity: attention sub-chunk length
     /// for wide-chunk prefill. SWA/CSA attention cost grows super-linearly
     /// with chunk width while MoE gather_qmm throughput grows with batch, so

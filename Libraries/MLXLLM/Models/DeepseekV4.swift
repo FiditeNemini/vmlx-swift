@@ -1115,7 +1115,8 @@ class DeepseekV4DecoderLayer: Module {
         _ h: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
-        inputIds: MLXArray?
+        inputIds: MLXArray?,
+        statsSink: ((String, MLXArray)) -> Void = { _ in }
     ) -> MLXArray {
         // Explicit Release diagnostic only. Splitting the lazy graph at each
         // block boundary perturbs total throughput, but attributes the
@@ -1166,6 +1167,12 @@ class DeepseekV4DecoderLayer: Module {
             attnOut = selfAttn(normedA, mask: mask, cache: cache)
         }
         finishStage("attention", [attnOut])
+        // Sub-block stats split the layer-output trace into "attention block"
+        // vs "MoE block" so a magnitude injection names its half. Raw path
+        // only — the compiled decode region fuses past these seams, but the
+        // corruption under study already shows in the first prefill chunk,
+        // which always takes the raw path.
+        DeepseekV4Math.layerStat("layer\(layerIdx).attn", attnOut).map(statsSink)
 
         // Decode tail region (Python `_decode_tail_region`): everything after
         // SDPA fuses into one compiled dispatch per layer. Gated on the MoE
@@ -1222,6 +1229,7 @@ class DeepseekV4DecoderLayer: Module {
         finishStage("ffn_norm", [normedF])
         let ffnOut = mlp(normedF, inputIds: inputIds)
         finishStage("moe", [ffnOut])
+        DeepseekV4Math.layerStat("layer\(layerIdx).moe", ffnOut).map(statsSink)
         let hF = ffnHC.expand(
             blockOut: ffnOut, residual: residualF, post: postF, comb: combF)
         finishStage("ffn_hc_post", [hF])
@@ -1280,7 +1288,8 @@ public class DeepseekV4ModelInner: Module {
                 h,
                 mask: mask,
                 cache: cache?[i],
-                inputIds: inputs)
+                inputIds: inputs,
+                statsSink: { layerStats.append($0) })
             if layerwisePrefill {
                 MLX.eval(h)
             }
@@ -1294,6 +1303,28 @@ public class DeepseekV4ModelInner: Module {
         out = norm(out)
         layerStats.append(contentsOf: DeepseekV4Math.layerStat("norm", out).map { [$0] } ?? [])
         DeepseekV4Math.flushLayerStats(layerStats, length: out.dim(1))
+        // Weight checksums AFTER the first forward on purpose: forcing every
+        // layer-15 weight to materialize BEFORE the racy first-touch window
+        // would serialize the load and could suppress the very corruption
+        // being fingerprinted. Post-forward, the boot's fate is already
+        // decided; the checksum then separates "weights corrupted at load"
+        // from "weights fine, compute path corrupted".
+        if DeepseekV4Math.weightChecksumEnabled {
+            DeepseekV4Math.runWeightChecksumOnce {
+                for i in [14, 15, 16] where i < layers.count {
+                    let flat = layers[i].parameters().flattened()
+                    let stats = flat.map {
+                        ($0.0, MLX.abs($0.1.asType(.float32)).mean())
+                    }
+                    MLX.eval(stats.map(\.1))
+                    for (name, v) in stats {
+                        print(
+                            "[vmlx][dsv4/wsum] layer\(i).\(name) absmean=\(v.item(Float.self))"
+                        )
+                    }
+                }
+            }
+        }
         return out
     }
 }

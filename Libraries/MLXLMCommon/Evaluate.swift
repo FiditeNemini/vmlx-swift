@@ -4070,14 +4070,29 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             // drain. Local chat/tool consumers may start a post-tool decode as
             // soon as `.info` closes the stream, so `.info` must not be visible
             // while this generation task can still touch MLX command encoders.
+            // The three phases below run on the request path, so the stream
+            // does not finish until they do. Timed to split "GPU drain" from
+            // "disk store" for the post-output hang: the fix differs by an
+            // order of magnitude depending on which phase owns the wall time.
+            let genTailTrace =
+                ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+            let tailT0 = Date()
             Stream().synchronize()
+            let tailT1 = Date()
             iterator.storeCacheAfterGeneration(
                 generatedTokenIds: generatedTokenIds,
                 includeGeneratedBoundary: stopReason == .stop
                     && !handler.stopSequenceHit
                     && !handler.emittedToolCall)
-
+            let tailT2 = Date()
             Stream().synchronize()
+            if genTailTrace {
+                let tailT3 = Date()
+                print(
+                    "[vmlx][gen/tail] drain1=\(tailT1.timeIntervalSince(tailT0))s"
+                        + " store=\(tailT2.timeIntervalSince(tailT1))s"
+                        + " drain2=\(tailT3.timeIntervalSince(tailT2))s")
+            }
 
             // Router-advice readback runs on its own Dispatch queue. Drain it
             // after MLX synchronization so short-lived CLI runs and app unload
