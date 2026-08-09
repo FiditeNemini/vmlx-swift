@@ -932,6 +932,8 @@ public struct InitialSuppressTokensProcessor: LogitProcessor {
     private let tokens: [Int]
     private var remaining: Int
     private let negInf = MLXArray(-Float.infinity)
+    private let trace = ProcessInfo.processInfo.environment[
+        "VMLX_REASONING_FLOOR_TRACE"] == "1"
 
     public init(tokens: [Int], count: Int) {
         self.tokens = Array(Set(tokens)).sorted()
@@ -945,12 +947,28 @@ public struct InitialSuppressTokensProcessor: LogitProcessor {
         let vocabSize = logits.dim(-1)
         let valid = tokens.filter { $0 >= 0 && $0 < vocabSize }
         guard !valid.isEmpty else { return logits }
+        if trace {
+            let flat = logits.reshaped(-1)
+            let top = argMax(flat).item(Int.self)
+            let probs = softmax(flat.asType(.float32), axis: -1)
+            let bannedMass = valid.map { probs[$0].item(Float.self) }.reduce(0, +)
+            let line =
+                "[vmlx][reasoning-floor] step remaining=\(remaining) preMaskTop=\(top) "
+                + "bannedMass=\(bannedMass) topMass=\(probs[top].item(Float.self))\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
         logits[0..., MLXArray(valid.map(Int32.init)).asType(.uint32)] = negInf
         return logits
     }
 
     mutating public func didSample(token: MLXArray) {
-        if remaining > 0 { remaining -= 1 }
+        guard remaining > 0 else { return }
+        if trace {
+            let line =
+                "[vmlx][reasoning-floor] sampled=\(token.reshaped(-1)[0].item(Int.self))\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+        remaining -= 1
     }
 }
 
