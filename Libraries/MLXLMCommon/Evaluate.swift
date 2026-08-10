@@ -2765,6 +2765,14 @@ public struct TokenIterator: TokenIteratorProtocol {
             Self.logger.debug(
                 "TokenIterator: skipped history-boundary cache rederive: \(String(describing: error), privacy: .public)"
             )
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                // This catch silently costs hybrid-SSM models every
+                // cross-conversation prefix hit (vmlx#219). At debug level the
+                // reason is unobservable on a real run, so surface it.
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/rederive-failed] tokens=\(tokens.count) "
+                        + "error=\(String(describing: error))\n").utf8))
+            }
             return nil
         }
     }
