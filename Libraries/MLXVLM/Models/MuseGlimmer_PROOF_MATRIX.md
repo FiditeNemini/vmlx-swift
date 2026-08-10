@@ -173,6 +173,70 @@ cache entry, and two that render the same line must not miss.
 and grep for `Reasoning strength:` — count the occurrences and read the value.
 That single check settles 1–3.
 
+## Vision: broken, then fixed — 2026-08-10
+
+Vision did not work, and the test that said otherwise accepted any non-empty
+answer containing a word from a list the prompt itself supplied. Rebuilt around
+matched opposite stimuli — so a constant answer scores half, not full — and run
+against Qwen3.6-27B as a positive control, because a probe no model passes
+measures the probe.
+
+| probe (scored as opposite pairs) | before | after | Qwen3.6 control |
+|---|---|---|---|
+| six-trial shape battery | 3/6 (constant "circle" = chance) | **6/6** | 6/6 |
+| solid red field / solid blue field | "green" / "green" | **red / blue** | 2/2 |
+| bar top / bottom | top / bottom | top / bottom | top / bottom |
+| bar left / right | "right" / "right" | **left / right** | left / right |
+
+Both quants pass: JANG_6M and JANG_4M each score 6/6 on shapes and name both
+solid fields correctly.
+
+The model's own description of a centred black circle, before and after:
+
+> before: "an amorphous, irregular blob… muted yellow-olive… sits in the lower
+> part of the frame"
+>
+> after: "a perfectly round disc, filled in solid… the disc is black… centred in
+> the frame with a roughly even margin on all four sides"
+
+### What was actually wrong
+
+Four defects, all invisible to shape checks because every one of them preserves
+tensor dimensions:
+
+1. **RoPE axis order.** The checkpoint interleaves its head dimension as
+   `[w, h, w, h]`; the port built `[h, w, h, w]`. Every patch had its row and
+   column coordinates exchanged. This is what produced the diagnostic signature
+   — vertical position readable, horizontal not — because vision tokens arrive
+   raster-ordered, so rows survive in token order even when the positional
+   signal is wrong, while columns have no such backup.
+2. **RoPE coordinate offset.** Coordinates are 1-based, not 0-based.
+3. **Grid order.** The encoder runs over the raster grid, not over merge blocks.
+   `QwenVL.patchify` groups its rows by merge block, so the rows are ungrouped
+   on entry and regrouped at the end.
+4. **The 2x2 merge is feature-major.** The merged vector is all `mergeUnit`
+   values of feature 0, then feature 1, and so on — not one patch vector
+   concatenated after another. Same width either way.
+
+Plus the patch vector layout fixed earlier: `[temporal][channel][h][w]`, not
+`[channel][temporal][h][w]`, identified from the weights (temporal-pair cosine
+0.990 against 0.492) before the reference confirmed it.
+
+The window size inferred as `pos_emb_height * patch_size` turned out to match
+the reference; the adapter's trailing activation, removed at one point on the
+strength of a Qwen analogy and then restored, is also correct.
+
+### Dead ends worth not repeating
+
+Two internal metrics looked like proof and were withdrawn once controlled:
+the layerwise contrast collapse (46 to 0.13 through the stack — Qwen's working
+tower scores 0.515 on the same statistic) and a gradient row-order correlation
+(Muse 0.42, Qwen **-0.07**, i.e. Muse scored better). Neither could separate a
+working tower from a broken one. `MuseGlimmerMetricControl` keeps that closed.
+
+Rejected by running them: disabling rope, the interleaved rope pairing,
+removing the adapter's trailing activation, and window sizes 224/112/56.
+
 ## Post-merge live evidence (2026-08-10 session, merged build)
 
 - **SSD prefix HIT proven**: `HIT disk boundary=2819 remaining=7786 tokens=10605`

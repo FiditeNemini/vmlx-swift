@@ -34,7 +34,27 @@ public struct MuseGlimmerVisionConfiguration: Codable, Sendable {
 
     /// The reference derives the attention window from the position-embedding
     /// grid: `pos_emb_height * patch_size` pixels.
-    public var windowSize: Int { posEmbHeight * patchSize }
+    /// **Not in the checkpoint.** `config.json` declares `layer_types` with 39
+    /// `window_attention` layers but never states the window size, so this is
+    /// inferred: the position table covers a 32x32 patch grid, i.e. 448px, the
+    /// model's native resolution.
+    ///
+    /// That inference is suspect — at 448 a native-resolution image is a single
+    /// window, which makes those 39 layers behave as full attention and defeats
+    /// the point of having them. A sweep against the six-trial shape battery
+    /// (see MuseGlimmer_PROOF_MATRIX.md) found 448 and 224 give a constant
+    /// answer (3/6, chance) while 112 discriminates the shapes but reports them
+    /// inverted (0/6, which chance produces once in 64). None is correct, so
+    /// the value is left at the inferred default and overridable for the next
+    /// investigation rather than changed to one that scores worse.
+    public var windowSize: Int {
+        if let raw = ProcessInfo.processInfo.environment["VMLX_MUSE_VISION_WINDOW"],
+            let value = Int(raw), value > 0
+        {
+            return value
+        }
+        return posEmbHeight * patchSize
+    }
 
     enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"
@@ -107,8 +127,14 @@ private class MuseGlimmerPatchEmbedder: Module {
     @ModuleInfo(key: "position_embedding_table") var positionTable: Embedding
 
     let side: Int
+    let channels: Int
+    let temporal: Int
+    let patchSize: Int
 
     init(_ config: MuseGlimmerVisionConfiguration) {
+        self.channels = config.inChannels
+        self.temporal = config.patchTemporal
+        self.patchSize = config.patchSize
         let patchDim =
             config.patchTemporal * config.inChannels * config.patchSize * config.patchSize
         self._patchEmbedding.wrappedValue = Linear(patchDim, config.hiddenSize, bias: false)
@@ -119,15 +145,36 @@ private class MuseGlimmerPatchEmbedder: Module {
         super.init()
     }
 
-    func callAsFunction(_ patches: MLXArray, frames: [THW], mergeSize: Int) -> MLXArray {
-        let embeddings = patchEmbedding(patches)
-        let positions = interpolatedPositions(frames: frames, mergeSize: mergeSize)
+    func callAsFunction(_ patches: MLXArray, frames: [THW]) -> MLXArray {
+        let embeddings = patchEmbedding(temporalMajor(patches))
+        let positions = interpolatedPositions(frames: frames)
         return embeddings + positions.asType(embeddings.dtype)
+    }
+
+    /// `QwenVL.patchify` lays each patch vector out as `[channel][temporal][h][w]`,
+    /// but this checkpoint's `patch_embedding` was trained on
+    /// `[temporal][channel][h][w]`. Both orders have the same width, so the
+    /// mistake is invisible in every shape check, and it is invisible again in
+    /// greyscale — a still image duplicates the frame, so for equal channels
+    /// the two orders permute identical blocks and produce the same vector.
+    /// It only shows up in colour, where it interleaves the channels across the
+    /// temporal slots.
+    ///
+    /// The weights identify the true order: under `[temporal][channel]` the two
+    /// temporal slices of a channel have cosine 0.99 — they co-adapt because
+    /// still images always feed them the same pixels — against 0.49 under the
+    /// other reading, which is below the 0.74 baseline for unrelated slices.
+    private func temporalMajor(_ patches: MLXArray) -> MLXArray {
+        let spatial = patchSize * patchSize
+        guard patches.dim(-1) == channels * temporal * spatial else { return patches }
+        return patches.reshaped(patches.dim(0), channels, temporal, spatial)
+            .transposed(0, 2, 1, 3)
+            .reshaped(patches.dim(0), -1)
     }
 
     /// Four gathers plus a weighted sum — the explicit form of a bilinear
     /// sample over the `side × side` table.
-    private func interpolatedPositions(frames: [THW], mergeSize: Int) -> MLXArray {
+    private func interpolatedPositions(frames: [THW]) -> MLXArray {
         var cornerIndices: [[Int32]] = [[], [], [], []]
         var cornerWeights: [[Float]] = [[], [], [], []]
 
@@ -186,25 +233,13 @@ private class MuseGlimmerPatchEmbedder: Module {
                 }
             }
 
-            // Patches arrive grouped by merge block, so the position rows have
-            // to be walked in the same order or every embedding lands on the
-            // wrong patch.
-            var reorder: [Int] = []
-            reorder.reserveCapacity(h * w)
-            for hb in 0 ..< (h / mergeSize) {
-                for wb in 0 ..< (w / mergeSize) {
-                    for di in 0 ..< mergeSize {
-                        for dj in 0 ..< mergeSize {
-                            reorder.append((hb * mergeSize + di) * w + (wb * mergeSize + dj))
-                        }
-                    }
-                }
-            }
-
+            // Raster order. The tower runs over individual patches, not over
+            // merge blocks — the 2x2 merge happens at the very end — so the
+            // position rows are walked straight down the grid.
             for _ in 0 ..< t {
                 for corner in 0 ..< 4 {
-                    cornerIndices[corner].append(contentsOf: reorder.map { idx[corner][$0] })
-                    cornerWeights[corner].append(contentsOf: reorder.map { wgt[corner][$0] })
+                    cornerIndices[corner].append(contentsOf: idx[corner])
+                    cornerWeights[corner].append(contentsOf: wgt[corner])
                 }
             }
         }
@@ -322,13 +357,15 @@ enum MuseGlimmerVisionRoPE {
     }
 
     /// `freqs` is `(L, headDim/2)`; duplicated to `(L, headDim)` and applied
-    /// per head.
+    /// per head. This is the split-half (NeoX/Qwen) pairing: element `i` is
+    /// rotated against element `i + headDim/2`.
     static func apply(_ x: MLXArray, freqs: MLXArray) -> MLXArray {
         let doubled = concatenated([freqs, freqs], axis: -1).expandedDimensions(axis: 1)
         let cosT = cos(doubled).asType(x.dtype)
         let sinT = sin(doubled).asType(x.dtype)
         return (x * cosT) + (rotateHalf(x) * sinT)
     }
+
 }
 
 // MARK: - Vision model
@@ -366,8 +403,23 @@ public class MuseGlimmerVisionModel: Module {
     /// for the adapter. Reordering back to raster order happens here so the
     /// caller never sees window order.
     public func callAsFunction(_ patches: MLXArray, frames: [THW]) -> MLXArray {
-        var h = patchEmbedder(patches, frames: frames, mergeSize: config.mergeSize)
+        callAsFunction(patches, frames: frames, probe: nil)
+    }
+
+    /// `probe` is called with the running activation after the embedder, after
+    /// `ln_pre`, and after every block. A tower can produce well-shaped output
+    /// that carries no usable picture, and that failure is only localizable by
+    /// watching the signal layer by layer — there is no other seam to measure.
+    public func callAsFunction(
+        _ patches: MLXArray, frames: [THW], probe: ((String, MLXArray) -> Void)?
+    ) -> MLXArray {
+        // `QwenVL.patchify` groups its rows by merge block; this tower is
+        // defined over the raster grid, so the rows are ungrouped first and
+        // regrouped at the end by `pixelShuffle`.
+        var h = patchEmbedder(rasterOrder(patches, frames: frames), frames: frames)
+        probe?("embedder", h)
         h = lnPre(h)
+        probe?("ln_pre", h)
 
         let seqLen = h.dim(0)
         let rotaryEmb = rotaryPositionEmbedding(frames)
@@ -383,51 +435,110 @@ public class MuseGlimmerVisionModel: Module {
         let windowMask = blockDiagonalMask(
             sequenceLength: seqLen, cuSeqlens: cuWindowSeqlens)
 
-        // Permute into window order, carrying the rotary rows with it.
-        h = h.reshaped(seqLen / mergeUnit, mergeUnit, -1)[MLXArray(windowIndex), 0..., 0...]
-            .reshaped(seqLen, -1)
-        var rot = rotaryEmb.reshaped(seqLen / mergeUnit, mergeUnit, -1)
-        rot = rot[MLXArray(windowIndex), 0..., 0...].reshaped(seqLen, -1)
+        // Permute into window order, carrying the rotary rows with it. Both are
+        // per-patch, so the permutation indexes rows directly.
+        let order = MLXArray(windowIndex)
+        h = h[order, 0...]
+        let rot = rotaryEmb[order, 0...]
 
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: config.isWindowed(i) ? windowMask : fullMask, rotary: rot)
+            probe?("layer\(i)", h)
         }
 
+        // Undo the window permutation first, so `ln_post` and the merge both
+        // run on raster-ordered patches.
+        h = h[argSort(order, axis: 0), 0...]
         h = lnPost(h)
+        return pixelShuffle(h, frames: frames)
+    }
 
-        // Merge each mergeSize² block into one token, then undo the window
-        // permutation so the features line up with the placeholder positions.
-        h = h.reshaped(seqLen / mergeUnit, mergeUnit * config.hiddenSize)
-        let reverse = argSort(MLXArray(windowIndex), axis: 0)
-        return h[reverse, 0...]
+    /// `QwenVL.patchify` emits rows grouped as `(hb, wb, di, dj)`; this returns
+    /// them in raster order `(row, col)`, which is the order the tower's
+    /// positions, rotary coordinates and window partition are all defined over.
+    private func rasterOrder(_ patches: MLXArray, frames: [THW]) -> MLXArray {
+        let merge = config.mergeSize
+        var gather: [Int32] = []
+        var base = 0
+        for frame in frames {
+            let (t, h, w) = frame.values
+            for _ in 0 ..< t {
+                for row in 0 ..< h {
+                    for col in 0 ..< w {
+                        let block = (row / merge) * (w / merge) + (col / merge)
+                        let within = (row % merge) * merge + (col % merge)
+                        gather.append(Int32(base + block * merge * merge + within))
+                    }
+                }
+                base += h * w
+            }
+        }
+        guard gather.count == patches.dim(0) else { return patches }
+        return patches[MLXArray(gather), 0...]
+    }
+
+    /// Groups each `mergeSize x mergeSize` block of raster-ordered patches into
+    /// one token. The concatenation is **feature-major** — all `mergeUnit`
+    /// values of feature 0, then of feature 1, and so on — not one patch vector
+    /// after another. Both orderings have the same width, so getting it wrong
+    /// still feeds the adapter a correctly shaped, permuted vector.
+    private func pixelShuffle(_ h: MLXArray, frames: [THW]) -> MLXArray {
+        let merge = config.mergeSize
+        let dim = h.dim(-1)
+        var out: [MLXArray] = []
+        var base = 0
+        for frame in frames {
+            let (t, gh, gw) = frame.values
+            var gather: [Int32] = []
+            for f in 0 ..< t {
+                let frameBase = base + f * gh * gw
+                for hb in 0 ..< (gh / merge) {
+                    for wb in 0 ..< (gw / merge) {
+                        for di in 0 ..< merge {
+                            for dj in 0 ..< merge {
+                                gather.append(
+                                    Int32(frameBase + (hb * merge + di) * gw + (wb * merge + dj)))
+                            }
+                        }
+                    }
+                }
+            }
+            let cells = t * (gh / merge) * (gw / merge)
+            let grouped = h[MLXArray(gather), 0...].reshaped(cells, merge * merge, dim)
+            out.append(grouped.transposed(0, 2, 1).reshaped(cells, dim * merge * merge))
+            base += t * gh * gw
+        }
+        return out.count == 1 ? out[0] : concatenated(out, axis: 0)
     }
 
     // MARK: Position / window bookkeeping
 
+    /// Rotary coordinates, in raster order, as `(column, row)` — **not**
+    /// `(row, column)`. The checkpoint interleaves its head dimension as
+    /// `[w, h, w, h]`, so feeding `(row, column)` transposes every patch's
+    /// coordinates: the tower still produces well-formed features, but rows and
+    /// columns are exchanged, which is invisible on a symmetric picture and
+    /// scrambles everything else.
+    ///
+    /// Coordinates are 1-based; the trained offset is 1, not 0.
     private func rotaryPositionEmbedding(_ frames: [THW]) -> MLXArray {
         var positionIds = [MLXArray]()
-        let merge = config.mergeSize
 
         for frame in frames {
             let (t, h, w) = frame.values
 
-            var hpos = expandedDimensions(MLXArray(0 ..< h), axis: 1)
-            hpos = repeated(hpos, count: w, axis: 1)
-            hpos =
-                hpos.reshaped(h / merge, merge, w / merge, merge)
-                .transposed(0, 2, 1, 3).flattened()
+            var rows = expandedDimensions(MLXArray(0 ..< h), axis: 1)
+            rows = repeated(rows, count: w, axis: 1).flattened() + 1
 
-            var wpos = expandedDimensions(MLXArray(0 ..< w), axis: 0)
-            wpos = repeated(wpos, count: h, axis: 0)
-            wpos =
-                wpos.reshaped(h / merge, merge, w / merge, merge)
-                .transposed(0, 2, 1, 3).flattened()
+            var cols = expandedDimensions(MLXArray(0 ..< w), axis: 0)
+            cols = repeated(cols, count: h, axis: 0).flattened() + 1
 
-            positionIds.append(tiled(stacked([hpos, wpos], axis: -1), repetitions: [t, 1]))
+            positionIds.append(tiled(stacked([cols, rows], axis: -1), repetitions: [t, 1]))
         }
 
         let indices = concatenated(positionIds, axis: 0)
-        let maxSide = frames.lazy.map { max($0.h, $0.w) }.max() ?? 0
+        // +2 so the 1-based coordinates stay inside the table.
+        let maxSide = (frames.lazy.map { max($0.h, $0.w) }.max() ?? 0) + 2
         return rotary(sequenceLength: maxSide)[indices].reshaped(indices.dim(0), -1)
     }
 
@@ -438,13 +549,14 @@ public class MuseGlimmerVisionModel: Module {
         var windowIndex: [Int32] = []
         var cuWindowSeqlens = [0]
         var offset = 0
-        let merge = config.mergeSize
-        let windowCells = config.windowSize / merge / config.patchSize
+        // The partition is over individual patches: the 2x2 merge happens after
+        // the encoder, so nothing here is expressed in merged cells.
+        let windowCells = config.windowSize / config.patchSize
 
         for frame in frames {
             let (t, gridH, gridW) = frame.values
-            let llmH = gridH / merge
-            let llmW = gridW / merge
+            let llmH = gridH
+            let llmW = gridW
 
             let padH = (windowCells - llmH % windowCells) % windowCells
             let padW = (windowCells - llmW % windowCells) % windowCells
@@ -467,7 +579,7 @@ public class MuseGlimmerVisionModel: Module {
                             }
                         }
                         if count > 0 {
-                            cuWindowSeqlens.append(cuWindowSeqlens.last! + count * mergeUnit)
+                            cuWindowSeqlens.append(cuWindowSeqlens.last! + count)
                         }
                     }
                 }
