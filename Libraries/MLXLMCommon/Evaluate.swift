@@ -2105,9 +2105,75 @@ public struct TokenIterator: TokenIteratorProtocol {
                 promptTokensForProcessor: input.text.tokens)
             return
         }
+        if try prepareCapturingStableBoundaries(input: input, windowSize: windowSize) {
+            return
+        }
         try prepareRemainder(
             input: input, windowSize: windowSize,
             promptTokensForProcessor: input.text.tokens)
+    }
+
+    /// Prefill in segments that end on each processor-declared stable boundary,
+    /// keeping the cache state at every one.
+    ///
+    /// The store loop needs exactly these snapshots after generation. Without
+    /// them it reconstructs each boundary: topologies that can be trimmed take
+    /// the cheap path, and everything else replays the prefix through the model
+    /// — an extra prefill per boundary, on the request path, after the answer is
+    /// already on screen. That reconstruction is also cancellable, and on a slow
+    /// enough model it loses the race: Bonsai-27B produced
+    /// `rederive-failed tokens=2986 error=CancellationError()` and therefore
+    /// never wrote its stable seed at all, so every later conversation
+    /// cold-prefilled the whole shared prefix.
+    ///
+    /// Prefill already crosses these boundaries, so the state is free at that
+    /// moment and only the cache copy is paid for. Segments run through the
+    /// model's real prepare/forward path in order, exactly as the single-split
+    /// capture above does, so sampling and template behaviour are unchanged.
+    /// Returns false when there is nothing worth splitting, leaving the caller
+    /// on the untouched single-prefill path.
+    private mutating func prepareCapturingStableBoundaries(
+        input: LMInput, windowSize: Int?
+    ) throws -> Bool {
+        let promptCount = input.text.tokenIds?.count ?? input.text.tokens.size
+        // Store shifts stable boundaries one token short for disk-backed
+        // restores, so capture N-1 as well and let the loop find either.
+        let wanted = Set(
+            input.cacheStablePrefixTokenCounts
+                .filter { $0 > 0 && $0 < promptCount }
+                .flatMap { [$0, $0 - 1] }
+        ).filter { $0 > 0 }.sorted()
+        guard !wanted.isEmpty else { return false }
+
+        var consumed = 0
+        var remaining = input
+        for boundary in wanted {
+            guard boundary > consumed,
+                let split = boundarySplit(of: remaining, at: boundary - consumed),
+                let head = split.head
+            else { continue }
+            let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
+                try model.prepare(head, cache: cache, windowSize: windowSize)
+            }
+            switch prepared {
+            case .tokens(let leftover):
+                _ = model(
+                    leftover[text: .newAxis],
+                    cache: cache.isEmpty ? nil : cache,
+                    state: nil)
+            case .logits:
+                break
+            }
+            MLX.eval(cache)
+            stableBoundarySnapshots[boundary] = makePromptBoundaryCacheSnapshot(from: cache)
+            remaining = split.tail
+            consumed = boundary
+        }
+        guard consumed > 0 else { return false }
+        try prepareRemainder(
+            input: remaining, windowSize: windowSize,
+            promptTokensForProcessor: input.text.tokens)
+        return true
     }
 
     /// Prefill `input` and prime `y` with the first sampled token.
