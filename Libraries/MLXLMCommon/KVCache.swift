@@ -696,6 +696,31 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             idx = keep
         }
 
+        // The write below indexes `idx ..< idx + S` into the buffer, but `idx`
+        // and the buffer width can legitimately disagree: a cache restored
+        // from disk carries an `offset` from its metadata while `idx` is
+        // whatever the restore left behind, and `updateConcat` sets `idx` to
+        // the full buffer width. Either way the next in-place write can start
+        // at or past the end, and the failure surfaces as an opaque
+        // precondition trap inside the MLX scatter rather than anything that
+        // names the cache. Rotate to `keep` when the window cannot take the
+        // write, which is what the rotation below the trim would have done had
+        // `idx` matched.
+        var capacity = self.keys!.dim(2)
+        if idx + S > capacity {
+            idx = keep
+            capacity = self.keys!.dim(2)
+        }
+        if idx + S > capacity {
+            // Still cannot fit even after rotating to `keep`. Rather than
+            // compute a cleverer index, hand the write to `updateConcat`,
+            // which owns its own buffer and therefore cannot overrun. Reaching
+            // here means `idx`/`offset`/width disagree — the state a
+            // disk-restored cache arrives in — and every arithmetic fix
+            // attempted at this site missed some combination of them.
+            return updateConcat(keys: keys, values: values)
+        }
+
         // Assign
         self.keys![.ellipsis, idx ..< (idx + S), 0...] = keys
         self.values![.ellipsis, idx ..< (idx + S), 0...] = values
@@ -712,9 +737,29 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return (self.keys!, self.values!)
     }
 
+    /// True when a single-token in-place write is guaranteed to land inside the
+    /// existing buffer.
+    ///
+    /// `updateInPlace` writes `idx ..< idx + S` and can only grow the buffer
+    /// when `offset` has caught up with its width. A cache restored from disk
+    /// takes `offset` from metadata while `idx` comes from wherever the restore
+    /// left it, and `updateConcat` sets `idx` to the full width — so the two can
+    /// disagree and the write lands past the end. `updateConcat` has no such
+    /// assumption, so route to it whenever the fast path is not provably safe.
+    private func canUpdateInPlace(_ S: Int) -> Bool {
+        guard let currentKeys = self.keys else { return true }
+        let capacity = currentKeys.dim(2)
+        // The in-place path may grow by one step when offset has reached the
+        // current width; account for that before deciding.
+        let grown = offset >= capacity && capacity < maxCacheSize
+        let effective = grown ? min(capacity + step, maxCacheSize) : capacity
+        let start = (idx >= effective) ? keep : idx
+        return start + S <= effective
+    }
+
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let result =
-            if keys.dim(2) == 1 {
+            if keys.dim(2) == 1 && canUpdateInPlace(keys.dim(2)) {
                 updateInPlace(keys: keys, values: values)
             } else {
                 updateConcat(keys: keys, values: values)

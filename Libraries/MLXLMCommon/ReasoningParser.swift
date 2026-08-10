@@ -843,6 +843,32 @@ extension ReasoningParser {
                 startTagAliases: ["\u{2B55}thought\n"])
         case "none", "off", "disabled", "mistral", "gemma":
             return nil
+        case "muse_glimmer", "muse-glimmer", "muse", "atem":
+            // Muse Glimmer's turn is a recipient-channel envelope, observed
+            // live off the real bundle:
+            //
+            //   <|start|>assistant to=self<|message|>THINKING<|eom|>
+            //   <|start|>assistant to=user<|message|>ANSWER<|eot|>
+            //
+            // `to=self` segments are the model's reasoning; `to=user` carries
+            // the visible answer. The mapping onto the tag machinery is chosen
+            // so the header junk between channels lands *inside* a reasoning
+            // segment instead of leaking to chat:
+            //
+            // - `to=self<|message|>` opens reasoning; `<|eom|>` closes it.
+            // - `<|start|>assistant` also OPENS reasoning: after an `<|eom|>`
+            //   the follow-on header (` to=user`) is thereby swallowed until…
+            // - `to=user<|message|>` closes reasoning (end alias), so the
+            //   answer streams as content. Outside reasoning the same spelling
+            //   is a stray tag and is stripped — which also removes the bare
+            //   `to=user<|message|>` some turns emit before any thinking.
+            return ReasoningParser(
+                startTag: "to=self<|message|>",
+                endTag: "<|eom|>",
+                startInReasoning: false,
+                stripStrayTags: true,
+                startTagAliases: [" to=self<|message|>", "<|start|>assistant"],
+                endTagAliases: ["to=user<|message|>", " to=user<|message|>"])
         default:
             return nil
         }

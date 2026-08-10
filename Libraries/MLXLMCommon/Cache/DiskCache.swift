@@ -304,12 +304,28 @@ public final class DiskCache: @unchecked Sendable {
         // while the default GPU stream still has a committed command buffer
         // can trip Metal's `_status < MTLCommandBufferStatusCommitted`
         // assertion. Sync before materializing, then again before/after save.
+        let phaseTrace =
+            ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+        let tStart = Date()
         Stream.gpu.synchronize()
         MLX.eval(Array(arrays.values))
         Stream.gpu.synchronize()
+        let tEval = Date()
         do {
             try save(arrays: arrays, metadata: ["format": "mlx"], url: url)
             Stream.gpu.synchronize()
+            if phaseTrace {
+                // A 27B ternary model spent ~25 s storing a single ~357 MB
+                // boundary — about 14 MB/s, which is far too slow to be the
+                // write itself, so the cost is either materializing the cache
+                // or serializing it. Splitting the two says which, instead of
+                // leaving it to inference.
+                let tSave = Date()
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/store-phase] count=\(tokenCount) "
+                        + "eval=\(tEval.timeIntervalSince(tStart))s "
+                        + "save=\(tSave.timeIntervalSince(tEval))s\n").utf8))
+            }
 
             let fileSize: Int
             if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
@@ -445,6 +461,34 @@ public final class DiskCache: @unchecked Sendable {
               let current = _fileFingerprint(url: url),
               current == validated,
               current.size > 0,
+              let indexed = _entryMetadataLocked(hash: hash),
+              indexed.tokenCount == tokens.count,
+              indexed.fileSize == current.size
+        else {
+            return false
+        }
+        return true
+    }
+
+    /// Whether a complete, self-consistent entry for exactly these tokens is on
+    /// disk, regardless of which process wrote it.
+    ///
+    /// `hasValidatedEntry` deliberately trusts only what this process wrote or
+    /// read, which is right for skipping a rewrite it can vouch for. It is too
+    /// strict for deciding whether a boundary needs producing at all: after a
+    /// restart, or on any turn that restored from cache, the entry is on disk
+    /// but unvalidated, so the store path tries to rebuild it — and rebuilding
+    /// means replaying the prefix through the model, which is cancellable and
+    /// was observed dying as `rederive-failed ... CancellationError()` on a
+    /// user Stop. The key is content-addressed over exactly these tokens, so an
+    /// indexed row whose size matches the file on disk is the same bytes a
+    /// rebuild would produce.
+    public func hasDurableEntry(tokens: [Int], mediaSalt: String? = nil) -> Bool {
+        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
+        let url = safetensorsURL(for: hash)
+        lock.lock()
+        defer { lock.unlock() }
+        guard let current = _fileFingerprint(url: url), current.size > 0,
               let indexed = _entryMetadataLocked(hash: hash),
               indexed.tokenCount == tokens.count,
               indexed.fileSize == current.size
