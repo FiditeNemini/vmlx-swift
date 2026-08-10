@@ -1324,6 +1324,22 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// a second full prefill. Released once stored.
     var hybridStripSnapshot: [KVCache]?
 
+    /// Cache state at each processor-declared stable boundary, captured during
+    /// prefill, keyed by the token count actually stored.
+    ///
+    /// Without this the post-generation store loop has to reconstruct those
+    /// boundaries. Trimming serves topologies that can trim; everything else
+    /// falls through to `cacheSnapshotForBoundary`, which replays the prefix
+    /// through the model — a whole extra prefill per boundary, on the request
+    /// path, after the user's answer is already on screen. Measured on a
+    /// DeepSeek-V4-Flash turn writing five boundaries: 12.4 s of store against
+    /// a 1.2 ms GPU drain, which is the stall hosts report as the answer
+    /// finishing and the turn refusing to end.
+    ///
+    /// Prefill already passes through every one of these boundaries, so the
+    /// state is free at that moment; keeping a copy costs one cache copy.
+    var stableBoundarySnapshots: [Int: [KVCache]] = [:]
+
     /// Absolute `promptTokenIds.count - 1` boundary for text-only
     /// standalone rotating/SWA cache topologies.
     ///
@@ -2075,14 +2091,89 @@ public struct TokenIterator: TokenIteratorProtocol {
             case .diskSeed:
                 diskSeedSnapshot = snapshot
             }
+            // The head we just prefilled ends exactly at a boundary the store
+            // loop will ask for later. Keep it so that loop can use it instead
+            // of replaying the prefix through the model.
+            if let head = capture.head {
+                let headCount = head.text.tokenIds?.count ?? head.text.tokens.size
+                if headCount > 0 {
+                    stableBoundarySnapshots[headCount] = snapshot
+                }
+            }
             try prepareRemainder(
                 input: capture.tail, windowSize: windowSize,
                 promptTokensForProcessor: input.text.tokens)
             return
         }
+        if try prepareCapturingStableBoundaries(input: input, windowSize: windowSize) {
+            return
+        }
         try prepareRemainder(
             input: input, windowSize: windowSize,
             promptTokensForProcessor: input.text.tokens)
+    }
+
+    /// Prefill in segments that end on each processor-declared stable boundary,
+    /// keeping the cache state at every one.
+    ///
+    /// The store loop needs exactly these snapshots after generation. Without
+    /// them it reconstructs each boundary: topologies that can be trimmed take
+    /// the cheap path, and everything else replays the prefix through the model
+    /// — an extra prefill per boundary, on the request path, after the answer is
+    /// already on screen. That reconstruction is also cancellable, and on a slow
+    /// enough model it loses the race: Bonsai-27B produced
+    /// `rederive-failed tokens=2986 error=CancellationError()` and therefore
+    /// never wrote its stable seed at all, so every later conversation
+    /// cold-prefilled the whole shared prefix.
+    ///
+    /// Prefill already crosses these boundaries, so the state is free at that
+    /// moment and only the cache copy is paid for. Segments run through the
+    /// model's real prepare/forward path in order, exactly as the single-split
+    /// capture above does, so sampling and template behaviour are unchanged.
+    /// Returns false when there is nothing worth splitting, leaving the caller
+    /// on the untouched single-prefill path.
+    private mutating func prepareCapturingStableBoundaries(
+        input: LMInput, windowSize: Int?
+    ) throws -> Bool {
+        let promptCount = input.text.tokenIds?.count ?? input.text.tokens.size
+        // Store shifts stable boundaries one token short for disk-backed
+        // restores, so capture N-1 as well and let the loop find either.
+        let wanted = Set(
+            input.cacheStablePrefixTokenCounts
+                .filter { $0 > 0 && $0 < promptCount }
+                .flatMap { [$0, $0 - 1] }
+        ).filter { $0 > 0 }.sorted()
+        guard !wanted.isEmpty else { return false }
+
+        var consumed = 0
+        var remaining = input
+        for boundary in wanted {
+            guard boundary > consumed,
+                let split = boundarySplit(of: remaining, at: boundary - consumed),
+                let head = split.head
+            else { continue }
+            let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
+                try model.prepare(head, cache: cache, windowSize: windowSize)
+            }
+            switch prepared {
+            case .tokens(let leftover):
+                _ = model(
+                    leftover[text: .newAxis],
+                    cache: cache.isEmpty ? nil : cache,
+                    state: nil)
+            case .logits:
+                break
+            }
+            MLX.eval(cache)
+            stableBoundarySnapshots[boundary] = makePromptBoundaryCacheSnapshot(from: cache)
+            remaining = split.tail
+            consumed = boundary
+        }
+        guard consumed > 0 else { return false }
+        try prepareRemainder(
+            input: remaining, windowSize: windowSize,
+            promptTokensForProcessor: input.text.tokens)
+        return true
     }
 
     /// Prefill `input` and prime `y` with the first sampled token.
@@ -2607,16 +2698,41 @@ public struct TokenIterator: TokenIteratorProtocol {
                         )
                         continue
                     }
-                    if let boundarySnapshot = cacheSnapshotForBoundary(
-                        tokens: boundaryTokens,
-                        storageSnapshot: storageTopologySnapshot,
-                        storageSnapshotTokenCount: storageSnapshotTokenCount,
-                        allowDiskBackedRederive: shouldForceStableBoundaryRederive(
-                            isStableBoundary: isStableBoundary,
-                            isReusablePrefixWarmup: isReusablePrefixWarmup,
-                            requiresRecurrentSSMCompanion:
-                                coordinator.requiresRecurrentSSMCompanion))
-                    {
+                    let allowRederive = shouldForceStableBoundaryRederive(
+                        isStableBoundary: isStableBoundary,
+                        isReusablePrefixWarmup: isReusablePrefixWarmup,
+                        requiresRecurrentSSMCompanion:
+                            coordinator.requiresRecurrentSSMCompanion)
+                    // Prefer a snapshot taken while prefill was passing through
+                    // this boundary. `cacheSnapshotForBoundary` otherwise
+                    // replays the prefix through the model for any topology it
+                    // cannot trim, which is a whole extra prefill per boundary
+                    // and runs after the answer is already visible.
+                    let boundarySnapshotOrNil =
+                        stableBoundarySnapshots[storeBoundary].map { captured in
+                            captured.map { $0.copy() }
+                        }
+                        ?? cacheSnapshotForBoundary(
+                            tokens: boundaryTokens,
+                            storageSnapshot: storageTopologySnapshot,
+                            storageSnapshotTokenCount: storageSnapshotTokenCount,
+                            allowDiskBackedRederive: allowRederive)
+                    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                        // Hybrid-SSM models never store the seed their own
+                        // fetch probes for, so a second conversation re-prefills
+                        // the whole system/tool prefix. The decision that drops
+                        // it is several guards deep and only logs at debug
+                        // level, which is not persisted — so report the inputs
+                        // and the outcome for each boundary considered.
+                        FileHandle.standardError.write(Data(
+                            ("[vmlx][cache/store-boundary] boundary=\(boundary)"
+                                + " store=\(storeBoundary) stable=\(isStableBoundary)"
+                                + " allowRederive=\(allowRederive)"
+                                + " snapshotTokens=\(storageSnapshotTokenCount)"
+                                + " snapshot=\(boundarySnapshotOrNil == nil ? "nil" : "ok")\n")
+                                .utf8))
+                    }
+                    if let boundarySnapshot = boundarySnapshotOrNil {
                         store(
                             tokens: boundaryTokens,
                             cache: boundarySnapshot,
@@ -2749,6 +2865,14 @@ public struct TokenIterator: TokenIteratorProtocol {
             Self.logger.debug(
                 "TokenIterator: skipped history-boundary cache rederive: \(String(describing: error), privacy: .public)"
             )
+            if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                // This catch silently costs hybrid-SSM models every
+                // cross-conversation prefix hit (vmlx#219). At debug level the
+                // reason is unobservable on a real run, so surface it.
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/rederive-failed] tokens=\(tokens.count) "
+                        + "error=\(String(describing: error))\n").utf8))
+            }
             return nil
         }
     }
