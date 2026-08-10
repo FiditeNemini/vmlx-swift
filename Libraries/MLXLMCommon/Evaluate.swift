@@ -2607,16 +2607,32 @@ public struct TokenIterator: TokenIteratorProtocol {
                         )
                         continue
                     }
-                    if let boundarySnapshot = cacheSnapshotForBoundary(
+                    let allowRederive = shouldForceStableBoundaryRederive(
+                        isStableBoundary: isStableBoundary,
+                        isReusablePrefixWarmup: isReusablePrefixWarmup,
+                        requiresRecurrentSSMCompanion:
+                            coordinator.requiresRecurrentSSMCompanion)
+                    let boundarySnapshotOrNil = cacheSnapshotForBoundary(
                         tokens: boundaryTokens,
                         storageSnapshot: storageTopologySnapshot,
                         storageSnapshotTokenCount: storageSnapshotTokenCount,
-                        allowDiskBackedRederive: shouldForceStableBoundaryRederive(
-                            isStableBoundary: isStableBoundary,
-                            isReusablePrefixWarmup: isReusablePrefixWarmup,
-                            requiresRecurrentSSMCompanion:
-                                coordinator.requiresRecurrentSSMCompanion))
-                    {
+                        allowDiskBackedRederive: allowRederive)
+                    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                        // Hybrid-SSM models never store the seed their own
+                        // fetch probes for, so a second conversation re-prefills
+                        // the whole system/tool prefix. The decision that drops
+                        // it is several guards deep and only logs at debug
+                        // level, which is not persisted — so report the inputs
+                        // and the outcome for each boundary considered.
+                        FileHandle.standardError.write(Data(
+                            ("[vmlx][cache/store-boundary] boundary=\(boundary)"
+                                + " store=\(storeBoundary) stable=\(isStableBoundary)"
+                                + " allowRederive=\(allowRederive)"
+                                + " snapshotTokens=\(storageSnapshotTokenCount)"
+                                + " snapshot=\(boundarySnapshotOrNil == nil ? "nil" : "ok")\n")
+                                .utf8))
+                    }
+                    if let boundarySnapshot = boundarySnapshotOrNil {
                         store(
                             tokens: boundaryTokens,
                             cache: boundarySnapshot,
