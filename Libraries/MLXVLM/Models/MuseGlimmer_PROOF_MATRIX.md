@@ -107,6 +107,75 @@ Press Stop mid-generation, then send another turn in the same chat.
 - TTFT on a warm prefix vs cold
 - prefill pp/s at short and long context
 
+### Decode ceiling — measured 2026-08-10, UNDER GPU CONTENTION
+
+**Read this first: every absolute number below was taken while an unrelated
+inference workload was running on the same GPU.** They are therefore *lower
+bounds*, not ceilings, and the "25 tok/s is unreachable" conclusion is NOT
+established — it needs a re-measure on an idle machine before anyone acts on it.
+
+What does survive the contention is everything expressed as a ratio, because
+those pairs were measured minutes apart under the same load:
+
+- the full model runs at **~100% of what its own bare quantized kernel reaches**,
+  so there is no overhead left in the surrounding port;
+- **compiled decode adds 3.7%** here, against +72% on a dispatch-bound model —
+  this family is not dispatch-bound;
+- the **4-bit path reaches 55-80% of fp16** bandwidth on the same shape, so
+  dequantization is a real cost and a faster GEMV is the lever that matters.
+
+The absolute figures, as a contended-machine baseline:
+
+### The 25 tok/s gate at 4-bit — contended measurement, 2026-08-10
+
+Live app: **12-13 tok/s**. Isolated forward pass, no sampler/detokenizer/cache/UI:
+**12.2-13.6 tok/s**, so the serving stack costs essentially nothing and the
+whole budget is the forward pass.
+
+Weight bytes actually read per decode token, from the JANG_4M shard headers
+(the vision tower is not touched during text decode):
+
+| component | GB | share |
+|---|---|---|
+| text MLP | 11.66 | 53.8% |
+| text attn qkvo | 3.20 | 14.8% |
+| lm_head | 1.43 | 6.6% |
+| attn output gate (this family's extra) | 0.80 | 3.7% |
+| embeddings | 0.76 | 3.5% |
+| **text total** | **17.85** | |
+| vision tower (idle during decode) | 3.84 | |
+
+That puts measured decode at **~245 GB/s**. Bare matvec at this model's own MLP
+shape (19968x6656):
+
+| kernel | GB/s |
+|---|---|
+| fp16 | 342 |
+| 4-bit quantized, chained | 241-273 |
+| **full model decode** | **245** |
+
+The model already runs at ~100% of what the bare quantized kernel reaches, so
+there is no surrounding overhead left to reclaim. Two things follow:
+
+1. **The ceiling is the kernel, not the port.** Compiled decode buys +3.7% here
+   (not the +72% it gave Gemma E2B — that model was dispatch-bound, this one is
+   not). Folding the centered-norm `+1` into the weights at load removes 208
+   tensor ops per token and cannot be slower, but the effect is inside the
+   ~11% run-to-run variance, so no speedup is claimed for it.
+2. **25 tok/s needs 446 GB/s**, which is above even the *fp16* rate on this
+   shape. A perfect zero-overhead implementation running at fp16 speed would
+   cap at 342/17.85 = **19 tok/s**. At the quantized kernel's real rate the cap
+   is **~15 tok/s**, and 12-13 measured is 80-89% of that.
+
+So on this measurement the gate is not met by optimizing the port — but the
+absolute rates were taken under GPU contention, so re-measure idle before
+concluding the gate is unreachable. What the ratios do establish is that the
+remaining headroom is in the quantized kernel, not in the port. Beyond that it
+needs fewer bytes per token — the 2-bit JANG_2D bundle (~9 GB/token, implying ~30 tok/s) or a smaller
+model — or a faster 4-bit GEMV kernel, since the current one reaches only 55-80%
+of fp16 bandwidth. Measure before attempting either: thermals move these numbers
+~11% run to run, so any claim needs ABAB attribution.
+
 **No speculative decoding.** The `-assistant` draft bundle is out of scope for
 now, so 25 tok/s has to come from the base decode path alone. Budget: ~30B
 dense at 4-bit is ~17–18 GB of weight reads per token, which puts 25 tok/s at
