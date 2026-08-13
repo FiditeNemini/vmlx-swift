@@ -29,6 +29,26 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(!evaluate.contains("reasoningCloseBias active"))
         #expect(!engine.contains("parametersWithAutomaticReasoningCloseBias"))
         #expect(!engine.contains("_parametersWithAutomaticReasoningCloseBias"))
+
+        // The explicit ceiling added for the DSV4 runaway must stay explicit.
+        // These assertions are what keep `ReasoningBudget` on the right side
+        // of the rule above: it may exist, but it may never arm itself.
+        let budget = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/ReasoningBudget.swift",
+            encoding: .utf8)
+        #expect(evaluate.contains("public var reasoningBudgetTokens: Int? = nil"))
+        #expect(evaluate.contains("public var reasoningBudgetCloseTokenID: Int? = nil"))
+        // Armed from one place, and only through the opt-in entry point.
+        #expect(engine.contains("ReasoningBudget.armIfNeeded("))
+        // The opt-in gate: no environment variable, no budget.
+        #expect(budget.contains("VMLX_REASONING_BUDGET"))
+        #expect(budget.contains("guard let budget = configuredTokenCount else { return nil }"))
+        // No self-arming variant may be introduced alongside it. Targets
+        // declarations, not prose, so the doc comment explaining WHY there is
+        // no automatic variant does not trip its own guard.
+        #expect(!budget.contains("func automatic"))
+        #expect(!budget.contains("var automatic"))
+        #expect(!engine.contains("ReasoningBudget.automatic"))
     }
 
     @Test("sampling applies temperature before probability filters")
@@ -63,7 +83,10 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(model.contains("minNumPatches"))
         #expect(model.contains("maxNumPatches"))
         #expect(model.contains("maxModelLen"))
-        #expect(model.contains("tokenCounts.map { _ in THW(1, pixels.dim(2), pixels.dim(3)) }"))
+        // Per-image dims, not one shape reused for the whole batch. The
+        // earlier form (`tokenCounts.map { _ in THW(1, pixels.dim(2), ...) }`)
+        // could only describe a batch whose images all shared a resolution.
+        #expect(model.contains("dims.map { THW(1, $0.h, $0.w) }"))
         #expect(model.contains("totalImageTokens = tokenCounts.reduce(0, +)"))
 
         #expect(preprocessors.contains("private func nemotronOmniSourceTargetPatches("))
@@ -71,8 +94,17 @@ struct NoHiddenReasoningCloseBiasFocusedTests {
         #expect(preprocessors.contains("private func rasterizeImage("))
         #expect(preprocessors.contains("width: Int"))
         #expect(preprocessors.contains("height: Int"))
-        #expect(preprocessors.contains("throws -> (pixelValues: MLXArray, tokenCounts: [Int])"))
-        #expect(preprocessors.contains("Nemotron Omni image batches with mixed dynamic resolutions are not yet supported"))
+        // The signature carries per-image dims alongside the token counts,
+        // which is what lets a batch mix resolutions.
+        #expect(
+            preprocessors.contains(
+                "throws -> (pixelValues: MLXArray, tokenCounts: [Int], dims: [(h: Int, w: Int)])"))
+        // Mixed dynamic resolutions are SUPPORTED now, so the old refusal must
+        // be gone. Asserting its absence keeps the capability from silently
+        // regressing back into a thrown error.
+        #expect(
+            !preprocessors.contains(
+                "Nemotron Omni image batches with mixed dynamic resolutions are not yet supported"))
         #expect(!preprocessors.contains("rasterizeTile("))
     }
 

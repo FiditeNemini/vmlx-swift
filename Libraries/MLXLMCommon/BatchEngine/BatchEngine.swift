@@ -474,6 +474,16 @@ public actor BatchEngine {
             parameters.initialSuppressTokens = [floor.closeTokenID]
             parameters.initialSuppressCount = floor.tokenCount
         }
+        // Upper bound. Inert unless VMLX_REASONING_BUDGET names a token count,
+        // so this changes nothing for callers who do not ask for it.
+        if let budget = ReasoningBudget.armIfNeeded(
+            tokenizer: context.tokenizer, promptTail: promptTail)
+        {
+            parameters.reasoningBudgetTokens = budget.tokenCount
+            parameters.reasoningBudgetCloseTokenID = budget.closeTokenID
+            parameters.reasoningBudgetStartTokenIDs = budget.startTokenIDs
+            parameters.reasoningBudgetOpenTokenIDs = budget.openTokenIDs
+        }
         let request = BatchPendingRequest(
             input: input,
             parameters: parameters,
@@ -586,6 +596,18 @@ public actor BatchEngine {
         {
             parameters.initialSuppressTokens = [floor.closeTokenID]
             parameters.initialSuppressCount = floor.tokenCount
+        }
+        // `generate` is the path the app's single-request chat actually takes
+        // (via `startSoloFastPath`), so arming only in `submit` left the
+        // ceiling inert for every GUI turn — verified live: env set on the
+        // process, sampling trace writing, and zero budget trace lines.
+        if let budget = ReasoningBudget.armIfNeeded(
+            tokenizer: tokenizer, promptTail: promptTail)
+        {
+            parameters.reasoningBudgetTokens = budget.tokenCount
+            parameters.reasoningBudgetCloseTokenID = budget.closeTokenID
+            parameters.reasoningBudgetStartTokenIDs = budget.startTokenIDs
+            parameters.reasoningBudgetOpenTokenIDs = budget.openTokenIDs
         }
         if parameters.draftStrategy?.usesNativeMTP == true {
             guard canStartExclusiveSoloPath else {
