@@ -1230,6 +1230,258 @@ enum VLBench {
         }
     }
 
+    /// Eric's variating pattern: one model, one conversation, one coordinator,
+    /// walking reasoning/image/tool combinations and probing the cache at EVERY
+    /// transition. A single happy-path multiturn proves almost nothing about
+    /// prefix reuse — the point here is that the boundaries survive when the
+    /// SHAPE of the turn changes (reasoning on->off, text->image, no-tools->tools),
+    /// which is exactly where media salts and boundary captures interact.
+    ///
+    ///   1. reasoning on,  text
+    ///   2. reasoning off, image
+    ///   3. reasoning off, tools
+    ///   4. reasoning off, image AND tools
+    static func runVariatingPattern(modelPath: String, maxNewTokens: Int) async throws {
+        let modelDir = URL(fileURLWithPath: modelPath)
+        print("=== VLBench variating pattern (reasoning x image x tools) ===")
+        print("model: \(modelDir.lastPathComponent)")
+
+        let loadStart = CFAbsoluteTimeGetCurrent()
+        let context = try await loadProductionContext(from: modelDir)
+        print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
+        print("Model: \(type(of: context.model))")
+
+        let params = GenerateParameters(
+            maxTokens: maxNewTokens, temperature: 0, prefillStepSize: 512)
+        let coordinator = makeProofCoordinator(
+            modelDir: modelDir, context: context, parameters: params, label: "variating")
+        nonisolated(unsafe) let ctx = context
+        let engine = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
+
+        let image = try synthesiseGradientImage(side: 224)
+        let weatherTool: ToolSpec = [
+            "type": "function",
+            "function": [
+                "name": "get_weather",
+                "description": "Get the current weather for a city",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "location": ["type": "string", "description": "City name"]
+                    ],
+                    "required": ["location"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+
+        func prepare(
+            _ chat: [Chat.Message], thinking: Bool, tools: [ToolSpec]?
+        ) async throws -> LMInput {
+            var input = UserInput(chat: chat, tools: tools)
+            input.additionalContext = ["enable_thinking": thinking]
+            return try await context.processor.prepare(input: input)
+        }
+
+        /// Probe the coordinator with the tokens this turn is about to send, so
+        /// the reuse is reported BEFORE generation rather than inferred after.
+        func probe(_ input: LMInput, label: String) {
+            let tokens = input.text.tokens.reshaped(-1).asArray(Int.self)
+            let salt = computeCacheSalt(for: input, parameters: params)
+            switch coordinator.fetch(tokens: tokens, mediaSalt: salt) {
+            case .hit(let matched, _, let detail, _, _, _):
+                let pct = tokens.isEmpty ? 0 : matched * 100 / tokens.count
+                print("  [\(label)] cache probe: HIT \(detail.rawValue) "
+                    + "\(matched)/\(tokens.count) (\(pct)% reused) media=\(input.hasMediaContent)")
+            case .miss:
+                print("  [\(label)] cache probe: MISS tokens=\(tokens.count) "
+                    + "media=\(input.hasMediaContent)")
+            }
+        }
+
+        /// Run one turn through the real generate path so tool calls surface as
+        /// structured events rather than text.
+        func turn(
+            _ label: String, chat: [Chat.Message], thinking: Bool, tools: [ToolSpec]?
+        ) async throws -> (text: String, reasoning: String, toolCalls: [ToolCall]) {
+            let input = try await prepare(chat, thinking: thinking, tools: tools)
+            probe(input, label: label)
+            nonisolated(unsafe) let sendable = input
+            let stream = await engine.generate(input: sendable, parameters: params)
+            var text = ""
+            var reasoning = ""
+            var calls: [ToolCall] = []
+            for await event in stream {
+                switch event {
+                case .chunk(let c): text += c
+                case .reasoning(let r): reasoning += r
+                case .toolCall(let call): calls.append(call)
+                default: break
+                }
+            }
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let preview = text.count > 110 ? String(text.prefix(110)) + "..." : text
+            print("  [\(label)] think=\(thinking) tools=\(tools?.count ?? 0) "
+                + "reasoning=\(reasoning.count)ch toolCalls=\(calls.count) "
+                + "text=\"\(preview)\"")
+            for call in calls {
+                print("      -> \(call.function.name)(\(call.function.arguments))")
+            }
+            // A leaked control marker means the turn was mis-parsed even if it
+            // looks fine to a human reader.
+            for marker in ["<think>", "</think>", "<image>", "<|tool_call_start|>"] {
+                if text.contains(marker) {
+                    throw NSError(
+                        domain: "VLBench.variating", code: 80,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "\(label): leaked \(marker) into visible text"])
+                }
+            }
+            return (text, reasoning, calls)
+        }
+
+        let system = Chat.Message.system("Answer briefly.")
+
+        // 1. reasoning ON, text only.
+        var chat: [Chat.Message] = [system, .user("Name the capital of France in one word.")]
+        let t1 = try await turn("1 think+text", chat: chat, thinking: true, tools: nil)
+        guard !t1.text.isEmpty || !t1.reasoning.isEmpty else {
+            throw NSError(domain: "VLBench.variating", code: 81,
+                userInfo: [NSLocalizedDescriptionKey: "turn 1 produced nothing"])
+        }
+
+        // 2. reasoning OFF, image added to the SAME conversation.
+        chat.append(.assistant(t1.text.isEmpty ? "Paris." : t1.text))
+        chat.append(.user("Describe this image in one sentence.", images: [.ciImage(image)]))
+        let t2 = try await turn("2 image+nothink", chat: chat, thinking: false, tools: nil)
+        guard !t2.text.isEmpty else {
+            throw NSError(domain: "VLBench.variating", code: 82,
+                userInfo: [NSLocalizedDescriptionKey: "turn 2 (image) produced no text"])
+        }
+
+        // 3. reasoning OFF, tools offered, no new image.
+        chat.append(.assistant(t2.text))
+        chat.append(.user("What is the weather in Tokyo? Use the tool."))
+        let t3 = try await turn("3 tools+nothink", chat: chat, thinking: false, tools: [weatherTool])
+        guard !t3.toolCalls.isEmpty else {
+            throw NSError(domain: "VLBench.variating", code: 83,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "turn 3 offered a tool but produced no structured tool call"])
+        }
+
+        // 4. image AND tools together — the combination, not either alone.
+        chat.append(.assistant("Checked the weather."))
+        chat.append(.user(
+            "Look at this image, then get the weather in Tokyo with the tool.",
+            images: [.ciImage(image)]))
+        let t4 = try await turn("4 image+tools", chat: chat, thinking: false, tools: [weatherTool])
+        guard !t4.toolCalls.isEmpty || !t4.text.isEmpty else {
+            throw NSError(domain: "VLBench.variating", code: 84,
+                userInfo: [NSLocalizedDescriptionKey: "turn 4 (image+tools) produced nothing"])
+        }
+
+        // 4b. Same image+tools turn, but phrased as a single tool instruction.
+        //     Turn 4 asks for two things at once ("look at this image, THEN get
+        //     the weather"); this isolates whether the tool is lost because an
+        //     image is present at all, or only because the instruction is split.
+        var directChat = chat
+        directChat.removeLast()
+        directChat.append(.user(
+            "Get the weather in Tokyo.", images: [.ciImage(image)]))
+        let t4b = try await turn(
+            "4b image+tools direct", chat: directChat, thinking: false, tools: [weatherTool])
+        if t4.toolCalls.isEmpty && t4b.toolCalls.isEmpty {
+            print("      NOTE: image+tools produced no call under EITHER phrasing")
+        } else if t4.toolCalls.isEmpty {
+            print("      NOTE: image+tools works with a direct instruction; the "
+                + "split \"look at image, then use tool\" phrasing is what loses it")
+        }
+
+        // Does the tools block actually reach the prompt when an image is in the
+        // same turn? Render the identical chat with and without tools and compare
+        // token counts — if they match, the tools were dropped before the model
+        // ever saw them, which is a rendering bug rather than model behaviour.
+        let withTools = try await prepare(directChat, thinking: false, tools: [weatherTool])
+        let withoutTools = try await prepare(directChat, thinking: false, tools: nil)
+        let nWith = withTools.text.tokens.reshaped(-1).size
+        let nWithout = withoutTools.text.tokens.reshaped(-1).size
+        print("  [render probe] image turn: with tools=\(nWith) tok, "
+            + "without tools=\(nWithout) tok, delta=\(nWith - nWithout)")
+        // Same comparison on a text-only turn, as the control.
+        let textOnly: [Chat.Message] = [system, .user("Get the weather in Tokyo.")]
+        let textWith = try await prepare(textOnly, thinking: false, tools: [weatherTool])
+        let textWithout = try await prepare(textOnly, thinking: false, tools: nil)
+        let tWith = textWith.text.tokens.reshaped(-1).size
+        let tWithout = textWithout.text.tokens.reshaped(-1).size
+        print("  [render probe] text turn:  with tools=\(tWith) tok, "
+            + "without tools=\(tWithout) tok, delta=\(tWith - tWithout)")
+        if nWith == nWithout && tWith != tWithout {
+            throw NSError(domain: "VLBench.variating", code: 85,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "tools are rendered for a text turn but DROPPED for an image turn"])
+        }
+
+        // 5b. TWO images in ONE turn. The app crashed here with SIGTRAP in
+        //     `mergeInputIdsWithImageFeatures` because the placeholder expansion
+        //     collapsed a RUN of consecutive `<image>` tokens into a single
+        //     image's worth, leaving the second image's features unbound. Every
+        //     single-image row passed while this crashed, which is why it is now
+        //     its own row.
+        let imageB = try synthesiseGradientImage(side: 224, invert: true)
+        let twoImageChat: [Chat.Message] = [
+            system,
+            .user("How many images did I send? Answer with the digit only.",
+                  images: [.ciImage(image), .ciImage(imageB)]),
+        ]
+        let t5b = try await turn(
+            "5b two images one turn", chat: twoImageChat, thinking: false, tools: nil)
+        guard !t5b.text.isEmpty else {
+            throw NSError(domain: "VLBench.variating", code: 87,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "two images in one turn produced no output"])
+        }
+
+        // 6+7. CONTROL: two turns of IDENTICAL shape (no tools, thinking off),
+        //      growing only by the appended turn. Every probe above missed with
+        //      `noRow` — content divergence, not a missing boundary — because
+        //      tools and reasoning render into the SYSTEM prompt at the HEAD, so
+        //      changing either rewrites the prefix a prefix-cache depends on.
+        //      That is correct behaviour, not a caching defect, and this control
+        //      is what distinguishes the two: with the head held constant the
+        //      growing conversation MUST hit.
+        var growChat: [Chat.Message] = [system, .user("Name a primary colour.")]
+        let g1 = try await turn("6 grow A", chat: growChat, thinking: false, tools: nil)
+        growChat.append(.assistant(g1.text.isEmpty ? "Red." : g1.text))
+        growChat.append(.user("Name another one."))
+        let beforeGrowHits = coordinator.snapshotStats().diskStats?.hits ?? 0
+        _ = try await turn("7 grow B (same shape)", chat: growChat, thinking: false, tools: nil)
+        let afterGrowHits = coordinator.snapshotStats().diskStats?.hits ?? 0
+        if afterGrowHits <= beforeGrowHits {
+            throw NSError(domain: "VLBench.variating", code: 86,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "a growing conversation with an UNCHANGED head did not reuse its "
+                    + "prefix — that is a real cache defect, unlike the head-rewriting "
+                    + "turns above"])
+        }
+        print("      grow-control reused the prefix (disk hits \(beforeGrowHits) -> "
+            + "\(afterGrowHits))")
+
+        // 5. Replay turn 1 verbatim: its prefix is still the head of this
+        //    conversation, so the boundary must still be reachable after every
+        //    shape change above.
+        let replayChat: [Chat.Message] = [system, .user("Name the capital of France in one word.")]
+        _ = try await turn("5 replay turn1", chat: replayChat, thinking: true, tools: nil)
+
+        let stats = coordinator.snapshotStats()
+        let pagedHits: Int = stats.pagedStats?.cacheHits ?? 0
+        let pagedMisses: Int = stats.pagedStats?.cacheMisses ?? 0
+        let diskHits: Int = stats.diskStats?.hits ?? 0
+        let diskMisses: Int = stats.diskStats?.misses ?? 0
+        let diskStores: Int = stats.diskStats?.stores ?? 0
+        print("  final cache stats: paged{hits=\(pagedHits),misses=\(pagedMisses)} "
+            + "disk{hits=\(diskHits),misses=\(diskMisses),stores=\(diskStores)}")
+        print("=== VLBench variating pattern: passed ===")
+    }
+
     private static func prepareChat(
         _ chat: [Chat.Message], context: ModelContext
     ) async throws -> LMInput {

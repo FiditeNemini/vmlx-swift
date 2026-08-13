@@ -675,6 +675,25 @@ public struct LFM2VLProcessor: UserInputProcessor {
         self.tokenizer = tokenizer
     }
 
+    /// The `<image>` placeholder id for THIS bundle's vocabulary.
+    ///
+    /// LFM2-VL-1.6B uses 396; LFM2.5-VL-3B uses 124907, and in the 3B vocabulary
+    /// 396 is the ordinary text token `"ab"`. Resolving from the tokenizer keeps
+    /// the processor's id and the model's `imageTokenIndex` (which reads
+    /// `image_token_id` from `config.json`) in agreement on any bundle.
+    ///
+    /// `convertTokenToId` returns the *unknown-token* id rather than nil for a
+    /// token the vocabulary lacks, so the round-trip through `convertIdToToken`
+    /// is what makes this an existence test rather than a lookup that always
+    /// "succeeds".
+    static func resolveImageTokenId(tokenizer: any Tokenizer) -> Int {
+        let legacyLFM2VL16B = 396
+        guard let candidate = tokenizer.convertTokenToId("<image>"),
+            tokenizer.convertIdToToken(candidate) == "<image>"
+        else { return legacyLFM2VL16B }
+        return candidate
+    }
+
     /// Preprocess a single image
     func preprocess(image: CIImage, targetSize: CGSize) -> CIImage {
         image
@@ -763,9 +782,20 @@ public struct LFM2VLProcessor: UserInputProcessor {
 
         // Text-only input
         if input.images.isEmpty {
+            // `toolSchemas` has to ride along or the engine never learns the tool
+            // NAMES. BatchEngine reads them from `LMInput.toolSchemas` (callers
+            // pass tools through `UserInput` -> processor, not as a separate
+            // submit argument), and with none it builds a strip-only
+            // `ToolCallProcessor`; the inline fallbacks then match against a
+            // hard-coded default name list instead of the offered tools, so a
+            // call emitted without the native envelope leaks to the user as
+            // prose with `toolCalls=0`. Tagged formats hide this because their
+            // envelope is self-identifying. Peers already do this — see
+            // Gemma4.swift:1676 and Qwen3VL.swift:156/239.
             return LMInput(
                 tokens: MLXArray(promptTokens),
-                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+                toolSchemas: input.tools)
         }
 
         // Process images
@@ -791,31 +821,48 @@ public struct LFM2VLProcessor: UserInputProcessor {
             totalImageTokens += h * w
         }
 
-        // Replace image placeholder tokens with the correct count
-        // image_token_id is 396 for LFM2 VL models
-        let imageTokenId = 396
+        // Replace image placeholder tokens with the correct count.
+        //
+        // This id used to be the literal `396`, which is only right for
+        // LFM2-VL-1.6B. LFM2.5-VL-3B declares `image_token_id: 124907`, and in
+        // ITS vocabulary 396 is the ordinary text token `"ab"` — so the scan
+        // below matched nothing, no expansion happened, and the model fataled
+        // with `Image features and image tokens do not match: tokens: 1,
+        // features 256`. (The mirror hazard is worse: on a bundle where 396 is
+        // real text, every prompt containing that subword would have had it
+        // expanded into image tokens.)
+        //
+        // Resolve from the tokenizer instead, which is the same `<image>` the
+        // chat template emits. `convertTokenToId` answers with the unknown-token
+        // id rather than nil for a token the vocabulary lacks, so round-trip the
+        // result before trusting it.
+        let imageTokenId = Self.resolveImageTokenId(tokenizer: tokenizer)
         var newPromptTokens = [Int]()
         var imageIdx = 0
         var i = 0
         while i < promptTokens.count {
             if promptTokens[i] == imageTokenId {
-                // Count consecutive image tokens
-                var count = 0
-                while i + count < promptTokens.count && promptTokens[i + count] == imageTokenId {
-                    count += 1
-                }
-                // Replace with correct number for this image
+                // ONE placeholder == ONE image.
+                //
+                // This used to collapse a RUN of consecutive placeholders into a
+                // single expansion, which is wrong the moment a turn carries more
+                // than one image: the template emits one `<image>` per image and
+                // they land adjacent, so the run was expanded for image 0 only
+                // while image 1 still contributed its own features. The merge then
+                // asserted `Image features and image tokens do not match`.
+                //
+                // Caught by attaching two images in the app — SIGTRAP in
+                // `mergeInputIdsWithImageFeatures`. The single-image harness rows
+                // could not see it.
                 if imageIdx < allSpatialShapes.count {
                     let shape = allSpatialShapes[imageIdx]
                     let h = shape.0 / downsampleFactor
                     let w = shape.1 / downsampleFactor
-                    let numTokens = h * w
-                    for _ in 0 ..< numTokens {
-                        newPromptTokens.append(imageTokenId)
-                    }
+                    newPromptTokens.append(
+                        contentsOf: repeatElement(imageTokenId, count: h * w))
                     imageIdx += 1
                 }
-                i += count
+                i += 1
             } else {
                 newPromptTokens.append(promptTokens[i])
                 i += 1
@@ -838,7 +885,8 @@ public struct LFM2VLProcessor: UserInputProcessor {
                 pixels: pixelValuesConcatenated,
                 frames: frames
             ),
-            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            toolSchemas: input.tools
         )
     }
 }
