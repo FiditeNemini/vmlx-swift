@@ -2891,9 +2891,37 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         diskCacheDir: cacheDir,
         ssmMaxEntries: 64,
         modelKey: modelName))
+    // Mirror `ModelContainer.swift:310`. Without this the coordinator's
+    // generation-prompt suffix is EMPTY, `hybridStripBoundaryIndex` returns nil,
+    // and the turn-start boundary — the whole cross-turn reuse mechanism this row
+    // exists to measure — never fires. The row still passed, because paged
+    // post-answer reuse carried it; a `VMLX_HYBRID_STRIPPED_STORE` A/B through
+    // here printed byte-identical numbers in both arms and looked like "no
+    // effect" when it was really "never ran".
+    let genPromptSuffixTokens: [Int] = {
+        guard let gp = context.tokenizer as? GenerationPromptControllableTokenizer
+        else { return [] }
+        let dummy: [[String: any Sendable]] = [["role": "user", "content": "x"]]
+        guard
+            let withGen = try? gp.applyChatTemplate(
+                messages: dummy, tools: nil, additionalContext: nil,
+                addGenerationPrompt: true),
+            let withoutGen = try? gp.applyChatTemplate(
+                messages: dummy, tools: nil, additionalContext: nil,
+                addGenerationPrompt: false)
+        else { return [] }
+        var common = 0
+        let maxCommon = min(withGen.count, withoutGen.count)
+        while common < maxCommon, withGen[common] == withoutGen[common] { common += 1 }
+        let suffix = Array(withGen[common...])
+        guard (1...64).contains(suffix.count) else { return [] }
+        return suffix
+    }()
+    coordinator.setGenPromptSuffixTokens(genPromptSuffixTokens)
     print(
         "Cache policy: paged=\(usePagedCache) disk=\(enableDiskCache) "
-            + "blockSize=64 maxBlocks=512")
+            + "blockSize=64 maxBlocks=512 "
+            + "genPromptSuffix=\(genPromptSuffixTokens.count) tokens")
 
     let budget = max(maxNew, 48)
     var params: GenerateParameters
@@ -2954,6 +2982,14 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             count: prefixRepeat)
         : ""
     let recallPhrase = env["BENCH_GROWING_RECALL_PHRASE"] ?? "vmlx-cache-green"
+    // `BENCH_GROWING_THINK=1` runs the same conversation with reasoning ON and
+    // replays turn 1 the way a host does — visible text only, think block
+    // stripped. That combination is the only one that makes the post-answer
+    // boundary stop being a prefix of the next prompt, so it is the only shape
+    // in which the turn-start boundary can be shown to matter. With reasoning
+    // off (the default) turn 1 emits no think content, history round-trips
+    // exactly, and both boundaries stay valid.
+    let enableThinking = (env["BENCH_GROWING_THINK"] ?? "0") == "1"
     let firstTurnPrompt = longPrefix
         + "Reply with exactly this phrase and nothing else: \(recallPhrase)"
     let messages: [[String: any Sendable]] = [
@@ -2962,16 +2998,22 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let promptTokens = try context.tokenizer.applyChatTemplate(
         messages: messages,
         tools: nil,
-        additionalContext: ["enable_thinking": false])
+        additionalContext: ["enable_thinking": enableThinking])
     let historyBoundaryTokens = try? (
         context.tokenizer as? GenerationPromptControllableTokenizer
     )?.applyChatTemplate(
         messages: messages,
         tools: nil,
-        additionalContext: ["enable_thinking": false],
+        additionalContext: ["enable_thinking": enableThinking],
         addGenerationPrompt: false)
+    // `BENCH_GROWING_NO_HISTORY_BOUNDARY=1` models a caller that does NOT hand
+    // the runtime a turn-start boundary. Osaurus always supplies one, so the
+    // default arm keeps it; the suppressed arm is how you tell whether the
+    // runtime can find that boundary on its own.
+    let suppressHistoryBoundary = (env["BENCH_GROWING_NO_HISTORY_BOUNDARY"] ?? "0") == "1"
     let cachePrefixTokenCounts: [Int]
-    if let historyBoundaryTokens,
+    if !suppressHistoryBoundary,
+       let historyBoundaryTokens,
        !historyBoundaryTokens.isEmpty,
        historyBoundaryTokens.count < promptTokens.count,
        promptTokens.prefix(historyBoundaryTokens.count).elementsEqual(historyBoundaryTokens)
@@ -2984,7 +3026,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         .reshaped(1, promptTokens.count)
     let turn1 = LMInput(
         text: LMInput.Text(tokens: promptArray),
-        cacheScopeSalt: cacheScopeSalt(from: ["enable_thinking": false]),
+        cacheScopeSalt: cacheScopeSalt(from: ["enable_thinking": enableThinking]),
         cachePrefixTokenCounts: cachePrefixTokenCounts,
         cacheStablePrefixTokenCounts: cachePrefixTokenCounts)
     print("  Cache history-boundary counts: \(cachePrefixTokenCounts)")
@@ -3126,8 +3168,23 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             "  \(label) cache stats: hybrid=\(snapshot.isHybrid) pagedIncompatible=\(snapshot.isPagedIncompatible) paged{\(paged)} disk{\(disk)} ssm{hits=\(ssm.hits),misses=\(ssm.misses),reDerives=\(ssm.reDerives)}")
     }
 
-    let turn1Text = context.tokenizer.decode(tokenIds: r1.tokens)
+    let turn1Raw = context.tokenizer.decode(tokenIds: r1.tokens)
         .trimmingCharacters(in: .whitespacesAndNewlines)
+    // What a host puts back into history: the visible answer, with any think
+    // block removed. `</think>` alone is enough to find the split — an opening
+    // tag may be primed by the template and never generated.
+    let turn1Text: String = {
+        guard let close = turn1Raw.range(of: "</think>", options: .backwards) else {
+            return turn1Raw
+        }
+        return String(turn1Raw[close.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }()
+    if turn1Text != turn1Raw {
+        print(
+            "  History replay stripped think: raw=\(turn1Raw.count) chars -> "
+                + "visible=\(turn1Text.count) chars")
+    }
     if !turn1Text.lowercased().contains(recallPhrase.lowercased()) {
         throw NSError(domain: "BENCH_GROWING_CHAT_CACHE", code: 10,
             userInfo: [NSLocalizedDescriptionKey:
@@ -3156,7 +3213,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let turn2Tokens = try context.tokenizer.applyChatTemplate(
         messages: turn2Messages,
         tools: nil,
-        additionalContext: ["enable_thinking": false])
+        additionalContext: ["enable_thinking": enableThinking])
     let turn2RenderedTail = context.tokenizer.decode(
         tokenIds: Array(turn2Tokens.suffix(160)),
         skipSpecialTokens: false)
