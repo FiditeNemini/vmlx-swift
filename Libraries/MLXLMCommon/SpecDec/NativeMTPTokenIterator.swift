@@ -106,12 +106,12 @@ public struct NativeMTPGenerationStats: Sendable, Equatable {
     /// Draft depth actually in effect at the start of generation (`depth=`).
     ///
     /// This is the REQUESTED depth after the policy cap, not the raw request:
-    /// the iterator clamps to `VMLX_MTP_DEPTH_CAP` (default `1`) because depths
-    /// above 1 only ever won on a deterministic counting prompt, and measured
-    /// 14% slower than plain autoregressive decode on real prose. A host that
-    /// asks for `.nativeMTP(depth: 3)` therefore sees `depth == 1` here — which
-    /// is the point of surfacing it, since that gap is otherwise invisible
-    /// without reading stderr.
+    /// the iterator clamps to `VMLX_MTP_DEPTH_CAP` (default `2` — the D2
+    /// ceiling; depths past 2 only ever won on a deterministic counting
+    /// prompt, and Nemotron measured D3 at 0.48x on real prose). A host that
+    /// asks for `.nativeMTP(depth: 3)` therefore sees `depth == 2` here —
+    /// which is the point of surfacing it, since that gap is otherwise
+    /// invisible without reading stderr.
     public let depth: Int
 
     /// Draft depth in effect at end of generation, after any adaptive
@@ -320,7 +320,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         guard effectiveParameters.canUseNativeMTP(for: input) else {
             throw NativeMTPRuntimeError.unsupportedSampling(
-                "native MTP is enabled only for text-only greedy requests with temperature=0, top_p>=1, top_k=0, min_p=0, and no active penalties")
+                "native MTP is enabled only for text-only requests with no active penalties, no suppress/reasoning-budget processors, and an unbounded KV window; sampled requests run the exact-pq accept path")
         }
 
         self.model = model
@@ -331,13 +331,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
         self.maxTokens = effectiveParameters.maxTokens
-        // Python-vmlx policy parity: depths > 1 only ever won on a
-        // deterministic counting prompt (the 1.83x artifact); on real prose
-        // depth-3 measured 14% slower than AR. Cap at 1 unless a benchmark
-        // explicitly raises it via VMLX_MTP_DEPTH_CAP.
+        // Depth policy: D2 is the ceiling (Nemotron measured D3 at 0.48x; the
+        // Python-vmlx depth-3 prose figure was 14% SLOWER than AR — depths
+        // past 2 only ever won on a deterministic counting prompt, the 1.83x
+        // artifact). The cap used to be 1, which silently clamped a host that
+        // requested the measured bestDepth=2 from vmlx_mtp_tuning.json back to
+        // D1 — auto-launch D2 could never actually run. Hosts only request
+        // depth > 1 when a measured artifact says so, and benchmarks can still
+        // override via VMLX_MTP_DEPTH_CAP.
         let depthCap =
             ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CAP"]
-            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 1
+            .flatMap(Int.init).map { Swift.max($0, 1) } ?? 2
         self.depth = Swift.min(requestedDepth, depthCap)
         self.currentDepth = Swift.min(requestedDepth, depthCap)
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
@@ -1014,10 +1018,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
 
+        // An EXPLICIT verifier mode (per-request, tuning artifact, or env) is
+        // the operator's decision — warmup exists to pick a safety mode
+        // automatically when nobody chose one. A measured tuning artifact
+        // ships `verifier_mode` validated in that mode, so forcing 16
+        // sequential-priced cycles in front of it only re-creates the
+        // "MTP is slower" overhead the artifact already paid to rule out.
         let shouldUseHybridSafetyWarmup = usesHybridMambaCache
             && speculativeSampler.isGreedy
             && processor == nil
             && !hybridSafetyWarmupComplete
+            && Self.nativeMTPHybridVerifySetting(verifierModeSetting) == nil
 
         if shouldUseHybridSafetyWarmup || Self.requiresSequentialVerifierRepair(
             cache,
@@ -1029,8 +1040,14 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         let requested = [primary] + drafts
+        // ONE batched materialization for every id this cycle needs. The old
+        // per-element `.item()` map cost one full pipeline drain per token,
+        // and the replay/audit/pending paths below each re-materialized the
+        // same ids again — 6-9 drains per verify cycle, which the sustained-D1
+        // measurement showed dominating the whole cycle cost (5.4s of
+        // materialize sync against 3.1s of actual forwards over 154 cycles).
         let requestedInputIds = recordMaterializeSync {
-            requested.map { Int32($0.item(Int.self)) }
+            stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
         }
         let input = MLXArray(requestedInputIds).reshaped(1, requested.count)
         let replayChunkCommit = Self.requiresChunkTokenReplayRepair(
@@ -1068,6 +1085,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         guard let verifyDecision = Self.verifyDrafts(
             logits: verifier.logits,
             drafts: drafts,
+            draftTokenIds: requestedInputIds.dropFirst().map(Int.init),
             draftProbabilities: draftProbabilities,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
@@ -1101,9 +1119,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
 
             func replayPrefix(count: Int) -> NativeMTPForwardResult {
-                let acceptedInputIds = recordMaterializeSync {
-                    requested.prefix(count).map { Int32($0.item(Int.self)) }
-                }
+                // Host ids already materialized once at cycle start.
+                let acceptedInputIds = Array(requestedInputIds.prefix(count))
                 let acceptedInput = MLXArray(acceptedInputIds).reshaped(1, count)
                 let replayStart = Date.timeIntervalSinceReferenceDate
                 let repaired = model.nativeBackboneForward(acceptedInput, cache: cache)
@@ -1130,9 +1147,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
                 var auditedAccepted = 0
                 while auditedAccepted < accepted {
-                    let draftID = recordMaterializeSync {
-                        requested[auditedAccepted + 1].item(Int.self)
-                    }
+                    let draftID = Int(requestedInputIds[auditedAccepted + 1])
                     guard audited.tokenIds[auditedAccepted] == draftID else { break }
                     auditedAccepted += 1
                 }
@@ -1184,9 +1199,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             FileHandle.standardError.write(Data(line.utf8))
         }
 
-        for token in drafts.prefix(accepted) {
+        for (index, token) in drafts.prefix(accepted).enumerated() {
             processor?.didSample(token: token)
-            pendingTokens.append(recordMaterializeSync { token.item(Int.self) })
+            pendingTokens.append(Int(requestedInputIds[1 + index]))
         }
 
         if requiresSequentialRepair && accepted > 0 {
@@ -1197,9 +1212,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             checkpoint.restore(into: &cache)
             cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - restoreStart
 
-            let acceptedInputIds = recordMaterializeSync {
-                requested.prefix(accepted + 1).map { Int32($0.item(Int.self)) }
-            }
+            let acceptedInputIds = Array(requestedInputIds.prefix(accepted + 1))
             let acceptedInput = MLXArray(acceptedInputIds).reshaped(1, accepted + 1)
             let replayStart = Date.timeIntervalSinceReferenceDate
             let repaired = model.nativeBackboneForward(acceptedInput, cache: cache)
@@ -1318,7 +1331,17 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
     }
 
+    /// Measurement-only escape hatch: `VMLX_NATIVE_MTP_DISABLE_ADAPTIVE=1`
+    /// keeps the adaptive controller from bailing or downshifting, so a bench
+    /// can measure SUSTAINED speculation cost at a fixed depth. The shipped
+    /// artifacts' floors are calibrated from exactly these runs; without the
+    /// hatch, every hybrid leg measured "12 cycles of trying, then AR" and the
+    /// steady-state number did not exist.
+    private static let adaptiveDisabledForMeasurement =
+        ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_DISABLE_ADAPTIVE"] == "1"
+
     private mutating func recordAdaptiveCycle(accepted: Int) {
+        if Self.adaptiveDisabledForMeasurement { return }
         adaptiveWindow.append(AdaptiveCycle(depth: currentDepth, accepted: accepted))
         if adaptiveWindow.count > Self.adaptiveWindowSize {
             adaptiveWindow.removeFirst(adaptiveWindow.count - Self.adaptiveWindowSize)
@@ -1334,7 +1357,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 partial + item.key * item.value
             }
             let averageAccepted = Double(acceptedTokens) / Double(Swift.max(verifyCalls, 1))
-            if averageAccepted >= Self.hybridWarmupMinimumAverageAccepted {
+            let warmupFloor =
+                Self.hybridWarmupMinimumAverageAcceptedPerDraft * Double(currentDepth)
+            if averageAccepted >= warmupFloor {
                 hybridSafetyWarmupComplete = true
                 NativeMTPHybridWarmupMemo.record(true, for: model)
             } else {
@@ -1368,7 +1393,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        if currentDepth <= 2, acceptanceRatio < Self.depthTwoMinimumAcceptanceRatio {
+        if currentDepth == 2, acceptanceRatio < Self.depthTwoMinimumAcceptanceRatio {
+            // A failing D2 downshifts to D1 first — D1's breakeven is far
+            // lower, so "D2 doesn't pay" is not evidence that speculation
+            // itself doesn't.
+            currentDepth = 1
+            adaptiveDepthDownshiftCount += 1
+            adaptiveWindow.removeAll(keepingCapacity: true)
+            mtpCache = model.makeNativeMTPCache()
+            mtpCacheRefreshCount += 1
+            return
+        }
+
+        if currentDepth == 1, acceptanceRatio < Self.depthOneMinimumAcceptanceRatio {
             enableAutoregressiveFallback(
                 reason: String(
                     format: "adaptive_accept_ratio=%.2f_depth=%d",
@@ -1594,6 +1631,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static func verifyDrafts(
         logits: MLXArray,
         drafts: [MLXArray],
+        draftTokenIds: [Int],
         draftProbabilities: [MLXArray],
         sampler: LogitSampler,
         speculativeSampler: SpeculativeSamplingController,
@@ -1637,11 +1675,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
             var accepted = 0
             while accepted < drafts.count {
-                let targetID = sampledIDs[accepted]
-                let syncStart = Date.timeIntervalSinceReferenceDate
-                let draftID = drafts[accepted].item(Int.self)
-                materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
-                guard targetID == draftID else { break }
+                // Draft ids were materialized once at cycle start — no
+                // per-draft pipeline drain here.
+                guard sampledIDs[accepted] == draftTokenIds[accepted] else { break }
                 accepted += 1
             }
 
@@ -1734,8 +1770,27 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private static let adaptiveMinimumSamplesPerDepth = 6
     private static let depthThreeMinimumAcceptanceRatio = 0.85
     private static let depthTwoMinimumAcceptanceRatio = 0.75
+    /// D1 breakeven is far below D2's. A depth-1 cycle costs one 2-position
+    /// verify forward (≈ one decode forward on a bandwidth-bound dense
+    /// backbone) plus a 1-layer MTP head forward, and emits 1 + accept
+    /// tokens — so speculation pays for itself well below 0.75 acceptance.
+    /// The flat ≤2 floor of 0.75 was measured killing a profitable D1 on
+    /// Qwen3.6-27B prose: accept ratio 0.67 (avgCommittedPerVerify 1.67)
+    /// tripped `adaptive_accept_ratio` at exactly window size 12, before the
+    /// 16-cycle hybrid warmup could ever complete, so every hybrid run paid
+    /// 12 sequential-priced cycles and then fell back to AR — 29.9 tok/s vs
+    /// 34.0 AR, the precise shape of the "MTP is slower" reports.
+    private static let depthOneMinimumAcceptanceRatio = 0.5
     private static let hybridWarmupCycleCount = 16
-    private static let hybridWarmupMinimumAverageAccepted = 2.75
+    /// Per-DRAFT warmup floor. The old absolute floor (2.75 average accepted
+    /// drafts per cycle) is unreachable below depth 3 — depth 1 caps at 1.0
+    /// and depth 2 at 2.0 — so hybrids running the shipped D1/D2 policy could
+    /// never complete warmup, never reach the chunk verifier, and (worse)
+    /// recorded a permanent negative `NativeMTPHybridWarmupMemo` for the
+    /// model. 0.55 × depth keeps the same strictness the 2.75 value expressed
+    /// at its native depth (2.75/3 ≈ 0.92 was Nemotron-D3-era calibration,
+    /// deliberately relaxed here to the D1-breakeven scale).
+    private static let hybridWarmupMinimumAverageAcceptedPerDraft = 0.55
 
     private static func nativeMTPHybridVerifySetting(_ verifierMode: String? = nil) -> String? {
         let env = ProcessInfo.processInfo.environment
