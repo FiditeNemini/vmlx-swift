@@ -1431,6 +1431,93 @@ public class MambaCache: ArraysCache {
         prefixCommitStates.removeAll(keepingCapacity: true)
     }
 
+    // MARK: - Verify-input stash (DFlash 2 lazy rollback)
+
+    /// Per-layer inputs of the LAST speculative verify forward, stashed by
+    /// the owning recurrent layer so a rejected block can be rolled back
+    /// with ONE replay kernel over the accepted rows.
+    ///
+    /// This replaces per-prefix state recording for block speculation.
+    /// Recording cost was measured at 48 layers × 7 prefixes = 336 extra
+    /// scan launches AND 336 `MLX.eval` flushes per cycle — the dominant
+    /// term of a 5.1×-a-decode-step verify. The stash is pure references
+    /// (MLX arrays are immutable buffers), so it costs nothing until a
+    /// rejection actually happens; the reference implementation's
+    /// `_GDNStateCapture` uses the same design.
+    ///
+    /// Owned and interpreted by the layer that wrote it. The cache only
+    /// stores; `arrays` layout is layer-private.
+    public struct VerifyInputStash {
+        public let arrays: [MLXArray]
+        /// Cache offset BEFORE the verify forward advanced it.
+        public let baseOffset: Int
+        /// Recurrent state BEFORE the verify forward, `nil` on a cold start.
+        public let initialState: MLXArray?
+        /// Conv state (`cache[0]`) before the verify forward, if the layer
+        /// carries one.
+        public let initialConvState: MLXArray?
+
+        public init(
+            arrays: [MLXArray], baseOffset: Int,
+            initialState: MLXArray?, initialConvState: MLXArray?
+        ) {
+            self.arrays = arrays
+            self.baseOffset = baseOffset
+            self.initialState = initialState
+            self.initialConvState = initialConvState
+        }
+    }
+
+    public var verifyInputStash: VerifyInputStash?
+
+    public func clearVerifyInputStash() {
+        verifyInputStash = nil
+    }
+
+    // MARK: - Verify staging (compiled DFlash 2 verify)
+
+    /// Fixed staging slots for `input_capture_staged` verify forwards.
+    ///
+    /// `verifyInputStash` cannot survive a `compile()` trace: the host
+    /// struct assignment runs once at trace time and would pin the trace's
+    /// tracer arrays forever. These slots instead hold PERSISTENT MLXArrays
+    /// that the layer updates IN PLACE (`_updateInternal`) — they are part
+    /// of `innerState()`, so the compile transform tracks them as state
+    /// outputs and every replay leaves this call's real values here.
+    ///
+    /// Layout is layer-private (the owning layer writes and reads it).
+    /// Slots are allocated by the first staged verify, which must run
+    /// EAGERLY — `compile()` needs the objects to exist before the trace.
+    public var verifyStagingSlots: [MLXArray?] = Array(repeating: nil, count: 8)
+
+    public var verifyStagingReady: Bool {
+        !verifyStagingSlots.contains(where: { $0 == nil })
+    }
+
+    public func stageVerifySlot(_ index: Int, _ value: MLXArray) {
+        // In place ONLY while the shape is stable — the slots are tracked
+        // compile state, and `_updateInternal` with a different shape
+        // corrupts a trace built against the old one. The block size
+        // changes the row count, so the runtime must call
+        // `clearVerifyStaging()` (and drop its compiled traces) first;
+        // this rebinds defensively rather than corrupting silently.
+        if let existing = verifyStagingSlots[index], existing.shape == value.shape {
+            existing._updateInternal(value)
+        } else {
+            verifyStagingSlots[index] = value
+        }
+    }
+
+    /// Drop the staging slots so the next staged verify reallocates them.
+    /// Required whenever the verify block length changes.
+    public func clearVerifyStaging() {
+        verifyStagingSlots = Array(repeating: nil, count: verifyStagingSlots.count)
+    }
+
+    public override func innerState() -> [MLXArray] {
+        super.innerState() + verifyStagingSlots.compactMap { $0 }
+    }
+
     public override func copy() -> any KVCache {
         let new = MambaCache()
         let s = self.state

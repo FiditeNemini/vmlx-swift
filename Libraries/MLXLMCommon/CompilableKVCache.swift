@@ -96,7 +96,10 @@ public class CompilableKVCache: BaseKVCache {
             offsetArray[0].item(Int.self)
         }
         set {
-            offsetArray = MLXArray([Int32(newValue)])
+            // In place, NEVER a rebind: compile() state tracking captured
+            // this exact object — replacing it silently detaches every
+            // compiled function that references the cache.
+            offsetArray._updateInternal(MLXArray([Int32(newValue)]))
         }
     }
 
@@ -222,18 +225,31 @@ public class CompilableKVCache: BaseKVCache {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        // The static buffer needs no data movement to trim — rewinding the
+        // offset re-exposes the rows to the next update()/makeMask(). The
+        // rewind MUST keep `offsetArray`'s object identity (in-place update,
+        // no rebind) or compiled functions tracking this cache detach.
         let current: Int = offsetArray[0].item(Int.self)
         let trimmed = min(current, n)
-        offsetArray = MLXArray([Int32(current - trimmed)])
+        offsetArray._updateInternal(MLXArray([Int32(current - trimmed)]))
         super.offset = current - trimmed
         return trimmed
     }
 
     public override func copy() -> any KVCache {
         let c = CompilableKVCache(maxLength: maxLength, step: step)
-        c.keys = keys
-        c.values = values
-        c.offsetArray = offsetArray
+        // Pin every buffer with a `* 1` graph node instead of sharing the
+        // reference. This cache mutates IN PLACE — `update()` has always
+        // done so for keys/values (compile() captures the objects and
+        // expects them to be mutated), and the offset now does too — so a
+        // shared reference is not a snapshot, it is a live view that
+        // follows the cache. `copy()` feeds the prefix-cache store path,
+        // where that would persist whatever the cache happened to hold
+        // later rather than what was captured. Same reason ArraysCache
+        // copies its slots.
+        c.keys = keys.map { $0 * 1 }
+        c.values = values.map { $0 * 1 }
+        c.offsetArray = offsetArray * 1
         return c
     }
 

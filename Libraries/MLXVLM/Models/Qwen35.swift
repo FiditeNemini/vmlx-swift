@@ -18,7 +18,12 @@ private let compiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray 
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (x: MLXArray, gate: MLXArray) -> MLXArray in
         x * sigmoid(gate)
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    guard HardwareInfo.isCompiledDecodeSupported else { return body }
+    let compiled = compile(shapeless: true, body)
+    // Inside the outer compiled-decode trace a separately-compiled function is
+    // an illegal nested compile (see `safeGeluApproximate` in SwitchLayers);
+    // run the plain body there — its ops fuse into the outer graph anyway.
+    return { x, g in CompiledDecodeTrace.isActive ? body(x, g) : compiled(x, g) }
 }()
 
 /// Compiled shared expert gate: sigmoid(gate_output) * expert_output → 1 fused op.
@@ -26,7 +31,10 @@ private let compiledSigmoidGate: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (gateOutput: MLXArray, expertOutput: MLXArray) -> MLXArray in
         sigmoid(gateOutput) * expertOutput
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    guard HardwareInfo.isCompiledDecodeSupported else { return body }
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { g, e in CompiledDecodeTrace.isActive ? body(g, e) : compiled(g, e) }
 }()
 
 private enum Qwen35VLError: Error {
@@ -41,7 +49,10 @@ private let _vlmCompiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> ML
         let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
         return decay
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    guard HardwareInfo.isCompiledDecodeSupported else { return body }
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { l, a, d in CompiledDecodeTrace.isActive ? body(l, a, d) : compiled(l, a, d) }
 }()
 
 /// Compiled swiglu: silu(gate) * x → 1 fused Metal dispatch instead of 2.
@@ -52,7 +63,9 @@ private let _vlmCompiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         (gate: MLXArray, x: MLXArray) -> MLXArray in
         silu(gate) * x
     }
-    return compile(shapeless: true, body)
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { g, x in CompiledDecodeTrace.isActive ? body(g, x) : compiled(g, x) }
 }()
 
 /// Compiled precise swiglu: casts to float32, does silu+mul, casts back.
@@ -65,7 +78,9 @@ private let _vlmCompiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) 
         let xF32 = x.asType(.float32)
         return (gateF32 * xF32).asType(h.dtype)
     }
-    return compile(shapeless: true, body)
+    let compiled = compile(shapeless: true, body)
+    // Plain body inside the outer compiled-decode trace — nested compile is illegal.
+    return { h, g, x in CompiledDecodeTrace.isActive ? body(h, g, x) : compiled(h, g, x) }
 }()
 
 private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray)
@@ -808,6 +823,13 @@ enum Qwen35Language {
             var kvSeqLen = keys.dim(-2)
             var positionIds = positionIds
 
+            // A Compilable cache (compiled decode) returns the FULL static
+            // buffer from `update` and its `makeMask` already covers it, so
+            // the kvSeqLen mask slice must not run — and reading `.offset`
+            // (Int) is an illegal `.item()` inside the compile trace.
+            let fullBufferCache = !(cache is BatchKVCache)
+                && graphOffsetArray(for: cache) != nil
+
             if positionIds == nil {
                 // Build position IDs from cache offset. For batched decode with
                 // BatchKVCache, use per-sequence offsets for correct positional encoding.
@@ -818,6 +840,11 @@ enum Qwen35Language {
                     // Shape: [3, B, 1] — 3 for the 3D rope dimensions
                     let base = offsets.reshaped(1, B, 1)
                     positionIds = tiled(base, repetitions: [3, 1, L])
+                } else if fullBufferCache, let graphOffset = graphOffsetArray(for: cache) {
+                    var base = graphOffset.reshaped([]).asType(.int32)
+                        + MLXArray(0 ..< L).asType(.int32)
+                    base = tiled(base[.newAxis, 0...], repetitions: [B, 1])
+                    positionIds = tiled(base[.newAxis, 0..., 0...], repetitions: [3, 1, 1])
                 } else {
                     let offset = cache?.offset ?? 0
                     kvSeqLen += offset + 1
@@ -826,7 +853,7 @@ enum Qwen35Language {
                     positionIds = base[.newAxis, 0..., 0...]
                     positionIds = tiled(positionIds!, repetitions: [3, 1, 1])
                 }
-            } else if let cache {
+            } else if let cache, !fullBufferCache {
                 kvSeqLen += cache.offset + 1
             }
 
@@ -836,7 +863,10 @@ enum Qwen35Language {
 
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
             if let mask {
-                attentionMask = .array(mask[.ellipsis, 0 ..< kvSeqLen])
+                // Full-buffer (Compilable) caches: mask and K/V both span the
+                // whole static buffer — pass through unsliced.
+                attentionMask = fullBufferCache
+                    ? .array(mask) : .array(mask[.ellipsis, 0 ..< kvSeqLen])
             } else {
                 attentionMask = .none
             }
@@ -993,10 +1023,20 @@ enum Qwen35Language {
 
             let convInput = concatenated([convState, mixedQKV], axis: 1)
                 .reshaped(B, convState.dim(1) + S, convDim)
+            // Staged verify (compiled DFlash 2): committed cache slots and
+            // offset stay UNTOUCHED for the whole forward; everything the
+            // post-acceptance commit needs goes into fixed staging slots.
+            let stageVerify = cache != nil && S > 1 && mask == nil
+                && NativeMTPVerifierStatePolicy.shouldStageVerifyInputs
             if let cache, convKernelSize > 1 {
                 let end = convInput.dim(1)
                 let start = max(0, end - (convKernelSize - 1))
-                cache[0] = convInput[0..., start ..< end, 0...]
+                let tail = convInput[0..., start ..< end, 0...]
+                if stageVerify {
+                    cache.stageVerifySlot(7, tail)
+                } else {
+                    cache[0] = tail
+                }
             }
 
             let convOut = silu(conv1d(convInput))
@@ -1048,26 +1088,155 @@ enum Qwen35Language {
             let finalState = state!
 
             if let cache {
-                if recordPrefixCommitStates, S > 1,
-                   NativeMTPVerifierStatePolicy.shouldRecordAcceptedPrefixStates {
-                    self.recordPrefixCommitStates(
-                        cache: cache,
-                        convInput: convInput,
-                        q: qNormed,
-                        k: kNormed,
-                        v: v,
-                        a: a,
-                        b: b,
-                        initialState: initialState,
-                        mask: mask,
-                        baseOffset: cache.offset)
+                if stageVerify {
+                    // The first staged verify must run eagerly to allocate
+                    // the slots — assigning a trace tracer as a persistent
+                    // slot would pin it into every later replay.
+                    if CompiledDecodeTrace.isActive, !cache.verifyStagingReady {
+                        fatalError(
+                            "[Qwen35] staged verify traced before an eager "
+                                + "warm-up allocated the staging slots")
+                    }
+                    cache.stageVerifySlot(0, qNormed)
+                    cache.stageVerifySlot(1, kNormed)
+                    cache.stageVerifySlot(2, v)
+                    cache.stageVerifySlot(3, a)
+                    cache.stageVerifySlot(4, b)
+                    cache.stageVerifySlot(5, convInput)
+                    cache.stageVerifySlot(6, finalState)
+                    // cache[0]/cache[1]/offset untouched — committed by
+                    // commitVerifyStaged after acceptance.
+                } else {
+                    if recordPrefixCommitStates, S > 1,
+                       NativeMTPVerifierStatePolicy.shouldRecordAcceptedPrefixStates {
+                        self.recordPrefixCommitStates(
+                            cache: cache,
+                            convInput: convInput,
+                            q: qNormed,
+                            k: kNormed,
+                            v: v,
+                            a: a,
+                            b: b,
+                            initialState: initialState,
+                            mask: mask,
+                            baseOffset: cache.offset)
+                    }
+                    // DFlash 2 lazy rollback: references only, replayed once
+                    // on rejection. See the LLM twin for the measured cost of
+                    // the per-prefix recording this replaces.
+                    if S > 1, mask == nil,
+                        NativeMTPVerifierStatePolicy.shouldStashVerifyInputs
+                    {
+                        cache.verifyInputStash = MambaCache.VerifyInputStash(
+                            arrays: [qNormed, kNormed, v, a, b, convInput],
+                            baseOffset: cache.offset,
+                            initialState: initialState.map { $0 * 1 },
+                            initialConvState: nil)
+                    }
+                    cache[1] = finalState
+                    cache.offset += S
                 }
-                cache[1] = finalState
-                cache.offset += S
             }
 
             out = norm(out, gate: z)
             return outProj(out.reshaped(B, S, -1))
+        }
+
+        /// Commit for the STAGED (compile-compatible) verify: the forward
+        /// left cache[0]/cache[1]/offset untouched and wrote everything
+        /// into the staging slots. Runs on EVERY staged cycle — a full
+        /// accept just adopts the staged final state; a partial accept
+        /// replays the accepted rows from the still-intact pre-verify
+        /// state in cache[1].
+        func commitVerifyStaged(
+            cache: MambaCache, acceptedInputs: Int, blockLength: Int
+        ) -> Bool {
+            guard cache.verifyStagingReady else { return false }
+            let n = acceptedInputs
+            guard n > 0, n <= blockLength else { return false }
+            let slots = cache.verifyStagingSlots
+            if n == blockLength {
+                cache[1] = slots[6]!
+                if convKernelSize > 1 { cache[0] = slots[7]! }
+            } else {
+                let q = slots[0]!
+                let k = slots[1]!
+                let v = slots[2]!
+                let a = slots[3]!
+                let b = slots[4]!
+                let convInput = slots[5]!
+                // Pre-verify state: still exactly what the verify forward
+                // started from, because the staged forward never wrote it.
+                let initialState: MLXArray? = cache[1]
+                let (_, prefixState) = gatedDeltaUpdate(
+                    q: q[0..., ..<n, 0..., 0...],
+                    k: k[0..., ..<n, 0..., 0...],
+                    v: v[0..., ..<n, 0..., 0...],
+                    a: a[0..., ..<n, 0...],
+                    b: b[0..., ..<n, 0...],
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: initialState,
+                    mask: nil)
+                cache[1] = prefixState
+                if convKernelSize > 1 {
+                    let convEnd = convInput.dim(1) - blockLength + n
+                    let convStart = max(0, convEnd - max(0, convKernelSize - 1))
+                    cache[0] = convInput[0..., convStart ..< convEnd, 0...]
+                }
+            }
+            cache.offset += n
+            return true
+        }
+
+        /// One-shot lazy rollback — see the LLM twin for rationale.
+        func commitVerifyStash(cache: MambaCache, acceptedInputs: Int) -> Bool {
+            guard let stash = cache.verifyInputStash, stash.arrays.count == 6 else { return false }
+            defer { cache.clearVerifyInputStash() }
+            let q = stash.arrays[0]
+            let k = stash.arrays[1]
+            let v = stash.arrays[2]
+            let a = stash.arrays[3]
+            let b = stash.arrays[4]
+            let convInput = stash.arrays[5]
+            let blockLength = q.dim(1)
+            guard acceptedInputs > 0, acceptedInputs <= blockLength else { return false }
+            if acceptedInputs == blockLength { return true }
+
+            let n = acceptedInputs
+            let audit = ProcessInfo.processInfo.environment["VMLX_DFLASH2_ROLLBACK_AUDIT"] == "1"
+            let (_, prefixState) = gatedDeltaUpdate(
+                q: q[0..., ..<n, 0..., 0...],
+                k: k[0..., ..<n, 0..., 0...],
+                v: v[0..., ..<n, 0..., 0...],
+                a: a[0..., ..<n, 0...],
+                b: b[0..., ..<n, 0...],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: stash.initialState,
+                mask: nil)
+            let convEnd = convInput.dim(1) - blockLength + n
+            let convStart = max(0, convEnd - max(0, convKernelSize - 1))
+            if audit {
+                var chained: MLXArray? = stash.initialState
+                for step in 0 ..< n {
+                    let r = step ..< (step + 1)
+                    let (_, s) = gatedDeltaUpdate(
+                        q: q[0..., r, 0..., 0...], k: k[0..., r, 0..., 0...],
+                        v: v[0..., r, 0..., 0...], a: a[0..., r, 0...], b: b[0..., r, 0...],
+                        aLog: aLog, dtBias: dtBias, state: chained, mask: nil)
+                    chained = s
+                }
+                let diff = abs(prefixState - chained!).max().item(Float.self)
+                let scale = abs(chained!).max().item(Float.self)
+                FileHandle.standardError.write(Data(String(
+                    format: "[rollback-audit] n=%d replay-vs-chained maxdiff=%.3e scale=%.3e\n",
+                    n, diff, scale).utf8))
+            }
+            cache[1] = prefixState
+            cache[0] = convInput[0..., convStart ..< convEnd, 0...]
+            cache.offset = stash.baseOffset + n
+            return true
         }
 
         private func recordPrefixCommitStates(
@@ -1513,7 +1682,8 @@ enum Qwen35Language {
             inputsEmbeds: MLXArray? = nil,
             cache: [KVCache?]? = nil,
             positionIds: MLXArray? = nil,
-            captureLayerIDs: Set<Int>
+            captureLayerIDs: Set<Int>,
+            recordPrefixCommitStates: Bool = false
         ) -> (MLXArray, [Int: MLXArray]) {
             var hiddenStates: MLXArray
             if let inputsEmbeds {
@@ -1547,7 +1717,8 @@ enum Qwen35Language {
                     attentionMask: faMask,
                     ssmMask: layerSSMMask,
                     cache: cacheArray?[index],
-                    positionIds: positionIds
+                    positionIds: positionIds,
+                    recordPrefixCommitStates: recordPrefixCommitStates
                 )
                 if captureLayerIDs.contains(index) {
                     captured[index] = hiddenStates
@@ -1612,9 +1783,19 @@ enum Qwen35Language {
                 ropeDeltas = nil
             }
 
+            // Compiled decode: the promoted caches keep their offset as an
+            // MLXArray. Reading `.offset` (Int) forces `.item()` — illegal
+            // inside the compile trace and, worse, would bake the trace-time
+            // offset into the graph as a constant for every later token.
+            // Build the positions from the graph offset instead.
             var cacheOffset = 0
+            var graphOffset: MLXArray? = nil
             if let cache, let faCache = cache[model.faIdx] {
-                cacheOffset = faCache.offset
+                if let g = graphOffsetArray(for: faCache) {
+                    graphOffset = g
+                } else {
+                    cacheOffset = faCache.offset
+                }
             }
 
             var ropeMask = mask
@@ -1623,6 +1804,36 @@ enum Qwen35Language {
             }
 
             var positionIds = providedPositionIds
+            if positionIds == nil, let graphOffset,
+                ropeMask == nil || ropeMask?.ndim == 2
+            {
+                // Graph-visible twin of the `else` (delta) branch below. A
+                // Compilable cache only exists after prefill, so the offset
+                // is non-zero and text positions are offset + arange —
+                // shifted by ropeDeltas when the prompt carried media.
+                let batchSize = inputs.dim(0)
+                let seqLength = inputs.dim(1)
+
+                var delta = graphOffset.reshaped([]).asType(.int32)
+                if let ropeDeltas {
+                    delta = delta + ropeDeltas.asType(.int32)
+                }
+
+                var base = MLXArray(0 ..< seqLength).asType(.int32)
+                base = broadcast(base[.newAxis, 0...], to: [batchSize, seqLength])
+
+                if delta.ndim == 0 {
+                    delta = broadcast(delta, to: [batchSize])
+                } else if delta.dim(0) < batchSize {
+                    delta = repeated(delta, count: batchSize, axis: 0)
+                } else if delta.dim(0) > batchSize {
+                    delta = delta[0 ..< batchSize]
+                }
+
+                base = base + delta[0..., .newAxis]
+                return broadcast(
+                    base[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
+            }
             if positionIds == nil && (ropeMask == nil || ropeMask?.ndim == 2) {
                 if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
                     || ropeDeltas == nil
@@ -1730,13 +1941,36 @@ enum Qwen35Language {
         func textOnlyForwardCapturing(
             _ inputs: MLXArray,
             cache: [KVCache]?,
-            captureLayerIDs: Set<Int>
+            captureLayerIDs: Set<Int>,
+            recordPrefixCommitStates: Bool = false
         ) -> (MLXArray, [Int: MLXArray]) {
             let cacheOpt: [KVCache?]? = cache?.map { $0 as KVCache? }
+            // Media-aware RoPE continuation ONLY when this process actually
+            // ran a media prefill (`ropeDeltas` exists). Forcing position
+            // resolution without that state is wrong twice on a
+            // cache-restored text path: `resolvedPositionIds` computes a
+            // table from the CHUNK's own rows starting at position 0 —
+            // ignoring the restored offset — and the next chunk then
+            // slices past the end of that short table
+            // (measured: restored offset 1375, chunk 33, slice [1408..<1412]
+            // → broadcast abort). `nil` positions make attention derive
+            // them from the cache offset, exactly like the plain forward.
+            let positionIds: MLXArray? = ropeDeltas != nil
+                ? resolvedPositionIds(
+                    inputs: inputs,
+                    cache: cacheOpt,
+                    mask: nil,
+                    providedPositionIds: nil,
+                    imageGridTHW: nil,
+                    videoGridTHW: nil,
+                    resetForMedia: false)
+                : nil
             let (hidden, captured) = model.callAsFunctionCapturing(
                 inputs,
                 cache: cacheOpt,
-                captureLayerIDs: captureLayerIDs)
+                positionIds: positionIds,
+                captureLayerIDs: captureLayerIDs,
+                recordPrefixCommitStates: recordPrefixCommitStates)
             let logits: MLXArray
             if let lmHead {
                 logits = lmHead(hidden)
@@ -1852,7 +2086,7 @@ enum Qwen35Language {
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel {
+public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel, DFlash2StagedVerifyRollbackModel {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
@@ -2084,6 +2318,49 @@ public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderMod
     ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
         languageModel.textOnlyForwardCapturing(
             inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+    }
+
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureLayerIDs: Set<Int>,
+        recordPrefixCommitStates: Bool
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        languageModel.textOnlyForwardCapturing(
+            inputs, cache: cache, captureLayerIDs: captureLayerIDs,
+            recordPrefixCommitStates: recordPrefixCommitStates)
+    }
+
+    /// The GatedDeltaNet layers record their per-step state, so DFlash 2
+    /// can roll a rejected block back without replaying the prefix.
+    public var supportsCapturingPrefixCommitRecording: Bool { true }
+
+    // MARK: - DFlash2VerifyRollbackModel
+
+    public func commitVerifiedBlock(cache: [KVCache], acceptedInputs: Int) -> Bool {
+        for (index, layer) in languageModel.model.layers.enumerated() where layer.isLinear {
+            guard index < cache.count, let mamba = cache[index] as? MambaCache,
+                let gdn = layer.linearAttn,
+                gdn.commitVerifyStash(cache: mamba, acceptedInputs: acceptedInputs)
+            else { return false }
+        }
+        return true
+    }
+
+    // MARK: - DFlash2StagedVerifyRollbackModel
+
+    public func commitStagedVerifiedBlock(
+        cache: [KVCache], acceptedInputs: Int, blockLength: Int
+    ) -> Bool {
+        for (index, layer) in languageModel.model.layers.enumerated() where layer.isLinear {
+            guard index < cache.count, let mamba = cache[index] as? MambaCache,
+                let gdn = layer.linearAttn,
+                gdn.commitVerifyStaged(
+                    cache: mamba, acceptedInputs: acceptedInputs,
+                    blockLength: blockLength)
+            else { return false }
+        }
+        return true
     }
 
     /// `TokenEmbedderModel` conformance — exposes the target's shared
