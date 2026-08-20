@@ -40,8 +40,20 @@ final class DFlash2StrategyMatrixTests: XCTestCase {
             .appendingPathComponent("models/Qwen3.8-27B-DFlash2")
     }
 
-    private static let prompt =
-        "List the first eight prime numbers, then explain in two sentences why 1 is not prime."
+    // VMLX_DFLASH2_MATRIX_PROMPT=code|prose swaps the prompt — structured
+    // output accepts drafts far better than free prose (the same domain
+    // split every MTP stack reports), and the prose prompt runs long
+    // enough to fill a 320-token budget instead of stopping at 94.
+    private static let prompt: String = {
+        switch ProcessInfo.processInfo.environment["VMLX_DFLASH2_MATRIX_PROMPT"] {
+        case "code":
+            return "Write a Swift function that parses a CSV line into fields, handling quoted fields with embedded commas. Code only, no explanation."
+        case "prose":
+            return "Write a detailed explanation of how tides work, covering the moon's role, spring and neap tides, and why some coasts see larger tides than others."
+        default:
+            return "List the first eight prime numbers, then explain in two sentences why 1 is not prime."
+        }
+    }()
 
     func testMatrix() async throws {
         guard let targetPath = Self.targetPath else {
@@ -63,15 +75,30 @@ final class DFlash2StrategyMatrixTests: XCTestCase {
         if let mtpModel = ctx.model as? any NativeMTPModel {
             print("[matrix] nativeMTPAvailable=\(mtpModel.nativeMTPAvailable)")
         }
-        let maxTokens = 160
+        let maxTokens = ProcessInfo.processInfo.environment["VMLX_DFLASH2_MATRIX_MAXTOKENS"]
+            .flatMap(Int.init) ?? 160
 
         struct Arm { let name: String; let strategy: DraftStrategy? }
-        let arms: [Arm] = [
+        let allArms: [Arm] = [
             Arm(name: "plain", strategy: nil),
             Arm(name: "mtp-d1", strategy: .nativeMTP(depth: 1)),
+            Arm(name: "mtp-d2", strategy: .nativeMTP(depth: 2)),
+            Arm(name: "mtp-d3", strategy: .nativeMTP(depth: 3)),
+            Arm(name: "mtp-d4", strategy: .nativeMTP(depth: 4)),
             Arm(name: "dflash2-b8", strategy: .dflash2(drafterPath: Self.drafterURL, blockSize: 8)),
             Arm(name: "dflash2-b4", strategy: .dflash2(drafterPath: Self.drafterURL, blockSize: 4)),
         ]
+        // VMLX_DFLASH2_MATRIX_ARMS=plain,mtp-d3 runs a subset;
+        // VMLX_DFLASH2_MATRIX_THINK=on|off runs one leg.
+        let armFilter = ProcessInfo.processInfo.environment["VMLX_DFLASH2_MATRIX_ARMS"]?
+            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        let arms = allArms.filter { armFilter?.contains($0.name) ?? true }
+        let thinkLegs: [Bool]
+        switch ProcessInfo.processInfo.environment["VMLX_DFLASH2_MATRIX_THINK"]?.lowercased() {
+        case "on": thinkLegs = [true]
+        case "off": thinkLegs = [false]
+        default: thinkLegs = [true, false]
+        }
 
         func run(_ arm: Arm, thinking: Bool) async throws
             -> (reasoning: String, content: String, seconds: Double, tokens: Int)
@@ -108,7 +135,7 @@ final class DFlash2StrategyMatrixTests: XCTestCase {
             return (reasoning, content, Date().timeIntervalSince(start), tokens)
         }
 
-        for thinking in [true, false] {
+        for thinking in thinkLegs {
             var round2: [String: (reasoning: String, content: String, seconds: Double, tokens: Int)] = [:]
             for round in 1 ... 2 {
                 for arm in arms {
@@ -123,7 +150,7 @@ final class DFlash2StrategyMatrixTests: XCTestCase {
                 }
             }
 
-            let plain = try XCTUnwrap(round2["plain"])
+            guard let plain = round2["plain"] else { continue }
             print("[matrix think=\(thinking ? "ON" : "OFF")] plain reasoning: \"\(plain.reasoning.prefix(90))\"")
             print("[matrix think=\(thinking ? "ON" : "OFF")] plain content  : \"\(plain.content.prefix(90))\"")
             if thinking {
