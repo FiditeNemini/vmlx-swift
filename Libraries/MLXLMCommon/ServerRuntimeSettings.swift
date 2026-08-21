@@ -9,7 +9,13 @@ import Foundation
 /// `nil` means "do not override the bundle/engine default"; it must not be
 /// converted into hidden sampling clamps or family-specific recovery behavior.
 public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
-    public static let contractVersion = 1
+    /// Bumped whenever a persisted default changes in a way that existing
+    /// installs must follow. `migrateToCurrentSchema()` performs the one-shot.
+    ///
+    /// 2: disk-cache size default moved from a flat 10 GB to auto (10% of the
+    ///    cache volume). Installs that had already written the literal 10.0
+    ///    must move to auto, otherwise only fresh installs benefit.
+    public static let contractVersion = 2
 
     public var network: VMLXServerNetworkSettings
     public var concurrency: VMLXServerConcurrencySettings
@@ -23,6 +29,12 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// Optional so existing server-runtime.json files decode unchanged.
     /// `effectivePerformance` resolves nil to defaults.
     public var performance: VMLXServerPerformanceSettings?
+
+    /// Schema version of the persisted file this value was decoded from.
+    /// Optional so pre-existing `server-runtime.json` files decode unchanged —
+    /// nil means "written before versioning", which is exactly the population a
+    /// migration needs to catch.
+    public var schemaVersion: Int?
 
     public var effectivePerformance: VMLXServerPerformanceSettings {
         performance ?? .init()
@@ -38,8 +50,10 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         multimodal: VMLXServerMultimodalSettings = .init(),
         mtp: VMLXServerMTPSettings = .init(),
         memorySafety: VMLXMemorySafetySettings = .init(),
-        performance: VMLXServerPerformanceSettings? = nil
+        performance: VMLXServerPerformanceSettings? = nil,
+        schemaVersion: Int? = nil
     ) {
+        self.schemaVersion = schemaVersion
         self.network = network
         self.concurrency = concurrency
         self.cache = cache
@@ -50,6 +64,39 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         self.mtp = mtp
         self.memorySafety = memorySafety
         self.performance = performance
+    }
+
+    /// Apply one-shot migrations for persisted defaults that have changed.
+    ///
+    /// Call immediately after decoding a stored settings file, before handing
+    /// the value to the runtime. Idempotent: it stamps `schemaVersion`, so a
+    /// second call is a no-op.
+    ///
+    /// v2 — disk-cache size. The default used to be a flat 10 GB, which could
+    /// not hold one full-context conversation of a 27B (256 KiB/token at bf16
+    /// over a 222k window is ~54 GB) and is shared across every model in the
+    /// cache root. Auto (10% of the volume) only fills in for an UNSET value,
+    /// so without this migration every install that had already persisted the
+    /// literal 10.0 would keep 10 GB forever after updating and only fresh
+    /// installs would benefit.
+    ///
+    /// Deliberately version-gated rather than "rewrite any 10.0 we find": once
+    /// a user has been migrated, a later deliberate choice of 10 GB is theirs
+    /// and must survive. Same shape as the MTP-Off defect, where the fix was a
+    /// schema version rather than deleting the migration.
+    public mutating func migrateToCurrentSchema() {
+        let stored = schemaVersion ?? 1
+        if stored < 2 {
+            // Only the exact legacy default moves; any other explicit size the
+            // user chose is left alone.
+            if let size = cache.blockDisk.maxSizeGB, size == 10.0 {
+                cache.blockDisk.maxSizeGB = nil
+            }
+            if let legacy = cache.legacyDisk.maxSizeGB, legacy == 10.0 {
+                cache.legacyDisk.maxSizeGB = nil
+            }
+        }
+        schemaVersion = Self.contractVersion
     }
 
     public func validationIssues(
@@ -837,7 +884,12 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         }
         let diskDir = diskCacheDirectory
             ?? VMLXServerRuntimeSettings.resolvedDirectory(diskDirectory)
-        let diskMaxGB = Float(diskMaxSizeGB ?? 10.0)
+        // Unset means AUTO — a share of the cache volume, not a flat constant.
+        // Applies to every model because the cap governs the whole cache root
+        // (`CacheCoordinator.enforceSharedDiskQuota`), not one bundle.
+        let diskMaxGB = Float(
+            diskMaxSizeGB
+                ?? VMLXServerRuntimeSettings.autoDiskCacheMaxGB(for: diskDir))
 
         return CacheCoordinatorConfig(
             usePagedCache: reuseEnabled && cache.pagedKV.enabled,
@@ -852,6 +904,49 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             defaultKVMode: cache.defaultKVMode,
             defaultMaxKVSize: cache.defaultMaxKVSize,
             longPromptMultiplier: cache.longPromptMultiplier)
+    }
+
+    /// Fraction of the cache volume's total capacity used when the user has not
+    /// set an explicit disk-cache size. Matches the "auto" convention other MLX
+    /// servers use, and is deliberately a share of the DISK rather than a flat
+    /// constant: KV cost scales with the model, so a fixed number is wrong for
+    /// every machine at once.
+    public static let autoDiskCacheFraction: Double = 0.10
+
+    /// Floor for the auto size. Equal to the historical flat default, so
+    /// resolving "auto" can only ever raise the cap, never lower it — no user
+    /// loses cache they had before, and a volume whose capacity cannot be read
+    /// falls back to exactly the old behaviour.
+    public static let autoDiskCacheFloorGB: Double = 10.0
+
+    /// Resolve the effective disk-cache cap in GB for a nil (unset) setting.
+    ///
+    /// A flat 10 GB could not hold ONE full-context conversation of a 27B: at
+    /// 64 layers / 4 KV heads / head_dim 256 the KV cost is 256 KiB per token at
+    /// bf16, so a 222k window needs ~54 GB, and the cap is shared across every
+    /// model in the cache root. Past ~18% of one window each store had to evict
+    /// earlier boundaries of the SAME conversation, so reuse collapsed exactly
+    /// as context grew — the reported symptom.
+    ///
+    /// This ADVISES a larger cap; it never refuses or blocks. If the volume's
+    /// capacity cannot be read it returns the floor rather than guessing small.
+    public static func autoDiskCacheMaxGB(for directory: URL?) -> Double {
+        guard let directory else { return autoDiskCacheFloorGB }
+        // Walk up to the nearest existing ancestor: the cache dir itself may not
+        // exist yet on first run, and `resourceValues` needs a real path.
+        var probe = directory
+        while !FileManager.default.fileExists(atPath: probe.path) {
+            let parent = probe.deletingLastPathComponent()
+            guard parent.path != probe.path else { return autoDiskCacheFloorGB }
+            probe = parent
+        }
+        guard
+            let capacity = try? probe.resourceValues(
+                forKeys: [.volumeTotalCapacityKey]
+            ).volumeTotalCapacity
+        else { return autoDiskCacheFloorGB }
+        let gb = Double(capacity) / 1_073_741_824.0 * autoDiskCacheFraction
+        return Swift.max(autoDiskCacheFloorGB, gb)
     }
 
     private static func resolvedDirectory(_ path: String?) -> URL? {
