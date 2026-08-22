@@ -429,7 +429,8 @@ public final class ModelContainer: Sendable {
     /// consume this automatically — the runtime keeps the explicit
     /// caller-controlled `GenerateParameters` contract. Callers that want
     /// the bundle's stamped defaults (max_new_tokens, temperature, top_p,
-    /// top_k, min_p, repetition_penalty, do_sample) should pass the result
+    /// top_k, min_p, repetition_penalty, presence_penalty,
+    /// frequency_penalty, do_sample) should pass the result
     /// of this method into `generate(...)`.
     ///
     /// Merge policy mirrors `GenerateParameters.init(generationConfig:fallback:)`

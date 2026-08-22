@@ -31,6 +31,18 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
     public var topK: Int?
     public var minP: Float?
     public var repetitionPenalty: Float?
+    /// vLLM/OpenAI parameters. HuggingFace's own `GenerationConfig` has no field for either, but model
+    /// authors write them here anyway, because this is where a bundle's sampling defaults live in
+    /// practice — Qwen-family cards publish `presence_penalty` for non-thinking operation, and bundles
+    /// in the wild ship the key in this exact file.
+    ///
+    /// Their value there is usually 0.0, the base default, with any non-zero setting living in a
+    /// mode-specific block instead. So this is a CONSISTENCY fix rather than an unlock: every other
+    /// sampling field in this file is decoded and adopted, and a caller using the opt-in defaults has
+    /// no way to tell "the author said 0" from "nobody parsed it". A bundle that does declare a
+    /// non-zero value has it silently dropped today.
+    public var presencePenalty: Float?
+    public var frequencyPenalty: Float?
     public var doSample: Bool?
     public var suppressTokens: [Int]?
     public var defaultChatTemplateKwargs: ChatTemplateKwargsDefaults?
@@ -66,6 +78,8 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         topK: Int? = nil,
         minP: Float? = nil,
         repetitionPenalty: Float? = nil,
+        presencePenalty: Float? = nil,
+        frequencyPenalty: Float? = nil,
         doSample: Bool? = nil,
         suppressTokens: [Int]? = nil,
         defaultChatTemplateKwargs: ChatTemplateKwargsDefaults? = nil,
@@ -84,6 +98,8 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         self.topK = topK
         self.minP = minP
         self.repetitionPenalty = repetitionPenalty
+        self.presencePenalty = presencePenalty
+        self.frequencyPenalty = frequencyPenalty
         self.doSample = doSample
         self.suppressTokens = suppressTokens
         self.defaultChatTemplateKwargs = defaultChatTemplateKwargs
@@ -104,6 +120,8 @@ public struct GenerationConfigFile: Codable, Equatable, Sendable {
         case topK = "top_k"
         case minP = "min_p"
         case repetitionPenalty = "repetition_penalty"
+        case presencePenalty = "presence_penalty"
+        case frequencyPenalty = "frequency_penalty"
         case doSample = "do_sample"
         case suppressTokens = "suppress_tokens"
         case defaultChatTemplateKwargs = "default_chat_template_kwargs"
