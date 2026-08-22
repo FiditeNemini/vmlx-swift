@@ -108,14 +108,24 @@ import Testing
     #expect(settings.schemaVersion == VMLXServerRuntimeSettings.contractVersion)
 }
 
-@Test func migrationLeavesADeliberateNonDefaultSizeAlone() {
+/// BEHAVIOUR CHANGE, schema v3: the one-time reset moves EVERY updating
+/// install onto 10% of its own disk, including one that had hand-set a GB
+/// figure. Previously such a value was left alone.
+///
+/// That is the intent, not an accident. The setting is a share of the disk
+/// now, and a stale absolute number is exactly what the change exists to
+/// retire — the old flat 10 GB could not hold one full-context conversation
+/// of a 27B (~54 GB at a 222k window), and any GB figure is wrong for some
+/// machine. It happens once; a size chosen after updating survives.
+@Test func migrationResetsADeliberateGigabyteSizeToTheShare() {
     var settings = VMLXServerRuntimeSettings()
     settings.cache.blockDisk.maxSizeGB = 40.0
     settings.schemaVersion = nil
 
     settings.migrateToCurrentSchema()
 
-    #expect(settings.cache.blockDisk.maxSizeGB == 40.0)
+    #expect(settings.cache.blockDisk.maxSizeGB == nil, "stale absolute size must be cleared")
+    #expect(settings.cache.blockDisk.maxSizePercent == 10.0)
 }
 
 @Test func migrationDoesNotRunTwiceOnADeliberateTenGigabyteChoice() {
@@ -162,6 +172,13 @@ import Testing
 @Test func aFreshSettingsValueIsAlreadyAtTheCurrentSchema() {
     var settings = VMLXServerRuntimeSettings()
     settings.migrateToCurrentSchema()
-    #expect(settings.schemaVersion == 2)
+    // Against `contractVersion` rather than a literal: the assertion is that a
+    // fresh value needs no migration, which stays true at every schema bump.
+    // Pinning the number made adding a migration look like a regression.
+    #expect(settings.schemaVersion == VMLXServerRuntimeSettings.contractVersion)
     #expect(settings.cache.blockDisk.maxSizeGB == nil)
+    // A fresh install lands on the same explicit 10% an updating install gets,
+    // so both paths resolve to one cap rather than one going through "unset →
+    // auto" and the other through a stored percent.
+    #expect(settings.cache.blockDisk.maxSizePercent == 10.0)
 }
