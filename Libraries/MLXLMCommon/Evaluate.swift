@@ -191,14 +191,21 @@ public struct GenerateParameters: Sendable {
     /// additive penalty for tokens that appear in recent context
     public var presencePenalty: Float?
 
-    /// number of tokens to consider for presence penalty
-    public var presenceContextSize: Int
+    /// Window for the presence penalty, in GENERATED tokens.
+    ///
+    /// `nil` (the default) means UNBOUNDED, which is what the parameter means: vLLM and OpenAI apply
+    /// `presence_penalty` to every token generated so far, with no window at all. A positive value is a
+    /// deliberate deviation — cheaper on very long generations, and a different function from the
+    /// published one, since a token penalised at step 100 is forgiven by step 100+size. `0` disables.
+    public var presenceContextSize: Int?
 
     /// additive penalty that scales with token frequency in recent context
     public var frequencyPenalty: Float?
 
-    /// number of tokens to consider for frequency penalty
-    public var frequencyContextSize: Int
+    /// Window for the frequency penalty, in GENERATED tokens. `nil` (default) = UNBOUNDED, matching
+    /// vLLM's whole-output bin counts; a positive value windows it; `0` disables. See
+    /// ``presenceContextSize``.
+    public var frequencyContextSize: Int?
 
     /// Token ids that must never be sampled. Mirrors Hugging Face
     /// `generation_config.json`'s `suppress_tokens` field.
@@ -295,9 +302,9 @@ public struct GenerateParameters: Sendable {
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int = 20,
         presencePenalty: Float? = nil,
-        presenceContextSize: Int = 20,
+        presenceContextSize: Int? = nil,
         frequencyPenalty: Float? = nil,
-        frequencyContextSize: Int = 20,
+        frequencyContextSize: Int? = nil,
         prefillStepSize: Int = 512,
         extraStopStrings: [String] = [],
         suppressTokens: [Int] = []
@@ -404,7 +411,8 @@ public struct GenerateParameters: Sendable {
         }
 
         let presenceContext: PresencePenaltyContext?
-        if let presencePenalty, presencePenalty != 0, presenceContextSize > 0 {
+        // nil = unbounded (enabled), a positive value = windowed (enabled), 0 = explicitly disabled.
+        if let presencePenalty, presencePenalty != 0, presenceContextSize != 0 {
             presenceContext = PresencePenaltyContext(
                 presencePenalty: presencePenalty,
                 presenceContextSize: presenceContextSize
@@ -414,7 +422,7 @@ public struct GenerateParameters: Sendable {
         }
 
         let frequencyContext: FrequencyPenaltyContext?
-        if let frequencyPenalty, frequencyPenalty != 0, frequencyContextSize > 0 {
+        if let frequencyPenalty, frequencyPenalty != 0, frequencyContextSize != 0 {
             frequencyContext = FrequencyPenaltyContext(
                 frequencyPenalty: frequencyPenalty,
                 frequencyContextSize: frequencyContextSize
@@ -915,17 +923,59 @@ public struct RepetitionContext: LogitProcessor {
     }
 }
 
+/// Per-vocabulary counts of the tokens GENERATED so far, for the unbounded penalty mode.
+///
+/// This is the structure vLLM uses (`get_token_bin_counts_and_mask` over `output_tokens`), and it is
+/// what "no window" wants: the cost is fixed by the VOCABULARY, not by how long the generation runs,
+/// so a 32k-token answer costs the same per step as a 32-token one. Updating it is a single-element
+/// read-modify-write; a ring instead pays a gather/scatter over every token it still remembers.
+///
+/// It is a reference type for a reason. The vocabulary is only knowable once logits arrive, and
+/// `LogitProcessor.process` is non-mutating, so the counts cannot be a stored property of the struct.
+/// That is not a new liberty: `TokenRing.buffer` is already an `MLXArray`, itself a handle to shared
+/// storage that `process` writes through.
+final class GeneratedTokenCounts {
+    private var counts: MLXArray?
+
+    /// Counts as a `[vocabSize]` Float32 vector, allocating on first sight of the logits.
+    func vector(vocabSize: Int) -> MLXArray {
+        if let counts, counts.dim(0) == vocabSize { return counts }
+        let fresh = MLXArray.zeros([vocabSize], type: Float32.self)
+        counts = fresh
+        return fresh
+    }
+
+    /// Record one sampled token. O(1): a one-element gather and a one-element scatter, NOT a
+    /// vocab-sized rebuild.
+    func record(_ token: MLXArray) {
+        guard let counts else { return }   // no logits seen yet, so nothing to count into
+        let idx = token.asType(.int32).reshaped(-1)
+        counts[idx] = counts[idx] + MLXArray(Float(1))
+    }
+}
+
 /// Processor that applies an additive presence penalty to tokens in a recent context window.
 ///
 /// The penalty is applied once per unique token via scatter-write (writing the
 /// same value to the same index multiple times is idempotent).
 public struct PresencePenaltyContext: LogitProcessor {
-    private var ring: TokenRing
+    /// Exactly one of these is non-nil: `ring` for the windowed mode, `counts` for the unbounded one.
+    private var ring: TokenRing?
+    private let counts: GeneratedTokenCounts?
     let presencePenalty: Float
 
-    public init(presencePenalty: Float, presenceContextSize: Int) {
+    /// `presenceContextSize == nil` selects the UNBOUNDED mode, which is the published semantics.
+    /// A positive value keeps the sliding window, for callers who want the cheaper approximation on
+    /// very long generations and accept that it is a different function.
+    public init(presencePenalty: Float, presenceContextSize: Int?) {
         self.presencePenalty = presencePenalty
-        self.ring = TokenRing(capacity: presenceContextSize)
+        if let presenceContextSize, presenceContextSize > 0 {
+            self.ring = TokenRing(capacity: presenceContextSize)
+            self.counts = nil
+        } else {
+            self.ring = nil
+            self.counts = GeneratedTokenCounts()
+        }
     }
 
     /// DELIBERATELY EMPTY: the presence penalty applies to GENERATED tokens only.
@@ -947,13 +997,19 @@ public struct PresencePenaltyContext: LogitProcessor {
     mutating public func prompt(_ prompt: MLXArray) {}
 
     public func process(logits: MLXArray) -> MLXArray {
-        guard let indices = ring.validTokens?.asType(.uint32) else { return logits }
+        if let counts {
+            // `clip(counts, 0, 1)` IS the presence mask: penalise a token once however often it was
+            // produced. That is the difference from the frequency penalty, which uses the raw counts.
+            let seen = clip(counts.vector(vocabSize: logits.dim(-1)), min: 0, max: 1)
+            return logits - (seen * presencePenalty).reshaped(1, -1)
+        }
+        guard let indices = ring?.validTokens?.asType(.uint32) else { return logits }
         logits[0..., indices] = logits[0..., indices] - presencePenalty
         return logits
     }
 
     mutating public func didSample(token: MLXArray) {
-        ring.append(token)
+        if let counts { counts.record(token) } else { ring?.append(token) }
     }
 }
 
@@ -962,12 +1018,23 @@ public struct PresencePenaltyContext: LogitProcessor {
 /// Frequency counting is performed on GPU via `scatter_add` to build a histogram
 /// of token occurrences, avoiding CPU←GPU synchronization.
 public struct FrequencyPenaltyContext: LogitProcessor {
-    private var ring: TokenRing
+    /// Exactly one of these is non-nil: `ring` for the windowed mode, `counts` for the unbounded one.
+    private var ring: TokenRing?
+    private let counts: GeneratedTokenCounts?
     let frequencyPenalty: Float
 
-    public init(frequencyPenalty: Float, frequencyContextSize: Int) {
+    /// `frequencyContextSize == nil` selects the UNBOUNDED mode. Note this is the mode that is also
+    /// FASTER: the windowed path rebuilds a vocab-sized histogram from the ring on every decode step,
+    /// while the unbounded path keeps one and updates a single element.
+    public init(frequencyPenalty: Float, frequencyContextSize: Int?) {
         self.frequencyPenalty = frequencyPenalty
-        self.ring = TokenRing(capacity: frequencyContextSize)
+        if let frequencyContextSize, frequencyContextSize > 0 {
+            self.ring = TokenRing(capacity: frequencyContextSize)
+            self.counts = nil
+        } else {
+            self.ring = nil
+            self.counts = GeneratedTokenCounts()
+        }
     }
 
     /// DELIBERATELY EMPTY, for the same reason as `PresencePenaltyContext.prompt`: `frequency_penalty`
@@ -976,7 +1043,10 @@ public struct FrequencyPenaltyContext: LogitProcessor {
     mutating public func prompt(_ prompt: MLXArray) {}
 
     public func process(logits: MLXArray) -> MLXArray {
-        guard let validTokens = ring.validTokens else { return logits }
+        if let counts {
+            return logits - (counts.vector(vocabSize: logits.dim(-1)) * frequencyPenalty).reshaped(1, -1)
+        }
+        guard let validTokens = ring?.validTokens else { return logits }
 
         let vocabSize = logits.dim(-1)
         let ones = MLXArray.ones([validTokens.dim(0)], type: Float32.self)
@@ -987,7 +1057,7 @@ public struct FrequencyPenaltyContext: LogitProcessor {
     }
 
     mutating public func didSample(token: MLXArray) {
-        ring.append(token)
+        if let counts { counts.record(token) } else { ring?.append(token) }
     }
 }
 
