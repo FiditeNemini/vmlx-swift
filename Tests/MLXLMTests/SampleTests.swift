@@ -164,32 +164,91 @@ public class SampleTests: XCTestCase {
         XCTAssertEqual(decision.correction?.item(Int.self), 1)
     }
 
-    func testPresencePenaltyContextPenalizesSeenTokens() {
+    /// `presence_penalty` is defined over GENERATED tokens only.
+    ///
+    /// The prompt leg is the whole point: before this contract, the ring was
+    /// seeded from the prompt, so at the first decode step the window was 100%
+    /// prompt and every opening token was penalised for the USER's wording.
+    /// vLLM — which defines this parameter in practice, HuggingFace having no
+    /// equivalent — feeds `prompt_tokens_tensor` to `repetition_penalties`
+    /// alone and computes presence from `output_mask`.
+    func testPresencePenaltyContextPenalizesGeneratedTokensNotPrompt() {
         var processor = PresencePenaltyContext(presencePenalty: 0.5, presenceContextSize: 20)
-        processor.prompt(MLXArray([1, 1, 3]))
-
         let logits =
             MLXArray([1.0 as Float, 2.0 as Float, 3.0 as Float, 4.0 as Float])[.newAxis, .ellipsis]
-        let processed = processor.process(logits: logits)
-        let values = processed[0].asArray(Float.self)
+
+        // A token seen ONLY in the prompt must not be penalised at all.
+        processor.prompt(MLXArray([1, 1, 3]))
+        let promptOnly = processor.process(logits: logits)[0].asArray(Float.self)
+        XCTAssertEqual(promptOnly[1], 2.0, accuracy: 1e-6)
+        XCTAssertEqual(promptOnly[3], 4.0, accuracy: 1e-6)
+
+        // Generated tokens are penalised once each, however often they recur —
+        // presence is a set membership, not a count.
+        processor.didSample(token: MLXArray([1]))
+        processor.didSample(token: MLXArray([1]))
+        processor.didSample(token: MLXArray([3]))
+        let values = processor.process(logits: logits)[0].asArray(Float.self)
         XCTAssertEqual(values[0], 1.0, accuracy: 1e-6)
         XCTAssertEqual(values[1], 1.5, accuracy: 1e-6)
         XCTAssertEqual(values[2], 3.0, accuracy: 1e-6)
         XCTAssertEqual(values[3], 3.5, accuracy: 1e-6)
     }
 
-    func testFrequencyPenaltyContextPenalizesByCount() {
+    /// `frequency_penalty` scales with a COUNT, which is why prompt seeding was
+    /// worse here in kind rather than degree: a word the user happened to
+    /// repeat three times was suppressed three times as hard.
+    func testFrequencyPenaltyContextPenalizesGeneratedCountsNotPrompt() {
         var processor = FrequencyPenaltyContext(frequencyPenalty: 0.5, frequencyContextSize: 20)
-        processor.prompt(MLXArray([1, 1, 3]))
-
         let logits =
             MLXArray([1.0 as Float, 2.0 as Float, 3.0 as Float, 4.0 as Float])[.newAxis, .ellipsis]
-        let processed = processor.process(logits: logits)
-        let values = processed[0].asArray(Float.self)
+
+        // Repeated PROMPT tokens contribute nothing.
+        processor.prompt(MLXArray([1, 1, 3]))
+        let promptOnly = processor.process(logits: logits)[0].asArray(Float.self)
+        XCTAssertEqual(promptOnly[1], 2.0, accuracy: 1e-6)
+        XCTAssertEqual(promptOnly[3], 4.0, accuracy: 1e-6)
+
+        // The same multiset, once GENERATED, is penalised per occurrence:
+        // token 1 twice (-1.0), token 3 once (-0.5).
+        processor.didSample(token: MLXArray([1]))
+        processor.didSample(token: MLXArray([1]))
+        processor.didSample(token: MLXArray([3]))
+        let values = processor.process(logits: logits)[0].asArray(Float.self)
         XCTAssertEqual(values[0], 1.0, accuracy: 1e-6)
         XCTAssertEqual(values[1], 1.0, accuracy: 1e-6)
         XCTAssertEqual(values[2], 3.0, accuracy: 1e-6)
         XCTAssertEqual(values[3], 3.5, accuracy: 1e-6)
+    }
+
+    /// The three processors share a shape but not a specification:
+    /// `repetition_penalty` is HuggingFace's, defined over `input_ids` — prompt
+    /// INCLUDED — so it must still see the prompt after presence/frequency
+    /// stopped doing so. Pinning the divergence keeps a future "consistency"
+    /// cleanup from collapsing them back together.
+    func testRepetitionPenaltyStillSeesThePromptUnlikeTheOthers() {
+        // Each processor gets its OWN logits. `RepetitionContext.process` writes
+        // through `logits[0..., indices] = …`, and MLXArray is a reference to
+        // shared storage — sharing one array here would feed the second
+        // processor the first one's output and quietly compare the wrong thing.
+        func freshLogits() -> MLXArray {
+            MLXArray([1.0 as Float, 2.0 as Float, 3.0 as Float, 4.0 as Float])[.newAxis, .ellipsis]
+        }
+
+        var repetition = RepetitionContext(repetitionPenalty: 1.5, repetitionContextSize: 20)
+        repetition.prompt(MLXArray([1, 1, 3]))
+        let repeated = repetition.process(logits: freshLogits())[0].asArray(Float.self)
+        // HuggingFace's rule: a positive logit is DIVIDED by the penalty.
+        XCTAssertEqual(repeated[1], 2.0 / 1.5, accuracy: 1e-6)
+        XCTAssertEqual(repeated[3], 4.0 / 1.5, accuracy: 1e-6)
+        // Token 2 was never in the prompt, so it is untouched either way.
+        XCTAssertEqual(repeated[2], 3.0, accuracy: 1e-6)
+
+        var presence = PresencePenaltyContext(presencePenalty: 0.5, presenceContextSize: 20)
+        presence.prompt(MLXArray([1, 1, 3]))
+        let unpenalised = presence.process(logits: freshLogits())[0].asArray(Float.self)
+        XCTAssertEqual(unpenalised[1], 2.0, accuracy: 1e-6)
+        XCTAssertEqual(unpenalised[3], 4.0, accuracy: 1e-6)
     }
 
     func testGenerateParametersCreatesExpectedPenaltyProcessor() {
@@ -255,7 +314,9 @@ public class SampleTests: XCTestCase {
 
     func testPresencePenaltyContextPenalizesUniqueSeenTokens() {
         var processor = PresencePenaltyContext(presencePenalty: 0.5, presenceContextSize: 5)
-        processor.prompt(MLXArray([0, 0, 0, 1, 1]))
+        for token in [0, 0, 0, 1, 1] {
+            processor.didSample(token: MLXArray([token]))
+        }
 
         let logits = MLXArray.zeros([1, 4], type: Float.self)
         let processed = processor.process(logits: logits)
@@ -269,7 +330,9 @@ public class SampleTests: XCTestCase {
 
     func testFrequencyPenaltyContextPenalizesByTokenCount() {
         var processor = FrequencyPenaltyContext(frequencyPenalty: 0.5, frequencyContextSize: 5)
-        processor.prompt(MLXArray([0, 0, 0, 1, 1]))
+        for token in [0, 0, 0, 1, 1] {
+            processor.didSample(token: MLXArray([token]))
+        }
 
         let logits = MLXArray.zeros([1, 4], type: Float.self)
         let processed = processor.process(logits: logits)
@@ -289,7 +352,18 @@ public class SampleTests: XCTestCase {
         ).processor()
         XCTAssertNotNil(processor)
 
+        // Feed the same multiset through BOTH entry points. Repetition takes it
+        // from the prompt, presence/frequency from `didSample`, and with a
+        // capacity-5 ring the generated tokens overwrite the prompt-seeded ones
+        // one-for-one — so all three windows end up holding [0,0,0,1,1] and the
+        // composed result is unchanged from when every processor read the
+        // prompt. The expected values below are therefore the same numbers as
+        // before the split, which is the point: composition order and arithmetic
+        // did not change, only WHERE each processor gets its tokens.
         processor?.prompt(MLXArray([0, 0, 0, 1, 1]))
+        for token in [0, 0, 0, 1, 1] {
+            processor?.didSample(token: MLXArray([token]))
+        }
         let logits = MLXArray([1.0 as Float, 0.5 as Float, 0.0 as Float, -0.5 as Float])[
             .newAxis, .ellipsis
         ]
@@ -302,5 +376,40 @@ public class SampleTests: XCTestCase {
         XCTAssertEqual(values[1], -0.6667, accuracy: 1e-4)
         XCTAssertEqual(values[2], 0.0, accuracy: 1e-4)
         XCTAssertEqual(values[3], -0.5, accuracy: 1e-4)
+    }
+
+    /// A non-positive context size disables the penalty — 0 AND negatives.
+    ///
+    /// When the size became optional, the guard moved from `> 0` to `!= 0`, and
+    /// a negative slipped through it into the context's init, where `if let x,
+    /// x > 0` also failed and dropped it into the UNBOUNDED branch. "Off"
+    /// silently became the strongest setting available. Nothing in-tree passes
+    /// a negative, which is exactly why only a test keeps this honest.
+    func testNonPositiveContextSizeDisablesPenalty() {
+        // nil is the enabled default (unbounded), not "off".
+        XCTAssertNotNil(
+            GenerateParameters(presencePenalty: 0.5, presenceContextSize: nil).processor())
+        XCTAssertNotNil(
+            GenerateParameters(frequencyPenalty: 0.5, frequencyContextSize: nil).processor())
+
+        // A positive size selects the ring — still enabled.
+        XCTAssertNotNil(
+            GenerateParameters(presencePenalty: 0.5, presenceContextSize: 20).processor())
+        XCTAssertNotNil(
+            GenerateParameters(frequencyPenalty: 0.5, frequencyContextSize: 20).processor())
+
+        // 0 disables.
+        XCTAssertNil(
+            GenerateParameters(presencePenalty: 0.5, presenceContextSize: 0).processor())
+        XCTAssertNil(
+            GenerateParameters(frequencyPenalty: 0.5, frequencyContextSize: 0).processor())
+
+        // Negatives disable too, as they did before the size became optional.
+        XCTAssertNil(
+            GenerateParameters(presencePenalty: 0.5, presenceContextSize: -1).processor())
+        XCTAssertNil(
+            GenerateParameters(frequencyPenalty: 0.5, frequencyContextSize: -1).processor())
+        XCTAssertNil(
+            GenerateParameters(presencePenalty: 0.5, presenceContextSize: Int.min).processor())
     }
 }

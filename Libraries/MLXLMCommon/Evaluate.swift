@@ -418,7 +418,16 @@ public struct GenerateParameters: Sendable {
 
         let presenceContext: PresencePenaltyContext?
         // nil = unbounded (enabled), a positive value = windowed (enabled), 0 = explicitly disabled.
-        if let presencePenalty, presencePenalty != 0, presenceContextSize != 0 {
+        //
+        // NON-POSITIVE means disabled, not just 0. The guard was `> 0` before
+        // the size became optional, so every negative value disabled the
+        // penalty. Testing `!= 0` instead would let a negative through here and
+        // then fail `if let x, x > 0` inside the context's init, landing in the
+        // UNBOUNDED branch — turning "off" into the strongest possible setting,
+        // silently and in the opposite direction to the caller's intent.
+        if let presencePenalty, presencePenalty != 0,
+            presenceContextSize.map({ $0 > 0 }) ?? true
+        {
             presenceContext = PresencePenaltyContext(
                 presencePenalty: presencePenalty,
                 presenceContextSize: presenceContextSize
@@ -428,7 +437,10 @@ public struct GenerateParameters: Sendable {
         }
 
         let frequencyContext: FrequencyPenaltyContext?
-        if let frequencyPenalty, frequencyPenalty != 0, frequencyContextSize != 0 {
+        // Non-positive means disabled — see the note on `presenceContextSize`.
+        if let frequencyPenalty, frequencyPenalty != 0,
+            frequencyContextSize.map({ $0 > 0 }) ?? true
+        {
             frequencyContext = FrequencyPenaltyContext(
                 frequencyPenalty: frequencyPenalty,
                 frequencyContextSize: frequencyContextSize
