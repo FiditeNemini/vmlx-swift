@@ -859,6 +859,8 @@ let package = Package(
                 "CanonicalChatCacheBoundariesTests.swift",
                 "RotatingKVCachePhysicalGrowthTests.swift",
                 "NativeMTPWarmupMemoScopeTests.swift",
+                "NormConventionResolverTests.swift",
+                "TestSourcesAreRegisteredTests.swift",
                 "BatchEngineGrowingChatCacheSourceTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",
