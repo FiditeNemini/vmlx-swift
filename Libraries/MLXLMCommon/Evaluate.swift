@@ -362,6 +362,12 @@ public struct GenerateParameters: Sendable {
         if let repetitionPenalty = generationConfig.repetitionPenalty {
             self.repetitionPenalty = repetitionPenalty
         }
+        if let presencePenalty = generationConfig.presencePenalty {
+            self.presencePenalty = presencePenalty
+        }
+        if let frequencyPenalty = generationConfig.frequencyPenalty {
+            self.frequencyPenalty = frequencyPenalty
+        }
         if generationConfig.doSample == false {
             self.temperature = 0
         }
