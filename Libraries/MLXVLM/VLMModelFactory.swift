@@ -753,11 +753,15 @@ public final class VLMModelFactory: ModelFactory {
             processorType: processorType, tokenizer: tokenizer)
         let defaultAdditionalContext = VLMDefaultContextUserInputProcessor.defaultContext(
             capabilities: jangConfig?.capabilities)
+        let needsReasoningTranslation =
+            VLMDefaultContextUserInputProcessor.requiresReasoningTranslation(
+                modelType: baseConfig.modelType)
         let processor: any UserInputProcessor =
-            if defaultAdditionalContext != nil {
+            if defaultAdditionalContext != nil || needsReasoningTranslation {
                 VLMDefaultContextUserInputProcessor(
                     base: baseProcessor,
-                    defaultAdditionalContext: defaultAdditionalContext)
+                    defaultAdditionalContext: defaultAdditionalContext,
+                    modelType: baseConfig.modelType)
             } else {
                 baseProcessor
             }
@@ -859,10 +863,24 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
 struct VLMDefaultContextUserInputProcessor: UserInputProcessor {
     let base: any UserInputProcessor
     let defaultAdditionalContext: [String: any Sendable]?
+    /// Needed by the per-family reasoning adapters, which gate on it.
+    let modelType: String?
 
-    init(base: any UserInputProcessor, defaultAdditionalContext: [String: any Sendable]?) {
+    init(
+        base: any UserInputProcessor,
+        defaultAdditionalContext: [String: any Sendable]?,
+        modelType: String? = nil
+    ) {
         self.base = base
         self.defaultAdditionalContext = defaultAdditionalContext
+        self.modelType = modelType
+    }
+
+    /// True when this model needs the wrapper even with no default context —
+    /// i.e. its template keys reasoning on a variable the request surface does
+    /// not use, so something has to translate.
+    static func requiresReasoningTranslation(modelType: String?) -> Bool {
+        MuseGlimmerReasoningTemplateContext.applies(to: modelType)
     }
 
     static func defaultContext(capabilities: JangCapabilities?) -> [String: any Sendable]? {
@@ -876,13 +894,22 @@ struct VLMDefaultContextUserInputProcessor: UserInputProcessor {
     }
 
     func prepare(input: UserInput) async throws -> LMInput {
-        guard let defaultAdditionalContext, !defaultAdditionalContext.isEmpty else {
-            return try await base.prepare(input: input)
-        }
-
-        var merged = defaultAdditionalContext
+        // The reasoning translation must run even when there is no default
+        // context to merge. Muse Glimmer declares `supports_thinking`, so
+        // `defaultContext` returns nil for it and the old early return skipped
+        // the wrapper entirely — the adapter would have been wired and still
+        // never reached.
+        var merged = defaultAdditionalContext ?? [:]
         for (key, value) in input.additionalContext ?? [:] {
             merged[key] = value
+        }
+        let translated = MuseGlimmerReasoningTemplateContext.apply(
+            additionalContext: merged.isEmpty ? nil : merged,
+            modelType: modelType
+        )
+        merged = translated ?? [:]
+        guard !merged.isEmpty else {
+            return try await base.prepare(input: input)
         }
 
         let rewritten = UserInput(

@@ -1262,8 +1262,15 @@ private struct LLMUserInputProcessor: UserInputProcessor {
     }
 
     func prepare(input: UserInput) throws -> LMInput {
-        let additionalContext = Hy3ReasoningTemplateContext.apply(
-            additionalContext: try mergedAdditionalContext(input.additionalContext),
+        // Two per-family adapters, each translating the generic request
+        // surface into ITS template's contract. Both are no-ops for every
+        // other family (they gate on `modelType` first), so the order between
+        // them is irrelevant.
+        let additionalContext = MuseGlimmerReasoningTemplateContext.apply(
+            additionalContext: Hy3ReasoningTemplateContext.apply(
+                additionalContext: try mergedAdditionalContext(input.additionalContext),
+                modelType: modelType
+            ),
             modelType: modelType
         )
         let bailingMessages = BailingThinkingTemplateContext.apply(
