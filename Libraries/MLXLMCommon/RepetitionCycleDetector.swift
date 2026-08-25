@@ -85,6 +85,21 @@ public struct RepetitionCycleDetector: Sendable {
     /// separators, blank lines and `}` / `)` closers from ever qualifying.
     public static let minimumLineLength = 24
 
+    /// Consecutive characters of SHORT-PERIOD filler that count as a collapse.
+    ///
+    /// The primitivity rule below excludes `....`, `----`, `| | |` on purpose:
+    /// those are ordinary punctuation and formatting, and halting on them would
+    /// be far worse than the bug. But that rule looks only at the UNIT and never
+    /// at the VOLUME, so a model emitting `.` forever is indistinguishable from
+    /// an ellipsis and runs to the token cap — reported live as "looping `.`
+    /// output".
+    ///
+    /// Volume is what separates them. A horizontal rule is ~80 characters; a
+    /// markdown table rule is ~80; the longest legitimate run of a <32-character
+    /// unit in prose or code is far below this. 1024 consecutive characters of
+    /// the same short unit is not formatting, it is a collapsed decoder.
+    public static let fillerCollapseLength = 1024
+
     /// Rolling tail. Only the end of the stream can carry a cycle that is
     /// still running, and bounding this keeps `feed` O(1) in stream length.
     private static let tailCapacity = maximumUnitLength * (minimumRepeats + 1)
@@ -233,12 +248,42 @@ public struct RepetitionCycleDetector: Sendable {
             // something shorter than the floor, the real period is that
             // shorter thing and this is filler.
             let candidate = Array(buffer[(n - unit) ..< n])
-            guard minimalPeriod(of: candidate) >= minimumUnitLength else { continue }
+            let period = minimalPeriod(of: candidate)
+            guard period >= minimumUnitLength else {
+                // Filler by unit, but check VOLUME before dismissing it: past
+                // `fillerCollapseLength` characters of one short unit this is a
+                // collapsed decoder, not punctuation.
+                if let collapse = fillerCollapse(in: buffer, period: period) {
+                    return collapse
+                }
+                continue
+            }
             return Cycle(unit: String(candidate), repeats: repeats)
         }
         return nil
     }
 
+
+    /// How far back the buffer is an unbroken repetition of its last `period`
+    /// characters, reported as a cycle once it passes `fillerCollapseLength`.
+    ///
+    /// Deliberately measured in CHARACTERS rather than repeats: `.` repeated
+    /// 1024 times and a 4-character unit repeated 256 times are the same
+    /// pathology and the same wasted decode.
+    static func fillerCollapse(in buffer: [Character], period: Int) -> Cycle? {
+        guard period > 0, buffer.count >= fillerCollapseLength else { return nil }
+        let unit = Array(buffer.suffix(period))
+        var length = period
+        var index = buffer.count - period
+        while index >= period,
+            Array(buffer[(index - period) ..< index]) == unit
+        {
+            length += period
+            index -= period
+        }
+        guard length >= fillerCollapseLength else { return nil }
+        return Cycle(unit: String(unit), repeats: length / period)
+    }
 
     /// Length of the shortest string whose repetition builds `unit` exactly.
     /// Returns `unit.count` when the unit is primitive.

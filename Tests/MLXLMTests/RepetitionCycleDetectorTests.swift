@@ -255,4 +255,74 @@ extension String {
         }
         #expect(fired == nil)
     }
+
+    // MARK: - Filler collapse (volume, not unit)
+
+    /// The reported symptom: "looping `.` output". The primitivity rule
+    /// deliberately dismisses `.` as filler, and the line scan rejects it for
+    /// having no letter — so before this it ran to the token cap.
+    @Test("a dot loop is caught once it passes the volume threshold")
+    func dotLoopIsCaught() throws {
+        var detector = RepetitionCycleDetector()
+        var fired: RepetitionCycleDetector.Cycle?
+        for _ in 0 ..< 200 where fired == nil {
+            fired = detector.feed(String(repeating: ".", count: 32))
+        }
+        let cycle = try #require(fired, "a sustained '.' loop must be caught")
+        #expect(cycle.unit == ".")
+    }
+
+    /// Same pathology with a longer short-period unit.
+    @Test("a short repeating unit collapses on volume too")
+    func shortUnitCollapsesOnVolume() throws {
+        var detector = RepetitionCycleDetector()
+        var fired: RepetitionCycleDetector.Cycle?
+        // Enough iterations to clear fillerCollapseLength: the threshold is
+        // measured in CHARACTERS, and a 4-character unit needs 256+ of them.
+        let iterations = RepetitionCycleDetector.fillerCollapseLength  // 4 chars each
+        for _ in 0 ..< iterations where fired == nil {
+            fired = detector.feed(". . ")
+        }
+        #expect(fired != nil, "a sustained '. . ' loop must be caught")
+    }
+
+    /// FALSE POSITIVES ARE WORSE. Ordinary punctuation and formatting stay
+    /// well under the volume threshold and must never fire.
+    @Test("ordinary punctuation and rules never reach the threshold")
+    func ordinaryFillerNeverFires() {
+        let benign = [
+            "Wait for it...",                                   // ellipsis
+            "Section one\n" + String(repeating: "-", count: 80) + "\nBody text here.",
+            "| col | col |\n" + String(repeating: "|---", count: 20) + "|\n",
+            String(repeating: "=", count: 100) + "\nHeading\n",
+            "Loading" + String(repeating: ".", count: 60) + " done.",
+        ]
+        for text in benign {
+            var detector = RepetitionCycleDetector()
+            var fired: RepetitionCycleDetector.Cycle?
+            for _ in 0 ..< 3 where fired == nil { fired = detector.feed(text) }
+            #expect(fired == nil, "benign filler fired: \(text.prefix(30))")
+        }
+    }
+
+    /// The threshold is a real boundary, so pin both sides of it rather than
+    /// only the side that fires.
+    @Test("just under the threshold stays silent")
+    func belowThresholdStaysSilent() {
+        var detector = RepetitionCycleDetector()
+        var fired: RepetitionCycleDetector.Cycle?
+        let under = RepetitionCycleDetector.fillerCollapseLength - 64
+        fired = detector.feed("Reticulating splines" + String(repeating: ".", count: under))
+        #expect(fired == nil, "a run below fillerCollapseLength must not fire")
+    }
+
+    @Test("VMLX_REPETITION_STOP=0 disables the filler scan as well")
+    func disabledSkipsFillerScan() {
+        var detector = RepetitionCycleDetector.fromEnvironment(["VMLX_REPETITION_STOP": "0"])
+        var fired: RepetitionCycleDetector.Cycle?
+        for _ in 0 ..< 200 where fired == nil {
+            fired = detector.feed(String(repeating: ".", count: 32))
+        }
+        #expect(fired == nil)
+    }
 }
