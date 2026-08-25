@@ -64,6 +64,27 @@ public struct RepetitionCycleDetector: Sendable {
     /// happens to echo itself is left alone.
     public static let minimumOutputLength = 128
 
+    /// Consecutive repeats of a LINE cycle required. Four back-to-back
+    /// repeats of a block whose every line clears `minimumLineLength` is
+    /// already unambiguous — at period 8 that is 32 identical substantial
+    /// lines in a row.
+    public static let minimumLineRepeats = 4
+
+    /// Longest line CYCLE considered, in lines.
+    ///
+    /// Must comfortably exceed the number of lines it takes to pass the
+    /// character scan's `maximumUnitLength` (512), or this scan cannot see its
+    /// own target case: a unit longer than 512 characters necessarily spans
+    /// several lines, and an earlier value of 4 here missed an 8-line block
+    /// entirely. Cost is a handful of whole-line comparisons per completed
+    /// line, not per chunk, so the headroom is cheap.
+    public static let maximumLineCycle = 12
+
+    /// A line must be at least this long, trimmed, before it can anchor a
+    /// line cycle — and must contain a letter. Keeps table rules (`|---|`),
+    /// separators, blank lines and `}` / `)` closers from ever qualifying.
+    public static let minimumLineLength = 24
+
     /// Rolling tail. Only the end of the stream can carry a cycle that is
     /// still running, and bounding this keeps `feed` O(1) in stream length.
     private static let tailCapacity = maximumUnitLength * (minimumRepeats + 1)
@@ -74,6 +95,11 @@ public struct RepetitionCycleDetector: Sendable {
 
     private var tail: [Character] = []
     private var total = 0
+    /// Completed visible lines, most recent last. Bounded by the largest
+    /// window the line scan can need.
+    private var lines: [String] = []
+    /// Bytes of the line currently being built (no newline seen yet).
+    private var pendingLine: String = ""
 
     public init(isEnabled: Bool = true) {
         self.isEnabled = isEnabled
@@ -101,7 +127,82 @@ public struct RepetitionCycleDetector: Sendable {
             tail.removeFirst(tail.count - Self.tailCapacity)
         }
         guard total >= Self.minimumOutputLength else { return nil }
-        return Self.cycle(in: tail)
+        if let cycle = Self.cycle(in: tail) { return cycle }
+        return feedLines(text)
+    }
+
+    /// Line-level cycle scan.
+    ///
+    /// The character scan bounds its unit at `maximumUnitLength` (512) because
+    /// the cost of looking for longer units on every chunk is not worth it —
+    /// the comment there says a longer cycle is "cheaper to let the token cap
+    /// handle". That trade was costed against SCAN time, never against the
+    /// user's wall clock, and the two diverge badly on slow hardware: a
+    /// runaway that reaches a 16,384-token cap is ~2 minutes on a fast Mac and
+    /// ~34 minutes at 8 tok/s on a base laptop. Reported live: a 36 KB file
+    /// task where the model "kept writing the same line over and over" and the
+    /// user gave up after 35 minutes.
+    ///
+    /// So this catches exactly the class the character scan gives up on — a
+    /// repeating unit LONGER than 512 characters — and it does so at O(1) per
+    /// completed line rather than O(unit x tail) per chunk, because it compares
+    /// whole lines instead of every possible period.
+    private mutating func feedLines(_ text: String) -> Cycle? {
+        // Only completed lines can be compared; a line still being written
+        // would false-negative on its own prefix.
+        pendingLine += text
+        guard pendingLine.contains("\n") else { return nil }
+        var parts = pendingLine.components(separatedBy: "\n")
+        pendingLine = parts.removeLast()
+        lines.append(contentsOf: parts)
+        let window = Self.maximumLineCycle * (Self.minimumLineRepeats + 1)
+        if lines.count > window { lines.removeFirst(lines.count - window) }
+        return Self.lineCycle(in: lines)
+    }
+
+    /// Shortest line cycle whose back-to-back repetition ends `lines`.
+    ///
+    /// Exposed for testing alongside `cycle(in:)`.
+    public static func lineCycle(in lines: [String]) -> Cycle? {
+        for period in 1 ... maximumLineCycle {
+            guard lines.count >= period * minimumLineRepeats else { continue }
+            let unit = Array(lines.suffix(period))
+            // Every line in the unit must be substantial. Without this a run
+            // of `|---|---|`, blank lines, or `    }` would qualify, and those
+            // are ordinary formatting rather than a collapsed model.
+            guard unit.allSatisfy({ line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                return trimmed.count >= minimumLineLength
+                    && trimmed.contains(where: { $0.isLetter })
+            }) else { continue }
+            // A unit that is itself a repetition of a shorter block has that
+            // shorter block as its real period — the same primitivity rule the
+            // character scan applies, so `A A` is never reported as period 2.
+            if period > 1, isRepetition(unit) { continue }
+            var repeats = 1
+            var offset = lines.count - period
+            while offset >= period, Array(lines[(offset - period) ..< offset]) == unit {
+                repeats += 1
+                offset -= period
+            }
+            guard repeats >= minimumLineRepeats else { continue }
+            return Cycle(unit: unit.joined(separator: "\n"), repeats: repeats)
+        }
+        return nil
+    }
+
+    /// True when `unit` is a whole number of copies of a shorter prefix.
+    private static func isRepetition(_ unit: [String]) -> Bool {
+        let n = unit.count
+        for period in 1 ..< n where n % period == 0 {
+            var matches = true
+            for i in period ..< n where unit[i] != unit[i - period] {
+                matches = false
+                break
+            }
+            if matches { return true }
+        }
+        return false
     }
 
     /// Shortest unit whose back-to-back repetition ends the buffer.
