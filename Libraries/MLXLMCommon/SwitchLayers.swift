@@ -61,6 +61,87 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return { g, x in CompiledDecodeTrace.isActive ? body(g, x) : compiled(g, x) }
 }()
 
+private enum Qwen4ExpCompiledRoutedSwitchGLU {
+    typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
+
+    private static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment[
+            "VMLINUX_QWEN4_EXP_COMPILE_ROUTED_MOE"] ?? "1"
+        return value != "0" && value.lowercased() != "false"
+    }()
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var regions: [String: Region] = [:]
+    nonisolated(unsafe) private static var didReport = false
+
+    static func call(
+        input: MLXArray,
+        indices: MLXArray,
+        gate: QuantizedSwitchLinear,
+        up: QuantizedSwitchLinear,
+        down: QuantizedSwitchLinear
+    ) -> MLXArray? {
+        guard enabled, !CompiledDecodeTrace.isActive, input.dim(-2) == 1,
+            indices.size < 64, input.dtype == .bfloat16,
+            gate.groupSize == up.groupSize, gate.groupSize == down.groupSize,
+            gate.bits == up.bits, gate.bits == down.bits,
+            gate.mode == up.mode, gate.mode == down.mode,
+            gate.scales.dtype == .bfloat16, up.scales.dtype == .bfloat16,
+            down.scales.dtype == .bfloat16,
+            let gateBiases = gate.biases, let upBiases = up.biases,
+            let downBiases = down.biases,
+            gateBiases.dtype == .bfloat16, upBiases.dtype == .bfloat16,
+            downBiases.dtype == .bfloat16
+        else { return nil }
+
+        let key = [
+            String(input.dim(-1)), String(gate.outputDims),
+            String(gate.groupSize), String(gate.bits), String(describing: gate.mode),
+        ].joined(separator: "|")
+        lock.lock()
+        var region = regions[key]
+        if region == nil {
+            let groupSize = gate.groupSize
+            let bits = gate.bits
+            let mode = gate.mode
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let x = MLX.expandedDimensions(args[0], axes: [-2, -3])
+                let idx = args[1]
+                let gateOutput = MLX.gatherQuantizedMM(
+                    x, args[2], scales: args[3], biases: args[4],
+                    rhsIndices: idx, transpose: true,
+                    groupSize: groupSize, bits: bits, mode: mode,
+                    sortedIndices: false)
+                let upOutput = MLX.gatherQuantizedMM(
+                    x, args[5], scales: args[6], biases: args[7],
+                    rhsIndices: idx, transpose: true,
+                    groupSize: groupSize, bits: bits, mode: mode,
+                    sortedIndices: false)
+                let activated = silu(gateOutput) * upOutput
+                let downOutput = MLX.gatherQuantizedMM(
+                    activated, args[8], scales: args[9], biases: args[10],
+                    rhsIndices: idx, transpose: true,
+                    groupSize: groupSize, bits: bits, mode: mode,
+                    sortedIndices: false)
+                return [MLX.squeezed(downOutput, axis: -2)]
+            }
+            regions[key] = region
+        }
+        if !didReport {
+            didReport = true
+            FileHandle.standardError.write(Data(
+                "[Qwen4Exp] compiled_routed_switch_glu=active stock_gather_qmm=true shared_weight_inputs=true dtype=bfloat16\n".utf8))
+        }
+        lock.unlock()
+
+        return region!([
+            input, indices,
+            gate.weight, gate.scales, gateBiases,
+            up.weight, up.scales, upBiases,
+            down.weight, down.scales, downBiases,
+        ]).first
+    }
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
@@ -143,6 +224,18 @@ public class SwitchGLU: Module, SwitchGLULayer {
     private var fusedBits: Int = 4
     private var fusedMode: QuantizationMode = .affine
     private var fusionAttempted: Bool = false
+    private let allowFusedGateUpCache: Bool
+    private let compileSeparatedDecode: Bool
+    /// Built after checkpoint loading on the first Qwen4Exp decode call, then
+    /// reused without repeating projection casts, shape walks, or dtype checks
+    /// in every routed layer for every token.
+    private lazy var qwen4ExpReducer: Qwen4ExpFusedAffineMoE.Reducer? = {
+        guard let gate = gateProj as? QuantizedSwitchLinear,
+            let up = upProj as? QuantizedSwitchLinear,
+            let down = downProj as? QuantizedSwitchLinear
+        else { return nil }
+        return Qwen4ExpFusedAffineMoE.makeReducer(gate: gate, up: up, down: down)
+    }()
 
     public init(
         inputDims: Int,
@@ -151,7 +244,9 @@ public class SwitchGLU: Module, SwitchGLULayer {
         activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
         bias: Bool = false,
         glue: ((MLXArray, MLXArray) -> MLXArray)? = nil,
-        scoredGlue: ((MLXArray, MLXArray, MLXArray) -> MLXArray)? = nil
+        scoredGlue: ((MLXArray, MLXArray, MLXArray) -> MLXArray)? = nil,
+        allowFusedGateUpCache: Bool = true,
+        compileSeparatedDecode: Bool = false
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
@@ -159,6 +254,8 @@ public class SwitchGLU: Module, SwitchGLULayer {
         self.activation = activation
         self.glue = glue
         self.scoredGlue = scoredGlue
+        self.allowFusedGateUpCache = allowFusedGateUpCache
+        self.compileSeparatedDecode = compileSeparatedDecode
         // Detect common activation types for compiled fast path.
         // Use safeGeluApproximate for comparison to avoid MLXNN's compiledGeluApproximate
         // which uses the Power primitive (x ** 3) and crashes on some Metal GPUs during
@@ -186,6 +283,12 @@ public class SwitchGLU: Module, SwitchGLULayer {
     private func ensureFusedGateUp() {
         if fusionAttempted { return }
         fusionAttempted = true
+
+        // Some routed families already keep their complete non-PLE expert
+        // bank resident. Building a second concatenated gate/up bank is then
+        // a permanent duplicate, not a cache. Those callers disable it at
+        // construction and retain the two production gather QMMs.
+        guard allowFusedGateUpCache else { return }
 
         // Feature flag — opt out for A/B comparison.
         if ProcessInfo.processInfo.environment["BENCH_NO_FUSED_GATE_UP"] == "1" {
@@ -262,6 +365,15 @@ public class SwitchGLU: Module, SwitchGLULayer {
         callAsFunction(x, indices, preDownScores: nil)
     }
 
+    /// Exact-shape Qwen4Exp decode reduction. Returns `nil` unless the
+    /// q4/g64 2560→640→2560 top-10 BF16 contract and opt-in flag match.
+    public func qwen4ExpReduced(
+        _ input: MLXArray, indices: MLXArray, scores: MLXArray
+    ) -> MLXArray? {
+        guard let reducer = qwen4ExpReducer else { return nil }
+        return reducer(input, indices, scores)
+    }
+
     /// Variant for model graphs that weight each routed activation before its
     /// expert down projection. The score tensor has the same leading shape as
     /// `indices`; sorting keeps scores aligned with the expert dispatch rows.
@@ -271,6 +383,17 @@ public class SwitchGLU: Module, SwitchGLULayer {
         preDownScores: MLXArray?
     ) -> MLXArray {
         ensureFusedGateUp()
+
+        if compileSeparatedDecode, preDownScores == nil, glue == nil,
+            scoredGlue == nil, isSiluActivation,
+            let gate = gateProj as? QuantizedSwitchLinear,
+            let up = upProj as? QuantizedSwitchLinear,
+            let down = downProj as? QuantizedSwitchLinear,
+            let compiled = Qwen4ExpCompiledRoutedSwitchGLU.call(
+                input: input, indices: indices, gate: gate, up: up, down: down)
+        {
+            return compiled
+        }
 
         // Fused gate+up is a net win for DECODE (single-token forward pass,
         // compute-bound per-expert matmul) but a net LOSS for PREFILL
