@@ -157,6 +157,11 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// loading the sidecar does not force speculative decode for every request.
     public var nativeMTP: Bool
 
+    /// Explicit user-selected MTP depth (1–3) carried into the load so the
+    /// activation gate can accept a tensor-complete head without a measured
+    /// tuning artifact. Nil for Auto/Off — Auto stays tuning-gated.
+    public var nativeMTPManualDepth: Int? = nil
+
     /// Load DSV4-0731 with the checkpoint's activation-QAT simulation graph.
     ///
     /// `nil` preserves the headless compatibility fallback

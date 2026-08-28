@@ -601,10 +601,16 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         status: MTPBundleStatus?
     ) -> LoadConfiguration {
         var resolved = base
-        resolved.nativeMTP = resolvedMTPLaunch(
+        let launch = resolvedMTPLaunch(
             configData: configData,
             jangConfig: jangConfig,
-            status: status).launchMode == .speculative
+            status: status)
+        resolved.nativeMTP = launch.launchMode == .speculative
+        // Thread the manual depth into the load scope so the activation gate
+        // accepts a tensor-complete head without a measured tuning artifact.
+        resolved.nativeMTPManualDepth =
+            (mtp.mode == .forceOn && launch.launchMode == .speculative)
+            ? mtp.explicitDepth : nil
         resolved.deepseekV4ActivationQAT =
             effectivePerformance.deepseekV4ActivationQAT
         return resolved

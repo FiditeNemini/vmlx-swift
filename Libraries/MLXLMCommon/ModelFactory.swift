@@ -705,11 +705,15 @@ public func loadModel(
             loadConfiguration.deepseekV4ActivationQAT
         ) {
             try await NativeMTPActivation.withExplicitRequest(loadConfiguration.nativeMTP) {
-                try await load {
-                    try await $0.load(
-                        from: loadDirectory,
-                        using: tokenizerLoader,
-                        configuration: configuration)
+                try await NativeMTPActivation.$manualDepthOverride.withValue(
+                    loadConfiguration.nativeMTPManualDepth
+                ) {
+                    try await load {
+                        try await $0.load(
+                            from: loadDirectory,
+                            using: tokenizerLoader,
+                            configuration: configuration)
+                    }
                 }
             }
         }
