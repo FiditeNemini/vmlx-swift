@@ -165,6 +165,24 @@ func testCacheCopyOnEmptyCache(creator: (() -> any KVCache)) async throws {
     #expect(restored[2]?.item(Int32.self) == 3)
     #expect(restored[4] == nil)
     #expect(restored[5] == nil)
+
+    // The exact crash payload: a plain recurrent restore carries only TWO
+    // arrays (conv + ssm state). The old setter replaced the backing array
+    // with that payload, shrinking six slots to two, and the next PLE
+    // prefetch trapped reading slot 2. A two-array restore must keep the
+    // declared topology, answer nil for the PLE companion slots, and accept
+    // late writes into them.
+    let twoArrayRestore = MambaCache(slots: 6)
+    twoArrayRestore.state = [MLXArray([Int32(11)]), MLXArray([Int32(22)])]
+    #expect(twoArrayRestore.slotCount == 6)
+    #expect(twoArrayRestore[0]?.item(Int32.self) == 11)
+    #expect(twoArrayRestore[1]?.item(Int32.self) == 22)
+    #expect(twoArrayRestore[2] == nil)
+    #expect(twoArrayRestore[3] == nil)
+    twoArrayRestore[2] = MLXArray([Int32(33)])
+    twoArrayRestore[3] = MLXArray([Int32(44)])
+    #expect(twoArrayRestore[2]?.item(Int32.self) == 33)
+    #expect(twoArrayRestore[3]?.item(Int32.self) == 44)
 }
 
 /// CacheList.copy() produces independent sub-caches.
