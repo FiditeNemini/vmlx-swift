@@ -1227,6 +1227,12 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "QWEN3_5") == .xmlFunction)
 
+        // Qwen 3.8 Flash Next dispatches as qwen4_exp and converter bundles
+        // stamp the same XML-function contract with the Hermes alias.
+        #expect(ToolCallFormat.infer(from: "qwen4_exp") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "QWEN4_EXP_TEXT") == .xmlFunction)
+        #expect(ToolCallFormat.fromCapabilityName("hermes") == .xmlFunction)
+
         // Mistral3 models (prefix matching)
         #expect(ToolCallFormat.infer(from: "mistral3") == .mistral)
         #expect(ToolCallFormat.infer(from: "Mistral3") == .mistral)
