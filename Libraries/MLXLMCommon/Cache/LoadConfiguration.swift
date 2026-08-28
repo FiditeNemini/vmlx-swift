@@ -266,6 +266,13 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// Top-level or JANG-sidecar `weight_format`, lowercased when available.
     public var weightFormat: String?
 
+    /// Embedded `jang_config.format`, lowercased when available. Newer JANG
+    /// bundles carry this contract inside `config.json` instead of a sidecar.
+    public var jangFormat: String?
+
+    /// Top-level or nested text-model compute dtype declared by the bundle.
+    public var declaredComputeDType: String?
+
     /// True when the bundle has a `jang_config.json` sidecar.
     public var hasJangConfig: Bool
 
@@ -311,6 +318,8 @@ public struct LoadBundleFacts: Sendable, Equatable {
         physicalMemory: UInt64,
         modelType: String? = nil,
         weightFormat: String? = nil,
+        jangFormat: String? = nil,
+        declaredComputeDType: String? = nil,
         hasJangConfig: Bool = false,
         hasJangTQRuntime: Bool = false,
         routedExpertLayout: String? = nil,
@@ -319,6 +328,8 @@ public struct LoadBundleFacts: Sendable, Equatable {
     ) {
         self.modelType = modelType
         self.weightFormat = weightFormat?.lowercased()
+        self.jangFormat = jangFormat?.lowercased()
+        self.declaredComputeDType = declaredComputeDType?.lowercased()
         self.hasJangConfig = hasJangConfig
         self.hasJangTQRuntime = hasJangTQRuntime
         self.routedExpertLayout = routedExpertLayout?.lowercased()
@@ -360,6 +371,8 @@ public struct LoadBundleFacts: Sendable, Equatable {
         var numHiddenLayers: Int?
         var modelType: String?
         var weightFormat: String?
+        var jangFormat: String?
+        var declaredComputeDType: String?
         var routedExpertLayout: String?
         let configURL = url.appendingPathComponent("config.json")
         if let data = try? Data(contentsOf: configURL),
@@ -404,6 +417,11 @@ public struct LoadBundleFacts: Sendable, Equatable {
                 in: json, keys: ["num_hidden_layers", "n_layers"])
             modelType = json["model_type"] as? String
             weightFormat = (json["weight_format"] as? String)?.lowercased()
+            declaredComputeDType = ((json["dtype"] as? String)
+                ?? (json["torch_dtype"] as? String))?.lowercased()
+            if let embeddedJang = json["jang_config"] as? [String: Any] {
+                jangFormat = (embeddedJang["format"] as? String)?.lowercased()
+            }
             routedExpertLayout = (json["routed_expert_layout"] as? String)?.lowercased()
             for key in routedKeys {
                 if let n = json[key] as? Int, n > 1 {
@@ -429,6 +447,10 @@ public struct LoadBundleFacts: Sendable, Equatable {
                     }
                     if weightFormat == nil {
                         weightFormat = (nested["weight_format"] as? String)?.lowercased()
+                    }
+                    if declaredComputeDType == nil {
+                        declaredComputeDType = ((nested["dtype"] as? String)
+                            ?? (nested["torch_dtype"] as? String))?.lowercased()
                     }
                     if numHiddenLayers == nil {
                         numHiddenLayers = firstPositiveInt(
@@ -465,6 +487,9 @@ public struct LoadBundleFacts: Sendable, Equatable {
             if weightFormat == nil {
                 weightFormat = (json["weight_format"] as? String)?.lowercased()
             }
+            if jangFormat == nil {
+                jangFormat = (json["format"] as? String)?.lowercased()
+            }
             if routedExpertLayout == nil {
                 routedExpertLayout =
                     (json["routed_expert_layout"] as? String)?.lowercased()
@@ -484,6 +509,8 @@ public struct LoadBundleFacts: Sendable, Equatable {
             physicalMemory: physical,
             modelType: modelType,
             weightFormat: weightFormat,
+            jangFormat: jangFormat,
+            declaredComputeDType: declaredComputeDType,
             hasJangConfig: hasJangConfig,
             hasJangTQRuntime: hasJangTQRuntime,
             routedExpertLayout: routedExpertLayout,
@@ -574,13 +601,25 @@ public struct LoadBundleFacts: Sendable, Equatable {
             && (numRoutedExperts ?? 0) >= 128
     }
 
-    /// The plain affine DSV4 implementation reaches its intended decode rate
-    /// only with the routed banks resident. A file-backed active-expert path
-    /// has to synchronize 43 GPU router results with the CPU and stream the
-    /// selected banks on every token; it is an explicitly rejected production
-    /// route for split-expert bundles. Converter-prestacked affine banks avoid
-    /// that materialization and retain the existing GPU gather path. Other
-    /// families retain the caller's mmap choice.
+    /// Qwen3.8 Flash Next JANG keeps its large PLE/ngram table in a
+    /// model-owned exact-row SSD reader. Match the bundle's explicit family,
+    /// JANG format, and BF16 compute declaration; model names and directory
+    /// names are deliberately irrelevant.
+    public var isQwen4ExpBF16JANG: Bool {
+        let type = modelType?.lowercased() ?? ""
+        let format = jangFormat?.lowercased() ?? ""
+        let dtype = declaredComputeDType?.lowercased() ?? ""
+        return (type == "qwen4_exp" || type == "qwen4_exp_text")
+            && format.hasPrefix("jang")
+            && !hasJangTQRuntime
+            && ["bfloat16", "bf16"].contains(dtype)
+            && isRouted
+    }
+
+    /// Plain split-expert DSV4 currently requires a resident compute bank.
+    /// Qwen4Exp must retain the caller's mmap choice: its 61+ GiB packed bank
+    /// is valid mixed-dtype MLX input, while its PLE/ngram tensors already stay
+    /// in the model-owned exact-row SSD reader.
     public var requiresResidentSafetensors: Bool {
         isPlainDeepseekV4AffineJANG && !hasPrestackedAffineRoutedExperts
     }

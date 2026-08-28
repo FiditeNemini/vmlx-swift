@@ -607,9 +607,9 @@ public func loadModel(
     let dsv4NativeAllocatorCeiling =
         applyPlainDeepseekV4ProcessMemoryLimitsIfNeeded(facts: facts)
     if loadConfiguration.useMmapSafetensors && !useMmapSafetensors {
+        let reason = "DeepSeek V4 affine JANG selected resident safetensors for production decode"
         FileHandle.standardError.write(Data(
-            "[Load] DeepSeek V4 affine JANG selected resident safetensors for production decode\n"
-                .utf8))
+            "[Load] \(reason)\n".utf8))
     }
     if loadConfiguration.memoryLimit != memoryLimit {
         FileHandle.standardError.write(Data(

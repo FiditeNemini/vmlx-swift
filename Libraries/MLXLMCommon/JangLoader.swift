@@ -1056,7 +1056,23 @@ public struct JangLoader: Sendable {
 
     /// Check if a model directory contains a JANG model.
     public static func isJangModel(at path: URL) -> Bool {
-        findConfigPath(at: path) != nil
+        if findConfigPath(at: path) != nil {
+            return true
+        }
+        return embeddedConfigJSON(at: path) != nil
+    }
+
+    /// Read the JANG contract embedded by newer converters at
+    /// `config.json.jang_config`. Older bundles use a standalone
+    /// `jang_config.json`; that sidecar remains authoritative when present.
+    private static func embeddedConfigJSON(at modelPath: URL) -> [String: Any]? {
+        let configURL = modelPath.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configURL),
+            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+        return root["jang_config"] as? [String: Any]
     }
 
     /// Find the JANG config file in a model directory.
@@ -1644,16 +1660,20 @@ public struct JangLoader: Sendable {
 
     /// Load and parse the JANG config from a model directory.
     public static func loadConfig(at modelPath: URL) throws -> JangConfig {
-        guard let configURL = findConfigPath(at: modelPath) else {
-            throw JangLoaderError.configNotFound(modelPath.path)
+        if let configURL = findConfigPath(at: modelPath) {
+            let data = try Data(contentsOf: configURL)
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                throw JangLoaderError.invalidConfig("Failed to parse JSON")
+            }
+            return try parseConfig(from: json)
         }
 
-        let data = try Data(contentsOf: configURL)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw JangLoaderError.invalidConfig("Failed to parse JSON")
+        if let embedded = embeddedConfigJSON(at: modelPath) {
+            return try parseConfig(from: embedded)
         }
 
-        return try parseConfig(from: json)
+        throw JangLoaderError.configNotFound(modelPath.path)
     }
 
     /// Parse a JangConfig from a raw JSON dictionary.

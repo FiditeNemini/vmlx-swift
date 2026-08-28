@@ -53,6 +53,8 @@ public enum JangPressShardError: Error, CustomStringConvertible {
     case openFailed(URL, errno: Int32)
     case statFailed(URL, errno: Int32)
     case mmapFailed(URL, errno: Int32)
+    case noCacheFailed(URL, errno: Int32)
+    case readFailed(URL, errno: Int32)
     case truncatedHeader(URL)
     case malformedHeaderJSON(URL, String)
     case headerSizeOutOfBounds(URL, declared: UInt64, fileSize: UInt64)
@@ -63,6 +65,8 @@ public enum JangPressShardError: Error, CustomStringConvertible {
         case .openFailed(let url, let e): return "open(\(url.lastPathComponent)) failed errno=\(e)"
         case .statFailed(let url, let e): return "fstat(\(url.lastPathComponent)) failed errno=\(e)"
         case .mmapFailed(let url, let e): return "mmap(\(url.lastPathComponent)) failed errno=\(e)"
+        case .noCacheFailed(let url, let e): return "fcntl(F_NOCACHE, \(url.lastPathComponent)) failed errno=\(e)"
+        case .readFailed(let url, let e): return "pread(\(url.lastPathComponent)) failed errno=\(e)"
         case .truncatedHeader(let url): return "safetensors header truncated in \(url.lastPathComponent)"
         case .malformedHeaderJSON(let url, let m): return "safetensors header JSON malformed in \(url.lastPathComponent): \(m)"
         case .headerSizeOutOfBounds(let url, let h, let f): return "header size \(h) > file size \(f) in \(url.lastPathComponent)"
@@ -100,12 +104,13 @@ public final class JangPressShard: @unchecked Sendable {
     public let url: URL
     public let fileSize: UInt64
     public let baseAddress: UnsafeRawPointer
+    public let noCacheIOEnabled: Bool
     public private(set) var tensors: [String: TensorDescriptor] = [:]
 
     private let fd: Int32
     private let pageSize: Int
 
-    public init(path: URL) throws {
+    public init(path: URL, noCacheIO: Bool = false) throws {
         self.url = path
         self.pageSize = Int(getpagesize())
 
@@ -113,6 +118,15 @@ public final class JangPressShard: @unchecked Sendable {
         let fdLocal = open(path.path, O_RDONLY)
         guard fdLocal >= 0 else { throw JangPressShardError.openFailed(path, errno: errno) }
         self.fd = fdLocal
+
+        if noCacheIO {
+            guard fcntl(fdLocal, F_NOCACHE, 1) == 0 else {
+                let savedErrno = errno
+                close(fdLocal)
+                throw JangPressShardError.noCacheFailed(path, errno: savedErrno)
+            }
+        }
+        self.noCacheIOEnabled = noCacheIO
 
         var st = stat()
         guard fstat(fdLocal, &st) == 0 else {
@@ -278,6 +292,39 @@ public final class JangPressShard: @unchecked Sendable {
         let start = baseAddress.advanced(by: Int(range.lowerBound))
         let count = Int(range.upperBound - range.lowerBound)
         return UnsafeRawBufferPointer(start: start, count: count)
+    }
+
+    /// Read an exact file range through `pread`. When the shard was opened
+    /// with `noCacheIO: true`, Darwin services these reads with `F_NOCACHE`,
+    /// so one-shot row gathers do not populate the unified file cache with the
+    /// full backing table. The mmap remains only for the safetensors header and
+    /// descriptor index; payload callers can stay off the mapped data pages.
+    public func readBytes(range: Range<UInt64>) throws -> Data {
+        guard range.lowerBound <= range.upperBound,
+              range.upperBound <= fileSize,
+              range.count <= UInt64(Int.max)
+        else {
+            throw JangPressShardError.readFailed(url, errno: EINVAL)
+        }
+        let byteCount = Int(range.count)
+        var data = Data(count: byteCount)
+        var completed = 0
+        while completed < byteCount {
+            let readNow = data.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return pread(
+                    fd,
+                    base.advanced(by: completed),
+                    byteCount - completed,
+                    off_t(range.lowerBound) + off_t(completed))
+            }
+            guard readNow > 0 else {
+                throw JangPressShardError.readFailed(
+                    url, errno: readNow == 0 ? EIO : errno)
+            }
+            completed += readNow
+        }
+        return data
     }
 
     // MARK: - madvise

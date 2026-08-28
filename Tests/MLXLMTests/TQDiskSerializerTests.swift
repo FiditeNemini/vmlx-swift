@@ -348,6 +348,57 @@ func testRoundTripHybridWithSSMState() async throws {
     #expect(restored[2].state.count == 2)
 }
 
+/// Exact qwen4_exp warm-prefix sequence: the v2 payload seats the ordinary
+/// two-slot Mamba prefix first, then the separately stored SSM companion
+/// restores the PLE host's additional persistent slots. Neither step may
+/// collapse the model-declared six-slot container.
+@Test
+func testQwen4ExpExtendedPLEWarmRestoreSequence() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let attention = KVCacheSimple()
+    let (keys, values) = smallKV(seqLen: 12)
+    _ = attention.update(keys: keys, values: values)
+
+    let ple = MambaCache(slots: 6)
+    for index in 0 ..< 4 {
+        ple[index] = MLXArray([Int32(index + 10)])
+    }
+    ple.offset = 12
+
+    let ordinary = MambaCache()
+    ordinary[0] = MLXArray([Int32(20)])
+    ordinary[1] = MLXArray([Int32(21)])
+    ordinary.offset = 12
+
+    let source: [any KVCache] = [attention, ple, ordinary]
+    let diskPayload = TQDiskSerializer.serialize(cache: source)
+    let companion = extractSSMStates(from: source)
+    #expect(companion.count == 6)
+
+    let restoredPLE = MambaCache(slots: 6)
+    let restoredOrdinary = MambaCache()
+    var restored: [any KVCache] = [KVCacheSimple(), restoredPLE, restoredOrdinary]
+
+    let restoredTokens = restoreFromDiskArrays(diskPayload, into: &restored)
+    #expect(restoredTokens == 12)
+    #expect(restoredPLE.slotCount == 6)
+    #expect(restoredPLE.state.count == 2)
+    #expect(restoredPLE[2] == nil)
+
+    restoreSSMStates(companion, into: restored, boundary: restoredTokens)
+    #expect(restoredPLE.slotCount == 6)
+    #expect(restoredPLE.state.count == 4)
+    #expect(restoredPLE[2]?.item(Int32.self) == 12)
+    #expect(restoredPLE[3]?.item(Int32.self) == 13)
+    #expect(restoredPLE[4] == nil)
+    #expect(restoredPLE[5] == nil)
+    #expect(restoredPLE.offset == 12)
+    #expect(restoredOrdinary[1]?.item(Int32.self) == 21)
+    #expect(restoredOrdinary.offset == 12)
+}
+
 // MARK: - Format version detection
 
 @Test

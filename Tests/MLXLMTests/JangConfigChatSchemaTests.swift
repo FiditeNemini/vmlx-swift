@@ -181,4 +181,54 @@ struct JangConfigChatSchemaTests {
         #expect(cfg.capabilities?.supportsThinking == false)
         #expect(cfg.capabilities?.thinkInTemplate == true)
     }
+
+    @Test("loadConfig reads config.json.jang_config when no sidecar exists")
+    func loadsEmbeddedJangConfig() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "embedded-jang-config-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let root: [String: Any] = [
+            "model_type": "qwen4_exp",
+            "jang_config": [
+                "format": "jang",
+                "model_family": "qwen4_exp",
+                "capabilities": [
+                    "tool_parser": "qwen",
+                    "reasoning_parser": "qwen3",
+                    "supports_tools": true,
+                    "supports_thinking": true,
+                ] as [String: Any],
+            ] as [String: Any],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: root)
+        try data.write(to: directory.appendingPathComponent("config.json"))
+
+        #expect(JangLoader.isJangModel(at: directory))
+        let config = try JangLoader.loadConfig(at: directory)
+        #expect(config.modelFamily == "qwen4_exp")
+        #expect(config.capabilities?.toolParser == "qwen")
+        #expect(config.capabilities?.reasoningParser == "qwen3")
+    }
+
+    @Test("standalone jang_config.json remains authoritative over embedded config")
+    func sidecarPrecedesEmbeddedJangConfig() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "sidecar-jang-config-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let root: [String: Any] = [
+            "model_type": "qwen4_exp",
+            "jang_config": ["model_family": "embedded"] as [String: Any],
+        ]
+        try JSONSerialization.data(withJSONObject: root).write(
+            to: directory.appendingPathComponent("config.json"))
+        try JSONSerialization.data(withJSONObject: ["model_family": "sidecar"]).write(
+            to: directory.appendingPathComponent("jang_config.json"))
+
+        let config = try JangLoader.loadConfig(at: directory)
+        #expect(config.modelFamily == "sidecar")
+    }
 }

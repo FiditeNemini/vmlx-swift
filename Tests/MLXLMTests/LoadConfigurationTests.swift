@@ -572,6 +572,31 @@ struct LoadConfigurationTests {
         #expect(shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: dir) == expected)
     }
 
+    @Test("Qwen4Exp affine mmap preserves checkpoint quantization metadata")
+    func qwen4ExpAffineMmapDtypePolicy() throws {
+        let valid = try Self.makeBundle(files: [
+            ("config.json", try JSONSerialization.data(withJSONObject: [
+                "model_type": "qwen4_exp",
+                "text_config": ["model_type": "qwen4_exp_text", "dtype": "bfloat16"],
+                "quantization": ["group_size": 64, "bits": 8],
+            ] as [String: Any]))
+        ])
+        let dense = try Self.makeBundle(files: [
+            ("config.json", try JSONSerialization.data(withJSONObject: [
+                "model_type": "qwen4_exp",
+                "text_config": ["model_type": "qwen4_exp_text", "dtype": "bfloat16"],
+            ] as [String: Any]))
+        ])
+        defer {
+            try? FileManager.default.removeItem(at: valid)
+            try? FileManager.default.removeItem(at: dense)
+        }
+
+        #expect(shouldPreserveQwen4ExpJANGAffineMmapDtypes(modelDirectory: valid))
+        #expect(!shouldPreserveQwen4ExpJANGAffineMmapDtypes(modelDirectory: dense))
+    }
+
+
     @Test("mmap dtype preservation requires validated pre-stacked affine DSV4")
     func dsv4PrestackedAffineMmapDtypePolicy() throws {
         let valid = try Self.makeDeepseekV4AffineBundle(

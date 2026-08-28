@@ -4,6 +4,20 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Allows a model to keep file-backed auxiliary tensors out of the generic
+/// MLX weight loader. The predicate is evaluated against safetensors header
+/// names before tensor mappings or dtype-alignment copies are created.
+public protocol SafetensorsLoadKeyExcluding: AnyObject {
+    func excludeFromGenericSafetensorsLoad(key: String) -> Bool
+    var requiresExactTensorMmapBuffers: Bool { get }
+    var requiresResidentSafetensorsWeights: Bool { get }
+}
+
+public extension SafetensorsLoadKeyExcluding {
+    var requiresExactTensorMmapBuffers: Bool { false }
+    var requiresResidentSafetensorsWeights: Bool { false }
+}
+
 private func isPreservedMTPWeightKey(_ key: String) -> Bool {
     let lower = key.lowercased()
     return lower.hasPrefix("mtp.")
@@ -319,6 +333,9 @@ public func loadWeights(
         var skippedStreamingSourceTensors = 0
         var skippedPreservedMTPTensors = 0
         var skippedPreservedMTPShards = 0
+        var skippedModelExcludedTensors = 0
+        var skippedModelExcludedShards = 0
+        var residentSafetensorsBytes = 0
         let shouldFilterPreservedMTP =
             !loadPreservedMTP && (modelIndexContainsPreservedMTPWeight(at: modelDirectory) ?? true)
         let streamingRoutedExperts =
@@ -330,18 +347,52 @@ public func loadWeights(
         if streamingRoutedExperts {
             JANGTQStreamingExperts.configureModelDirectory(modelDirectory)
         }
+        let modelKeyExcluder = model as? any SafetensorsLoadKeyExcluding
         for url in allShardURLs {
-            if shouldFilterPreservedMTP,
-                let headerNames = try? loadSafetensorsHeaderNamesForBaseLoad(url),
-                !headerNames.isEmpty,
-                headerNames.allSatisfy(isPreservedMTPWeightKey)
-            {
-                skippedPreservedMTPShards += 1
-                skippedPreservedMTPTensors += headerNames.count
-                continue
-            }
-            let (w, m) = try loadArraysAndMetadata(url: url)
             let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
+            let headerNames = (try? loadSafetensorsHeaderNamesForBaseLoad(url)) ?? []
+            var excludedKeys = Set<String>()
+            if !headerNames.isEmpty {
+                for key in headerNames {
+                    if shouldFilterPreservedMTP, isPreservedMTPWeightKey(key) {
+                        excludedKeys.insert(key)
+                        skippedPreservedMTPTensors += 1
+                    } else if let modelKeyExcluder,
+                        modelKeyExcluder.excludeFromGenericSafetensorsLoad(key: key)
+                    {
+                        excludedKeys.insert(key)
+                        skippedModelExcludedTensors += 1
+                    } else if streamingRoutedExperts,
+                        JANGTQStreamingExperts.isStreamableRoutedTensorKey(key)
+                    {
+                        excludedKeys.insert(key)
+                        skippedStreamingSourceTensors += 1
+                    } else if !isPrestackedShard,
+                        let replacementKey = JangPressPrestacker.prestackedReplacementKey(
+                            forPerExpertKey: key),
+                        prestackedRoutedKeys.contains(replacementKey)
+                    {
+                        excludedKeys.insert(key)
+                        skippedPrestackedSourceTensors += 1
+                    }
+                }
+                if excludedKeys.count == headerNames.count {
+                    if headerNames.allSatisfy(isPreservedMTPWeightKey) {
+                        skippedPreservedMTPShards += 1
+                    }
+                    if headerNames.contains(where: {
+                        modelKeyExcluder?.excludeFromGenericSafetensorsLoad(key: $0) == true
+                    }) {
+                        skippedModelExcludedShards += 1
+                    }
+                    continue
+                }
+            }
+            let (w, m) = try loadArraysAndMetadata(
+                url: url,
+                excludingKeys: excludedKeys,
+                exactTensorBuffers: modelKeyExcluder?.requiresExactTensorMmapBuffers == true)
+            var shardWeights: [String: MLXArray] = [:]
             for (key, value) in w {
                 if shouldFilterPreservedMTP, isPreservedMTPWeightKey(key) {
                     skippedPreservedMTPTensors += 1
@@ -361,7 +412,23 @@ public func loadWeights(
                     skippedPrestackedSourceTensors += 1
                     continue
                 }
-                weights[key] = value
+                shardWeights[key] = value
+            }
+            if modelKeyExcluder?.requiresResidentSafetensorsWeights == true {
+                // Qwen3.8 Flash Next's sparse compute tensors are mmap-safe but
+                // must remain resident for usable decode.  Leaving them lazy
+                // makes throughput depend on the filesystem page cache: a
+                // freshly converted bundle is fast, then falls to SSD-streaming
+                // speed once those pages cool.  The model-owned PLE table was
+                // excluded above, so this materializes compute tensors only.
+                // `* 1` creates owned MLX storage even for already-contiguous
+                // mmap inputs (unlike `contiguous()`, which may return them as-is).
+                let resident = shardWeights.mapValues { $0 * 1 }
+                MLX.eval(Array(resident.values))
+                residentSafetensorsBytes += resident.values.reduce(0) { $0 + $1.nbytes }
+                for (key, value) in resident { weights[key] = value }
+            } else {
+                for (key, value) in shardWeights { weights[key] = value }
             }
             if metadata.isEmpty {
                 metadata = m
@@ -378,6 +445,19 @@ public func loadWeights(
         if skippedPreservedMTPTensors > 0 {
             FileHandle.standardError.write(Data(
                 "[loadWeights] preserved MTP tensors are isolated from base AR load; skipped \(skippedPreservedMTPTensors) tensor(s) across \(skippedPreservedMTPShards) MTP-only shard(s)\n".utf8))
+        }
+        if skippedModelExcludedTensors > 0 {
+            FileHandle.standardError.write(Data(
+                ("[loadWeights] model-owned file-backed tensors bypassed generic MLX load; "
+                    + "skipped \(skippedModelExcludedTensors) tensor(s) including "
+                    + "\(skippedModelExcludedShards) auxiliary-only shard(s); "
+                    + "exact_tensor_mmap_buffers="
+                    + "\(modelKeyExcluder?.requiresExactTensorMmapBuffers == true)\n").utf8))
+        }
+        if residentSafetensorsBytes > 0 {
+            FileHandle.standardError.write(Data(String(format:
+                "[loadWeights] resident compute materialization complete bytes=%.3f_GiB auxiliary_model_owned_tensors=excluded\n",
+                Double(residentSafetensorsBytes) / 1_073_741_824).utf8))
         }
         if loadPreservedMTP {
             FileHandle.standardError.write(Data(
@@ -737,6 +817,12 @@ public func loadWeights(
         effectivePerLayerQuantization = inferred
     }
 
+    // Qwen4-exp declares BF16 compute in its bundle. Its F16 affine metadata
+    // is converted to BF16 below and then runs through MLX's precompiled BF16
+    // quantized kernels; the custom mixed-storage kernel remains diagnostic
+    // code only.
+    let qwen4ExpNativeBF16Affine = false
+
     // quantize if needed
     if quantization != nil || effectivePerLayerQuantization != nil {
         func quantizedWeightBaseCandidates(_ path: String) -> [String] {
@@ -808,6 +894,14 @@ public func loadWeights(
             // especially important for routed-MoE `SwitchLinear`, where the
             // placeholder can be tens of GB on Ling/DSV4-class bundles.
             if let linear = m as? Linear {
+                if qwen4ExpNativeBF16Affine, mode == .affine {
+                    return (path, Qwen4ExpBF16QuantizedLinear(
+                        weight: loadedWeight,
+                        bias: weights[biasKey] ?? linear.bias,
+                        scales: loadedScales,
+                        biases: quantBiases,
+                        groupSize: gs, bits: b, mode: mode))
+                }
                 return (path, QuantizedLinear(
                     weight: loadedWeight,
                     bias: weights[biasKey] ?? linear.bias,
@@ -817,6 +911,17 @@ public func loadWeights(
             }
 
             if let switchLinear = m as? SwitchLinear {
+                if qwen4ExpNativeBF16Affine, mode == .affine {
+                    return (path, Qwen4ExpBF16QuantizedSwitchLinear(
+                        inputDims: switchLinear.inputDims,
+                        outputDims: switchLinear.outputDims,
+                        numExperts: switchLinear.numExperts,
+                        weight: loadedWeight,
+                        bias: weights[biasKey] ?? switchLinear.bias,
+                        scales: loadedScales,
+                        biases: quantBiases,
+                        groupSize: gs, bits: b, mode: mode))
+                }
                 return (path, QuantizedSwitchLinear(
                     inputDims: switchLinear.inputDims,
                     outputDims: switchLinear.outputDims,
@@ -829,6 +934,15 @@ public func loadWeights(
             }
 
             if m is Embedding {
+                if qwen4ExpNativeBF16Affine, mode == .affine {
+                    return (path, Qwen4ExpBF16QuantizedEmbedding(
+                        weight: loadedWeight,
+                        scales: loadedScales,
+                        biases: quantBiases,
+                        groupSize: gs,
+                        bits: b,
+                        mode: mode))
+                }
                 return (path, QuantizedEmbedding(
                     weight: loadedWeight,
                     scales: loadedScales,
@@ -842,6 +956,15 @@ public func loadWeights(
                 return (path, q)
             }
             return nil
+        }
+        if qwen4ExpNativeBF16Affine {
+            let linearCount = updates.count { $0.1 is Qwen4ExpBF16QuantizedLinear }
+            let switchCount = updates.count { $0.1 is Qwen4ExpBF16QuantizedSwitchLinear }
+            let embeddingCount = updates.count { $0.1 is Qwen4ExpBF16QuantizedEmbedding }
+            FileHandle.standardError.write(Data(
+                ("[Qwen4Exp] native_bf16_affine_modules linear=\(linearCount) "
+                    + "switch=\(switchCount) embedding=\(embeddingCount) "
+                    + "total_updates=\(updates.count)\n").utf8))
         }
         do {
             try model.update(modules: ModuleChildren.unflattened(updates), verify: .none)
@@ -927,16 +1050,20 @@ public func loadWeights(
     let allowJANGTQMmapBFloat16 = envFlag("VMLINUX_JANGTQ_BF16_MMAP")
         || envFlag("MLX_JANGTQ_BF16_MMAP")
     let autoJANGTQMmapBFloat16 = requiresJANGTQMmapBFloat16(modelDirectory)
-    // Gemma 4 JANG affine bundles carry several GiB of fp16 scales, biases,
-    // and preserved multimodal weights. Validated pre-stacked DSV4 affine
-    // bundles have the same constraint at much larger scale: recasting their
-    // routed scales/biases eagerly materializes a second anonymous bank and
-    // defeats the file-backed layout. Affine matmul accepts the bundle dtype
-    // directly, so preserve it only for the two exact, fail-closed layouts.
+    // Gemma 4 and Qwen4-exp JANG affine bundles carry F16 scales/biases whose
+    // checkpoint values must remain exact and file-backed. MLX's production
+    // quantized kernels accept BF16 activations with F16 affine metadata; do
+    // not turn Qwen's 61+ GiB packed bank plus 7+ GiB metadata into anonymous
+    // resident allocations merely to align storage dtypes. Validated
+    // pre-stacked DSV4 affine bundles have the same constraint at larger scale.
+    // Recasting zero-points to BF16 both materializes a second bank and can
+    // alter logits; activation dtype is owned by each model runtime.
     // Split DSV4 bundles intentionally remain on the resident conversion path.
     let preserveJANGAffineMmapDtypes = mmapSafetensorsActive
         && !isJANGTQNative
         && (shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: modelDirectory)
+            || shouldPreserveQwen4ExpJANGAffineMmapDtypes(
+                modelDirectory: modelDirectory)
             || shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(
                 modelDirectory: modelDirectory))
     if !preserveJANGAffineMmapDtypes
@@ -946,6 +1073,51 @@ public func loadWeights(
         convertToBFloat16(
             model: model,
             shouldSkip: isJANGTQNative ? isJANGTQParameterKey : { _ in false })
+    }
+
+    if shouldPreserveQwen4ExpJANGAffineMmapDtypes(modelDirectory: modelDirectory) {
+        let flat = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        var count = 0
+        var dtypes = Set<String>()
+        for (key, value) in flat
+        where key.hasSuffix(".scales") || key.hasSuffix(".biases") {
+            let stem = String(key.dropLast(7))
+            guard flat[stem + ".weight"]?.dtype == .uint32 else { continue }
+            count += 1
+            dtypes.insert(String(describing: value.dtype))
+        }
+        FileHandle.standardError.write(Data(
+            ("[Qwen4Exp] runtime_affine_metadata_dtype="
+                + dtypes.sorted().joined(separator: ",")
+                + " runtime_affine_metadata_count=\(count)"
+                + " projection_compute_dtype=bfloat16\n").utf8))
+
+        let floating = flat.filter {
+            $0.value.dtype == .float16 || $0.value.dtype == .bfloat16
+                || $0.value.dtype == .float32
+        }
+        let f16Keys = floating.compactMap { key, value in
+            value.dtype == .float16 ? key : nil
+        }.sorted()
+        let bf16Count = floating.count { $0.value.dtype == .bfloat16 }
+        let f32Keys = floating.compactMap { key, value in
+            value.dtype == .float32 ? key : nil
+        }.sorted()
+        func parameterDTypeSummary(matching needle: String) -> String {
+            flat.compactMap { key, value in
+                key.contains(needle) ? "\(key)=\(value.dtype)" : nil
+            }.sorted().joined(separator: ",")
+        }
+        FileHandle.standardError.write(Data(
+            ("[Qwen4Exp] runtime_parameter_dtypes bf16_count=\(bf16Count)"
+                + " f16_count=\(f16Keys.count)"
+                + " f16_keys=\(f16Keys.isEmpty ? "none" : f16Keys.prefix(8).joined(separator: ","))"
+                + " f32_count=\(f32Keys.count)"
+                + " f32_keys=\(f32Keys.isEmpty ? "none" : f32Keys.prefix(8).joined(separator: ","))\n").utf8))
+        FileHandle.standardError.write(Data(
+            ("[Qwen4Exp] runtime_parameter_boundaries embedding={"
+                + parameterDTypeSummary(matching: "embed_tokens")
+                + "} lm_head={" + parameterDTypeSummary(matching: "lm_head") + "}\n").utf8))
     }
 
     eval(model)
@@ -983,6 +1155,38 @@ func shouldPreserveGemma4JANGAffineMmapDtypes(modelDirectory: URL) -> Bool {
         ?? (object["weight_format"] as? String)
         ?? "").lowercased()
     return normalizedModelType.hasPrefix("gemma4") && weightFormat == "jang_affine"
+}
+
+func shouldPreserveQwen4ExpJANGAffineMmapDtypes(modelDirectory: URL) -> Bool {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard
+        let data = try? Data(contentsOf: configURL),
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        object["quantization"] is [String: Any]
+    else {
+        return false
+    }
+    let textConfig = object["text_config"] as? [String: Any]
+    let outerType = ((object["model_type"] as? String) ?? "").lowercased()
+    let textType = ((textConfig?["model_type"] as? String) ?? "").lowercased()
+    return outerType == "qwen4_exp" || textType == "qwen4_exp_text"
+}
+
+func shouldUseQwen4ExpNativeBF16Affine(modelDirectory: URL) -> Bool {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard
+        let data = try? Data(contentsOf: configURL),
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        object["quantization"] is [String: Any]
+    else { return false }
+    let textConfig = object["text_config"] as? [String: Any]
+    let outerType = ((object["model_type"] as? String) ?? "").lowercased()
+    let textType = ((textConfig?["model_type"] as? String) ?? "").lowercased()
+    let dtype = ((textConfig?["dtype"] as? String)
+        ?? (object["dtype"] as? String)
+        ?? "").lowercased()
+    return (outerType == "qwen4_exp" || textType == "qwen4_exp_text")
+        && ["bfloat16", "bf16"].contains(dtype)
 }
 
 func shouldPreserveDeepseekV4PrestackedAffineMmapDtypes(

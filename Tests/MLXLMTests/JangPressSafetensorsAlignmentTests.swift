@@ -10,7 +10,7 @@ import Darwin
 import Glibc
 #endif
 
-@Suite("JangPress safetensors alignment overlay")
+@Suite("JangPress safetensors alignment overlay", .serialized)
 struct JangPressSafetensorsAlignmentTests {
 
     @Test("routed safetensors with unaligned data base is rewritten into aligned overlay")

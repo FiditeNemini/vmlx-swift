@@ -318,6 +318,9 @@ public enum JangPressPrestacker {
             throw posixError("open", path: tmpURL.path)
         }
         defer { _ = systemClose(outFD) }
+        guard systemEnableNoCache(outFD) == 0 else {
+            throw posixError("fcntl(F_NOCACHE)", path: tmpURL.path)
+        }
 
         var header: [String: Any] = [
             "__metadata__": [
@@ -689,6 +692,9 @@ public enum JangPressPrestacker {
         defer { _ = systemClose(outFD) }
 
         let (headerData, arranged) = try buildAlignedHeader(plan: plan)
+        guard systemEnableNoCache(outFD) == 0 else {
+            throw posixError("fcntl(F_NOCACHE)", path: tmpURL.path)
+        }
         var headerLength = UInt64(headerData.count).littleEndian
         try withUnsafeBytes(of: &headerLength) { raw in
             try writeAll(fd: outFD, raw.baseAddress!, raw.count)
@@ -702,6 +708,9 @@ public enum JangPressPrestacker {
             throw posixError("open", path: plan.source.url.path)
         }
         defer { _ = systemClose(inFD) }
+        guard systemEnableNoCache(inFD) == 0 else {
+            throw posixError("fcntl(F_NOCACHE)", path: plan.source.url.path)
+        }
 
         var currentOffset: UInt64 = 0
         for tensor in arranged {
@@ -1020,6 +1029,9 @@ public enum JangPressPrestacker {
         Darwin.open(path, flags, 0)
     }
     private static func systemClose(_ fd: Int32) -> Int32 { Darwin.close(fd) }
+    private static func systemEnableNoCache(_ fd: Int32) -> Int32 {
+        Darwin.fcntl(fd, F_NOCACHE, 1)
+    }
     private static func systemPread(
         _ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ count: Int, _ offset: Int64
     ) -> Int {
@@ -1035,6 +1047,7 @@ public enum JangPressPrestacker {
         Glibc.open(path, flags, 0)
     }
     private static func systemClose(_ fd: Int32) -> Int32 { Glibc.close(fd) }
+    private static func systemEnableNoCache(_ fd: Int32) -> Int32 { 0 }
     private static func systemPread(
         _ fd: Int32, _ buffer: UnsafeMutableRawPointer, _ count: Int, _ offset: Int64
     ) -> Int {

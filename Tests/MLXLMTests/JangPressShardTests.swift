@@ -113,6 +113,20 @@ struct JangPressShardTests {
         #expect(bytes1 == (0..<32).map { UInt8($0 + 100) })
     }
 
+    @Test("F_NOCACHE pread returns exact tensor bytes without touching mmap payload")
+    func noCacheReadRoundTrip() throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("mmap-shard-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try Self.writeSyntheticSafetensors(at: tmp)
+
+        let shard = try JangPressShard(path: tmp, noCacheIO: true)
+        #expect(shard.noCacheIOEnabled)
+        let range = try #require(shard.byteRange(for: "expert_1"))
+        let bytes = try shard.readBytes(range: range)
+        #expect(Array(bytes) == (0..<32).map { UInt8($0 + 100) })
+    }
+
     @Test("advise(.willNeed) and advise(.dontNeed) succeed")
     func adviseCalls() throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())

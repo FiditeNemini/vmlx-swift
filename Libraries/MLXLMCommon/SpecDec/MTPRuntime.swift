@@ -709,6 +709,8 @@ public enum NativeMTPActivation {
     /// act on no matter which mode the user picked.
     static func isSupportedNativeMTPModelType(_ value: String) -> Bool {
         switch normalize(value) {
+        case "qwen4_exp", "qwen4_exp_text", "qwen4exp", "qwen4exp_text":
+            return true
         case "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
              "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
              "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
@@ -1000,6 +1002,8 @@ public enum NativeMTPAutoDecodePolicy {
 
     private static func isSupportedQwenMTPModelType(_ value: String) -> Bool {
         switch value {
+        case "qwen4_exp", "qwen4_exp_text", "qwen4exp", "qwen4exp_text":
+            return true
         case "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
              "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
              "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
