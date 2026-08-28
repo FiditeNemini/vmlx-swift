@@ -43,6 +43,21 @@ int mlx_load_safetensors(
     mlx_map_string_to_string* res_1,
     const char* file,
     const mlx_stream s);
+int mlx_load_safetensors_excluding(
+    mlx_map_string_to_array* res_0,
+    mlx_map_string_to_string* res_1,
+    const char* file,
+    const char* const* excluded_keys,
+    int64_t excluded_key_count,
+    const mlx_stream s);
+int mlx_load_safetensors_excluding_with_options(
+    mlx_map_string_to_array* res_0,
+    mlx_map_string_to_string* res_1,
+    const char* file,
+    const char* const* excluded_keys,
+    int64_t excluded_key_count,
+    bool exact_tensor_buffers,
+    const mlx_stream s);
 int64_t mlx_safetensors_mmap_advise_routed(int32_t advice, int32_t cold_pct);
 int64_t mlx_safetensors_mmap_advise_experts(
     int32_t advice,

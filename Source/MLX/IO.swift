@@ -175,6 +175,68 @@ public func loadArraysAndMetadata(url: URL, stream: StreamOrDevice = .cpu) throw
     }
 }
 
+/// Load a safetensors file while excluding exact tensor keys before their
+/// storage is mapped or materialized.
+///
+/// This is distinct from filtering the returned dictionary: excluded tensors
+/// never enter MLX's mmap registry and dtype-unaligned excluded tensors never
+/// allocate realignment buffers. Metadata is still returned unchanged.
+public func loadArraysAndMetadata(
+    url: URL,
+    excludingKeys: Set<String>,
+    exactTensorBuffers: Bool = false,
+    stream: StreamOrDevice = .cpu
+) throws -> ([String: MLXArray], [String: String]) {
+    guard !excludingKeys.isEmpty else {
+        return try loadArraysAndMetadata(url: url, stream: stream)
+    }
+    precondition(url.isFileURL)
+    guard url.pathExtension == "safetensors" else {
+        throw LoadSaveError.unknownExtension(url.pathExtension)
+    }
+
+    var arrays = mlx_map_string_to_array_new()
+    var metadata = mlx_map_string_to_string_new()
+    defer { mlx_map_string_to_array_free(arrays) }
+    defer { mlx_map_string_to_string_free(metadata) }
+
+    let cStrings: [UnsafeMutablePointer<CChar>] = excludingKeys.map { key in
+        let bytes = key.utf8CString
+        let pointer = UnsafeMutablePointer<CChar>.allocate(capacity: bytes.count)
+        bytes.withUnsafeBufferPointer { source in
+            pointer.initialize(from: source.baseAddress!, count: source.count)
+        }
+        return pointer
+    }
+    defer { cStrings.forEach { $0.deallocate() } }
+    let pointers: [UnsafePointer<CChar>?] = cStrings.map { UnsafePointer($0) }
+    let path = url.path(percentEncoded: false)
+
+    _ = try withError {
+        pointers.withUnsafeBufferPointer { excluded in
+            if exactTensorBuffers {
+                mlx_load_safetensors_excluding_with_options(
+                    &arrays,
+                    &metadata,
+                    path.cString(using: .utf8),
+                    excluded.baseAddress,
+                    Int64(excluded.count),
+                    true,
+                    stream.ctx)
+            } else {
+                mlx_load_safetensors_excluding(
+                    &arrays,
+                    &metadata,
+                    path.cString(using: .utf8),
+                    excluded.baseAddress,
+                    Int64(excluded.count),
+                    stream.ctx)
+            }
+        }
+    }
+    return (mlx_map_array_values(arrays), mlx_map_string_values(metadata))
+}
+
 // MARK: - Memory I/O
 
 private class IOState {

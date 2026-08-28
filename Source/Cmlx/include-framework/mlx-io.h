@@ -41,6 +41,15 @@ MLX_API SafetensorsLoad
 load_safetensors(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s = {});
 MLX_API SafetensorsLoad
 load_safetensors(const std::string& file, StreamOrDevice s = {});
+MLX_API SafetensorsLoad load_safetensors_excluding(
+    const std::string& file,
+    const std::unordered_set<std::string>& excluded_keys,
+    StreamOrDevice s = {});
+MLX_API SafetensorsLoad load_safetensors_excluding(
+    const std::string& file,
+    const std::unordered_set<std::string>& excluded_keys,
+    bool exact_tensor_buffers,
+    StreamOrDevice s = {});
 
 MLX_API int64_t safetensors_mmap_advise_routed(
     int32_t advice,

@@ -50,6 +50,79 @@ final class SaveTests: XCTestCase {
         assertEqual(try XCTUnwrap(loadedArrays["bar"]), try XCTUnwrap(arrays["bar"]))
     }
 
+    public func testLoadSafetensorsExcludingKeysBeforeMaterialization() throws {
+        let safetensorsPath = temporaryPath.appending(
+            path: "filtered-arrays.safetensors",
+            directoryHint: .notDirectory
+        )
+        try MLX.save(
+            arrays: [
+                "keep": MLXArray([Float(1), 2, 3, 4]),
+                "drop": MLXArray([Float(5), 6, 7, 8]),
+            ],
+            metadata: ["owner": "selected-key-test"],
+            url: safetensorsPath)
+
+        try withEnvironment("MLX_SAFETENSORS_MMAP", value: "1") {
+            let (loaded, metadata) = try MLX.loadArraysAndMetadata(
+                url: safetensorsPath,
+                excludingKeys: ["drop"],
+                stream: .cpu)
+            XCTAssertEqual(loaded.keys.sorted(), ["keep"])
+            XCTAssertNil(loaded["drop"])
+            XCTAssertEqual(metadata["owner"], "selected-key-test")
+            assertEqual(
+                try XCTUnwrap(loaded["keep"]),
+                MLXArray([Float(1), 2, 3, 4]))
+        }
+    }
+
+    public func testFilteredExactTensorBuffersDoNotTrackExcludedShardSpan() throws {
+        try withMLXMetallibForTests {
+            let safetensorsPath = temporaryPath.appending(
+                path: "filtered-exact-tensor-buffers.safetensors",
+                directoryHint: .notDirectory
+            )
+            let keepKey = "layers.0.input_layernorm.weight"
+            let dropKey = "layers.0.mlp.switch_mlp.gate_proj.weight"
+            try writeSparseFloat32Safetensors(
+                at: safetensorsPath,
+                firstKey: keepKey,
+                firstValues: [1, 2, 3, 4],
+                secondKey: dropKey,
+                secondValues: [5, 6, 7, 8],
+                gapBytes: 1 << 20)
+
+            let fileBytes = try XCTUnwrap(
+                try FileManager.default.attributesOfItem(
+                    atPath: safetensorsPath.path)[.size] as? Int)
+
+            try withEnvironment("MLX_SAFETENSORS_MMAP", value: "1") {
+                // Prove the call-scoped option works even when the process-wide
+                // diagnostic knob explicitly says not to use tensor buffers.
+                try withEnvironment("MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS", value: "0") {
+                    let (loaded, _) = try MLX.loadArraysAndMetadata(
+                        url: safetensorsPath,
+                        excludingKeys: [dropKey],
+                        exactTensorBuffers: true,
+                        stream: .cpu)
+                    let keep = try XCTUnwrap(loaded[keepKey])
+                    XCTAssertNil(loaded[dropKey])
+
+                    let trackedBytes = mlx_safetensors_mmap_tracked_buffer_bytes()
+                    XCTAssertGreaterThan(trackedBytes, 0)
+                    XCTAssertLessThan(
+                        trackedBytes,
+                        Int64(fileBytes / 4),
+                        "an excluded routed payload must not remain inside a whole-shard Metal buffer")
+
+                    let result = MLX.sum(keep, stream: .gpu)
+                    XCTAssertEqual(result.item(Float.self), 10.0, accuracy: 0.001)
+                }
+            }
+        }
+    }
+
     public func testMmapSafetensorsLoadCanFeedGPUComputation() throws {
         try withMLXMetallibForTests {
             let safetensorsPath = temporaryPath.appending(

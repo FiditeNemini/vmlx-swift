@@ -52,6 +52,12 @@ extern "C" int vmlx_graph_stats(
                 file << text;
             }
         }
+        if (const char* path = std::getenv("VMLX_GRAPH_TEXT_PATH")) {
+            std::ofstream file(path, std::ios::out | std::ios::trunc);
+            if (file.is_open()) {
+                mlx::core::print_graph(file, mlx_array_get_(vmlx_graph_arr(array)));
+            }
+        }
         if (node_count) {
             *node_count = static_cast<int32_t>(
                 count_substring(text, "[label=") + count_substring(text, "[label ="));
