@@ -32,6 +32,7 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
         var indexerHeadDim = 128
         var indexerBudget = 2048
         var indexerCompressRatio = 4
+        var mropeSection = [11, 11, 10]
 
         enum CodingKeys: String, CodingKey {
             case dtype
@@ -55,6 +56,7 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
             case indexerHeadDim = "indexer_head_dim"
             case indexerBudget = "indexer_budget"
             case indexerCompressRatio = "indexer_compress_ratio"
+            case mropeSection = "mrope_section"
         }
 
         init(from decoder: Decoder) throws {
@@ -82,6 +84,8 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
             indexerBudget = try c.decodeIfPresent(Int.self, forKey: .indexerBudget) ?? 2048
             indexerCompressRatio =
                 try c.decodeIfPresent(Int.self, forKey: .indexerCompressRatio) ?? 4
+            mropeSection =
+                try c.decodeIfPresent([Int].self, forKey: .mropeSection) ?? [11, 11, 10]
         }
     }
 
@@ -851,9 +855,14 @@ private final class Qwen4ExpQSAIndexer: Module {
             text.hiddenSize, (extras.indexerNHeads + 1) * extras.indexerHeadDim, bias: false)
         _qNorm.wrappedValue = RMSNorm(dimensions: extras.indexerHeadDim, eps: text.rmsNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: extras.indexerHeadDim, eps: text.rmsNormEps)
+        // Real 3-channel M-RoPE sections. For text-only positions (all three
+        // channels equal) this is numerically identical to the previous
+        // collapsed [Int.max/4, 0, 0] section; with media present the h/w
+        // channels carry the vision grid geometry, matching the reference
+        // runtime's mrope_section=[11, 11, 10] contract.
         rotary = Qwen35Language.RotaryEmbedding(
             dim: Int(Float(text.headDim ?? 256) * text.partialRotaryFactor),
-            base: text.ropeTheta, mropeSection: [Int.max / 4, 0, 0])
+            base: text.ropeTheta, mropeSection: config.extras.mropeSection)
         super.init()
     }
 
@@ -926,11 +935,15 @@ private final class Qwen4ExpAttention: Module {
         _indexer.wrappedValue = Qwen4ExpQSAIndexer(config)
         rotary = Qwen35Language.RotaryEmbedding(
             dim: Int(Float(headDim) * text.partialRotaryFactor),
-            base: text.ropeTheta, mropeSection: [Int.max / 4, 0, 0])
+            base: text.ropeTheta, mropeSection: config.extras.mropeSection)
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray, cache: QSAKVCache?) -> MLXArray {
+    func callAsFunction(
+        _ x: MLXArray, cache: QSAKVCache?,
+        positionIds explicitPositions: MLXArray? = nil,
+        positionOffset: Int = 0
+    ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let past = cache?.offset ?? 0
         let sparseMask = indexer(x, cache: cache)
@@ -942,7 +955,12 @@ private final class Qwen4ExpAttention: Module {
         var key = kNorm(kProj(x).reshaped(B, S, text.kvHeads, headDim))
             .transposed(0, 2, 1, 3)
         let value = vProj(x).reshaped(B, S, text.kvHeads, headDim).transposed(0, 2, 1, 3)
-        let positions = MLXArray(past ..< (past + S)).asType(.int32).reshaped(1, S)
+        // Media prefill passes explicit 3-channel M-RoPE positions from
+        // getRopeIndex; decode after media continues from past + ropeDelta.
+        // Text-only keeps the sequential cache-offset positions (offset 0).
+        let positions = explicitPositions
+            ?? MLXArray((past + positionOffset) ..< (past + positionOffset + S))
+                .asType(.int32).reshaped(1, S)
         let (cos, sin) = rotary(x: value, positionIds: positions)
         (query, key) = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: query, k: key, cos: cos, sin: sin)
@@ -1025,7 +1043,9 @@ private final class Qwen4ExpDecoderLayer: Module {
         _ input: MLXArray, inputIds: MLXArray, cache: KVCache?,
         plePrefetch: Qwen4ExpPLE.Prefetch? = nil,
         pleEmbedding: MLXArray? = nil,
-        recordPrefixCommitStates: Bool = false
+        recordPrefixCommitStates: Bool = false,
+        positionIds: MLXArray? = nil,
+        positionOffset: Int = 0
     ) -> MLXArray {
         if Self.profiledLayer == layerIndex,
             inputIds.size == Self.profileSequenceLength,
@@ -1065,7 +1085,9 @@ private final class Qwen4ExpDecoderLayer: Module {
                     ? linearAttention!(
                         attentionMix.0, cache: cache as? MambaCache,
                         recordPrefixCommitStates: recordPrefixCommitStates)
-                    : attention!(attentionMix.0, cache: cache as? QSAKVCache)
+                    : attention!(
+                        attentionMix.0, cache: cache as? QSAKVCache,
+                        positionIds: positionIds, positionOffset: positionOffset)
                 return (result, [result])
             }
             hyper = evaluated("attention_combine") {
@@ -1109,7 +1131,9 @@ private final class Qwen4ExpDecoderLayer: Module {
             ? linearAttention!(
                 attentionInput, cache: cache as? MambaCache,
                 recordPrefixCommitStates: recordPrefixCommitStates)
-            : attention!(attentionInput, cache: cache as? QSAKVCache)
+            : attention!(
+                attentionInput, cache: cache as? QSAKVCache,
+                positionIds: positionIds, positionOffset: positionOffset)
         hyper = attentionResidual.combine(hyper, block: attentionOutput, injection: inject!)
         let (mlpInput, mlpInject) = mlpResidual.mix(hyper)
         return mlpResidual.combine(hyper, block: mlp(mlpInput), injection: mlpInject!)
@@ -1263,7 +1287,9 @@ private final class Qwen4ExpTextModel: Module {
     func forward(
         _ inputIds: MLXArray, embeddings: MLXArray? = nil, cache: [KVCache]?,
         pleEmbeddings: [Int: MLXArray]? = nil,
-        recordPrefixCommitStates: Bool = false
+        recordPrefixCommitStates: Bool = false,
+        positionIds: MLXArray? = nil,
+        positionOffset: Int = 0
     ) -> ForwardResult {
         let auditDTypes = Qwen4ExpDTypeTrace.claimTextAudit()
         var plePrefetches: [Int: Qwen4ExpPLE.Prefetch] = [:]
@@ -1289,7 +1315,9 @@ private final class Qwen4ExpTextModel: Module {
                 hidden, inputIds: inputIds, cache: cache?[index],
                 plePrefetch: plePrefetches[index],
                 pleEmbedding: pleEmbeddings?[index],
-                recordPrefixCommitStates: recordPrefixCommitStates)
+                recordPrefixCommitStates: recordPrefixCommitStates,
+                positionIds: positionIds,
+                positionOffset: positionOffset)
             if inputIds.dim(1) > 1, plePrefetches[index + 1] != nil {
                 // Commit the resident layer immediately so its Metal work can
                 // overlap the already-running SSD row prefetch during prefill.
@@ -1311,9 +1339,13 @@ private final class Qwen4ExpTextModel: Module {
     }
 
     func callAsFunction(
-        _ inputIds: MLXArray, embeddings: MLXArray? = nil, cache: [KVCache]?
+        _ inputIds: MLXArray, embeddings: MLXArray? = nil, cache: [KVCache]?,
+        positionIds: MLXArray? = nil, positionOffset: Int = 0
     ) -> MLXArray {
-        forward(inputIds, embeddings: embeddings, cache: cache).mixed
+        forward(
+            inputIds, embeddings: embeddings, cache: cache,
+            positionIds: positionIds, positionOffset: positionOffset
+        ).mixed
     }
 }
 
@@ -1329,6 +1361,15 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     @ModuleInfo(key: "language_model") private var textModel: Qwen4ExpTextModel
     @ModuleInfo(key: "lm_head") private var head: Linear
     @ModuleInfo(key: "mtp") private var mtp: Qwen4ExpMTPModule?
+    @ModuleInfo(key: "visual") private var visionModel: Qwen3VLVision.VisionModel
+
+    /// M-RoPE delta established by the most recent media prefill, keyed by the
+    /// conversation's cache identity so concurrent sessions do not cross.
+    /// Decode positions after a media prefill continue at
+    /// `cache.offset + delta`, matching the reference runtime's
+    /// `_rope_deltas` contract. Text-only conversations keep delta 0.
+    private let ropeDeltaLock = NSLock()
+    nonisolated(unsafe) private var ropeDeltas: [ObjectIdentifier: Int] = [:]
 
     public init(_ config: Qwen4ExpConfiguration) {
         self.config = config
@@ -1339,7 +1380,23 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         if config.extras.mtpNumHiddenLayers > 0 {
             _mtp.wrappedValue = Qwen4ExpMTPModule(config)
         }
+        _visionModel.wrappedValue = Qwen3VLVision.VisionModel(config.base.visionConfiguration)
         super.init()
+    }
+
+    private func setRopeDelta(_ delta: Int, for cache: [KVCache]?) {
+        guard let first = cache?.first else { return }
+        ropeDeltaLock.lock()
+        defer { ropeDeltaLock.unlock() }
+        if ropeDeltas.count > 128 { ropeDeltas.removeAll() }
+        ropeDeltas[ObjectIdentifier(first as AnyObject)] = delta
+    }
+
+    private func ropeDelta(for cache: [KVCache]?) -> Int {
+        guard let first = cache?.first else { return 0 }
+        ropeDeltaLock.lock()
+        defer { ropeDeltaLock.unlock() }
+        return ropeDeltas[ObjectIdentifier(first as AnyObject)] ?? 0
     }
 
     public var vocabularySize: Int { config.base.vocabSize }
@@ -1366,15 +1423,127 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     }
 
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
-        guard input.image == nil, input.video == nil else {
-            throw ModelFactoryError.unsupportedModelType(
-                "qwen4_exp vision bridge is not installed yet")
+        let inputIds = input.text.tokens
+
+        guard input.image != nil || input.video != nil else {
+            setRopeDelta(0, for: cache)
+            return .logits(LMOutput(logits: callAsFunction(inputIds, cache: cache)))
         }
-        return .logits(LMOutput(logits: callAsFunction(input.text.tokens, cache: cache)))
+
+        // Media prefill: encode pixels through the bundled quantized vision
+        // tower, scatter image rows onto image placeholders and video rows
+        // onto video placeholders (never interleaved), and derive 3-channel
+        // M-RoPE positions plus the rope delta that decode continues from.
+        let visionDType = visionModel.patchEmbed.proj.weight.dtype
+        var pixelParts: [MLXArray] = []
+        var imageFrames: [THW]?
+        var videoFrames: [THW]?
+        if let image = input.image {
+            pixelParts.append(image.pixels.asType(visionDType))
+            imageFrames = image.frames
+        }
+        if let video = input.video {
+            pixelParts.append(video.pixels.asType(visionDType))
+            videoFrames = video.frames
+        }
+        var frames: [THW] = []
+        if let imageFrames { frames.append(contentsOf: imageFrames) }
+        if let videoFrames { frames.append(contentsOf: videoFrames) }
+        guard !pixelParts.isEmpty, !frames.isEmpty else {
+            throw ModelFactoryError.unsupportedModelType(
+                "qwen4_exp media input carried no pixels/frames")
+        }
+
+        let textEmbeds = textModel.embedding(inputIds)
+        let (visionHidden, _) = visionModel(concatenated(pixelParts), gridTHW: frames)
+        let features = visionHidden.asType(textEmbeds.dtype)
+
+        let mergeSize = config.base.visionConfiguration.spatialMergeSize
+        let divisor = max(1, mergeSize * mergeSize)
+        let imageRowCount = (imageFrames ?? []).reduce(0) { $0 + $1.product / divisor }
+        let mergedEmbeddings = try Self.scatterMediaFeatures(
+            features: features,
+            imageRowCount: imageRowCount,
+            inputEmbeds: textEmbeds,
+            inputIds: inputIds,
+            imageTokenId: config.base.imageTokenIndex,
+            videoTokenId: config.base.videoTokenIndex)
+
+        let (positionIds, deltas) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: inputIds,
+            imageGridTHW: imageFrames,
+            videoGridTHW: videoFrames,
+            spatialMergeSize: mergeSize,
+            imageTokenId: config.base.imageTokenIndex,
+            videoTokenId: config.base.videoTokenIndex,
+            visionStartTokenId: config.base.visionStartTokenId,
+            attentionMask: nil)
+        setRopeDelta(deltas.reshaped(-1)[0].item(Int.self), for: cache)
+
+        let headInput = textModel(
+            inputIds, embeddings: mergedEmbeddings, cache: cache,
+            positionIds: positionIds)
+        return .logits(LMOutput(logits: projectToLogits(headInput)))
+    }
+
+    /// Fixed per-modality scatter: rows [0, imageRowCount) are image-batch
+    /// rows and land only on image placeholders; the remainder are video rows
+    /// and land only on video placeholders. A total-count mismatch fails
+    /// loudly instead of silently mis-assigning features.
+    private static func scatterMediaFeatures(
+        features: MLXArray,
+        imageRowCount: Int,
+        inputEmbeds: MLXArray,
+        inputIds: MLXArray,
+        imageTokenId: Int,
+        videoTokenId: Int
+    ) throws -> MLXArray {
+        let imageMask = (inputIds .== MLXArray(imageTokenId))
+        let videoMask = (inputIds .== MLXArray(videoTokenId))
+        let totalPlaceholders = (imageMask .|| videoMask).sum().item(Int.self)
+        let featureRows = features.dim(0)
+        guard totalPlaceholders == featureRows else {
+            throw ModelFactoryError.unsupportedModelType(
+                "qwen4_exp media features (\(featureRows) rows) do not match "
+                    + "placeholder tokens (\(totalPlaceholders))")
+        }
+
+        let originalShape = inputEmbeds.shape
+        let width = inputEmbeds.dim(-1)
+        var result = inputEmbeds.flattened()
+
+        func scatter(mask: MLXArray, rows: MLXArray) throws {
+            let flags = mask.flattened().asType(.bool).asArray(Bool.self)
+            var positions: [Int] = []
+            positions.reserveCapacity(rows.dim(0))
+            for (index, flag) in flags.enumerated() where flag { positions.append(index) }
+            guard !positions.isEmpty else { return }
+            guard positions.count == rows.dim(0) else {
+                throw ModelFactoryError.unsupportedModelType(
+                    "qwen4_exp per-modality media rows (\(rows.dim(0))) do not "
+                        + "match placeholders (\(positions.count))")
+            }
+            var flatIndices: [UInt32] = []
+            flatIndices.reserveCapacity(positions.count * width)
+            for position in positions {
+                let base = position * width
+                for offset in 0 ..< width { flatIndices.append(UInt32(base + offset)) }
+            }
+            result[MLXArray(flatIndices)] = rows.flattened()
+        }
+
+        if imageRowCount > 0 {
+            try scatter(mask: imageMask, rows: features[0 ..< imageRowCount])
+        }
+        if featureRows > imageRowCount {
+            try scatter(mask: videoMask, rows: features[imageRowCount ..< featureRows])
+        }
+        return result.reshaped(originalShape)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let headInput = textModel(inputs, cache: cache)
+        let headInput = textModel(
+            inputs, cache: cache, positionOffset: ropeDelta(for: cache))
         return projectToLogits(headInput)
     }
 
@@ -1511,8 +1680,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         var output: [String: MLXArray] = [:]
         output.reserveCapacity(weights.count)
         for (originalKey, originalValue) in weights {
-            if originalKey.hasPrefix("visual.")
-                || (originalKey.hasPrefix("mtp.") && mtp == nil)
+            if (originalKey.hasPrefix("mtp.") && mtp == nil)
                 || originalKey.contains("ngram_embedding.shards")
                 || originalKey.contains("ngram_heads_") || originalKey.contains("layer_multipliers")
             { continue }
@@ -1543,6 +1711,16 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             }
             if key.contains(".ple.ple_embedding.") {
                 key = key.replacingOccurrences(of: ".ple.ple_embedding.", with: ".ple.")
+            }
+            // The bundle stores the vision patch embed in HF Conv3d layout
+            // [out, in, t, h, w]; MLX conv expects channels-last
+            // [out, t, h, w, in]. Same guard as Qwen3VL's sanitize so an
+            // already-MLX-format tensor passes through untouched.
+            if key == "visual.patch_embed.proj.weight",
+                value.ndim == 5,
+                value.dim(-1) != config.base.visionConfiguration.inChannels
+            {
+                value = value.transposed(0, 2, 3, 4, 1)
             }
             if key.hasSuffix(".conv1d.weight"), value.ndim == 3, value.dim(1) == 1 {
                 value = value.squeezed(axis: 1).transposed(1, 0)
