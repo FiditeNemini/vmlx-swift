@@ -1426,6 +1426,14 @@ public struct TokenIterator: TokenIteratorProtocol {
         if typeName.contains("laguna") {
             return true
         }
+        // Qwen3.8 Flash Next's full-forward MLX transform changes reduction
+        // numerics enough to diverge from eager by token three and enter
+        // repetition loops. Its model-native fused decode kernels remain
+        // enabled; deny only the unsafe outer trace until token parity is
+        // proven on the released PLE/GDN topology.
+        if typeName.contains("qwen4exp") {
+            return true
+        }
         if typeName.contains("minimax") {
             return !compiledDecodeAllowsMiniMax()
         }
@@ -1465,6 +1473,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let kvMode: KVQuantizationMode
 
     private var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
+    private var compiledExternalInputModel: (any CompiledDecodeExternalInputModel)?
 
     /// Host-side offset bookkeeping for recurrent caches under compiled
     /// decode. `MambaCache.offset` is a plain Int advanced inside the model
@@ -2546,29 +2555,21 @@ public struct TokenIterator: TokenIteratorProtocol {
             //                      captures at trace-build time and then
             //                      reuses for later tokens)
             //   RotatingKVCache -> CompilableRotatingKVCache
-            //   MambaCache      -> passed through UNPROMOTED. Recurrent
-            //                      state is fixed-shape, already exposed via
-            //                      `innerState()` (so the compile transform
-            //                      tracks it as implicit input/output), and
-            //                      updated in place through the same
-            //                      `_updateInternal` mechanism the state
-            //                      tracker relies on. Requiring promotability
-            //                      of every layer silently disabled compiled
-            //                      decode for the hybrid GDN families
-            //                      (Qwen 3.5/3.6/3.8, Ornith) — measured on
-            //                      Qwen3.8-27B as 19 ms/token of per-token
-            //                      graph rebuild, the whole gap between this
-            //                      runtime (16.6 tok/s) and mlx-lm (24.6) on
-            //                      the identical bundle.
+            //   MambaCache      -> CompilableMambaCache. Plain ArraysCache
+            //                      stores optionals in a Swift array and its
+            //                      compactMap innerState does not preserve the
+            //                      stable state identity required by compile.
+            //                      The compilable form also preserves Qwen3.8
+            //                      PLE companion slots 2...5.
             let allPromotable = cache.allSatisfy { layer in
                 layer is KVCacheSimple
                     || (layer is RotatingKVCache && !(layer is CompilableRotatingKVCache))
-                    || layer is MambaCache
+                    || (layer is MambaCache && !(layer is CompilableMambaCache))
             }
             guard allPromotable else { return }
             promoted = cache.map { layer in
-                if layer is MambaCache {
-                    return layer
+                if let mamba = layer as? MambaCache {
+                    return CompilableMambaCache(from: mamba) as KVCache
                 }
                 if let rotating = layer as? RotatingKVCache {
                     return CompilableRotatingKVCache(from: rotating) as KVCache
@@ -2585,6 +2586,8 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         let capturedModel = model
         let cacheRef = promoted
+        let externalInputModel = model as? any CompiledDecodeExternalInputModel
+        self.compiledExternalInputModel = externalInputModel
 
         self.compiledForward = compile(
             inputs: cacheRef, outputs: cacheRef
@@ -2595,6 +2598,12 @@ public struct TokenIterator: TokenIteratorProtocol {
             // skip mid-graph `eval` scheduling aids that are illegal
             // inside compile transforms.
             CompiledDecodeTrace.withActive {
+                if let externalInputModel {
+                    return [externalInputModel.compiledDecodeForward(
+                        inputIds: args[0],
+                        externalInputs: Array(args.dropFirst()),
+                        cache: cacheRef)]
+                }
                 let result = capturedModel(
                     LMInput.Text(tokens: args[0])[text: .newAxis],
                     cache: cacheRef.isEmpty ? nil : cacheRef,
@@ -2608,8 +2617,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     mutating func step(previous: LMInput.Text) -> MLXArray {
         if self.compiledForward != nil {
             let input = previous.tokens
+            var compiledInputs = [input]
+            if let compiledExternalInputModel {
+                compiledInputs.append(contentsOf:
+                    compiledExternalInputModel.compiledDecodeExternalInputs(
+                        inputIds: input, cache: cache))
+            }
             let result = MLXPressGenerationProfile.time("decode.compiled_forward") {
-                self.compiledForward!([input])
+                self.compiledForward!(compiledInputs)
             }
 
             if result.count > 0 {
@@ -2630,6 +2645,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
             self.compiledForward = nil
+            self.compiledExternalInputModel = nil
         }
 
         // Models expect [B, L] input. If the caller passed 1D tokens [L], add a batch

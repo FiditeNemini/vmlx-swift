@@ -220,6 +220,32 @@ import Testing
     #expect(restored.count == 2)
 }
 
+@Test func restoreSSMStatesSupportsExtendedPLEMambaAlongsideOrdinaryMamba() {
+    let sourcePLE = MambaCache(slots: 6)
+    for index in 0 ..< 4 {
+        sourcePLE[index] = MLXArray([Int32(index + 10)])
+    }
+    let sourceOrdinary = MambaCache()
+    sourceOrdinary[0] = MLXArray([Int32(20)])
+    sourceOrdinary[1] = MLXArray([Int32(21)])
+
+    let states = extractSSMStates(from: [sourcePLE, sourceOrdinary])
+    #expect(states.count == 6)
+
+    let restoredPLE = MambaCache(slots: 6)
+    let restoredOrdinary = MambaCache()
+    restoreSSMStates(states, into: [restoredPLE, restoredOrdinary], boundary: 17)
+
+    #expect(restoredPLE.slotCount == 6)
+    #expect(restoredPLE.state.count == 4)
+    #expect(restoredPLE[2]?.item(Int32.self) == 12)
+    #expect(restoredPLE[4] == nil)
+    #expect(restoredPLE[5] == nil)
+    #expect(restoredPLE.offset == 17)
+    #expect(restoredOrdinary[1]?.item(Int32.self) == 21)
+    #expect(restoredOrdinary.offset == 17)
+}
+
 @Test func restoreSSMStatesSkipsKVCache() {
     let kv = KVCacheSimple()
     let states = [MLXArray.ones([1, 4, 16])]

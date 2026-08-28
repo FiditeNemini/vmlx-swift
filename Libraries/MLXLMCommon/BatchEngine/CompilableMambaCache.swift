@@ -73,6 +73,18 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
     /// Hidden / SSM state for the SSM layer (`cache[1]`).
     public var hiddenStateArray: MLXArray?
 
+    /// Model-owned companion state. Qwen3.8 Flash Next PLE shares the host
+    /// GDN cache and uses slot 2 for token history and slot 3 for its
+    /// convolution tail. Slots 4/5 are reserved for staged verification.
+    /// Keeping these as direct properties gives MLX.compile the same stable
+    /// object identity as the core conv/SSM slots.
+    public var companionStateArray2: MLXArray?
+    public var companionStateArray3: MLXArray?
+    public var companionStateArray4: MLXArray?
+    public var companionStateArray5: MLXArray?
+
+    private let stableSlotCount: Int
+
     // MARK: - Init
 
     /// Public direct initialiser — primarily for testing. The two state
@@ -80,7 +92,26 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
     public override init(leftPadding: [Int]? = nil) {
         self.convStateArray = nil
         self.hiddenStateArray = nil
+        self.companionStateArray2 = nil
+        self.companionStateArray3 = nil
+        self.companionStateArray4 = nil
+        self.companionStateArray5 = nil
+        self.stableSlotCount = 2
         super.init(leftPadding: leftPadding)
+    }
+
+    public override init(slots: Int, leftPadding: [Int]? = nil) {
+        precondition(
+            (2 ... 6).contains(slots),
+            "CompilableMambaCache supports 2 through 6 stable slots")
+        self.convStateArray = nil
+        self.hiddenStateArray = nil
+        self.companionStateArray2 = nil
+        self.companionStateArray3 = nil
+        self.companionStateArray4 = nil
+        self.companionStateArray5 = nil
+        self.stableSlotCount = slots
+        super.init(slots: slots, leftPadding: leftPadding)
     }
 
     /// Promote an existing populated ``MambaCache`` to a compile-traceable
@@ -89,7 +120,7 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
     /// - Parameter mamba: Source cache, typically produced by a model's
     ///   prefill of Mamba / GDN layers.
     public convenience init(from mamba: MambaCache) {
-        self.init(leftPadding: nil)
+        self.init(slots: mamba.slotCount, leftPadding: nil)
 
         // Copy offset + leftPadding from source.
         self.offset = mamba.offset
@@ -99,8 +130,9 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
         // state setter invokes the parent `ArraysCache.subscript` which
         // stores to its `[MLXArray?]` array — we override subscript here
         // so the writes land in our direct properties instead.
-        if let conv = mamba[0] { self[0] = conv }
-        if let hidden = mamba[1] { self[1] = hidden }
+        for index in 0 ..< mamba.slotCount {
+            if let value = mamba[index] { self[index] = value }
+        }
     }
 
     // MARK: - Subscript override
@@ -123,8 +155,14 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
             switch index {
             case 0: return convStateArray
             case 1: return hiddenStateArray
+            case 2 where stableSlotCount > 2: return companionStateArray2
+            case 3 where stableSlotCount > 3: return companionStateArray3
+            case 4 where stableSlotCount > 4: return companionStateArray4
+            case 5 where stableSlotCount > 5: return companionStateArray5
             default:
-                fatalError("CompilableMambaCache: index out of range \(index) (valid: 0 or 1)")
+                fatalError(
+                    "CompilableMambaCache: index out of range \(index) "
+                        + "(slotCount: \(stableSlotCount))")
             }
         }
         set {
@@ -141,9 +179,27 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
                 } else {
                     hiddenStateArray = newValue
                 }
+            case 2 where stableSlotCount > 2:
+                updateStableSlot(&companionStateArray2, newValue)
+            case 3 where stableSlotCount > 3:
+                updateStableSlot(&companionStateArray3, newValue)
+            case 4 where stableSlotCount > 4:
+                updateStableSlot(&companionStateArray4, newValue)
+            case 5 where stableSlotCount > 5:
+                updateStableSlot(&companionStateArray5, newValue)
             default:
-                fatalError("CompilableMambaCache: index out of range \(index) (valid: 0 or 1)")
+                fatalError(
+                    "CompilableMambaCache: index out of range \(index) "
+                        + "(slotCount: \(stableSlotCount))")
             }
+        }
+    }
+
+    private func updateStableSlot(_ slot: inout MLXArray?, _ newValue: MLXArray?) {
+        if let existing = slot, let newValue {
+            existing._updateInternal(newValue)
+        } else {
+            slot = newValue
         }
     }
 
@@ -160,6 +216,10 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
         var out: [MLXArray] = []
         if let conv = convStateArray { out.append(conv) }
         if let hidden = hiddenStateArray { out.append(hidden) }
+        if let value = companionStateArray2 { out.append(value) }
+        if let value = companionStateArray3 { out.append(value) }
+        if let value = companionStateArray4 { out.append(value) }
+        if let value = companionStateArray5 { out.append(value) }
         return out
     }
 
@@ -177,16 +237,18 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
             return out
         }
         set {
-            precondition(
-                newValue.count == 2 || newValue.isEmpty,
-                "CompilableMambaCache.state must have exactly 2 entries (conv, hidden) or 0"
-            )
+            precondition(newValue.count <= stableSlotCount)
             if newValue.isEmpty {
                 self.convStateArray = nil
                 self.hiddenStateArray = nil
+                self.companionStateArray2 = nil
+                self.companionStateArray3 = nil
+                self.companionStateArray4 = nil
+                self.companionStateArray5 = nil
             } else {
-                self.convStateArray = newValue[0]
-                self.hiddenStateArray = newValue[1]
+                for index in 0 ..< stableSlotCount {
+                    self[index] = index < newValue.count ? newValue[index] : nil
+                }
             }
         }
     }
@@ -194,11 +256,12 @@ public final class CompilableMambaCache: MambaCache, @unchecked Sendable {
     // MARK: - Copy
 
     public override func copy() -> any KVCache {
-        let new = CompilableMambaCache()
+        let new = CompilableMambaCache(slots: stableSlotCount)
         new.offset = self.offset
         new.leftPadding = self.leftPadding
-        if let conv = convStateArray { new.convStateArray = conv[.ellipsis] }
-        if let hidden = hiddenStateArray { new.hiddenStateArray = hidden[.ellipsis] }
+        for index in 0 ..< stableSlotCount {
+            if let value = self[index] { new[index] = value[.ellipsis] }
+        }
         return new
     }
 }

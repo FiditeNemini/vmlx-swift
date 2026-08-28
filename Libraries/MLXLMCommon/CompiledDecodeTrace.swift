@@ -10,6 +10,25 @@
 // the Swift closure body.
 
 import Foundation
+import MLX
+
+/// A model whose one-token compiled forward needs data that must be resolved
+/// on the host before MLX starts tracing/replaying the graph.
+///
+/// Qwen3.8 Flash Next's PLE table is the motivating case: the current token
+/// and the PLE history select a few rows from a disk-backed n-gram table.  A
+/// host `asArray()` readback and `pread()` cannot legally execute inside an
+/// MLX `compile` transform.  The iterator therefore resolves those small
+/// inputs first and supplies them as ordinary explicit graph inputs.
+public protocol CompiledDecodeExternalInputModel: AnyObject {
+    func compiledDecodeExternalInputs(
+        inputIds: MLXArray, cache: [KVCache]
+    ) -> [MLXArray]
+
+    func compiledDecodeForward(
+        inputIds: MLXArray, externalInputs: [MLXArray], cache: [KVCache]
+    ) -> MLXArray
+}
 
 public enum CompiledDecodeTrace {
     @TaskLocal private static var taskLocalActive = false

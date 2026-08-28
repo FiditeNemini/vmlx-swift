@@ -599,28 +599,31 @@ public func restoreSSMStates(
     into cache: [any KVCache],
     boundary: Int? = nil
 ) {
-    // `extractSSMStates` emits each MambaCache's OCCUPIED slots: full Mamba
-    // layers (Nemotron-H, Jamba) contribute 2 arrays, LFM2/LFM2.5 short-conv
-    // layers contribute exactly 1 (slot 1 is never written). A fresh restore
-    // target has empty state, so the per-layer arity must be recovered from
-    // the list itself: every mamba layer in one companion list shares one
-    // arity, so the total length disambiguates. A list matching neither
-    // layout is refused outright — consuming a best-effort prefix cross-wired
-    // layer N with layer N+1's state and left the tail layers empty.
+    // `extractSSMStates` emits each MambaCache's OCCUPIED persistent slots:
+    // ordinary full Mamba layers contribute 2 arrays, LFM2/LFM2.5 short-conv
+    // layers contribute 1, and qwen4_exp's extended PLE host contributes 4
+    // persistent arrays in a 6-slot container (the final 2 are transient MTP
+    // staging slots). Recover the ordinary-family arity from the total while
+    // accounting for extended caches at their fixed persistent width. A list
+    // matching neither layout is refused outright rather than cross-wiring
+    // layer N with layer N+1's state.
+    func restoreArity(_ mamba: MambaCache, ordinaryArity: Int) -> Int {
+        mamba.slotCount > 2 ? mamba.slotCount - 2 : ordinaryArity
+    }
     var totalWithTwoSlotMamba = 0
     var totalWithOneSlotMamba = 0
     for layer in cache {
-        if layer is MambaCache {
-            totalWithTwoSlotMamba += 2
-            totalWithOneSlotMamba += 1
+        if let mamba = layer as? MambaCache {
+            totalWithTwoSlotMamba += restoreArity(mamba, ordinaryArity: 2)
+            totalWithOneSlotMamba += restoreArity(mamba, ordinaryArity: 1)
         } else if let arrays = layer as? ArraysCache {
             totalWithTwoSlotMamba += arrays.slotCount
             totalWithOneSlotMamba += arrays.slotCount
         } else if let cacheList = layer as? CacheList {
             for i in 0..<cacheList.count {
-                if cacheList[i] is MambaCache {
-                    totalWithTwoSlotMamba += 2
-                    totalWithOneSlotMamba += 1
+                if let mamba = cacheList[i] as? MambaCache {
+                    totalWithTwoSlotMamba += restoreArity(mamba, ordinaryArity: 2)
+                    totalWithOneSlotMamba += restoreArity(mamba, ordinaryArity: 1)
                 } else if let arrays = cacheList[i] as? ArraysCache {
                     totalWithTwoSlotMamba += arrays.slotCount
                     totalWithOneSlotMamba += arrays.slotCount
@@ -643,9 +646,10 @@ public func restoreSSMStates(
     var stateIdx = 0
     for layer in cache {
         if let mamba = layer as? MambaCache {
-            if stateIdx + mambaArity <= states.count {
-                if mambaArity == 2 {
-                    mamba.state = Array(states[stateIdx..<(stateIdx + 2)])
+            let arity = restoreArity(mamba, ordinaryArity: mambaArity)
+            if stateIdx + arity <= states.count {
+                if arity > 1 {
+                    mamba.state = Array(states[stateIdx..<(stateIdx + arity)])
                         .map { $0[.ellipsis] }
                 } else {
                     // Single-slot short-conv layout: keep the 2-slot
@@ -653,7 +657,7 @@ public func restoreSSMStates(
                     mamba[0] = states[stateIdx][.ellipsis]
                 }
                 if let boundary { mamba.offset = boundary }
-                stateIdx += mambaArity
+                stateIdx += arity
             }
         } else if let arrays = layer as? ArraysCache {
             // ArraysCache (GatedDeltaNet / linear-attention recurrence, e.g.
@@ -682,15 +686,16 @@ public func restoreSSMStates(
         } else if let cacheList = layer as? CacheList {
             for i in 0..<cacheList.count {
                 if let mamba = cacheList[i] as? MambaCache {
-                    if stateIdx + mambaArity <= states.count {
-                        if mambaArity == 2 {
-                            mamba.state = Array(states[stateIdx..<(stateIdx + 2)])
+                    let arity = restoreArity(mamba, ordinaryArity: mambaArity)
+                    if stateIdx + arity <= states.count {
+                        if arity > 1 {
+                            mamba.state = Array(states[stateIdx..<(stateIdx + arity)])
                                 .map { $0[.ellipsis] }
                         } else {
                             mamba[0] = states[stateIdx][.ellipsis]
                         }
                         if let boundary { mamba.offset = boundary }
-                        stateIdx += mambaArity
+                        stateIdx += arity
                     }
                 } else if let arrays = cacheList[i] as? ArraysCache {
                     let slotCount = arrays.slotCount

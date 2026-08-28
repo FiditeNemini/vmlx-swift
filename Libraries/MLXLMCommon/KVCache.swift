@@ -595,6 +595,78 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
+/// KV cache for QSA (Qwen sparse attention, qwen4_exp) full-attention
+/// layers: the standard K/V buffers plus the layer's RAW indexer keys
+/// (pre-norm, pre-rope, `[B, T, indexerHeadDim]`). The indexer re-pools and
+/// re-ropes its key blocks every forward, so the raw keys are the only
+/// auxiliary state that must persist — and they must stay row-for-row in
+/// sync with `offset` across trim/rollback or block selection reads keys
+/// from the wrong positions.
+public class QSAKVCache: KVCacheSimple {
+    /// Raw indexer keys covering `[0, offset + pending)` — the layer calls
+    /// `updateIndexerKeys` BEFORE `update(keys:values:)` advances `offset`,
+    /// matching the reference forward order.
+    public private(set) var indexerKeys: MLXArray?
+
+    public func updateIndexerKeys(_ rawKeys: MLXArray) -> MLXArray {
+        if let existing = indexerKeys, existing.dim(1) > 0 {
+            // Stale rows beyond `offset` (a trim/rollback that happened
+            // between forwards) must not survive into the concat.
+            let valid = existing.dim(1) > offset
+                ? existing[0..., ..<offset, 0...] : existing
+            indexerKeys = concatenated([valid, rawKeys], axis: 1)
+        } else {
+            indexerKeys = rawKeys
+        }
+        return indexerKeys!
+    }
+
+    public override func innerState() -> [MLXArray] {
+        super.innerState() + [indexerKeys].compactMap { $0 }
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            var s = super.state
+            if let indexerKeys {
+                s.append(
+                    indexerKeys.dim(1) > offset
+                        ? indexerKeys[0..., ..<offset, 0...] : indexerKeys)
+            }
+            return s
+        }
+        set {
+            if newValue.count == 3 {
+                super.state = Array(newValue[0 ..< 2])
+                indexerKeys = newValue[2]
+            } else {
+                super.state = newValue
+                indexerKeys = nil
+            }
+        }
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = super.trim(n)
+        if trimmed > 0, let existing = indexerKeys, existing.dim(1) > offset {
+            indexerKeys = existing[0..., ..<offset, 0...]
+        }
+        return trimmed
+    }
+
+    public override func copy() -> any KVCache {
+        let new = QSAKVCache()
+        new.step = self.step
+        new.offset = self.offset
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map(ownedStateCopy)
+        }
+        return new
+    }
+}
+
 /// Rotating KV cache for sliding window attention
 ///
 /// - Note: Internal state members are `internal` (module-private) so
@@ -1347,24 +1419,37 @@ public class ArraysCache: BaseKVCache {
             return cache.compactMap { $0 }
         }
         set {
+            // Restores carry only occupied arrays. Keep the model-declared
+            // trailing slot geometry when that geometry is wider than the
+            // payload (qwen4_exp PLE uses four persistent slots in a six-slot
+            // MambaCache; slots 4/5 are transient native-MTP staging state).
+            // Replacing the backing array with a two-array v2 Mamba payload
+            // used to collapse that cache to two slots before the PLE
+            // companion restore could populate slots 2/3.
+            let capacity = max(cache.count, newValue.count)
             cache = newValue.map { $0 as MLXArray? }
+            if cache.count < capacity {
+                cache.append(contentsOf: repeatElement(nil, count: capacity - cache.count))
+            }
+        }
+    }
+
+    /// Copy occupied slots without compacting away nil holes or trailing
+    /// model-owned capacity. Subclasses use this when preserving their dynamic
+    /// type in `copy()`.
+    internal func copySlots(into destination: ArraysCache) {
+        precondition(destination.slotCount >= slotCount)
+        for index in cache.indices {
+            destination.cache[index] = cache[index].map { $0 * 1 }
         }
     }
 
     public override func copy() -> any KVCache {
         let new = ArraysCache(size: cache.count)
-        let s = self.state
-        if !s.isEmpty {
-            // ArraysCache users (Qwen 3.5/Ornith GatedDeltaNet among them)
-            // replace their recurrent tensor in place on every forward. An
-            // ellipsis slice is only a view of that storage, so a purported
-            // prompt-boundary `copy()` was later overwritten by tool/decode
-            // tokens and could be stored under the earlier prompt hash.
-            // Build fresh buffers here. Snapshot call sites materialize the
-            // complete cache list in one MLX.eval below, avoiding one GPU
-            // synchronization per layer.
-            new.state = s.map { $0 * 1 }
-        }
+        // ArraysCache users (Qwen 3.5/Ornith GatedDeltaNet among them)
+        // replace their recurrent tensor in place on every forward. Build
+        // fresh buffers here while retaining nil holes and trailing capacity.
+        copySlots(into: new)
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         return new
@@ -1410,6 +1495,14 @@ public class MambaCache: ArraysCache {
 
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
+    }
+
+    /// Recurrent layers that co-host extra stateful sublayers use more than
+    /// the two conv/SSM slots — qwen4_exp's PLE layer shares its host GDN
+    /// layer's cache and stores previous-context token ids in slot 2 and the
+    /// dilated-conv state in slot 3.
+    public init(slots: Int, leftPadding: [Int]? = nil) {
+        super.init(size: slots, leftPadding: leftPadding)
     }
 
     public func recordPrefixCommitState(length: Int, arrays: [MLXArray], offset: Int) {
@@ -1525,11 +1618,8 @@ public class MambaCache: ArraysCache {
     }
 
     public override func copy() -> any KVCache {
-        let new = MambaCache()
-        let s = self.state
-        if !s.isEmpty {
-            new.state = s.map { $0 * 1 }
-        }
+        let new = MambaCache(slots: slotCount)
+        copySlots(into: new)
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         return new

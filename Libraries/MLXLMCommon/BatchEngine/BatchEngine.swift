@@ -325,7 +325,7 @@ public actor BatchEngine {
     /// Maximum B=1 decode steps before yielding back to the actor executor.
     private let controlPlaneYieldInterval: Int = 8
 
-    /// DSV4, Hy3/Hunyuan, Laguna, and MiniMax are denied the generic
+    /// DSV4, Hy3/Hunyuan, Laguna, Qwen3.8 Flash Next, and MiniMax are denied the generic
     /// single-slot compiled trace. DSV4 already compiles its stateless gate and
     /// SwiGLU micrographs, but its composite SWA + CSA/HSA cache is not a
     /// promotable whole-forward cache. Keep the native DSV4 acceleration while
@@ -343,6 +343,9 @@ public actor BatchEngine {
             || modelName.contains("hy3") || modelName.contains("hy_v3") || modelName.contains("hy-v3")
             || modelTypeName.contains("hy3") || modelTypeName.contains("hunyuan")
             || modelName.contains("laguna") || modelTypeName.contains("laguna")
+            || modelName.contains("qwen3.8-flash-next")
+            || modelName.contains("qwen3_8_flash_next")
+            || modelTypeName.contains("qwen4exp")
             || modelName.contains("minimax") || modelTypeName.contains("minimax")
     }
 

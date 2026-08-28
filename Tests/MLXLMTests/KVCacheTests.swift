@@ -140,6 +140,33 @@ func testCacheCopyOnEmptyCache(creator: (() -> any KVCache)) async throws {
     #expect(copied.state.count == empty.state.count)
 }
 
+/// qwen4_exp co-hosts PLE state in one GDN cache. Warm-prefix snapshots and
+/// v2 cache restores must not collapse its six-slot topology to the occupied
+/// persistent prefix, otherwise PLE prefetch traps on slot 2.
+@Test func testExtendedMambaCopyAndRestorePreserveSlotTopology() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let source = MambaCache(slots: 6)
+    for index in 0 ..< 4 {
+        source[index] = MLXArray([Int32(index + 1)])
+    }
+
+    let copied = source.copy() as! MambaCache
+    #expect(copied.slotCount == 6)
+    #expect(copied.state.count == 4)
+    #expect(copied[2]?.item(Int32.self) == 3)
+    #expect(copied[4] == nil)
+    #expect(copied[5] == nil)
+
+    let restored = MambaCache(slots: 6)
+    restored.state = source.state.map { $0[.ellipsis] }
+    #expect(restored.slotCount == 6)
+    #expect(restored[2]?.item(Int32.self) == 3)
+    #expect(restored[4] == nil)
+    #expect(restored[5] == nil)
+}
+
 /// CacheList.copy() produces independent sub-caches.
 @Test
 func testCacheListCopyIsIndependent() async throws {
