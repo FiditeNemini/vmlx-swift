@@ -689,6 +689,18 @@ extension JangPressPolicy {
             // Threshold rule: enable iff routed AND bundle bytes
             // exceed half of physical RAM. Conservative on dense
             // models (no benefit) and tiny MoE (no pressure).
+            //
+            // Qwen3.8 Flash Next JANG is excluded from the threshold: its
+            // directory bytes include a 20-29 GiB PLE/ngram table that the
+            // model-owned exact-row SSD reader serves and that never becomes
+            // resident, so the whole-bundle size wildly overstates the
+            // resident need (96 GiB dir -> ~73 GiB resident on the 4-bit
+            // tier). The family's runtime contract requires every non-PLE
+            // compute weight resident — cold-compressing it only adds fault-in
+            // latency to a model that already fits.
+            if facts.isQwen4ExpBF16JANG {
+                return .disabled
+            }
             let halfRAM = facts.physicalMemory / 2
             if facts.isRouted && facts.totalSafetensorsBytes > halfRAM {
                 return JangPressLoadOptions(enabled: true, compressPct: 70)

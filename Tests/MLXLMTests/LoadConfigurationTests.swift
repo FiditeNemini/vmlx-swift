@@ -769,3 +769,46 @@ private func withEnvironmentValue<R>(
     }
     return block()
 }
+
+/// Qwen3.8 Flash Next JANG must never be cold-compressed by the auto
+/// threshold: its directory bytes include the 20–29 GiB SSD-served PLE table,
+/// so whole-bundle size overstates resident need, and the family's runtime
+/// contract keeps every non-PLE compute weight resident.
+@Suite struct Qwen4ExpJangPressExclusionTests {
+    private var flashNextFacts: LoadBundleFacts {
+        LoadBundleFacts(
+            totalSafetensorsBytes: 96 << 30,
+            isRouted: true,
+            physicalMemory: 128 << 30,
+            modelType: "qwen4_exp",
+            jangFormat: "jang_v2",
+            declaredComputeDType: "bfloat16",
+            numRoutedExperts: 512,
+            topK: 10)
+    }
+
+    @Test("auto threshold resolves DISABLED for Flash-Next despite 96GB routed")
+    func autoDisabledForFlashNext() {
+        let opts = withEnvironmentValue("JANGPRESS", nil) {
+            withEnvironmentValue("MLXPRESS", nil) {
+                JangPressPolicy.auto(envFallback: true).resolve(facts: flashNextFacts)
+            }
+        }
+        #expect(opts.enabled == false)
+    }
+
+    @Test("the threshold itself is unchanged for other routed big bundles")
+    func thresholdUnchangedElsewhere() {
+        let other = LoadBundleFacts(
+            totalSafetensorsBytes: 96 << 30,
+            isRouted: true,
+            physicalMemory: 128 << 30)
+        let opts = withEnvironmentValue("JANGPRESS", nil) {
+            withEnvironmentValue("MLXPRESS", nil) {
+                JangPressPolicy.auto(envFallback: true).resolve(facts: other)
+            }
+        }
+        #expect(opts.enabled == true)
+        #expect(opts.compressPct == 70)
+    }
+}
