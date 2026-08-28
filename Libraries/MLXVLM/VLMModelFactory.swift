@@ -126,6 +126,7 @@ public enum VLMTypeRegistry {
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
+        "qwen4_exp": create(Qwen4ExpConfiguration.self, Qwen4Exp.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "muse_glimmer": create(MuseGlimmerConfiguration.self, MuseGlimmer.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
@@ -597,6 +598,14 @@ public final class VLMModelFactory: ModelFactory {
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
+        }
+
+        // qwen4_exp's PLE embedding is a ~95 GiB table. Its model object must
+        // receive the bundle directory so it can install the page-granular
+        // safetensors row reader before any forward; ordinary MLX weight
+        // loading deliberately drops those table tensors in sanitize().
+        if let configurable = model as? Qwen4ExpModelDirectoryConfigurable {
+            try configurable.configure(modelDirectory: modelDirectory)
         }
 
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")

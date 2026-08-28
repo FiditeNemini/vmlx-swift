@@ -83,6 +83,400 @@ private let _vlmCompiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) 
     return { h, g, x in CompiledDecodeTrace.isActive ? body(h, g, x) : compiled(h, g, x) }
 }()
 
+/// Qwen3.8 Flash Next uses the same four-way GDN projection shape in every
+/// linear-attention layer.  Pass each layer's packed affine tensors as graph
+/// inputs so one trusted BF16 decode graph can be reused without retaining
+/// layer-specific weight constants.
+private enum Qwen4ExpCompiledGDNInputs {
+    typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
+
+    private static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["VMLINUX_QWEN4_EXP_COMPILE_GDN"]
+            ?? "1"
+        return value != "0" && value.lowercased() != "false"
+    }()
+    private static let allowFP32Tail =
+        ProcessInfo.processInfo.environment[
+            "VMLINUX_QWEN4_EXP_COMPILE_GDN_FP32_TAIL"] == "1"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var regions: [String: Region] = [:]
+    nonisolated(unsafe) private static var didReport = false
+    nonisolated(unsafe) private static var didReportTail = false
+    nonisolated(unsafe) private static var didReportFrontRejection = false
+    nonisolated(unsafe) private static var didReportTailRejection = false
+
+    static func call(
+        input: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        splitIndices: [Int],
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> [MLXArray]? {
+        let metadataDType = scales.dtype
+        guard enabled, !CompiledDecodeTrace.isActive, input.dim(1) == 1,
+            input.dtype == .bfloat16,
+            (metadataDType == .bfloat16 || metadataDType == .float16),
+            biases.dtype == metadataDType
+        else { return nil }
+
+        let key = ([String(describing: metadataDType), String(groupSize),
+            String(bits), String(describing: mode)]
+            + splitIndices.map(String.init)).joined(separator: "|")
+        lock.lock()
+        var region = regions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let combined = quantizedMM(
+                    args[0], args[1], scales: args[2], biases: args[3],
+                    transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+                return MLX.split(combined, indices: splitIndices, axis: -1)
+            }
+            regions[key] = region
+        }
+        if !didReport {
+            didReport = true
+            FileHandle.standardError.write(Data(
+                "[Qwen4Exp] compiled_gdn_input_projection=active shared_weight_inputs=true input=bfloat16 metadata=\(metadataDType)\n".utf8))
+        }
+        lock.unlock()
+
+        let outputs = region!([input, weight, scales, biases])
+        return outputs.count == 4 ? outputs : nil
+    }
+
+    static func callFront(
+        input: MLXArray,
+        convState: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        convWeight: MLXArray,
+        splitIndices: [Int],
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        convDim: Int,
+        convKernelSize: Int,
+        keyDim: Int,
+        numKHeads: Int,
+        headKDim: Int,
+        numVHeads: Int,
+        headVDim: Int
+    ) -> [MLXArray]? {
+        let metadataDType = scales.dtype
+        let supported = enabled && !CompiledDecodeTrace.isActive && input.dim(1) == 1
+            && input.dtype == .bfloat16
+            && (convState.dtype == .bfloat16 || convState.dtype == .float32)
+            && (metadataDType == .bfloat16 || metadataDType == .float16)
+            && biases.dtype == metadataDType && convWeight.dtype == .bfloat16
+        guard supported
+        else {
+            lock.lock()
+            if !didReportFrontRejection {
+                didReportFrontRejection = true
+                FileHandle.standardError.write(Data(
+                    ("[Qwen4Exp] compiled_gdn_front=rejected"
+                        + " enabled=\(enabled) trace=\(CompiledDecodeTrace.isActive)"
+                        + " input=\(input.shape):\(input.dtype)"
+                        + " conv_state=\(convState.shape):\(convState.dtype)"
+                        + " scales=\(metadataDType) biases=\(biases.dtype)"
+                        + " conv_weight=\(convWeight.dtype)\n").utf8))
+            }
+            lock.unlock()
+            return nil
+        }
+
+        let key = ([
+            "front", String(describing: metadataDType), String(groupSize),
+            String(bits), String(describing: mode),
+            String(describing: convState.dtype),
+            String(convDim), String(convKernelSize), String(keyDim),
+            String(numKHeads), String(headKDim), String(numVHeads),
+            String(headVDim),
+        ] + splitIndices.map(String.init)).joined(separator: "|")
+        lock.lock()
+        var region = regions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let input = args[0]
+                let B = input.dim(0)
+                let S = input.dim(1)
+                let combined = quantizedMM(
+                    input, args[2], scales: args[3], biases: args[4],
+                    transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+                let projections = MLX.split(combined, indices: splitIndices, axis: -1)
+                let z = projections[1].reshaped(B, S, numVHeads, headVDim)
+
+                let convInput = concatenated([args[1], projections[0]], axis: 1)
+                    .reshaped(B, args[1].dim(1) + S, convDim)
+                let convEnd = convInput.dim(1)
+                let convTail = convInput[
+                    0..., (convEnd - (convKernelSize - 1)) ..< convEnd, 0...]
+                let convOut = silu(conv1d(
+                    convInput, args[5], stride: 1, padding: 0,
+                    dilation: 1, groups: convDim))
+                let qkv = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+                let q = qkv[0].reshaped(B, S, numKHeads, headKDim)
+                let k = qkv[1].reshaped(B, S, numKHeads, headKDim)
+                let v = qkv[2].reshaped(B, S, numVHeads, headVDim)
+                let invScale = pow(Float(headKDim), -0.5)
+                let qNormed = MLXArray(pow(invScale, 2), dtype: q.dtype)
+                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                let kNormed = MLXArray(invScale, dtype: k.dtype)
+                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                return [
+                    z, projections[2], projections[3], qNormed, kNormed, v,
+                    convTail,
+                ]
+            }
+            regions[key] = region
+        }
+        if !didReport {
+            didReport = true
+            FileHandle.standardError.write(Data(
+                "[Qwen4Exp] compiled_gdn_front=active shared_weight_inputs=true input=bfloat16 metadata=\(metadataDType) conv_state=\(convState.dtype) recurrence=float32\n".utf8))
+        }
+        lock.unlock()
+
+        let outputs = region!([
+            input, convState, weight, scales, biases, convWeight,
+        ])
+        return outputs.count == 7 ? outputs : nil
+    }
+
+    static func callTail(
+        output: MLXArray,
+        gate: MLXArray,
+        normWeight: MLXArray,
+        outWeight: MLXArray,
+        outScales: MLXArray,
+        outBiases: MLXArray,
+        eps: Float,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> MLXArray? {
+        let metadataDType = outScales.dtype
+        let supported = enabled && !CompiledDecodeTrace.isActive && output.dim(1) == 1
+            && (output.dtype == .bfloat16
+                || (output.dtype == .float32 && allowFP32Tail))
+            && (gate.dtype == .bfloat16 || gate.dtype == .float32)
+            && normWeight.dtype == .bfloat16
+            && (metadataDType == .bfloat16 || metadataDType == .float16)
+            && outBiases.dtype == metadataDType
+        guard supported
+        else {
+            lock.lock()
+            if output.dim(1) == 1, !didReportTailRejection {
+                didReportTailRejection = true
+                FileHandle.standardError.write(Data(
+                    ("[Qwen4Exp] compiled_gdn_tail=rejected"
+                        + " enabled=\(enabled) trace=\(CompiledDecodeTrace.isActive)"
+                        + " output=\(output.shape):\(output.dtype)"
+                        + " gate=\(gate.shape):\(gate.dtype) norm=\(normWeight.dtype)"
+                        + " scales=\(metadataDType) biases=\(outBiases.dtype)\n").utf8))
+            }
+            lock.unlock()
+            return nil
+        }
+
+        let key = [
+            "tail", String(output.dim(-1)), String(gate.dim(-1)),
+            String(describing: output.dtype),
+            String(describing: gate.dtype),
+            String(describing: metadataDType),
+            String(groupSize), String(bits), String(describing: mode), String(eps),
+        ].joined(separator: "|")
+        lock.lock()
+        var region = regions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let normalized = MLXFast.rmsNorm(args[0], weight: args[2], eps: eps)
+                let gated = (normalized.asType(.float32)
+                    * sigmoid(args[1].asType(.float32))).asType(args[0].dtype)
+                let projected = quantizedMM(
+                    gated.reshaped(gated.dim(0), gated.dim(1), -1),
+                    args[3], scales: args[4], biases: args[5],
+                    transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+                return [projected]
+            }
+            regions[key] = region
+        }
+        if !didReportTail {
+            didReportTail = true
+            FileHandle.standardError.write(Data(
+                "[Qwen4Exp] compiled_gdn_tail=active recurrence_output=\(output.dtype) gate=\(gate.dtype) metadata=\(metadataDType) shared_weight_inputs=true\n".utf8))
+        }
+        lock.unlock()
+
+        return region!([
+            output, gate, normWeight, outWeight, outScales, outBiases,
+        ]).first
+    }
+}
+
+private enum Qwen4ExpCompiledMoE {
+    typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
+
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["VMLINUX_QWEN4_EXP_COMPILE_MOE"]
+            ?? "1"
+        return value != "0" && value.lowercased() != "false"
+    }()
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var routerRegions: [String: Region] = [:]
+    nonisolated(unsafe) private static var sharedRegions: [String: Region] = [:]
+    nonisolated(unsafe) private static var didReportRouter = false
+    nonisolated(unsafe) private static var didReportShared = false
+
+    static func router(
+        _ x: MLXArray,
+        weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        groupSize: Int, bits: Int, mode: QuantizationMode,
+        topK: Int, normTopK: Bool
+    ) -> (indices: MLXArray, scores: MLXArray)? {
+        guard enabled, !CompiledDecodeTrace.isActive, x.dim(1) == 1,
+            x.dtype == .bfloat16, scales.dtype == .bfloat16,
+            biases.dtype == .bfloat16
+        else { return nil }
+        let experts = weight.dim(0)
+        let key = "\(experts)|\(topK)|\(normTopK)|\(groupSize)|\(bits)|\(mode)"
+        lock.lock()
+        var region = routerRegions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let logits = quantizedMM(
+                    args[0], args[1], scales: args[2], biases: args[3],
+                    transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+                let gates = MLX.softmax(logits, axis: -1, precise: true)
+                let kth = experts - topK
+                let indices = MLX.argPartition(gates, kth: kth, axis: -1)[
+                    .ellipsis, kth...]
+                var scores = MLX.takeAlong(gates, indices, axis: -1)
+                if normTopK {
+                    scores = scores / scores.sum(axis: -1, keepDims: true)
+                }
+                return [indices, scores]
+            }
+            routerRegions[key] = region
+        }
+        if !didReportRouter {
+            didReportRouter = true
+            FileHandle.standardError.write(Data(
+                "[Qwen4Exp] compiled_moe_router=active shared_weight_inputs=true dtype=bfloat16\n".utf8))
+        }
+        lock.unlock()
+        let outputs = region!([x, weight, scales, biases])
+        guard outputs.count == 2 else { return nil }
+        return (outputs[0], outputs[1])
+    }
+
+    static func denseRouter(
+        _ x: MLXArray, weight: MLXArray, topK: Int, normTopK: Bool
+    ) -> (indices: MLXArray, scores: MLXArray)? {
+        guard enabled, !CompiledDecodeTrace.isActive, x.dim(1) == 1,
+            x.dtype == .bfloat16, weight.dtype == .bfloat16
+        else { return nil }
+        let experts = weight.dim(0)
+        let key = "dense|\(experts)|\(topK)|\(normTopK)"
+        lock.lock()
+        var region = routerRegions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let gates = MLX.softmax(
+                    matmul(args[0], args[1].transposed()), axis: -1, precise: true)
+                let kth = experts - topK
+                let indices = MLX.argPartition(gates, kth: kth, axis: -1)[
+                    .ellipsis, kth...]
+                var scores = MLX.takeAlong(gates, indices, axis: -1)
+                if normTopK {
+                    scores = scores / scores.sum(axis: -1, keepDims: true)
+                }
+                return [indices, scores]
+            }
+            routerRegions[key] = region
+        }
+        if !didReportRouter {
+            didReportRouter = true
+            FileHandle.standardError.write(Data(
+                "[Qwen4Exp] compiled_moe_router=active kind=dense shared_weight_inputs=true dtype=bfloat16\n".utf8))
+        }
+        lock.unlock()
+        let outputs = region!([x, weight])
+        guard outputs.count == 2 else { return nil }
+        return (outputs[0], outputs[1])
+    }
+
+    static func sharedExpert(
+        _ x: MLXArray,
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray,
+        downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray,
+        sharedGateWeight: MLXArray,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> MLXArray? {
+        guard enabled, !CompiledDecodeTrace.isActive, x.dim(1) == 1,
+            x.dtype == .bfloat16,
+            [gateScales, gateBiases, upScales, upBiases, downScales,
+             downBiases]
+                .allSatisfy({ $0.dtype == .bfloat16 })
+            && sharedGateWeight.dtype == .bfloat16
+        else { return nil }
+        let key = "shared|\(x.dim(-1))|\(gateWeight.dim(0))|\(groupSize)|\(bits)|\(mode)"
+        lock.lock()
+        var region = sharedRegions[key]
+        if region == nil {
+            region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
+                let gate = quantizedMM(
+                    args[0], args[1], scales: args[2], biases: args[3],
+                    transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+                let up = quantizedMM(
+                    args[0], args[4], scales: args[5], biases: args[6],
+                    transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+                let activated = silu(gate) * up
+                let shared = quantizedMM(
+                    activated, args[7], scales: args[8], biases: args[9],
+                    transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+                let gateOutput = matmul(args[0], args[10].transposed())
+                return [sigmoid(gateOutput) * shared]
+            }
+            sharedRegions[key] = region
+        }
+        if !didReportShared {
+            didReportShared = true
+            FileHandle.standardError.write(Data(
+                "[Qwen4Exp] compiled_moe_shared_expert=active shared_weight_inputs=true dtype=bfloat16\n".utf8))
+        }
+        lock.unlock()
+        let outputs = region!([
+            x,
+            gateWeight, gateScales, gateBiases,
+            upWeight, upScales, upBiases,
+            downWeight, downScales, downBiases,
+            sharedGateWeight,
+        ])
+        return outputs.first
+    }
+
+    private static let postRegion = vmlxTrustedCompile(shapeless: true) {
+        (routed: MLXArray, scores: MLXArray, shared: MLXArray) -> MLXArray in
+        let combined = (routed * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return combined + shared
+    }
+
+    static func post(
+        routed: MLXArray, scores: MLXArray, shared: MLXArray
+    ) -> MLXArray? {
+        guard enabled, !CompiledDecodeTrace.isActive, routed.dtype == .bfloat16,
+            scores.dtype == .bfloat16, shared.dtype == .bfloat16
+        else { return nil }
+        return postRegion(routed, scores, shared)
+    }
+}
+
 private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray)
     -> MLXArray
 {
@@ -243,7 +637,7 @@ private func makeVLMGatedDeltaKernel(
             auto dv_idx = thread_position_in_grid.y;
 
             auto g_ = g + b_idx * T * Hv;
-            auto beta_ = beta + b_idx * T * Hv;
+            auto b_ = b + b_idx * T * Hv;
 
             auto i_state = state_in + (n * Dv + dv_idx) * Dk;
             auto o_state = state_out + (n * Dv + dv_idx) * Dk;
@@ -264,7 +658,13 @@ private func makeVLMGatedDeltaKernel(
                 }
                 kv_mem = simd_sum(kv_mem);
 
-                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+                // `b` remains in the model's BF16 activation dtype. Compute
+                // sigmoid directly in the FP32 recurrence register instead
+                // of materializing a separate BF16 or FP32 beta tensor.
+                auto beta_value = 1.0f
+                    / (1.0f + metal::fast::exp(-static_cast<float>(b_[hv_idx])));
+                auto delta = (v_[dv_idx] - kv_mem)
+                    * beta_value;
 
                 float out = 0.0f;
                 for (int i = 0; i < n_per_t; ++i) {
@@ -285,14 +685,14 @@ private func makeVLMGatedDeltaKernel(
               v_ += Hv * Dv;
               y += Hv * Dv;
               g_ += Hv;
-              beta_ += Hv;
+              b_ += Hv;
             }
             for (int i = 0; i < n_per_t; ++i) {
               auto s_idx = n_per_t * dk_idx + i;
               o_state[s_idx] = static_cast<StT>(state[i]);
             }
         """
-    var inputNames = ["q", "k", "v", "g", "beta", "state_in", "T"]
+    var inputNames = ["q", "k", "v", "g", "b", "state_in", "T"]
     if hasMask { inputNames.append("mask") }
     let suffix = (hasMask ? "_mask" : "") + (roundStateEachStep ? "_strict" : "_fast")
     return MLXFast.metalKernel(
@@ -328,7 +728,7 @@ private final class VLMGatedDeltaKernelManager: @unchecked Sendable {
 
 private func vlmGatedDeltaKernel(
     q: MLXArray, k: MLXArray, v: MLXArray,
-    g: MLXArray, beta: MLXArray, state: MLXArray,
+    g: MLXArray, b: MLXArray, state: MLXArray,
     mask: MLXArray? = nil,
     roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
@@ -342,7 +742,7 @@ private func vlmGatedDeltaKernel(
     let stateType = state.dtype
 
     let selectedKernel: MLXFast.MLXFastKernel?
-    var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
+    var inputs: [MLXArray] = [q, k, v, g, b, state, MLXArray(T)]
     if let mask {
         selectedKernel = VLMGatedDeltaKernelManager.shared.kernel(
             hasMask: true,
@@ -386,7 +786,6 @@ private func gatedDeltaUpdate(
     mask: MLXArray? = nil,
     roundStateEachStep: Bool = false
 ) -> (MLXArray, MLXArray) {
-    let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
 
     let B = q.dim(0)
@@ -401,6 +800,8 @@ private func gatedDeltaUpdate(
     if state.dtype != .float32 {
         state = state.asType(.float32)
     }
+    QwenGatedDeltaDTypeTrace.reportOnce(
+        q: q, k: k, v: v, a: a, b: b, decay: g, state: state)
 
     // Prefer fused Metal kernel (Python parity, ~210 fewer dispatches per token).
     // The kernel tiles Dk in 32-wide SIMD chunks; unsupported head widths must
@@ -411,12 +812,30 @@ private func gatedDeltaUpdate(
         roundStateEachStep: roundStateEachStep)
     if selectedKernel != nil && Dk >= 32 && Dk % 32 == 0 {
         return vlmGatedDeltaKernel(
-            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask,
+            q: q, k: k, v: v, g: g, b: b, state: state, mask: mask,
             roundStateEachStep: roundStateEachStep)
     }
+    let beta = sigmoid(b)
     return gatedDeltaOps(
         q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask,
         roundStateEachStep: roundStateEachStep)
+}
+
+private enum QwenGatedDeltaDTypeTrace {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var didReport = false
+
+    static func reportOnce(
+        q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray,
+        decay: MLXArray, state: MLXArray
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didReport else { return }
+        didReport = true
+        FileHandle.standardError.write(Data(
+            "[QwenGDN] live_dtype_boundaries q=\(q.dtype) k=\(k.dtype) v=\(v.dtype) a=\(a.dtype) b=\(b.dtype) beta=fused_from_\(b.dtype) decay=\(decay.dtype) recurrent_state=\(state.dtype) output=\(q.dtype)\n".utf8))
+    }
 }
 
 // MARK: - Configuration
@@ -741,9 +1160,13 @@ enum Qwen35Language {
     final class RMSNormGated: Module {
         @ParameterInfo(key: "weight") var weight: MLXArray
         let eps: Float
+        /// qwen4_exp declares `output_gate_type: "sigmoid"` — the gate is
+        /// `sigmoid(z)` instead of the qwen3_5 family's `silu(z)`.
+        let sigmoidGate: Bool
 
-        init(dimensions: Int, eps: Float = 1e-6) {
+        init(dimensions: Int, eps: Float = 1e-6, sigmoidGate: Bool = false) {
             self.eps = eps
+            self.sigmoidGate = sigmoidGate
             _weight.wrappedValue = MLXArray.ones([dimensions])
             super.init()
         }
@@ -751,6 +1174,10 @@ enum Qwen35Language {
         func callAsFunction(_ hiddenStates: MLXArray, gate: MLXArray? = nil) -> MLXArray {
             let x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
             if let gate {
+                if sigmoidGate {
+                    return (x.asType(.float32) * sigmoid(gate.asType(.float32)))
+                        .asType(hiddenStates.dtype)
+                }
                 // Fused precise swiglu matching Python's _precise_swiglu (1 dispatch vs 2+casts).
                 return _vlmCompiledPreciseSwiGLU(hiddenStates, gate, x)
             }
@@ -905,6 +1332,18 @@ enum Qwen35Language {
     }
 
     final class GatedDeltaNet: Module {
+        private static let fusionDiagnosticLock = NSLock()
+        private nonisolated(unsafe) static var didReportDecodeInputFusion = false
+
+        private struct FusedDecodeInputProjection {
+            let weight: MLXArray
+            let scales: MLXArray
+            let biases: MLXArray
+            let groupSize: Int
+            let bits: Int
+            let mode: QuantizationMode
+        }
+
         let hiddenSize: Int
         let numVHeads: Int
         let numKHeads: Int
@@ -914,6 +1353,9 @@ enum Qwen35Language {
         let valueDim: Int
         let convKernelSize: Int
         let convDim: Int
+        let fuseDecodeInputProjections: Bool
+        private var attemptedDecodeInputFusion = false
+        private var fusedDecodeInputProjection: FusedDecodeInputProjection?
 
         @ModuleInfo(key: "conv1d") var conv1d: Conv1d
         @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
@@ -927,7 +1369,11 @@ enum Qwen35Language {
         @ModuleInfo(key: "norm") var norm: RMSNormGated
         @ModuleInfo(key: "out_proj") var outProj: Linear
 
-        init(_ args: Qwen35Configuration.TextConfiguration) {
+        init(
+            _ args: Qwen35Configuration.TextConfiguration,
+            outputGateSigmoid: Bool = false,
+            fuseDecodeInputProjections: Bool = false
+        ) {
             self.hiddenSize = args.hiddenSize
             self.numVHeads = args.linearNumValueHeads
             self.numKHeads = args.linearNumKeyHeads
@@ -937,6 +1383,7 @@ enum Qwen35Language {
             self.valueDim = headVDim * numVHeads
             self.convKernelSize = args.linearConvKernelDim
             self.convDim = keyDim * 2 + valueDim
+            self.fuseDecodeInputProjections = fuseDecodeInputProjections
 
             precondition(
                 numVHeads % numKHeads == 0,
@@ -963,9 +1410,118 @@ enum Qwen35Language {
             let a = MLXRandom.uniform(low: 0, high: 16, [numVHeads])
             _aLog.wrappedValue = log(a)
 
-            _norm.wrappedValue = RMSNormGated(dimensions: headVDim, eps: args.rmsNormEps)
+            _norm.wrappedValue = RMSNormGated(
+                dimensions: headVDim, eps: args.rmsNormEps, sigmoidGate: outputGateSigmoid)
             _outProj.wrappedValue = Linear(valueDim, hiddenSize, bias: false)
             super.init()
+        }
+
+        private func ensureFusedDecodeInputProjection(
+            _ inputs: MLXArray
+        ) -> FusedDecodeInputProjection? {
+            guard ProcessInfo.processInfo.environment[
+                    "VMLINUX_QWEN4_EXP_FUSE_DECODE_INPUTS"] != "0",
+                fuseDecodeInputProjections, inputs.dim(1) == 1,
+                !CompiledDecodeTrace.isActive
+            else { return nil }
+
+            if !attemptedDecodeInputFusion {
+                attemptedDecodeInputFusion = true
+                let modules = [inProjQKV, inProjZ, inProjB, inProjA]
+                guard let first = modules[0] as? QuantizedLinear,
+                    let firstBiases = first.biases,
+                    first.bias == nil,
+                    modules.allSatisfy({ module in
+                        guard let quantized = module as? QuantizedLinear,
+                            quantized.biases != nil, quantized.bias == nil
+                        else { return false }
+                        return quantized.groupSize == first.groupSize
+                            && quantized.bits == first.bits
+                            && quantized.mode == first.mode
+                            && quantized.scales.dtype == first.scales.dtype
+                            && quantized.biases?.dtype == firstBiases.dtype
+                            && quantized.scales.dtype == quantized.biases?.dtype
+                    })
+                else { return nil }
+
+                let quantized = modules.map { $0 as! QuantizedLinear }
+                let weight = concatenated(quantized.map(\.weight), axis: 0)
+                let scales = concatenated(quantized.map(\.scales), axis: 0)
+                let biases = concatenated(
+                    quantized.map { $0.biases ?? firstBiases }, axis: 0)
+                MLX.eval(weight, scales, biases)
+                fusedDecodeInputProjection = FusedDecodeInputProjection(
+                    weight: weight, scales: scales, biases: biases,
+                    groupSize: first.groupSize, bits: first.bits, mode: first.mode)
+                Self.fusionDiagnosticLock.lock()
+                if !Self.didReportDecodeInputFusion {
+                    Self.didReportDecodeInputFusion = true
+                    FileHandle.standardError.write(Data(
+                        "[Qwen4Exp] fused_gdn_decode_input_projections=active dtype=\(inputs.dtype)\n".utf8))
+                }
+                Self.fusionDiagnosticLock.unlock()
+            }
+
+            return fusedDecodeInputProjection
+        }
+
+        private func fusedDecodeInputs(_ inputs: MLXArray) -> [MLXArray]? {
+            guard let fusedDecodeInputProjection = ensureFusedDecodeInputProjection(inputs)
+            else { return nil }
+            let splitIndices = [
+                convDim, convDim + valueDim, convDim + valueDim + numVHeads,
+            ]
+            let combined = Qwen4ExpBF16Affine.dense(
+                inputs, fusedDecodeInputProjection.weight,
+                scales: fusedDecodeInputProjection.scales,
+                biases: fusedDecodeInputProjection.biases,
+                groupSize: fusedDecodeInputProjection.groupSize,
+                bits: fusedDecodeInputProjection.bits,
+                mode: fusedDecodeInputProjection.mode)
+            return MLX.split(
+                combined,
+                indices: splitIndices,
+                axis: -1)
+        }
+
+        private func compiledDecodeFront(
+            _ inputs: MLXArray, convState: MLXArray
+        ) -> [MLXArray]? {
+            guard let fused = ensureFusedDecodeInputProjection(inputs) else { return nil }
+            return Qwen4ExpCompiledGDNInputs.callFront(
+                input: inputs,
+                convState: convState,
+                weight: fused.weight,
+                scales: fused.scales,
+                biases: fused.biases,
+                convWeight: conv1d.weight,
+                splitIndices: [
+                    convDim, convDim + valueDim, convDim + valueDim + numVHeads,
+                ],
+                groupSize: fused.groupSize,
+                bits: fused.bits,
+                mode: fused.mode,
+                convDim: convDim,
+                convKernelSize: convKernelSize,
+                keyDim: keyDim,
+                numKHeads: numKHeads,
+                headKDim: headKDim,
+                numVHeads: numVHeads,
+                headVDim: headVDim)
+        }
+
+        private func compiledDecodeTail(_ output: MLXArray, gate: MLXArray) -> MLXArray? {
+            guard norm.sigmoidGate,
+                let quantized = outProj as? QuantizedLinear,
+                let biases = quantized.biases,
+                quantized.bias == nil
+            else { return nil }
+            return Qwen4ExpCompiledGDNInputs.callTail(
+                output: output, gate: gate, normWeight: norm.weight,
+                outWeight: quantized.weight, outScales: quantized.scales,
+                outBiases: biases, eps: norm.eps,
+                groupSize: quantized.groupSize, bits: quantized.bits,
+                mode: quantized.mode)
         }
 
         /// One-shot (per process) diagnostic for a discarded incompatible
@@ -993,11 +1549,6 @@ enum Qwen35Language {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
 
-            var mixedQKV = inProjQKV(inputs)
-            let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-            let b = inProjB(inputs)
-            let a = inProjA(inputs)
-
             // A restored cache (paged/hybrid restore, prefix commit) can hand
             // back a slot whose shape no longer matches this layer — an
             // over- or under-rank array here trips the MLXArray subscript
@@ -1017,33 +1568,63 @@ enum Qwen35Language {
                     [B, max(0, convKernelSize - 1), convDim], dtype: inputs.dtype)
             }
 
-            if let mask {
-                mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
-            }
-
-            let convInput = concatenated([convState, mixedQKV], axis: 1)
-                .reshaped(B, convState.dim(1) + S, convDim)
             // Staged verify (compiled DFlash 2): committed cache slots and
             // offset stay UNTOUCHED for the whole forward; everything the
             // post-acceptance commit needs goes into fixed staging slots.
             let stageVerify = cache != nil && S > 1 && mask == nil
                 && NativeMTPVerifierStatePolicy.shouldStageVerifyInputs
-            if let cache, convKernelSize > 1 {
-                let end = convInput.dim(1)
-                let start = max(0, end - (convKernelSize - 1))
-                let tail = convInput[0..., start ..< end, 0...]
-                if stageVerify {
-                    cache.stageVerifySlot(7, tail)
-                } else {
-                    cache[0] = tail
-                }
-            }
+            let front = compiledDecodeFront(inputs, convState: convState)
+            let z: MLXArray
+            let b: MLXArray
+            let a: MLXArray
+            let qNormed: MLXArray
+            let kNormed: MLXArray
+            let v: MLXArray
+            let convInput: MLXArray
+            if let front {
+                z = front[0]
+                b = front[1]
+                a = front[2]
+                qNormed = front[3]
+                kNormed = front[4]
+                v = front[5]
+                convInput = front[6]
+                if let cache, convKernelSize > 1 { cache[0] = front[6] }
+            } else {
+                let fusedInputs = fusedDecodeInputs(inputs)
+                var mixedQKV = fusedInputs?[0] ?? inProjQKV(inputs)
+                z = (fusedInputs?[1] ?? inProjZ(inputs)).reshaped(
+                    B, S, numVHeads, headVDim)
+                b = fusedInputs?[2] ?? inProjB(inputs)
+                a = fusedInputs?[3] ?? inProjA(inputs)
 
-            let convOut = silu(conv1d(convInput))
-            let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-            let q = split[0].reshaped(B, S, numKHeads, headKDim)
-            let k = split[1].reshaped(B, S, numKHeads, headKDim)
-            let v = split[2].reshaped(B, S, numVHeads, headVDim)
+                if let mask {
+                    mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
+                }
+                convInput = concatenated([convState, mixedQKV], axis: 1)
+                    .reshaped(B, convState.dim(1) + S, convDim)
+                if let cache, convKernelSize > 1 {
+                    let end = convInput.dim(1)
+                    let start = max(0, end - (convKernelSize - 1))
+                    let tail = convInput[0..., start ..< end, 0...]
+                    if stageVerify {
+                        cache.stageVerifySlot(7, tail)
+                    } else {
+                        cache[0] = tail
+                    }
+                }
+
+                let convOut = silu(conv1d(convInput))
+                let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+                let q = split[0].reshaped(B, S, numKHeads, headKDim)
+                let k = split[1].reshaped(B, S, numKHeads, headKDim)
+                v = split[2].reshaped(B, S, numVHeads, headVDim)
+                let invScale = pow(Float(headKDim), -0.5)
+                qNormed = MLXArray(pow(invScale, 2), dtype: q.dtype)
+                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                kNormed = MLXArray(invScale, dtype: k.dtype)
+                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            }
 
             // Same defense as the conv slot: a mis-restored recurrent state
             // with the wrong rank/head dims crashes inside `gatedDeltaUpdate`
@@ -1063,13 +1644,6 @@ enum Qwen35Language {
                 initialState = nil
             }
             var state = initialState
-            let invScale = pow(Float(headKDim), -0.5)
-            let qNormed =
-                MLXArray(pow(invScale, 2), dtype: q.dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale, dtype: k.dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
             var out: MLXArray
             (out, state) = gatedDeltaUpdate(
@@ -1138,6 +1712,7 @@ enum Qwen35Language {
                 }
             }
 
+            if let tail = compiledDecodeTail(out, gate: z) { return tail }
             out = norm(out, gate: z)
             return outProj(out.reshaped(B, S, -1))
         }
@@ -1303,6 +1878,7 @@ enum Qwen35Language {
         let normTopkProb: Bool
         let numExperts: Int
         let topK: Int
+        let compileDecodeRegions: Bool
 
         @ModuleInfo(key: "gate") var gate: Linear
         @ModuleInfo(key: "switch_mlp") var switchMLP: Module
@@ -1310,10 +1886,16 @@ enum Qwen35Language {
         @ModuleInfo(key: "shared_expert") var sharedExpert: MLP
         @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
-        init(_ args: Qwen35Configuration.TextConfiguration, layerIdx: Int = -1) {
+        init(
+            _ args: Qwen35Configuration.TextConfiguration,
+            layerIdx: Int = -1,
+            allowFusedGateUpCache: Bool = true,
+            compileDecodeRegions: Bool = false
+        ) {
             self.normTopkProb = args.normTopkProb
             self.numExperts = args.numExperts
             self.topK = args.numExpertsPerTok
+            self.compileDecodeRegions = compileDecodeRegions
 
             _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
             let weightFormat = args.weightFormat.lowercased()
@@ -1344,7 +1926,9 @@ enum Qwen35Language {
                 _switchMLP.wrappedValue = SwitchGLU(
                     inputDims: args.hiddenSize,
                     hiddenDims: args.moeIntermediateSize,
-                    numExperts: args.numExperts
+                    numExperts: args.numExperts,
+                    allowFusedGateUpCache: allowFusedGateUpCache,
+                    compileSeparatedDecode: compileDecodeRegions
                 )
             }
 
@@ -1356,30 +1940,97 @@ enum Qwen35Language {
             super.init()
         }
 
-        func callAsFunction(_ x: MLXArray) -> MLXArray {
-            var gates = gate(x)
-            gates = MLX.softmax(gates, axis: -1, precise: true)
+        private func compiledRouter(_ x: MLXArray) -> (MLXArray, MLXArray)? {
+            guard compileDecodeRegions else { return nil }
+            if let quantized = gate as? QuantizedLinear,
+                let biases = quantized.biases
+            {
+                return Qwen4ExpCompiledMoE.router(
+                    x, weight: quantized.weight, scales: quantized.scales,
+                    biases: biases, groupSize: quantized.groupSize,
+                    bits: quantized.bits, mode: quantized.mode,
+                    topK: topK, normTopK: normTopkProb)
+            }
+            guard gate.bias == nil else { return nil }
+            return Qwen4ExpCompiledMoE.denseRouter(
+                x, weight: gate.weight, topK: topK, normTopK: normTopkProb)
+        }
 
-            let kth = gates.dim(-1) - topK
-            let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
-            var scores = MLX.takeAlong(gates, inds, axis: -1)
-            if normTopkProb {
-                scores = scores / scores.sum(axis: -1, keepDims: true)
+        private func compiledSharedExpert(_ x: MLXArray) -> MLXArray? {
+            guard compileDecodeRegions,
+                let gate = sharedExpert.gateProj as? QuantizedLinear,
+                let up = sharedExpert.upProj as? QuantizedLinear,
+                let down = sharedExpert.downProj as? QuantizedLinear,
+                let gateBiases = gate.biases, let upBiases = up.biases,
+                let downBiases = down.biases,
+                sharedExpertGate.bias == nil,
+                [up, down].allSatisfy({
+                    $0.groupSize == gate.groupSize && $0.bits == gate.bits
+                        && $0.mode == gate.mode
+                })
+            else { return nil }
+            return Qwen4ExpCompiledMoE.sharedExpert(
+                x,
+                gateWeight: gate.weight, gateScales: gate.scales,
+                gateBiases: gateBiases,
+                upWeight: up.weight, upScales: up.scales, upBiases: upBiases,
+                downWeight: down.weight, downScales: down.scales,
+                downBiases: downBiases,
+                sharedGateWeight: sharedExpertGate.weight,
+                groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
+        }
+
+        func callAsFunction(_ x: MLXArray) -> MLXArray {
+            let inds: MLXArray
+            let scores: MLXArray
+            if let compiled = compiledRouter(x) {
+                (inds, scores) = compiled
+            } else {
+                var gates = gate(x)
+                gates = MLX.softmax(gates, axis: -1, precise: true)
+                let kth = gates.dim(-1) - topK
+                inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
+                var selected = MLX.takeAlong(gates, inds, axis: -1)
+                if normTopkProb {
+                    selected = selected / selected.sum(axis: -1, keepDims: true)
+                }
+                scores = selected
             }
 
-            let combined: MLXArray
+            let routed: MLXArray?
+            let eagerCombined: MLXArray?
             if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
-                combined = streaming.reduced(x, indices: inds, scores: scores)
+                routed = nil
+                eagerCombined = streaming.reduced(x, indices: inds, scores: scores)
             } else if let turbo = switchMLP as? TurboQuantSwitchGLU {
                 let y = turbo(x, inds)
-                combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+                routed = nil
+                eagerCombined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
             } else if let affine = switchMLP as? SwitchGLU {
-                let y = affine(x, inds)
-                combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+                if let combined = affine.qwen4ExpReduced(
+                    x, indices: inds, scores: scores)
+                {
+                    routed = nil
+                    eagerCombined = combined
+                } else {
+                    routed = affine(x, inds)
+                    eagerCombined = nil
+                }
             } else {
                 fatalError("Unsupported Qwen35 VLM MoE switch_mlp: \(type(of: switchMLP))")
             }
 
+            if let routed, let shared = compiledSharedExpert(x),
+                let result = Qwen4ExpCompiledMoE.post(
+                    routed: routed, scores: scores, shared: shared)
+            {
+                return result
+            }
+            if let eagerCombined, let shared = compiledSharedExpert(x) {
+                return eagerCombined + shared
+            }
+            let combined = eagerCombined
+                ?? (routed! * scores[.ellipsis, .newAxis]).sum(axis: -2)
             let sharedY = sharedExpert(x)
             let gatedSharedY = compiledSigmoidGate(sharedExpertGate(x), sharedY)
 
