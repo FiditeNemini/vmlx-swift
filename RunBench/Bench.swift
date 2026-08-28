@@ -619,6 +619,27 @@ struct Bench {
             return
         }
 
+        // These cache proof modes own their model context. Dispatch them before
+        // the legacy pre-tokenized bench loads a separate context below; loading
+        // that context first can transiently double a 100GB-class model.
+        if (env["BENCH_BATCH_DISK_RESTORE"] ?? "0") == "1" {
+            try await runBatchEngineDiskRestore(modelPath: modelPath, maxNew: maxNew)
+            return
+        }
+        if (env["BENCH_SOLO_DISK_RESTORE"] ?? "0") == "1" {
+            try await runSoloDiskRestore(modelPath: modelPath, maxNew: maxNew)
+            return
+        }
+        if (env["BENCH_GROWING_CHAT_CACHE"] ?? "0") == "1" {
+            do {
+                try await runGrowingChatCacheReuse(modelPath: modelPath, maxNew: maxNew)
+            } catch {
+                print("[BENCH_GROWING_CHAT_CACHE] error: \(String(reflecting: error))")
+                exit(benchFailureExitCode(for: error))
+            }
+            return
+        }
+
         print("=== vmlx-swift-lm — \(modelDir.lastPathComponent) MULTI-TURN ===")
         print("Tokens: \(tokensPath)")
         print("Loading...")
@@ -1292,8 +1313,13 @@ func runBatchEngineTurn(
     let t0 = CFAbsoluteTimeGetCurrent()
 
     // Prepare input directly on the loaded context (no container actor).
-    let input = try await context.processor.prepare(
-        input: UserInput(prompt: fullText))
+    // This row verifies visible multi-turn recall, not the model's optional
+    // reasoning stream.  Use Qwen's native template control so a short token
+    // cap cannot end inside reasoning and create a false empty-answer result.
+    // This is input context only; generation parameters remain bundle-driven.
+    let input = try await context.processor.prepare(input: UserInput(
+        prompt: fullText,
+        additionalContext: ["enable_thinking": false]))
     nonisolated(unsafe) let sendable = input
     // Iter 28: test the fixed `generate()` path. Iter 27 had to use
     // submit() as a workaround because generate() hung under real HF
@@ -1305,6 +1331,7 @@ func runBatchEngineTurn(
     var reasoning = ""
     var ttft: Double?
     var chunkCount = 0
+    var completionInfo: GenerateCompletionInfo?
     for await event in stream {
         switch event {
         case .chunk(let chunk):
@@ -1317,7 +1344,9 @@ func runBatchEngineTurn(
             reasoning += r
             chunkCount += 1
             if chunkCount > maxNew * 2 { break }
-        case .prefillProgress, .info, .toolCall, .toolCallProgress:
+        case .info(let info):
+            completionInfo = info
+        case .prefillProgress, .toolCall, .toolCallProgress:
             break
         }
     }
@@ -1326,6 +1355,15 @@ func runBatchEngineTurn(
     let previewSource = visible.isEmpty ? "[empty visible; reasoning chars=\(reasoning.count)]" : visible
     let preview = previewSource.count > 150 ? String(previewSource.prefix(150)) + "..." : previewSource
     print("    TTFT \(Int((ttft ?? 0) * 1000))ms, total \(String(format: "%.2fs", total))")
+    if let completionInfo {
+        print(String(format:
+            "    generation=%d tokens, %.2f tok/s, stop=%@",
+            completionInfo.generationTokenCount,
+            completionInfo.tokensPerSecond,
+            String(describing: completionInfo.stopReason)))
+    } else {
+        print("    generation metrics missing (FAIL)")
+    }
     print("    \"\(preview)\"")
     return visible
 }
@@ -2583,29 +2621,42 @@ func runSoloDiskRestore(modelPath: String, maxNew: Int) async throws {
         """, count: 3) + " Q: What is the colour of the sky?"
 
     let turn1Input = try await context.processor.prepare(
-        input: UserInput(prompt: basePrompt))
+        input: UserInput(
+            prompt: basePrompt,
+            additionalContext: ["enable_thinking": false]))
     let promptTokens = turn1Input.text.tokens.reshaped(-1).asArray(Int.self)
 
     func runSession(
         engine: BatchEngine, input: consuming sending LMInput, label: String
     ) async -> Int {
         var text = ""
+        var reasoning = ""
         var generated = 0
+        var completionInfo: GenerateCompletionInfo?
         let t0 = CFAbsoluteTimeGetCurrent()
         let stream = await engine.generate(input: input, parameters: params)
         for await event in stream {
             switch event {
             case .chunk(let chunk):
                 text += chunk
-                generated += 1
+            case .reasoning(let chunk):
+                reasoning += chunk
+            case .info(let info):
+                completionInfo = info
+                generated = info.generationTokenCount
             default:
                 break
             }
         }
         let wall = CFAbsoluteTimeGetCurrent() - t0
         let preview = text.count > 160 ? String(text.prefix(160)) + "..." : text
-        print(String(format: "  %@: chunks=%d wall=%.2fs", label, generated, wall))
-    print("    TEXT: \"\(preview)\"")
+        print(String(format:
+            "  %@: genTokens=%d wall=%.2fs tokps=%.2f textChars=%d reasoningChars=%d stop=%@",
+            label, generated, wall,
+            completionInfo?.tokensPerSecond ?? 0,
+            text.count, reasoning.count,
+            completionInfo.map { String(describing: $0.stopReason) } ?? "missing"))
+        print("    TEXT: \"\(preview)\"")
         return generated
     }
 
