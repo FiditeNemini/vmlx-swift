@@ -353,9 +353,23 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 field: "cache.longPromptMultiplier",
                 message: "Long-prompt multiplier must be positive."))
         }
+        if let depth = mtp.explicitDepth, !(1...3).contains(depth) {
+            issues.append(.error(
+                field: "mtp.explicitDepth",
+                message: "MTP explicit depth must be 1, 2, or 3."))
+        }
         if mtp.mode == .forceOn {
             if let status = mtpStatus {
-                if !status.canAutoLaunchMTP {
+                if mtp.explicitDepth != nil {
+                    // Manual depth is a deliberate user activation: it needs
+                    // tensor-complete evidence for a supported runtime, not a
+                    // measured tuning artifact — the user IS the measurement.
+                    if !status.hasCompleteMTPArtifact {
+                        issues.append(.error(
+                            field: "mtp.mode",
+                            message: "MTP manual depth requires complete MTP tensor evidence in the bundle (this bundle's artifact is absent or incomplete)."))
+                    }
+                } else if !status.canAutoLaunchMTP {
                     issues.append(.error(
                         field: "mtp.mode",
                         message: "MTP cannot be forced on until the bundle has complete tensor evidence and usable vmlx_mtp_tuning.json metadata for a supported native-MTP runtime."))
@@ -415,6 +429,11 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         case .auto:
             return (status?.canAutoLaunchMTP == true) ? .speculative : .off
         case .forceOn:
+            if mtp.explicitDepth != nil {
+                // Manual depth: tensor evidence alone activates; tuning is
+                // an Auto-mode requirement only.
+                return (status?.hasCompleteMTPArtifact == true) ? .speculative : .blocked
+            }
             return (status?.canAutoLaunchMTP == true) ? .speculative : .blocked
         }
     }
@@ -438,6 +457,36 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 launchMode: .blocked,
                 recommendation: nil,
                 reason: "MTP draft token limit must be positive.")
+        }
+
+        // Manual depth: an explicit user activation. Family/profile/tensor
+        // evidence is still required (requireVerifiedRuntime: false skips only
+        // the measured-tuning gate), the requested depth replaces the tuned
+        // recommendation, and greedy sampling is enforced for the session.
+        if mtp.mode == .forceOn, let depth = mtp.explicitDepth {
+            guard (1...3).contains(depth) else {
+                return .init(
+                    launchMode: .blocked,
+                    recommendation: nil,
+                    reason: "MTP explicit depth must be 1, 2, or 3 (got \(depth)).")
+            }
+            guard let manual = NativeMTPAutoDecodePolicy.manualRecommendation(
+                depth: depth,
+                configData: configData,
+                jangConfig: jangConfig,
+                status: status)
+            else {
+                return .init(
+                    launchMode: .blocked,
+                    recommendation: nil,
+                    reason: status?.hasCompleteMTPArtifact == true
+                        ? "Manual MTP depth is unsupported for this model family."
+                        : "Manual MTP depth requires complete MTP tensor evidence in the bundle (this bundle's artifact is absent or incomplete).")
+            }
+            return .init(
+                launchMode: .speculative,
+                recommendation: manual,
+                reason: manual.reason)
         }
 
         guard let recommendation = NativeMTPAutoDecodePolicy.recommendation(
@@ -1515,6 +1564,17 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     public var keepDraftCacheSeparate: Bool
     public var acceptedTokensOnlyEnterBaseCache: Bool
 
+    /// Explicit user-enforced draft depth (1–3) for `mode == .forceOn`.
+    ///
+    /// Manual depth is a different contract from Auto: Auto launches only
+    /// from a measured, usable `vmlx_mtp_tuning.json`, while an explicit
+    /// depth is a deliberate user activation that requires tensor-complete
+    /// MTP evidence for a supported runtime but NOT a tuning artifact —
+    /// the user is the measurement. Any active MTP launch (auto or manual)
+    /// forces greedy sampling for that model+session; see
+    /// ``mtpEnforcedGreedySampling``.
+    public var explicitDepth: Int?
+
     /// Folder holding a downloaded DFlash 2 drafter, or `nil` for none.
     ///
     /// Setting this REPLACES native MTP for models the drafter fits — the
@@ -1534,7 +1594,8 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
         keepDraftCacheSeparate: Bool = true,
         acceptedTokensOnlyEnterBaseCache: Bool = true,
         dflash2DrafterPath: String? = nil,
-        dflash2BlockSize: Int? = nil
+        dflash2BlockSize: Int? = nil,
+        explicitDepth: Int? = nil
     ) {
         self.mode = mode
         self.draftTokenLimit = draftTokenLimit
@@ -1542,7 +1603,17 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
         self.acceptedTokensOnlyEnterBaseCache = acceptedTokensOnlyEnterBaseCache
         self.dflash2DrafterPath = dflash2DrafterPath
         self.dflash2BlockSize = dflash2BlockSize
+        self.explicitDepth = explicitDepth
     }
+
+    /// The sampler override every active MTP launch enforces, scoped to the
+    /// requests of the model+session that runs speculative decode: greedy
+    /// (temperature 0, top-p 1, top-k 0, min-p 0). Measured on JANG_2L:
+    /// greedy MTP 41.4 tok/s with byte-exact AR parity; sampled MTP loses
+    /// ~10% and forfeits the parity guarantee.
+    public static var mtpEnforcedGreedySampling:
+        (temperature: Float, topP: Float, topK: Int, minP: Float)
+    { (0, 1, 0, 0) }
 
     /// Decodes settings written before DFlash 2 existed — both new keys
     /// are absent there and must default to "no drafter" rather than
@@ -1557,6 +1628,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
             try c.decodeIfPresent(Bool.self, forKey: .acceptedTokensOnlyEnterBaseCache) ?? true
         self.dflash2DrafterPath = try c.decodeIfPresent(String.self, forKey: .dflash2DrafterPath)
         self.dflash2BlockSize = try c.decodeIfPresent(Int.self, forKey: .dflash2BlockSize)
+        self.explicitDepth = try c.decodeIfPresent(Int.self, forKey: .explicitDepth)
     }
 }
 

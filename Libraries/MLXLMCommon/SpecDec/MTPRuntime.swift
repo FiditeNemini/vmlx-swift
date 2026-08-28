@@ -602,6 +602,26 @@ public enum NativeMTPActivationError: Error, LocalizedError, CustomStringConvert
 public enum NativeMTPActivation {
     @TaskLocal public static var explicitRequestOverride: Bool?
 
+    /// Task-scoped manual-depth request; wins over the environment form.
+    @TaskLocal public static var manualDepthOverride: Int?
+
+    /// The explicit user-selected draft depth (1–3), or nil when no manual
+    /// activation is in effect. Sourced from the task-local override first,
+    /// then `VMLX_MTP_MANUAL_DEPTH` / `VMLINUX_MTP_MANUAL_DEPTH`.
+    public static var manualDepthRequest: Int? {
+        if let manualDepthOverride {
+            return (1...3).contains(manualDepthOverride) ? manualDepthOverride : nil
+        }
+        let env = ProcessInfo.processInfo.environment
+        guard
+            let raw = (env["VMLX_MTP_MANUAL_DEPTH"] ?? env["VMLINUX_MTP_MANUAL_DEPTH"])?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            let depth = Int(raw),
+            (1...3).contains(depth)
+        else { return nil }
+        return depth
+    }
+
     public static var isExplicitlyRequested: Bool {
         if let explicitRequestOverride {
             return explicitRequestOverride
@@ -650,6 +670,14 @@ public enum NativeMTPActivation {
             throw NativeMTPActivationError.requestedButMissingArtifact(status)
         }
         if isTuningMeasurementRun {
+            return true
+        }
+        // Manual-depth activation: the user pressed an explicit depth button.
+        // Like measurement mode, a complete tensor artifact loads without a
+        // usable tuning file — the intent differs: the caller is a product
+        // surface and must also enforce greedy sampling for that
+        // model+session and report the engine's actual active depth.
+        if manualDepthRequest != nil {
             return true
         }
         guard status?.canAutoLaunchMTP == true else {
@@ -759,6 +787,38 @@ public struct NativeMTPAutoDecodeRecommendation: Codable, Sendable, Equatable {
 /// supported Qwen bundles resolve to a production launch recommendation only
 /// when their bundle-local `vmlx_mtp_tuning.json` row is usable.
 public enum NativeMTPAutoDecodePolicy {
+    /// Manual-depth recommendation: validates the same family/tensor evidence
+    /// as the auto path but takes the user's explicit depth instead of a
+    /// measured tuning artifact. A tuning file, when present, contributes only
+    /// its explicit verifier mode; a blocked or unusable artifact does not
+    /// veto a deliberate user activation. Callers must pair this with
+    /// enforced greedy sampling for the model+session.
+    public static func manualRecommendation(
+        depth: Int,
+        configData: Data?,
+        jangConfig: JangConfig?,
+        status: MTPBundleStatus?
+    ) -> NativeMTPAutoDecodeRecommendation? {
+        guard (1...3).contains(depth) else { return nil }
+        guard let status, status.hasCompleteMTPArtifact else { return nil }
+        let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
+            as? [String: Any]
+        let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
+        guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
+        let evidence = [
+            "model_types=\(modelTypes.sorted().joined(separator: ","))",
+            "mtp_tensors=\(status.tensorCount)",
+            "activation=manual_explicit_depth",
+            "explicit_depth=\(depth)",
+        ]
+        return NativeMTPAutoDecodeRecommendation(
+            depth: depth,
+            verifierMode: status.nativeMTPTuning?.explicitVerifierMode,
+            reason:
+                "User-enforced manual depth \(depth): tensor-evidence activation without measured tuning; greedy sampling enforced for this model+session.",
+            evidence: evidence)
+    }
+
     public static func recommendation(
         configData: Data?,
         jangConfig: JangConfig?,
