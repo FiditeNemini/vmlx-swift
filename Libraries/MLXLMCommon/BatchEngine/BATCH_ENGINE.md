@@ -1,8 +1,17 @@
 # Continuous Batching Engine
 
-**Status**: **PRODUCTION-READY** as of 2026-04-19 (iter 63) for `mlxBatchEngine=YES` default flip on osaurus's side.
+**Status**: **PARTIAL BY ARCHITECTURE** as of 2026-08-29. Native B>1
+decode is production-gated per cache topology; architectures without a proven
+B-wide state contract must advertise a smaller decode limit and retain only
+safe request queuing. See `docs/CONTINUOUS_BATCHING_FAMILY_TRIAGE_2026_08_29.md`
+for the current source and live-evidence matrix.
 
-Real continuous batching for mlx-swift-lm. Multiple generation requests are batched through a single model forward pass during decode. All model families supported — LLM, VLM, MoE, hybrid SSM, JANG quantized, Gemma-4 sliding-window.
+Real continuous batching for mlx-swift-lm. Multiple generation requests may be
+batched through one model forward pass only when the model's cache topology has
+a proven B-wide contract. Other architectures remain concurrent at the request
+queue but decode at their declared safe width. Do not interpret “request
+accepted,” a two-child `spawn_batch`, or process survival as proof of native
+B>1 decode.
 
 ## Osaurus integration (read first)
 
