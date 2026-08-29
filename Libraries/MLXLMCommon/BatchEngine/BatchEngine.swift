@@ -251,6 +251,10 @@ public actor BatchEngine {
     /// B-wide forward for a cache topology whose model implementation only
     /// supports B=1.
     private let modelMaximumDecodeBatchSize: Int?
+    /// Last serving-layer request, retained even when the model cap keeps the
+    /// effective width unchanged. Diagnostics need both values to distinguish
+    /// native parallelism from architecture-safe serialization.
+    private var requestedMaxBatchSize: Int
 
     /// Number of iterations between GPU memory cache purges.
     /// Matches the 256-token interval used by ``TokenIterator``.
@@ -389,6 +393,7 @@ public actor BatchEngine {
         }
         let effectiveMaxBatchSize = min(maxBatchSize, modelLimit ?? maxBatchSize)
         self.modelMaximumDecodeBatchSize = modelLimit
+        self.requestedMaxBatchSize = maxBatchSize
         self.maxBatchSize = effectiveMaxBatchSize
         self.memoryPurgeInterval = memoryPurgeInterval
         self.cacheCoordinator = cacheCoordinator
@@ -427,6 +432,7 @@ public actor BatchEngine {
         }
         let effectiveMaxBatchSize = min(
             newMaxBatchSize, modelMaximumDecodeBatchSize ?? newMaxBatchSize)
+        requestedMaxBatchSize = newMaxBatchSize
         guard effectiveMaxBatchSize != maxBatchSize else { return }
 
         let old = maxBatchSize
@@ -1551,6 +1557,8 @@ public actor BatchEngine {
         let active = activeCount
         let accepting = !isShutdown
         return BatchEngineCapacitySnapshot(
+            requestedMaximum: requestedMaxBatchSize,
+            architectureMaximum: modelMaximumDecodeBatchSize,
             configuredMaximum: maxBatchSize,
             activeCount: active,
             pendingCount: waitQueue.count,
