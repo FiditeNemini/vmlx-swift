@@ -439,13 +439,6 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .xmlFunction
         }
 
-        // Qwen 3.8 Flash Next bundles dispatch as `qwen4_exp`. Their native
-        // template uses the same nested XML-function envelope and converters
-        // may stamp that contract as `tool_parser = "hermes"`.
-        if normalized.hasPrefix("qwen4_exp") || compact.hasPrefix("qwen4exp") {
-            return .xmlFunction
-        }
-
         // StepFun Step 3.5 / 3.7 templates advertise the XML function
         // envelope, but live Step 3.7 rows can emit schema-valid
         // `name({"arg": ...})` calls inside the reasoning rail.

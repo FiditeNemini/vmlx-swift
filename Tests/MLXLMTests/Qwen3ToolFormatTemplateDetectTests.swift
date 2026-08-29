@@ -111,17 +111,28 @@ struct Qwen3ToolFormatTemplateDetectTests {
         #expect(r.source == .modelTypeHeuristic)
     }
 
-    @Test("hermes-stamped qwen4_exp bundle recovers .xmlFunction via template")
+    @Test("hermes-stamped qwen4_exp bundle recovers .xmlFunction from its template")
     func hermesStampedQwen4ExpRecovers() {
         // Qwen3.8 Flash-Next bundles: model_type=qwen4_exp. The bad stamp
-        // falls through to the family heuristic, which agrees with the real
-        // template envelope: <function=/<parameter=>.
+        // falls through to the real template envelope: <function=/<parameter=>.
+        // Do not guess solely from model_type: a future qwen4_exp template may
+        // declare a different wire contract.
         let r = ParserResolution.toolCall(
             capabilities: JangCapabilities(toolParser: "hermes"),
             modelType: "qwen4_exp",
             chatTemplate: qwen3CoderTemplate)
         #expect(r.format == .xmlFunction)
-        #expect(r.source == .modelTypeHeuristic)
+        #expect(r.source == .chatTemplate)
+    }
+
+    @Test("hermes-stamped qwen4_exp without a template fails closed")
+    func hermesStampedQwen4ExpWithoutTemplateFailsClosed() {
+        let r = ParserResolution.toolCall(
+            capabilities: JangCapabilities(toolParser: "hermes"),
+            modelType: "qwen4_exp",
+            chatTemplate: nil)
+        #expect(r.format == nil)
+        #expect(r.source == .none)
     }
 
     @Test("hermes-stamped genuine Hermes-style instruct still lands .json")
@@ -172,6 +183,6 @@ struct Qwen3ToolFormatTemplateDetectTests {
             modelType: modelType,
             chatTemplate: template)
         #expect(resolved.format == .xmlFunction)
-        #expect(resolved.source == .modelTypeHeuristic)
+        #expect(resolved.source == .chatTemplate)
     }
 }
