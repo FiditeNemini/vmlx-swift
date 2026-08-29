@@ -1332,6 +1332,11 @@ public class DeepseekV4ModelInner: Module {
 // MARK: - Outer model
 
 public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
+    /// The canonical SWA + CSA/HSA `DeepseekV4Cache` pool is path-dependent
+    /// and has no B-wide wrapper. Preserve concurrent request queuing while
+    /// decoding one DSV4 sequence at a time.
+    public var maximumSupportedDecodeBatchSize: Int? { 1 }
+
     public var kvHeads: [Int]
     var config: DeepseekV4Configuration
     public var model: DeepseekV4ModelInner

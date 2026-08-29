@@ -417,9 +417,12 @@ class BatchEngineIntegrationTests: XCTestCase {
 
     private func makeSlowPrefillEngine(
         prefillDelayMicroseconds: UInt32 = 800_000,
-        maxBatchSize: Int = 2
+        maxBatchSize: Int = 2,
+        modelMaximumDecodeBatchSize: Int? = nil
     ) -> BatchEngine {
-        let model = SlowPrefillLanguageModel(prefillDelayMicroseconds: prefillDelayMicroseconds)
+        let model = SlowPrefillLanguageModel(
+            prefillDelayMicroseconds: prefillDelayMicroseconds,
+            maximumSupportedDecodeBatchSize: modelMaximumDecodeBatchSize)
         let tokenizer = TestTokenizer(vocabularySize: model.vocabularySize)
         let processor = TestInputProcessor(
             tokenizer: tokenizer,
@@ -740,6 +743,24 @@ class BatchEngineIntegrationTests: XCTestCase {
             let result = await collectTokens(from: stream)
             XCTAssertNotNil(result.info, "Resized engine should finish every stream")
         }
+    }
+
+    /// Architectures with path-dependent caches that have no B-wide wrapper
+    /// must queue concurrent requests instead of entering an invalid forward.
+    func testModelDecodeBatchLimitClampsInitAndRuntimeResize() async throws {
+        let engine = makeSlowPrefillEngine(
+            maxBatchSize: 3,
+            modelMaximumDecodeBatchSize: 1)
+        let initialMaximum = await engine.maxBatchSize
+        let initialCapacity = await engine.capacitySnapshot
+        XCTAssertEqual(initialMaximum, 1)
+        XCTAssertEqual(initialCapacity.configuredMaximum, 1)
+
+        try await engine.updateMaxBatchSize(4)
+        let resizedMaximum = await engine.maxBatchSize
+        let resizedCapacity = await engine.capacitySnapshot
+        XCTAssertEqual(resizedMaximum, 1)
+        XCTAssertEqual(resizedCapacity.configuredMaximum, 1)
     }
 
     /// A capacity increase and the resulting queue admission happen on the
@@ -1459,11 +1480,16 @@ private final class SlowPrefillLanguageModel: Module, LanguageModel,
     KVCacheDimensionProvider, @unchecked Sendable
 {
     let prefillDelayMicroseconds: UInt32
+    let maximumSupportedDecodeBatchSize: Int?
     let vocabularySize = 32
     var kvHeads: [Int] { [1] }
 
-    init(prefillDelayMicroseconds: UInt32) {
+    init(
+        prefillDelayMicroseconds: UInt32,
+        maximumSupportedDecodeBatchSize: Int? = nil
+    ) {
         self.prefillDelayMicroseconds = prefillDelayMicroseconds
+        self.maximumSupportedDecodeBatchSize = maximumSupportedDecodeBatchSize
     }
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {

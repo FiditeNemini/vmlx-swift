@@ -246,6 +246,12 @@ public actor BatchEngine {
     /// Additional requests are queued until a slot opens.
     public private(set) var maxBatchSize: Int
 
+    /// Architecture limit captured from the loaded model. This is distinct
+    /// from host/RAM admission: it prevents the scheduler from constructing a
+    /// B-wide forward for a cache topology whose model implementation only
+    /// supports B=1.
+    private let modelMaximumDecodeBatchSize: Int?
+
     /// Number of iterations between GPU memory cache purges.
     /// Matches the 256-token interval used by ``TokenIterator``.
     public let memoryPurgeInterval: Int
@@ -376,10 +382,17 @@ public actor BatchEngine {
     ) {
         precondition(maxBatchSize > 0, "BatchEngine maxBatchSize must be greater than zero")
         self.context = context
-        self.maxBatchSize = maxBatchSize
+        let modelLimit = context.model.maximumSupportedDecodeBatchSize
+        if let modelLimit {
+            precondition(modelLimit > 0,
+                "LanguageModel maximumSupportedDecodeBatchSize must be positive")
+        }
+        let effectiveMaxBatchSize = min(maxBatchSize, modelLimit ?? maxBatchSize)
+        self.modelMaximumDecodeBatchSize = modelLimit
+        self.maxBatchSize = effectiveMaxBatchSize
         self.memoryPurgeInterval = memoryPurgeInterval
         self.cacheCoordinator = cacheCoordinator
-        self.initialAdmissionCoalescingNanos = maxBatchSize > 1 ? 25_000_000 : 0
+        self.initialAdmissionCoalescingNanos = effectiveMaxBatchSize > 1 ? 25_000_000 : 0
 
         let resolvedStops = resolveStopSequences(
             modelConfiguration: context.configuration,
@@ -387,6 +400,11 @@ public actor BatchEngine {
             includeUnknownToken: true)
         self.stopTokenIDs = resolvedStops.tokenIDs
         self.defaultStopStrings = resolvedStops.textStopStrings
+        if effectiveMaxBatchSize != maxBatchSize {
+            Self.logger.info(
+                "Clamped requested maxBatchSize=\(maxBatchSize, privacy: .public) to architecture limit=\(effectiveMaxBatchSize, privacy: .public) model=\(context.configuration.name, privacy: .public)"
+            )
+        }
     }
 
     // MARK: - Public API
@@ -407,15 +425,17 @@ public actor BatchEngine {
         guard !isShutdown else {
             throw BatchEngineConfigurationError.engineShutdown
         }
-        guard newMaxBatchSize != maxBatchSize else { return }
+        let effectiveMaxBatchSize = min(
+            newMaxBatchSize, modelMaximumDecodeBatchSize ?? newMaxBatchSize)
+        guard effectiveMaxBatchSize != maxBatchSize else { return }
 
         let old = maxBatchSize
-        maxBatchSize = newMaxBatchSize
+        maxBatchSize = effectiveMaxBatchSize
         Self.logger.info(
-            "Updated maxBatchSize from \(old, privacy: .public) to \(newMaxBatchSize, privacy: .public)"
+            "Updated maxBatchSize from \(old, privacy: .public) to \(effectiveMaxBatchSize, privacy: .public) requested=\(newMaxBatchSize, privacy: .public)"
         )
 
-        if newMaxBatchSize > old && soloFastPathTask == nil {
+        if effectiveMaxBatchSize > old && soloFastPathTask == nil {
             admitPendingRequests()
             if !activeSlots.isEmpty {
                 ensureLoopRunning()
