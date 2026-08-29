@@ -64,17 +64,27 @@ public enum AgenticTaskBench {
             .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
+    private static func canonicalSandboxPath(_ url: URL) -> String {
+        #if canImport(Darwin)
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        if Darwin.realpath(url.path, &buffer) != nil {
+            return String(cString: buffer)
+        }
+        #endif
+        return url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
     /// macOS seatbelt profile for the benchmark shell.  Commands may execute
     /// normal system binaries, but reads of the user's home/temp trees and all
     /// writes are denied unless they target this task's fixture directory.
     /// This is an eval-integrity boundary: setting only `cwd` does not confine
     /// absolute paths, `..`, subprocesses, or shell redirections.
     private static func shellSandboxProfile(taskDirectory: URL) -> String {
-        let task = sandboxEscaped(taskDirectory.resolvingSymlinksInPath().path)
-        let home = sandboxEscaped(URL(fileURLWithPath: NSHomeDirectory())
-            .resolvingSymlinksInPath().path)
-        let temporary = sandboxEscaped(URL(fileURLWithPath: NSTemporaryDirectory())
-            .resolvingSymlinksInPath().path)
+        let task = sandboxEscaped(canonicalSandboxPath(taskDirectory))
+        let home = sandboxEscaped(canonicalSandboxPath(
+            URL(fileURLWithPath: NSHomeDirectory())))
+        let temporary = sandboxEscaped(canonicalSandboxPath(
+            URL(fileURLWithPath: NSTemporaryDirectory())))
         return """
         (version 1)
         (allow default)
@@ -223,9 +233,13 @@ public enum AgenticTaskBench {
             guard let command = str("command") else { return "error: missing command" }
             let process = Process()
             #if os(macOS)
+            let sandboxProfile = shellSandboxProfile(taskDirectory: dir)
+            if ProcessInfo.processInfo.environment["BENCH_AGENT_SHELL_TRACE"] == "1" {
+                print("      shell sandbox task=\(dir.path) profile=\(sandboxProfile)")
+            }
             process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
             process.arguments = [
-                "-p", shellSandboxProfile(taskDirectory: dir),
+                "-p", sandboxProfile,
                 "/bin/bash", "-c", command,
             ]
             #else

@@ -22,6 +22,8 @@ struct AgenticTaskBenchConfinementFocusedTests {
         #expect(source.contains(#""/bin/bash", "-c", command"#))
         #expect(!source.contains(#"process.arguments = ["-lc", command]"#))
         #expect(source.contains("run_shell benchmark confinement is unavailable"))
+        #expect(source.contains("Darwin.realpath(url.path, &buffer)"))
+        #expect(source.contains("canonicalSandboxPath(taskDirectory)"))
     }
 
     @Test("run_shell has a bounded wall clock and terminates its process group")
