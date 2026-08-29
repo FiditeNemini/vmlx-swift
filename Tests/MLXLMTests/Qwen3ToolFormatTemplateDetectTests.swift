@@ -17,6 +17,10 @@ import Testing
 ///   - Qwen/Qwen3-Coder-30B-A3B-Instruct (qwen3_moe):
 ///       <tool_call>\n<function=name>\n<parameter=key>\nvalue\n</parameter>\n</function>\n</tool_call>
 struct Qwen3ToolFormatTemplateDetectTests {
+    private static let installedFlashNextPath = ProcessInfo.processInfo.environment[
+        "VMLINUX_QWEN38_BUNDLE_ROOT"
+    ].map(URL.init(fileURLWithPath:))
+
     private let qwen3InstructTemplate = """
         You are a helpful assistant. For each function call return a json object \
         with function name and arguments within <tool_call></tool_call> XML tags:
@@ -109,15 +113,15 @@ struct Qwen3ToolFormatTemplateDetectTests {
 
     @Test("hermes-stamped qwen4_exp bundle recovers .xmlFunction via template")
     func hermesStampedQwen4ExpRecovers() {
-        // Qwen3.8 Flash-Next bundles: model_type=qwen4_exp, which the
-        // heuristic does not know — the bundle's own chat template (real
-        // envelope: <function=/<parameter=) is the ground truth.
+        // Qwen3.8 Flash-Next bundles: model_type=qwen4_exp. The bad stamp
+        // falls through to the family heuristic, which agrees with the real
+        // template envelope: <function=/<parameter=>.
         let r = ParserResolution.toolCall(
             capabilities: JangCapabilities(toolParser: "hermes"),
             modelType: "qwen4_exp",
             chatTemplate: qwen3CoderTemplate)
         #expect(r.format == .xmlFunction)
-        #expect(r.source == .chatTemplate)
+        #expect(r.source == .modelTypeHeuristic)
     }
 
     @Test("hermes-stamped genuine Hermes-style instruct still lands .json")
@@ -144,5 +148,30 @@ struct Qwen3ToolFormatTemplateDetectTests {
             #expect(r.format == .xmlFunction, "stamp '\(stamp)' must resolve")
             #expect(r.source == .jangStamped)
         }
+    }
+
+    @Test(
+        "installed legacy Flash-Next bundle resolves XML through its real metadata",
+        .enabled(if: Self.installedFlashNextPath != nil))
+    func installedLegacyFlashNextBundleResolves() throws {
+        let directory = try #require(Self.installedFlashNextPath)
+        let configData = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let config = try #require(
+            JSONSerialization.jsonObject(with: configData) as? [String: Any])
+        let modelType = try #require(config["model_type"] as? String)
+        let jangConfig = try JangLoader.loadConfig(at: directory)
+        let template = try String(
+            contentsOf: directory.appendingPathComponent("chat_template.jinja"),
+            encoding: .utf8)
+
+        #expect(jangConfig.capabilities?.toolParser == "hermes")
+        #expect(modelType == "qwen4_exp")
+        #expect(template.contains("<function="))
+        let resolved = ParserResolution.toolCall(
+            capabilities: jangConfig.capabilities,
+            modelType: modelType,
+            chatTemplate: template)
+        #expect(resolved.format == .xmlFunction)
+        #expect(resolved.source == .modelTypeHeuristic)
     }
 }
