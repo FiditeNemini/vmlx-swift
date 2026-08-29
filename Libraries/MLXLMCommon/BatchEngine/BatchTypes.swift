@@ -32,7 +32,16 @@ public struct BatchRequestID: Hashable, Sendable, CustomStringConvertible {
 /// example, hybrid-pool cache requests), and another request can consume the
 /// headroom immediately after the snapshot is returned.
 public struct BatchEngineCapacitySnapshot: Sendable, Equatable {
+    /// Most recent width requested by the serving layer. This remains distinct
+    /// from `configuredMaximum`: an architecture may clamp the request.
+    public let requestedMaximum: Int
+
+    /// Model-declared decode-width ceiling, or nil when the architecture does
+    /// not impose a narrower ceiling than the serving configuration.
+    public let architectureMaximum: Int?
+
     /// Configured maximum number of simultaneously active sequences.
+    /// This is the effective value after applying `architectureMaximum`.
     public let configuredMaximum: Int
 
     /// Currently active sequences, including the direct B=1 solo path.
@@ -54,6 +63,8 @@ public struct BatchEngineCapacitySnapshot: Sendable, Equatable {
     public let activeCountHighWatermark: Int
 
     public init(
+        requestedMaximum: Int,
+        architectureMaximum: Int?,
         configuredMaximum: Int,
         activeCount: Int,
         pendingCount: Int,
@@ -62,6 +73,8 @@ public struct BatchEngineCapacitySnapshot: Sendable, Equatable {
         isShutdown: Bool,
         activeCountHighWatermark: Int
     ) {
+        self.requestedMaximum = requestedMaximum
+        self.architectureMaximum = architectureMaximum
         self.configuredMaximum = configuredMaximum
         self.activeCount = activeCount
         self.pendingCount = pendingCount

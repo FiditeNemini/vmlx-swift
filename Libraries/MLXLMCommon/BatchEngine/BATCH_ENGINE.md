@@ -296,6 +296,12 @@ width. A model that returns `1` retains concurrent request queuing but decodes
 one request at a time. This fail-safe serialization is not reported as native
 B>1 batching.
 
+Capacity diagnostics keep the three widths distinct. `requestedMaximum` is
+the serving layer's latest request, `architectureMaximum` is the model's
+optional hard ceiling, and `configuredMaximum` is the effective engine width
+after applying that ceiling. A capped `[1, 1]` run must not be reported as a
+native width-two run merely because the caller requested two slots.
+
 | Architecture/cache topology | Decode contract | Required current proof |
 |---|---|---|
 | Dense/standard attention (Gemma control) | Native B>1 through `BatchKVCache` | Same-model AgentLoop CB=2/3; both tool loops and final responses complete |

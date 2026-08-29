@@ -754,13 +754,33 @@ class BatchEngineIntegrationTests: XCTestCase {
         let initialMaximum = await engine.maxBatchSize
         let initialCapacity = await engine.capacitySnapshot
         XCTAssertEqual(initialMaximum, 1)
+        XCTAssertEqual(initialCapacity.requestedMaximum, 3)
+        XCTAssertEqual(initialCapacity.architectureMaximum, 1)
         XCTAssertEqual(initialCapacity.configuredMaximum, 1)
 
         try await engine.updateMaxBatchSize(4)
         let resizedMaximum = await engine.maxBatchSize
         let resizedCapacity = await engine.capacitySnapshot
         XCTAssertEqual(resizedMaximum, 1)
+        XCTAssertEqual(resizedCapacity.requestedMaximum, 4)
+        XCTAssertEqual(resizedCapacity.architectureMaximum, 1)
         XCTAssertEqual(resizedCapacity.configuredMaximum, 1)
+    }
+
+    /// An uncapped architecture reports the requested/effective width while
+    /// leaving the architecture ceiling absent instead of inventing one.
+    func testCapacitySnapshotSeparatesUncappedRequestFromArchitectureLimit() async throws {
+        let engine = makeSlowPrefillEngine(maxBatchSize: 2)
+        var snapshot = await engine.capacitySnapshot
+        XCTAssertEqual(snapshot.requestedMaximum, 2)
+        XCTAssertNil(snapshot.architectureMaximum)
+        XCTAssertEqual(snapshot.configuredMaximum, 2)
+
+        try await engine.updateMaxBatchSize(3)
+        snapshot = await engine.capacitySnapshot
+        XCTAssertEqual(snapshot.requestedMaximum, 3)
+        XCTAssertNil(snapshot.architectureMaximum)
+        XCTAssertEqual(snapshot.configuredMaximum, 3)
     }
 
     /// A capacity increase and the resulting queue admission happen on the
