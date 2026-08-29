@@ -643,11 +643,14 @@ public final class VLMModelFactory: ModelFactory {
             // bundles will stamp `chat.tool_calling.parser = "dsml"`.
             let chatStamped = ToolCallFormat.fromCapabilityName(
                 jangConfig?.chat?.toolCalling?.parser)
-            let jangStamped = ToolCallFormat.fromCapabilityName(
-                jangConfig?.capabilities?.toolParser)
+            let templateAwareJang = ParserResolution.toolCall(
+                capabilities: jangConfig?.capabilities,
+                modelType: baseConfig.modelType,
+                chatTemplate: chatTemplateText(modelDirectory: modelDirectory)
+            ).format
             mutableConfiguration.toolCallFormat =
                 chatStamped
-                ?? jangStamped
+                ?? templateAwareJang
                 ?? ToolCallFormat.infer(from: baseConfig.modelType)
         }
 

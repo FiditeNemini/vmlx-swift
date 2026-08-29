@@ -1227,11 +1227,13 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "QWEN3_5") == .xmlFunction)
 
-        // Qwen 3.8 Flash Next dispatches as qwen4_exp and converter bundles
-        // stamp the same XML-function contract with the Hermes alias.
-        #expect(ToolCallFormat.infer(from: "qwen4_exp") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "QWEN4_EXP_TEXT") == .xmlFunction)
-        #expect(ToolCallFormat.fromCapabilityName("hermes") == .xmlFunction)
+        // Qwen 3.8 Flash Next dispatches as qwen4_exp, but model_type alone
+        // does not define its tool wire contract. An accidentally stamped
+        // `hermes` bundle must recover from its own template; without that
+        // evidence both the model-type and capability guesses fail closed.
+        #expect(ToolCallFormat.infer(from: "qwen4_exp") == nil)
+        #expect(ToolCallFormat.infer(from: "QWEN4_EXP_TEXT") == nil)
+        #expect(ToolCallFormat.fromCapabilityName("hermes") == nil)
 
         // Mistral3 models (prefix matching)
         #expect(ToolCallFormat.infer(from: "mistral3") == .mistral)
