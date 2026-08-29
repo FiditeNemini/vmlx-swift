@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 import Foundation
+import MLX
 import MLXLMCommon
+
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Real-world agentic tasks with filesystem/sqlite-verified outcomes, run
 /// IN-PROCESS against the shipping bundle.
@@ -20,6 +25,75 @@ import MLXLMCommon
 /// step poisons the rest, a needle in a long file, a folder that starts broken,
 /// and cases where the correct action is to not act.
 public enum AgenticTaskBench {
+
+    /// Owns the process from the watchdog's `@Sendable` closure and records
+    /// whether the wall-clock limit actually fired.  The process is placed in
+    /// its own group before the watchdog is armed so a command such as
+    /// `find /` cannot survive as an orphan after its shell is terminated.
+    private final class ShellWatchdog: @unchecked Sendable {
+        private let lock = NSLock()
+        private let process: Process
+        private(set) var timedOut = false
+
+        init(process: Process) {
+            self.process = process
+        }
+
+        func fire() {
+            lock.lock()
+            defer { lock.unlock() }
+            guard process.isRunning else { return }
+            timedOut = true
+            #if canImport(Darwin)
+            _ = Darwin.kill(-process.processIdentifier, SIGTERM)
+            #else
+            process.terminate()
+            #endif
+        }
+
+        func didTimeOut() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return timedOut
+        }
+    }
+
+    private static func sandboxEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private static func canonicalSandboxPath(_ url: URL) -> String {
+        #if canImport(Darwin)
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        if Darwin.realpath(url.path, &buffer) != nil {
+            return String(cString: buffer)
+        }
+        #endif
+        return url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    /// macOS seatbelt profile for the benchmark shell.  Commands may execute
+    /// normal system binaries, but reads of the user's home/temp trees and all
+    /// writes are denied unless they target this task's fixture directory.
+    /// This is an eval-integrity boundary: setting only `cwd` does not confine
+    /// absolute paths, `..`, subprocesses, or shell redirections.
+    private static func shellSandboxProfile(taskDirectory: URL) -> String {
+        let task = sandboxEscaped(canonicalSandboxPath(taskDirectory))
+        let home = sandboxEscaped(canonicalSandboxPath(
+            URL(fileURLWithPath: NSHomeDirectory())))
+        let temporary = sandboxEscaped(canonicalSandboxPath(
+            URL(fileURLWithPath: NSTemporaryDirectory())))
+        return """
+        (version 1)
+        (allow default)
+        (deny file-write*)
+        (allow file-write* (subpath "\(task)") (literal "/dev/null"))
+        (deny file-read* (subpath "\(home)") (subpath "\(temporary)"))
+        (allow file-read* (subpath "\(task)"))
+        """
+    }
 
     struct Task: @unchecked Sendable {
         let id: String
@@ -158,20 +232,48 @@ public enum AgenticTaskBench {
         case "run_shell":
             guard let command = str("command") else { return "error: missing command" }
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/bash")
-            process.arguments = ["-lc", command]
+            #if os(macOS)
+            let sandboxProfile = shellSandboxProfile(taskDirectory: dir)
+            if ProcessInfo.processInfo.environment["BENCH_AGENT_SHELL_TRACE"] == "1" {
+                print("      shell sandbox task=\(dir.path) profile=\(sandboxProfile)")
+            }
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+            process.arguments = [
+                "-p", sandboxProfile,
+                "/bin/bash", "-c", command,
+            ]
+            #else
+            return "error: run_shell benchmark confinement is unavailable on this platform"
+            #endif
             process.currentDirectoryURL = dir
-            let out = Pipe()
-            let err = Pipe()
-            process.standardOutput = out
-            process.standardError = err
+            var environment = ProcessInfo.processInfo.environment
+            environment["HOME"] = dir.path
+            environment["TMPDIR"] = dir.path
+            process.environment = environment
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = output
             do { try process.run() } catch { return "error: \(error.localizedDescription)" }
-            let outData = out.fileHandleForReading.readDataToEndOfFile()
-            let errData = err.fileHandleForReading.readDataToEndOfFile()
+
+            #if canImport(Darwin)
+            _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
+            #endif
+            let watchdog = ShellWatchdog(process: process)
+            let timeoutSeconds = ProcessInfo.processInfo.environment[
+                "BENCH_AGENT_SHELL_TIMEOUT_SECONDS"
+            ].flatMap(Double.init) ?? 10
+            let timeoutWork = DispatchWorkItem { watchdog.fire() }
+            DispatchQueue.global().asyncAfter(
+                deadline: .now() + max(0.1, timeoutSeconds), execute: timeoutWork)
+
+            let data = output.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
-            var text = String(data: outData, encoding: .utf8) ?? ""
-            let errText = String(data: errData, encoding: .utf8) ?? ""
-            if !errText.isEmpty { text += "\n[stderr] " + errText }
+            timeoutWork.cancel()
+            var text = String(data: data, encoding: .utf8) ?? ""
+            if watchdog.didTimeOut() {
+                text += "\n[terminated: shell command exceeded "
+                    + String(format: "%.1f", timeoutSeconds) + " seconds]"
+            }
             if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 text = "(no output, exit \(process.terminationStatus))"
             }
@@ -631,18 +733,37 @@ public enum AgenticTaskBench {
         let thinking = (ProcessInfo.processInfo.environment["BENCH_AGENT_THINK"] ?? "0") == "1"
         let verbose = (ProcessInfo.processInfo.environment["BENCH_AGENT_VERBOSE"] ?? "0") == "1"
         // Two knobs for attributing a failure to PROMPT or SAMPLING rather than
-        // weights: swap the system message, or leave greedy for the bundle's own
-        // sampling defaults. Both are "can we fix this without a retrain?" tests.
+        // weights.  With no explicit sampler override, the exact bundle
+        // generation config is authoritative; the old harness silently forced
+        // temperature 0 and therefore did not score the artifact users run.
         let systemOverride = ProcessInfo.processInfo.environment["BENCH_AGENT_SYSTEM"]
-        let temperature = ProcessInfo.processInfo.environment["BENCH_AGENT_TEMP"]
-            .flatMap(Float.init) ?? 0
+        let explicitTemperature = ProcessInfo.processInfo.environment["BENCH_AGENT_TEMP"]
+            .flatMap(Float.init)
+        let seed = ProcessInfo.processInfo.environment["BENCH_AGENT_SEED"]
+            .flatMap(UInt64.init) ?? 42
 
         print("=== Agentic task bench (real tasks, filesystem-verified) ===")
         print("model: \(modelDir.lastPathComponent)  maxSteps=\(maxSteps)  thinking=\(thinking)")
 
         let context = try await VLBench.loadProductionContext(from: modelDir)
-        let params = GenerateParameters(
-            maxTokens: maxNewTokens, temperature: temperature, prefillStepSize: 512)
+        let fallback = GenerateParameters(
+            maxTokens: maxNewTokens,
+            temperature: 0,
+            topP: 1,
+            topK: 0,
+            minP: 0,
+            randomSeed: seed,
+            repetitionPenalty: nil,
+            prefillStepSize: 512)
+        var params = GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: fallback)
+        params.maxTokens = maxNewTokens
+        params.prefillStepSize = 512
+        params.randomSeed = seed
+        if let explicitTemperature {
+            params.temperature = explicitTemperature
+        }
         nonisolated(unsafe) let ctx = context
         let engine = BatchEngine(context: ctx, maxBatchSize: 1)
 
@@ -651,7 +772,12 @@ public enum AgenticTaskBench {
             + "real files. Do exactly what is asked — no more. When the task is done, reply "
             + "with a one-line summary and stop."
         let system = Chat.Message.system(systemOverride ?? defaultSystem)
-        print("  system: \(systemOverride == nil ? "default" : "OVERRIDE") temp=\(temperature)")
+        print(
+            "  system: \(systemOverride == nil ? "default" : "OVERRIDE")"
+                + " sampling=\(explicitTemperature == nil ? "bundle-defaults" : "temperature-override")"
+                + " seed=\(seed) temp=\(params.temperature) topP=\(params.topP)"
+                + " topK=\(params.topK) minP=\(params.minP)"
+                + " repetitionPenalty=\(params.repetitionPenalty.map { String($0) } ?? "nil")")
 
         var outcomes: [Outcome] = []
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -774,6 +900,19 @@ public enum AgenticTaskBench {
             print(String(
                 format: "  [%@] %@  steps=%d calls=%d %.1fs %@",
                 task.id, passed ? "PASS" : "FAIL", steps, totalCalls, seconds, note))
+
+            // Cases are independent fixtures.  Do not let MLX allocator-pool
+            // residue from an earlier case inflate later cases or the suite's
+            // physical-footprint gate.  Active bytes are reported separately:
+            // if they grow, that is a real engine/request-lifecycle leak and
+            // must not be hidden by clearing reusable allocator cache.
+            let activeBeforeClear = MLX.Memory.activeMemory
+            let cachedBeforeClear = MLX.Memory.cacheMemory
+            MLX.Memory.clearCache()
+            print(
+                "      memory activeBytes=\(activeBeforeClear)"
+                    + " allocatorCacheBefore=\(cachedBeforeClear)"
+                    + " allocatorCacheAfter=\(MLX.Memory.cacheMemory)")
         }
 
         // Summary by tier, then overall — the shape the comparison table needs.

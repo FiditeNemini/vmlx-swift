@@ -907,6 +907,7 @@ let package = Package(
                 "VMLXServerRuntimeSettingsTests.swift",
                 "VMLXMemorySafetySettingsTests.swift",
                 "DSV4AgenticToolSourceTests.swift",
+                "AgenticTaskBenchConfinementFocusedTests.swift",
                 "NoHiddenReasoningCloseBiasFocusedTests.swift",
                 "MinimumReasoningFloorFocusedTests.swift",
                 "TokenizerAddedTokenRegexFocusedTests.swift",
