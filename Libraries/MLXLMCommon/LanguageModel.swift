@@ -427,6 +427,14 @@ public protocol VisionLanguageModelProtocol: LanguageModel {}
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
 public protocol LanguageModel: Module {
 
+    /// Maximum number of sequences this architecture can decode in one
+    /// model forward. `nil` means the architecture supports the batch
+    /// engine's configured width. Models with path-dependent cache state that
+    /// does not yet have a B-wide wrapper must return `1`; the engine will
+    /// retain request concurrency in its queue without entering an invalid
+    /// batched forward.
+    var maximumSupportedDecodeBatchSize: Int? { get }
+
     /// Prepare the cache state and consume the ``LMInput``.
     ///
     /// This can return:
@@ -464,6 +472,10 @@ public protocol LanguageModel: Module {
 }
 
 extension LanguageModel {
+    /// Most standard-attention and wrapped recurrent-cache architectures use
+    /// the batch engine's configured width.
+    public var maximumSupportedDecodeBatchSize: Int? { nil }
+
     public func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
     {

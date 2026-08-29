@@ -1,8 +1,17 @@
 # Continuous Batching Engine
 
-**Status**: **PRODUCTION-READY** as of 2026-04-19 (iter 63) for `mlxBatchEngine=YES` default flip on osaurus's side.
+**Status**: **PARTIAL BY ARCHITECTURE** as of 2026-08-29. Native B>1
+decode is production-gated per cache topology; architectures without a proven
+B-wide state contract must advertise a smaller decode limit and retain only
+safe request queuing. See `docs/CONTINUOUS_BATCHING_FAMILY_TRIAGE_2026_08_29.md`
+for the current source and live-evidence matrix.
 
-Real continuous batching for mlx-swift-lm. Multiple generation requests are batched through a single model forward pass during decode. All model families supported — LLM, VLM, MoE, hybrid SSM, JANG quantized, Gemma-4 sliding-window.
+Real continuous batching for mlx-swift-lm. Multiple generation requests may be
+batched through one model forward pass only when the model's cache topology has
+a proven B-wide contract. Other architectures remain concurrent at the request
+queue but decode at their declared safe width. Do not interpret “request
+accepted,” a two-child `spawn_batch`, or process survival as proof of native
+B>1 decode.
 
 ## Osaurus integration (read first)
 
@@ -267,6 +276,7 @@ keeps the hot path from paying a yield every token while still allowing
 | `BatchKVCache` | `BaseKVCache` | `KVCache` | All standard attention layers |
 | `BatchArraysCache` | `MambaCache` | `MambaCache` | SSM layers (Qwen3.5, Jamba, LFM2, etc.) |
 | `BatchCacheList` | `CacheList` | `CacheList` | Composite layers (FalconH1, BaichuanM1) |
+| `BatchZayaCCACache` | `BaseKVCache` | `KVCache` | Zaya CCA layers (KV plus per-sequence conv/hidden state) |
 
 ### RoPE
 
@@ -280,7 +290,25 @@ Gemma4 KV-shared layers now pass `sharedOffsetArray: MLXArray?` through the atte
 
 ## Model Compatibility
 
-**All model families supported.** No sequential fallback.
+Batch support is an architecture contract, not a global assumption. A model
+with `maximumSupportedDecodeBatchSize == nil` may use the configured engine
+width. A model that returns `1` retains concurrent request queuing but decodes
+one request at a time. This fail-safe serialization is not reported as native
+B>1 batching.
+
+| Architecture/cache topology | Decode contract | Required current proof |
+|---|---|---|
+| Dense/standard attention (Gemma control) | Native B>1 through `BatchKVCache` | Same-model AgentLoop CB=2/3; both tool loops and final responses complete |
+| Qwen3.5/Ornith GatedDelta SSM | Native B>1 through `BatchArraysCache` plus per-sequence KV positions | Unequal-prefix B=2 decode, SSM split-back, AgentLoop CB=2, multi-turn cache continuation |
+| Zaya CCA | Native B>1 through `BatchZayaCCACache` gather/scatter | Unequal-prefix B=2 decode, CCA isolation, AgentLoop CB=2, multi-turn cache continuation |
+| DSV4 SWA + CSA/HSA pool | B=1 safe serialization (`maximumSupportedDecodeBatchSize = 1`) | Two concurrent submissions queue and both finish; telemetry must report effective width 1, never claim B>1 |
+| Qwen3.8 Flash Next QSA | B=1 safe serialization (`maximumSupportedDecodeBatchSize = 1`) until QSA has a B-wide index/cache contract | AgentLoop two-request queue under MTP off/auto/manual depth; both finish and MTP telemetry belongs to the active request only |
+
+Passing unit cache tests alone does not promote an architecture. The live gate
+must use the real OsaurusEvals AgentLoop continuous-batching fixture and record
+the requested/effective width, completion of every child, TTFT, token/s, peak
+physical footprint, cache/companion counters, stop reason, and process survival.
+Unsupported or unavailable rows are `BLOCKED`, not implicit passes.
 
 ### LLM — Full Batching via BatchKVCache
 

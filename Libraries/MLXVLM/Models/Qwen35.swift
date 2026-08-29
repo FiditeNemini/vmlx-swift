@@ -2465,7 +2465,12 @@ enum Qwen35Language {
                 let batchSize = inputs.dim(0)
                 let seqLength = inputs.dim(1)
 
-                var delta = graphOffset.reshaped([]).asType(.int32)
+                // Compiled single-sequence caches expose `[1]`, while
+                // `BatchKVCache` exposes one offset per live sequence as
+                // `[B]`. Preserve that batch dimension: reshaping `[B]` to a
+                // scalar is only valid for B == 1 and process-fatals as soon
+                // as continuous batching decodes two Qwen3.5/Ornith slots.
+                var delta = graphOffset.asType(.int32)
                 if let ropeDeltas {
                     delta = delta + ropeDeltas.asType(.int32)
                 }

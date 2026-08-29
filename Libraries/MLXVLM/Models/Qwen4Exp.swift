@@ -1357,6 +1357,11 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     SafetensorsLoadKeyExcluding, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
     CompiledDecodeExternalInputModel
 {
+    /// QSA index selection and its path-dependent cache currently require a
+    /// single sequence. Keep concurrent requests queued until a B-wide QSA
+    /// cache/indexer contract is implemented and proven.
+    public var maximumSupportedDecodeBatchSize: Int? { 1 }
+
     public let config: Qwen4ExpConfiguration
     @ModuleInfo(key: "language_model") private var textModel: Qwen4ExpTextModel
     @ModuleInfo(key: "lm_head") private var head: Linear
