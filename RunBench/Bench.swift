@@ -640,6 +640,14 @@ struct Bench {
             return
         }
 
+        // AgenticTaskBench owns a production-tokenizer context.  It must run
+        // before the legacy pre-tokenized context below: loading both used to
+        // double model residency and made every agentic RAM score false.
+        if (env["BENCH_AGENTIC_TASKS"] ?? "0") == "1" {
+            try await AgenticTaskBench.run(modelPath: modelPath, maxNewTokens: maxNew)
+            return
+        }
+
         print("=== vmlx-swift-lm — \(modelDir.lastPathComponent) MULTI-TURN ===")
         print("Tokens: \(tokensPath)")
         print("Loading...")
@@ -934,15 +942,6 @@ struct Bench {
         // on/off/on, tools none/offered/called/withdrawn, reasoning+tools in
         // one turn, tool-result feedback, grow control, verbatim replay — are
         // all crossed.
-        // BENCH_AGENTIC_TASKS=1: real-world agentic tasks with filesystem
-        // verification (the DGX harness's tiers 2-5, run in-process against the
-        // shipping bundle instead of over HTTP). BENCH_AGENT_FILTER selects a
-        // subset, BENCH_AGENT_THINK=1 runs them with reasoning on.
-        if (env["BENCH_AGENTIC_TASKS"] ?? "0") == "1" {
-            try await AgenticTaskBench.run(modelPath: modelPath, maxNewTokens: maxNew)
-            return
-        }
-
         if (env["BENCH_TEXT_VARIATING"] ?? "0") == "1" {
             try await VLBench.runVariatingTextPattern(
                 modelPath: modelPath, maxNewTokens: maxNew)
