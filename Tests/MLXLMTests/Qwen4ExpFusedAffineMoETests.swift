@@ -164,6 +164,133 @@ struct Qwen4ExpFusedAffineMoETests {
         }
     }
 
+    @Test("native-MTP rows 2 through 4 match independent row-1 decode for every shipped layout")
+    func smallRowIsolationParity() throws {
+        for (comboIndex, combo) in Self.shippedCombos.enumerated() {
+            let seed = UInt64(7001 + comboIndex * 101)
+            let (gate, _) = Self.makeProjection(
+                inputDims: Self.inputDims, outputDims: Self.expertDims,
+                bits: combo.gate.bits, groupSize: combo.gate.group, seed: seed)
+            let (up, _) = Self.makeProjection(
+                inputDims: Self.inputDims, outputDims: Self.expertDims,
+                bits: combo.up.bits, groupSize: combo.up.group, seed: seed + 1)
+            let (down, _) = Self.makeProjection(
+                inputDims: Self.expertDims, outputDims: Self.inputDims,
+                bits: combo.down.bits, groupSize: combo.down.group, seed: seed + 2)
+            let reducer = try #require(
+                Qwen4ExpFusedAffineMoE.makeReducer(gate: gate, up: up, down: down))
+
+            for rows in 2...4 {
+                var inputRows = [MLXArray]()
+                var indexRows = [MLXArray]()
+                var scoreRows = [MLXArray]()
+                var independentOutputs = [MLXArray]()
+
+                for row in 0..<rows {
+                    let rowSeed = seed + UInt64(10 + rows * 10 + row)
+                    let input = MLXRandom.uniform(
+                        low: -1.0, high: 1.0, [1, Self.inputDims],
+                        key: MLXRandom.key(rowSeed)
+                    ).asType(.bfloat16)
+                    let routeValues = (0..<Self.topK).map {
+                        UInt32(($0 * 3 + row * 5) % Self.experts)
+                    }
+                    let indices = MLXArray(routeValues, [1, Self.topK])
+                    let scores = MLX.softmax(
+                        MLXRandom.uniform(
+                            low: 0.0, high: 1.0, [1, Self.topK],
+                            key: MLXRandom.key(rowSeed + 1)
+                        ).asType(.float32), axis: -1)
+
+                    inputRows.append(input)
+                    indexRows.append(indices)
+                    scoreRows.append(scores)
+                    independentOutputs.append(try #require(reducer(input, indices, scores)))
+                }
+
+                let batched = try #require(
+                    reducer(
+                        concatenated(inputRows, axis: 0),
+                        concatenated(indexRows, axis: 0),
+                        concatenated(scoreRows, axis: 0)))
+                let independent = concatenated(independentOutputs, axis: 0)
+                let error = Self.relativeError(batched, independent)
+                print(
+                    "[FusedMoERowParity] combo=\(combo.label) rows=\(rows)"
+                        + " batched_vs_single=\(error)")
+                #expect(
+                    error < 0.001,
+                    "\(combo.label) rows \(rows) crossed row state: relative error \(error)")
+            }
+        }
+    }
+
+    @Test("native-MTP accepts production-shaped non-contiguous row views")
+    func smallNonContiguousRowParity() throws {
+        let seed: UInt64 = 7501
+        let combo = Self.shippedCombos[4] // Qwen3.8 Flash-Next 2L q2/q2/q2-g32.
+        let (gate, _) = Self.makeProjection(
+            inputDims: Self.inputDims, outputDims: Self.expertDims,
+            bits: combo.gate.bits, groupSize: combo.gate.group, seed: seed)
+        let (up, _) = Self.makeProjection(
+            inputDims: Self.inputDims, outputDims: Self.expertDims,
+            bits: combo.up.bits, groupSize: combo.up.group, seed: seed + 1)
+        let (down, _) = Self.makeProjection(
+            inputDims: Self.expertDims, outputDims: Self.inputDims,
+            bits: combo.down.bits, groupSize: combo.down.group, seed: seed + 2)
+        let reducer = try #require(
+            Qwen4ExpFusedAffineMoE.makeReducer(gate: gate, up: up, down: down))
+
+        for rows in 2...4 {
+            let paddedInput = MLXRandom.uniform(
+                low: -1.0, high: 1.0, [1, rows * 2, Self.inputDims],
+                key: MLXRandom.key(seed + UInt64(rows * 10))
+            ).asType(.bfloat16)
+            let input = paddedInput[0..., .stride(by: 2), 0...]
+
+            let routeValues = (0..<(rows * Self.topK * 2)).map {
+                UInt32(($0 * 3 + rows) % Self.experts)
+            }
+            let paddedIndices = MLXArray(routeValues, [1, rows, Self.topK * 2])
+            let indices = paddedIndices[0..., 0..., .stride(by: 2)]
+            let paddedScores = MLX.softmax(
+                MLXRandom.uniform(
+                    low: 0.0, high: 1.0, [1, rows, Self.topK * 2],
+                    key: MLXRandom.key(seed + UInt64(rows * 10 + 1))
+                ).asType(.float32), axis: -1)
+            let scores = paddedScores[0..., 0..., .stride(by: 2)]
+
+            let contiguousResult = try #require(
+                reducer(
+                    MLX.contiguous(input), MLX.contiguous(indices),
+                    MLX.contiguous(scores)))
+            let stridedResult = try #require(reducer(input, indices, scores))
+            let error = Self.relativeError(stridedResult, contiguousResult)
+            #expect(error == 0, "rows \(rows) read a strided view as contiguous: \(error)")
+        }
+    }
+
+    @Test("prefill rows above the native-MTP ceiling stay on the generic path")
+    func largerRowsRejected() throws {
+        let seed: UInt64 = 8001
+        let (gate, _) = Self.makeProjection(
+            inputDims: Self.inputDims, outputDims: Self.expertDims,
+            bits: 4, groupSize: 64, seed: seed)
+        let (up, _) = Self.makeProjection(
+            inputDims: Self.inputDims, outputDims: Self.expertDims,
+            bits: 4, groupSize: 64, seed: seed + 1)
+        let (down, _) = Self.makeProjection(
+            inputDims: Self.expertDims, outputDims: Self.inputDims,
+            bits: 4, groupSize: 64, seed: seed + 2)
+        let reducer = try #require(
+            Qwen4ExpFusedAffineMoE.makeReducer(gate: gate, up: up, down: down))
+        let rows = 5
+        let input = MLXArray.zeros([rows, Self.inputDims], dtype: .bfloat16)
+        let indices = MLXArray.zeros([rows, Self.topK], dtype: .uint32)
+        let scores = MLXArray.ones([rows, Self.topK], dtype: .float32) / Float(Self.topK)
+        #expect(reducer(input, indices, scores) == nil)
+    }
+
     @Test("Ornith 2048x512 top-8 q5 contract matches eager quantized math")
     func ornith35ShapeParity() throws {
         let inputDims = 2048

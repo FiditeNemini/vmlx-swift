@@ -26,6 +26,10 @@ enum Qwen4ExpFusedAffineMoE {
         inputDimensions: 2048, expertDimensions: 512, routes: 8)
     private static let supportedBits = Set([2, 3, 4, 5, 6])
     private static let supportedGroupSizes = Set([32, 64])
+    /// Decode and native-MTP verification only. A single decode token is one
+    /// row; native MTP verifies the current token plus at most three drafts.
+    /// Larger prompt/prefill batches deliberately stay on the generic path.
+    private static let maximumRows = 4
 
     private static let enabled: Bool = {
         let raw =
@@ -43,8 +47,10 @@ enum Qwen4ExpFusedAffineMoE {
             uint sgid = tid / 32u;
             uint lane = thread_index_in_simdgroup;
             uint m = sgid % EXPERT_DIM;
-            uint k = sgid / EXPERT_DIM;
-            uint e = uint(inds[k]);
+            uint route_row = sgid / EXPERT_DIM;
+            uint k = route_row % ROUTES;
+            uint row = route_row / ROUTES;
+            uint e = uint(inds[row * ROUTES + k]);
             size_t rowoff = size_t(e) * EXPERT_DIM + m;
             constexpr uint G_VALUES_PER_PACK = (G_BITS == 3 || G_BITS == 5) ? 8u : (G_BITS == 6 ? 4u : 32u / G_BITS);
             constexpr uint U_VALUES_PER_PACK = (U_BITS == 3 || U_BITS == 5) ? 8u : (U_BITS == 6 ? 4u : 32u / U_BITS);
@@ -82,7 +88,7 @@ enum Qwen4ExpFusedAffineMoE {
               float qsg = 0.0f;
               float xs = 0.0f;
               for (uint j = 0; j < G_VALUES_PER_PACK; ++j) {
-                float xv = float(x[xbase + j]);
+                float xv = float(x[row * INPUT_DIM + xbase + j]);
                 xs += xv;
                 qsg += xv * float((gwrd >> (G_BITS * j)) & G_CODE_MASK);
               }
@@ -106,7 +112,7 @@ enum Qwen4ExpFusedAffineMoE {
               float qsu = 0.0f;
               float xs = 0.0f;
               for (uint j = 0; j < U_VALUES_PER_PACK; ++j) {
-                float xv = float(x[xbase + j]);
+                float xv = float(x[row * INPUT_DIM + xbase + j]);
                 xs += xv;
                 qsu += xv * float((uwrd >> (U_BITS * j)) & U_CODE_MASK);
               }
@@ -118,10 +124,15 @@ enum Qwen4ExpFusedAffineMoE {
               float g = float(T(gacc));
               float u = float(T(uacc));
               float activated = g / (1.0f + metal::fast::exp(-g)) * u;
-              act[k * EXPERT_DIM + m] = T(activated);
+              act[(row * ROUTES + k) * EXPERT_DIM + m] = T(activated);
             }
             """,
-        ensureRowContiguous: false)
+        // Native MTP supplies lazy/sliced multi-row input, route, and score
+        // views. The kernel indexes those arrays as flat row-major storage, so
+        // accepting arbitrary strides silently reads the wrong tokens/routes.
+        // MLX only materializes inputs that need it; dense single-row decode
+        // remains the same allocation-free contract.
+        ensureRowContiguous: true)
 
     private static let downKernel = MLXFast.metalKernel(
         name: "vmlx_qwen4_q4g64_weighted_down10",
@@ -131,10 +142,11 @@ enum Qwen4ExpFusedAffineMoE {
             uint tid = thread_position_in_grid.x;
             uint sgid = tid / 32u;
             uint lane = thread_index_in_simdgroup;
-            uint d = sgid;
+            uint d = sgid % INPUT_DIM;
+            uint row = sgid / INPUT_DIM;
             float weighted = 0.0f;
             for (uint k = 0; k < ROUTES; ++k) {
-              uint e = uint(inds[k]);
+              uint e = uint(inds[row * ROUTES + k]);
               size_t rowoff = size_t(e) * INPUT_DIM + d;
               constexpr uint VALUES_PER_PACK = (BITS == 3 || BITS == 5) ? 8u : (BITS == 6 ? 4u : 32u / BITS);
               constexpr uint BYTES_PER_PACK = BITS == 5 ? 5u : ((BITS == 3 || BITS == 6) ? 3u : 4u);
@@ -159,7 +171,8 @@ enum Qwen4ExpFusedAffineMoE {
                 } else {
                   wrd = ulong(*reinterpret_cast<const device uint32_t*>(dp));
                 }
-                size_t abase = size_t(k) * EXPERT_DIM + pack_idx * VALUES_PER_PACK;
+                size_t abase = (size_t(row) * ROUTES + k) * EXPERT_DIM
+                    + pack_idx * VALUES_PER_PACK;
                 float qs = 0.0f;
                 float xs = 0.0f;
                 for (uint j = 0; j < VALUES_PER_PACK; ++j) {
@@ -170,11 +183,14 @@ enum Qwen4ExpFusedAffineMoE {
                 acc += sc * qs + bi * xs;
               }
               acc = simd_sum(acc);
-              weighted += float(scores[k]) * acc;
+              weighted += float(scores[row * ROUTES + k]) * acc;
             }
-            if (lane == 0u) out[d] = T(weighted);
+            if (lane == 0u) out[row * INPUT_DIM + d] = T(weighted);
             """,
-        ensureRowContiguous: false)
+        // `act` is dense, but `indices` and `scores` may be strided views from
+        // top-k selection during multi-token verification. This kernel also
+        // indexes them as flat row-major storage.
+        ensureRowContiguous: true)
 
     private static let reportLock = NSLock()
     nonisolated(unsafe) private static var reportedShapes = Set<String>()
@@ -214,14 +230,14 @@ enum Qwen4ExpFusedAffineMoE {
                     + " scores=\(scores.shape):\(scores.dtype):size\(scores.size)\n").utf8))
     }
 
-    private static func reportActivation(shape: Shape) {
+    private static func reportActivation(shape: Shape, rows: Int) {
         reportLock.lock()
         defer { reportLock.unlock() }
-        let label = "\(shape.inputDimensions)x\(shape.expertDimensions):topk\(shape.routes)"
+        let label = "\(shape.inputDimensions)x\(shape.expertDimensions):topk\(shape.routes):rows\(rows)"
         guard reportedShapes.insert(label).inserted else { return }
         FileHandle.standardError.write(
             Data(
-                ("[Qwen4Exp] fused_affine_moe_decode=active rows=1"
+                ("[Qwen4Exp] fused_affine_moe_decode=active rows=\(rows)"
                     + " shape=\(shape.inputDimensions)x\(shape.expertDimensions) topk=\(shape.routes)"
                     + " mixed_q2_q3_q4_q5_q6_g32_g64 input=bfloat16 output=bfloat16"
                     + " affine_metadata=bf16_or_f16 router_scores=bf16_or_f32"
@@ -288,12 +304,17 @@ enum Qwen4ExpFusedAffineMoE {
             // produces F32 scores. The reduction already converts scores to
             // FP32 registers; both are native inputs and neither changes the
             // BF16 activation/result contract.
+            let rows = input.size / shape.inputDimensions
+            let leadingShape = Array(input.shape.dropLast())
             guard input.dtype == .bfloat16,
                 scores.dtype == .bfloat16 || scores.dtype == .float32,
-                input.size == shape.inputDimensions,
+                rows >= 1, rows <= maximumRows,
+                input.size == rows * shape.inputDimensions,
                 input.dim(-1) == shape.inputDimensions,
-                indices.size == shape.routes, indices.dim(-1) == shape.routes,
-                scores.size == shape.routes, scores.dim(-1) == shape.routes
+                indices.size == rows * shape.routes, indices.dim(-1) == shape.routes,
+                scores.size == rows * shape.routes, scores.dim(-1) == shape.routes,
+                Array(indices.shape.dropLast()) == leadingShape,
+                Array(scores.shape.dropLast()) == leadingShape
             else {
                 reportInvocationRejection(input: input, indices: indices, scores: scores)
                 return nil
@@ -317,8 +338,9 @@ enum Qwen4ExpFusedAffineMoE {
                     ("U_GROUP_SIZE", upGroupSize),
                     ("INPUT_DIM", shape.inputDimensions),
                     ("EXPERT_DIM", shape.expertDimensions),
+                    ("ROUTES", shape.routes),
                 ],
-                grid: (32 * shape.expertDimensions * shape.routes, 1, 1),
+                grid: (32 * rows * shape.expertDimensions * shape.routes, 1, 1),
                 threadGroup: (128, 1, 1),
                 outputShapes: [pairShape],
                 outputDTypes: [input.dtype])[0]
@@ -336,12 +358,12 @@ enum Qwen4ExpFusedAffineMoE {
                     ("EXPERT_DIM", shape.expertDimensions),
                     ("ROUTES", shape.routes),
                 ],
-                grid: (32 * shape.inputDimensions, 1, 1),
+                grid: (32 * rows * shape.inputDimensions, 1, 1),
                 threadGroup: (128, 1, 1),
                 outputShapes: [input.shape],
                 outputDTypes: [input.dtype])[0]
 
-            reportActivation(shape: shape)
+            reportActivation(shape: shape, rows: rows)
             return output
         }
     }
