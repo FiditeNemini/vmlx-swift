@@ -125,15 +125,39 @@ extension MLXArray {
             return self.asType(type).asArray(type)
         }
 
-        self.eval()
-
-        return [T](unsafeUninitializedCapacity: self.size) { destination, initializedCount in
-            let source = UnsafeRawBufferPointer(
-                start: mlx_array_data_uint8(self.ctx), count: physicalSize * itemSize)
-            copy(from: source, toContiguous: UnsafeMutableRawBufferPointer(destination))
-            initializedCount = self.size
+        // Keep the shared-stream lock through the host copy, not only through
+        // `mlx_array_eval`. A concurrent teardown/cache-clear may otherwise
+        // enter after eval has returned but before `mlx_array_data_uint8`
+        // reads the backing descriptor. Qwen4Exp PLE performs this host read
+        // once per decode step, so server cancellation/load churn made that
+        // tiny gap a production EXC_BAD_ACCESS in Buffer::raw_ptr().
+        return withEvaluatedHostAccess {
+            return [T](unsafeUninitializedCapacity: self.size) { destination, initializedCount in
+                let source = UnsafeRawBufferPointer(
+                    start: mlx_array_data_uint8(self.ctx), count: physicalSize * itemSize)
+                copy(from: source, toContiguous: UnsafeMutableRawBufferPointer(destination))
+                initializedCount = self.size
+            }
         }
     }
+
+    /// Evaluate and keep the global MLX stream driver lock held while a
+    /// caller reads the realized host backing. Internal so every host-copy
+    /// surface can share the same lifetime boundary without exposing the lock.
+    func withEvaluatedHostAccess<Result>(
+        _ body: () throws -> Result
+    ) rethrows -> Result {
+        try evalLock.withLock {
+            self.eval()
+            return try body()
+        }
+    }
+
+#if DEBUG
+    static func withEvalLockForTesting(_ body: () -> Void) {
+        evalLock.withLock(body)
+    }
+#endif
 
     /// How to access backing data with ``asData(access:)`` -- this controls how
     /// ``MLXArrayData`` is produced.
