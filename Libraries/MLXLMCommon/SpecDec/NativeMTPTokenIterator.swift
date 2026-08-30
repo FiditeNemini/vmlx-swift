@@ -397,10 +397,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             effectiveParameters.kvMode = policy.kvMode
             effectiveParameters.maxKVSize = policy.maxKVSize
         }
-        guard effectiveParameters.canUseNativeMTP(for: input) else {
+        guard let nativeMTPParameters = effectiveParameters.nativeMTPEffectiveParameters(
+            for: input)
+        else {
             throw NativeMTPRuntimeError.unsupportedSampling(
-                "native MTP is enabled only for text-only requests with no active penalties, no suppress/reasoning-budget processors, and an unbounded KV window; sampled requests run the exact-pq accept path")
+                "native MTP is enabled only for text-only requests with no active penalties or suppress/reasoning-budget processors, and requires either an unbounded KV window or a prompt plus declared output ceiling that fits wholly inside the configured window; sampled requests run the exact-pq accept path")
         }
+        effectiveParameters = nativeMTPParameters
 
         self.model = model
         self.cache = cache ?? model.newCache(parameters: effectiveParameters)
