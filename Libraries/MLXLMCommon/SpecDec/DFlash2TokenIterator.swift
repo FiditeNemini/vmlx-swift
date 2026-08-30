@@ -323,6 +323,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         guard input.text.tokens.size > 0 else {
             throw DFlash2RuntimeError.emptyPrompt
         }
+        try Task.checkCancellation()
         if let maxTokens = parameters.maxTokens, maxTokens <= 1 {
             throw DFlash2RuntimeError.maxTokensTooSmall
         }
@@ -518,6 +519,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 + " restored=\(restoredCount) offsets=\(offsets)\n"
             FileHandle.standardError.write(Data(line.utf8))
         }
+        try Task.checkCancellation()
         let prefill = try Self.prefill(
             tokens: tokensToPrefill,
             target: target,
@@ -648,6 +650,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         var boundarySnapshot: [KVCache]?
         var start = 0
         while start < tokens.count {
+            try Task.checkCancellation()
             let remaining = tokens.count - start
             // Leave the final token to its own chunk so the last logits
             // row is the one the first sample comes from, matching the
@@ -678,10 +681,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 retained = retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
             }
             if end == captureBoundaryAt {
+                try Task.checkCancellation()
                 MLX.eval(cache)
                 boundarySnapshot = cache.map { $0.copy() }
             }
             if end < tokens.count {
+                try Task.checkCancellation()
                 MLX.eval(cache)
                 if let retained { MLX.eval(retained) }
                 Memory.clearCache()
@@ -692,6 +697,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             throw DFlash2RuntimeError.emptyPrompt
         }
         let lastLogits = logits[0..., (logits.dim(1) - 1)..., 0...]
+        try Task.checkCancellation()
         MLX.eval(lastLogits, retained)
         return PrefillResult(
             lastLogits: lastLogits, hidden: retained, boundarySnapshot: boundarySnapshot)

@@ -1256,20 +1256,38 @@ public actor BatchEngine {
                         "\(type(of: context.model)) does not expose per-layer hidden states and a shared LM head"
                     )
                 }
-                let drafter = try DFlash2DrafterResolver.shared.drafter(at: drafterPath)
-                let iterator = try DFlash2TokenIterator(
-                    input: input,
-                    target: dflashTarget,
-                    drafter: drafter,
-                    blockSize: strategy.dflash2BlockSize,
-                    cache: nil,
-                    parameters: soloParameters,
-                    cacheCoordinator: cacheCoordinator)
-                (sourceStream, generationTask) = generateTask(
+                // DFlash prefill and drafter loading are GPU-backed setup too.
+                // Keep them behind the same cancellable producer boundary as
+                // AR, block diffusion, and native MTP so a disconnected client
+                // cannot leave an unowned prefill holding the shared stream.
+                let promptTokenIdsForTail = input.text.tokens.reshaped(-1).asArray(Int.self)
+                let deferredParameters = soloParameters
+                let deferredBlockSize = strategy.dflash2BlockSize
+                let deferredDrafterPath = drafterPath
+                let deferredInputs = SendableBox(
+                    (input, dflashTarget, cacheCoordinator))
+                let makeIterator: @Sendable () throws -> any TokenIteratorProtocol = {
+                    try Task.checkCancellation()
+                    let (deferredInput, deferredTarget, deferredCoordinator) =
+                        deferredInputs.consume()
+                    let deferredDrafter = try DFlash2DrafterResolver.shared.drafter(
+                        at: deferredDrafterPath)
+                    try Task.checkCancellation()
+                    return try DFlash2TokenIterator(
+                        input: deferredInput,
+                        target: deferredTarget,
+                        drafter: deferredDrafter,
+                        blockSize: deferredBlockSize,
+                        cache: nil,
+                        parameters: deferredParameters,
+                        cacheCoordinator: deferredCoordinator)
+                }
+                (sourceStream, generationTask) = generateTaskDeferred(
                     promptTokenCount: promptTokenCount,
                     modelConfiguration: context.configuration,
                     tokenizer: context.tokenizer,
-                    iterator: iterator,
+                    promptTokenIds: promptTokenIdsForTail,
+                    makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
                     toolSchemas: toolSchemas)
@@ -1280,18 +1298,37 @@ public actor BatchEngine {
                 guard let nativeModel = context.model as? any NativeMTPModel else {
                     throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
                 }
-                let iterator = try NativeMTPTokenIterator(
-                    input: input,
-                    model: nativeModel,
-                    cache: nil,
-                    parameters: soloParameters,
-                    depth: depth,
-                    cacheCoordinator: cacheCoordinator)
-                (sourceStream, generationTask) = generateTask(
+                // Native MTP prefill used to run synchronously on the
+                // BatchEngine actor before `generationTask` and the stream's
+                // termination handler existed. A client disconnect during
+                // that window therefore could not cancel or drain the MTP
+                // producer, and later requests could enter after a half-built
+                // prefill still owned the shared Metal stream. Match the AR
+                // and block-diffusion paths: publish the stream first, then
+                // construct the iterator inside the cancellable producer.
+                let promptTokenIdsForTail = input.text.tokens.reshaped(-1).asArray(Int.self)
+                let deferredParameters = soloParameters
+                let deferredDepth = depth
+                let deferredInputs = SendableBox(
+                    (input, nativeModel, cacheCoordinator))
+                let makeIterator: @Sendable () throws -> any TokenIteratorProtocol = {
+                    try Task.checkCancellation()
+                    let (deferredInput, deferredModel, deferredCoordinator) =
+                        deferredInputs.consume()
+                    return try NativeMTPTokenIterator(
+                        input: deferredInput,
+                        model: deferredModel,
+                        cache: nil,
+                        parameters: deferredParameters,
+                        depth: deferredDepth,
+                        cacheCoordinator: deferredCoordinator)
+                }
+                (sourceStream, generationTask) = generateTaskDeferred(
                     promptTokenCount: promptTokenCount,
                     modelConfiguration: context.configuration,
                     tokenizer: context.tokenizer,
-                    iterator: iterator,
+                    promptTokenIds: promptTokenIdsForTail,
+                    makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
                     toolSchemas: toolSchemas)
