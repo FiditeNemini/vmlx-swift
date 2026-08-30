@@ -72,6 +72,8 @@ Production-patch evidence:
 - Release `RunBench` product build: PASS.
 - Added a numeric regression asserting exact native BF16 affine output for a
   four-row verifier batch versus four width-1 calls.
+- The `MLXLMTests` target, including that regression source, compiles in
+  Release with `-enable-testing` (283.26 seconds).
 - Local full SwiftPM test execution is currently BLOCKED by unrelated existing
   package failures: `MLXArray.withEvalLockForTesting` is absent in `MLXTests`,
   and the generated Xcode package build fails because
