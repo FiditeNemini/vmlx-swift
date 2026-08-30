@@ -1552,6 +1552,16 @@ enum Qwen35Language {
         private func compiledDecodeFront(
             _ inputs: MLXArray, convState: MLXArray
         ) -> [MLXArray]? {
+            // Keep AR decode and multi-token verification on the same native
+            // BF16 affine/conv path. The generic compiled front is not
+            // row-equivalent to that path: a width-1 AR step and a width-N
+            // verifier step can produce different GDN state from the first
+            // linear-attention layer, which breaks speculative-decoding
+            // output equivalence and draft acceptance. Retain it only as an
+            // explicit diagnostic while the native path remains the default.
+            guard ProcessInfo.processInfo.environment[
+                "VMLINUX_QWEN4_EXP_COMPILE_GDN_FRONT"
+            ] == "1" else { return nil }
             guard let fused = ensureFusedDecodeInputProjection(inputs) else { return nil }
             return Qwen4ExpCompiledGDNInputs.callFront(
                 input: inputs,
