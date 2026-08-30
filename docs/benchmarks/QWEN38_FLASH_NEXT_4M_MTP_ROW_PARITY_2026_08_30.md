@@ -26,12 +26,25 @@ fix that split only the final fused routed kernel passed its synthetic test but
 failed the real model unchanged. That experiment was discarded rather than
 presented as a fix.
 
-The retained change detects the real projection topology from loaded tensor
-types and quantization metadata. Only a `compileDecodeRegions` block whose
-gate, up and down routed projections are all affine q4/g64 uses decode-equivalent
-rows. The complete MoE block then evaluates each verifier position with the
-same `[1,1,H]` contract as AR before concatenating the rows. The 2L, 4S, 6S,
-TurboQuant and non-Qwen4Exp paths do not match that gate and remain unchanged.
+The first retained change detected projection topology from each loaded block.
+That was sufficient for the 4M proof but not sufficient to isolate the 4M
+checkpoint: 4S has a mixed q2/q3/q4 routed bank, so an individual q4 block
+could still enter the decode-equivalent path. The private MTP head also uses
+the same `SparseMoeBlock` type and can carry q4 tensors. A follow-up therefore
+moved the selector to the decoded bundle-wide quantization map. Every trunk
+layer's gate, up and down routed projections must resolve to affine q4/g64;
+the decision is passed only to trunk blocks and is explicitly false for the
+MTP head. The complete MoE block then evaluates each verifier position with
+the same `[1,1,H]` contract as AR before concatenating the rows. Mixed 4S,
+q2 2L, TurboQuant and non-Qwen4Exp paths do not match that gate.
+
+The spill was caught by a cross-quant live row: 4S D3 fell from its previous
+~67 tok/s range to 36.9 tok/s while still producing correct bytes. On the
+narrowed selector it returned to 67.4 tok/s (72.0 tail estimate), produced the
+same full-text SHA-256
+`20dbc5d7831d7a43c23bfa2cedb198965012b4d5b722d8c81a47271eb8c58b33`,
+stopped normally, and used zero AR fallback tokens. This correction is why a
+single loaded block's bit layout must never be used as a model-family proxy.
 
 ## Focused regression
 
@@ -44,9 +57,11 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   --filter q4VerifierUsesDecodeEquivalentMoERows
 ```
 
-Result: 1/1 passed. The test quantizes a complete synthetic Qwen4Exp MoE block
-to q4/g64, proves the four-row result is exactly equal to four width-1 calls,
-and proves a 6-bit block does not enter the new path.
+Result after the scope correction: 4/4 passed. The suite quantizes a complete
+synthetic Qwen4Exp MoE block to q4/g64, proves the four-row result is exactly
+equal to four width-1 calls, proves 2/6-bit blocks do not enter the new path,
+and proves mixed 4S plus q2 2L model-wide maps cannot enable a locally q4
+block.
 
 ## Matched live Release proof
 

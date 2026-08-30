@@ -92,10 +92,12 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
     let base: Qwen35Configuration
     let extras: TextExtras
     let jangMetadata: JangMetadata?
+    let quantizationContainer: BaseConfiguration.QuantizationContainer?
 
     enum CodingKeys: String, CodingKey {
         case text = "text_config"
         case jangMetadata = "jang_config"
+        case quantizationContainer = "quantization"
     }
 
     public init(from decoder: Decoder) throws {
@@ -103,6 +105,9 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         extras = try container.decode(TextExtras.self, forKey: .text)
         jangMetadata = try container.decodeIfPresent(JangMetadata.self, forKey: .jangMetadata)
+        quantizationContainer = try container.decodeIfPresent(
+            BaseConfiguration.QuantizationContainer.self,
+            forKey: .quantizationContainer)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -122,6 +127,29 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
         case "float32", "fp32", "float": .float32
         default: nil
         }
+    }
+
+    /// The row-equivalent verifier workaround is proven only for the released
+    /// 4M checkpoint's complete routed-expert bank. A local q4 sub-block is not
+    /// enough to identify that topology: 4S is mixed q2/q3/q4, and the private
+    /// MTP head can itself carry q4 tensors. Require every trunk layer's three
+    /// routed projections to resolve to affine q4/g64 from bundle metadata.
+    var hasUniformQ4G64TrunkRoutedExperts: Bool {
+        guard base.textConfiguration.hiddenLayers > 0,
+            let quantization = quantizationContainer?.perLayerQuantization
+        else { return false }
+
+        for layer in 0 ..< base.textConfiguration.hiddenLayers {
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                let path = "language_model.layers.\(layer).mlp.switch_mlp.\(projection)"
+                guard let resolved = quantization.quantization(layer: path),
+                    resolved.bits == 4,
+                    resolved.groupSize == 64,
+                    resolved.mode == .affine
+                else { return false }
+            }
+        }
+        return true
     }
 }
 
@@ -1026,7 +1054,8 @@ private final class Qwen4ExpDecoderLayer: Module {
         }
         _mlp.wrappedValue = Qwen35Language.SparseMoeBlock(
             text, layerIdx: layerIndex, allowFusedGateUpCache: false,
-            compileDecodeRegions: true)
+            compileDecodeRegions: true,
+            decodeEquivalentVerifierRows: config.hasUniformQ4G64TrunkRoutedExperts)
         _attentionResidual.wrappedValue = Qwen4ExpGatedResidual(config)
         _mlpResidual.wrappedValue = Qwen4ExpGatedResidual(config)
         if let pleIndex = config.extras.pleLayerIds.firstIndex(of: layerIndex + 1) {
@@ -1153,7 +1182,8 @@ private final class Qwen4ExpMTPDecoderLayer: Module {
         _attention.wrappedValue = Qwen4ExpAttention(config)
         _mlp.wrappedValue = Qwen35Language.SparseMoeBlock(
             config.base.textConfiguration, layerIdx: layerIndex,
-            allowFusedGateUpCache: false, compileDecodeRegions: true)
+            allowFusedGateUpCache: false, compileDecodeRegions: true,
+            decodeEquivalentVerifierRows: false)
         _attentionResidual.wrappedValue = Qwen4ExpGatedResidual(config)
         _mlpResidual.wrappedValue = Qwen4ExpGatedResidual(config)
         super.init()

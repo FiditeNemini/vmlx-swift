@@ -9,10 +9,28 @@ import Testing
 
 @Suite("qwen4_exp configuration")
 struct Qwen4ExpConfigurationTests {
-    private func configData(dtype: String) -> Data {
-        Data("""
+    private func configData(dtype: String, routedBits: [[Int]]? = nil) -> Data {
+        let quantization: String
+        if let routedBits {
+            var entries: [String] = ["\"group_size\":64", "\"bits\":8"]
+            for (layer, bits) in routedBits.enumerated() {
+                precondition(bits.count == 3)
+                for (projection, bit) in zip(
+                    ["gate_proj", "up_proj", "down_proj"], bits)
+                {
+                    entries.append(
+                        "\"language_model.layers.\(layer).mlp.switch_mlp.\(projection)\":"
+                            + "{\"group_size\":64,\"bits\":\(bit)}")
+                }
+            }
+            quantization = "\"quantization\":{\(entries.joined(separator: ","))},"
+        } else {
+            quantization = ""
+        }
+        return Data("""
             {
               "model_type":"qwen4_exp",
+              \(quantization)
               "text_config":{
                 "model_type":"qwen4_exp_text","dtype":"\(dtype)",
                 "mamba_ssm_dtype":"float32","mtp_num_hidden_layers":1,
@@ -89,13 +107,16 @@ struct Qwen4ExpConfigurationTests {
     @Test("4M q4g64 verifier isolates the complete MoE block by decode row")
     func q4VerifierUsesDecodeEquivalentMoERows() throws {
         let config = try JSONDecoder().decode(
-            Qwen4ExpConfiguration.self, from: configData(dtype: "bfloat16"))
+            Qwen4ExpConfiguration.self,
+            from: configData(dtype: "bfloat16", routedBits: [[4, 4, 4], [4, 4, 4]]))
+        #expect(config.hasUniformQ4G64TrunkRoutedExperts)
         var text = config.base.textConfiguration
         text.moeIntermediateSize = 64
         text.sharedExpertIntermediateSize = 64
         let block = Qwen35Language.SparseMoeBlock(
             text, layerIdx: 0,
-            allowFusedGateUpCache: false, compileDecodeRegions: true)
+            allowFusedGateUpCache: false, compileDecodeRegions: true,
+            decodeEquivalentVerifierRows: config.hasUniformQ4G64TrunkRoutedExperts)
         quantize(model: block, groupSize: 64, bits: 4)
 
         let values = (0 ..< (4 * 64)).map { Float(($0 % 37) - 18) / 19 }
@@ -113,10 +134,34 @@ struct Qwen4ExpConfigurationTests {
         for bits in [2, 6] {
             let nonFourBit = Qwen35Language.SparseMoeBlock(
                 text, layerIdx: 0,
-                allowFusedGateUpCache: false, compileDecodeRegions: true)
+                allowFusedGateUpCache: false, compileDecodeRegions: true,
+                decodeEquivalentVerifierRows: true)
             quantize(model: nonFourBit, groupSize: 64, bits: bits)
             #expect(!nonFourBit.requiresDecodeEquivalentRows(input))
         }
+    }
+
+    @Test("mixed 4S and q2 2L routed layouts never enable 4M verifier rows")
+    func mixedAndLowBitLayoutsDoNotEnableVerifierRows() throws {
+        let mixed = try JSONDecoder().decode(
+            Qwen4ExpConfiguration.self,
+            from: configData(dtype: "bfloat16", routedBits: [[3, 3, 3], [3, 2, 4]]))
+        let lowBit = try JSONDecoder().decode(
+            Qwen4ExpConfiguration.self,
+            from: configData(dtype: "bfloat16", routedBits: [[2, 2, 2], [2, 2, 2]]))
+        #expect(!mixed.hasUniformQ4G64TrunkRoutedExperts)
+        #expect(!lowBit.hasUniformQ4G64TrunkRoutedExperts)
+
+        var text = mixed.base.textConfiguration
+        text.moeIntermediateSize = 64
+        text.sharedExpertIntermediateSize = 64
+        let input = MLXArray.zeros([1, 4, 64], dtype: .bfloat16)
+        let mixedBlock = Qwen35Language.SparseMoeBlock(
+            text, layerIdx: 0, allowFusedGateUpCache: false,
+            compileDecodeRegions: true,
+            decodeEquivalentVerifierRows: mixed.hasUniformQ4G64TrunkRoutedExperts)
+        quantize(model: mixedBlock, groupSize: 64, bits: 4)
+        #expect(!mixedBlock.requiresDecodeEquivalentRows(input))
     }
 
     @Test("packed affine metadata preserves checkpoint storage dtype")
