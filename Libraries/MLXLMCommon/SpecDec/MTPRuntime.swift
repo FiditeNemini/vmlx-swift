@@ -142,6 +142,34 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
         return bestDepth
     }
 
+    /// The released 4M Flash-Next sidecar blocked native MTP because runtime
+    /// commit `447a6a2b` could not run its verifier through the decode-only
+    /// fused MoE path. PR #365 removed that exact limitation and re-proved
+    /// q4/g64 AR/D3 byte parity plus a D3 wall-clock win. Recognize only that
+    /// frozen legacy measurement so already-downloaded bundles can use the
+    /// repaired runtime; every other block, and every manual block, remains
+    /// authoritative.
+    public var isSupersededQwen4ExpQ4RowParityBlock: Bool {
+        guard blocked,
+            !manualBlocked,
+            quantizationBits == 4,
+            modelTypes.map(Self.normalizeModelType).contains(where: {
+                ["qwen4_exp", "qwen4_exp_text", "qwen4exp", "qwen4exp_text"].contains($0)
+            }),
+            artifact?.lowercased().contains("binary commit 447a6a2b") == true,
+            reason?.lowercased() == "measured slower than ar at all depths",
+            note?.lowercased().contains("cannot use the decode-only fused moe kernel") == true
+        else { return false }
+        return true
+    }
+
+    private static func normalizeModelType(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: ".", with: "_")
+    }
+
     /// Auto is a global product policy, so a tuning row measured only for one
     /// prompt class must not silently govern unrelated chat, tool, or coding
     /// requests. A caller can still explicitly select a manual depth for a
@@ -244,6 +272,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
     public let outputEquivalent: Bool
     public let blocked: Bool
     public let manualBlocked: Bool
+    public let legacyBlockSuperseded: Bool
     public let cacheMode: String?
     public let promptClass: String?
     public let measuredAt: String?
@@ -266,6 +295,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         outputEquivalent: Bool,
         blocked: Bool,
         manualBlocked: Bool = false,
+        legacyBlockSuperseded: Bool = false,
         cacheMode: String? = nil,
         promptClass: String? = nil,
         measuredAt: String? = nil,
@@ -287,6 +317,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         self.outputEquivalent = outputEquivalent
         self.blocked = blocked
         self.manualBlocked = manualBlocked
+        self.legacyBlockSuperseded = legacyBlockSuperseded
         self.cacheMode = cacheMode
         self.promptClass = promptClass
         self.measuredAt = measuredAt
@@ -310,6 +341,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         case outputEquivalent = "output_equivalent"
         case blocked
         case manualBlocked = "manual_blocked"
+        case legacyBlockSuperseded = "legacy_block_superseded"
         case cacheMode = "cache_mode"
         case promptClass = "prompt_class"
         case measuredAt = "measured_at"
@@ -336,6 +368,7 @@ public struct MTPBundleStatusSnapshot: Codable, Sendable, Equatable {
     public let runtimeCanSpeculativelyDecodeMTP: Bool
     public let speculativeDecodeEnabled: Bool
     public let canAutoLaunch: Bool
+    public let measuredFamilyAutoDepth: Int?
     public let requiresAcceptRejectBeforeEnable: Bool
     public let requiresNativeMTPTuningBeforeAutoLaunch: Bool
     public let bundleHasVision: Bool
@@ -356,6 +389,7 @@ public struct MTPBundleStatusSnapshot: Codable, Sendable, Equatable {
         runtimeCanSpeculativelyDecodeMTP: Bool,
         speculativeDecodeEnabled: Bool,
         canAutoLaunch: Bool,
+        measuredFamilyAutoDepth: Int? = nil,
         requiresAcceptRejectBeforeEnable: Bool,
         requiresNativeMTPTuningBeforeAutoLaunch: Bool,
         bundleHasVision: Bool,
@@ -375,6 +409,7 @@ public struct MTPBundleStatusSnapshot: Codable, Sendable, Equatable {
         self.runtimeCanSpeculativelyDecodeMTP = runtimeCanSpeculativelyDecodeMTP
         self.speculativeDecodeEnabled = speculativeDecodeEnabled
         self.canAutoLaunch = canAutoLaunch
+        self.measuredFamilyAutoDepth = measuredFamilyAutoDepth
         self.requiresAcceptRejectBeforeEnable = requiresAcceptRejectBeforeEnable
         self.requiresNativeMTPTuningBeforeAutoLaunch = requiresNativeMTPTuningBeforeAutoLaunch
         self.bundleHasVision = bundleHasVision
@@ -396,6 +431,7 @@ public struct MTPBundleStatusSnapshot: Codable, Sendable, Equatable {
         case runtimeCanSpeculativelyDecodeMTP = "runtime_can_speculatively_decode_mtp"
         case speculativeDecodeEnabled = "speculative_decode_enabled"
         case canAutoLaunch = "can_auto_launch"
+        case measuredFamilyAutoDepth = "measured_family_auto_depth"
         case requiresAcceptRejectBeforeEnable = "requires_accept_reject_before_enable"
         case requiresNativeMTPTuningBeforeAutoLaunch =
             "requires_native_mtp_tuning_before_auto_launch"
@@ -418,6 +454,7 @@ extension NativeMTPTuning {
             outputEquivalent: outputEquivalent,
             blocked: blocked,
             manualBlocked: manualBlocked,
+            legacyBlockSuperseded: isSupersededQwen4ExpQ4RowParityBlock,
             cacheMode: cacheMode,
             promptClass: promptClass,
             measuredAt: measuredAt,
@@ -445,6 +482,10 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
     public let visionTensorSamples: [String]
     public let configEvidence: [String]
     public let nativeMTPTuning: NativeMTPTuning?
+    /// Narrow family-level cold start backed by current cross-runtime sweeps.
+    /// Bundle-local blocks remain authoritative except for the exact frozen
+    /// 4M block whose recorded runtime limitation PR #365 removed.
+    public let measuredFamilyAutoDepth: Int?
 
     public init(
         bundleHasMTP: Bool = false,
@@ -455,7 +496,8 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         tensorSamples: [String] = [],
         visionTensorSamples: [String] = [],
         configEvidence: [String] = [],
-        nativeMTPTuning: NativeMTPTuning? = nil
+        nativeMTPTuning: NativeMTPTuning? = nil,
+        measuredFamilyAutoDepth: Int? = nil
     ) {
         self.bundleHasMTP = bundleHasMTP
         self.configuredLayers = configuredLayers
@@ -466,6 +508,7 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         self.visionTensorSamples = visionTensorSamples
         self.configEvidence = configEvidence
         self.nativeMTPTuning = nativeMTPTuning
+        self.measuredFamilyAutoDepth = measuredFamilyAutoDepth
     }
 
     public var hasCompleteMTPArtifact: Bool {
@@ -476,16 +519,25 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         nativeMTPTuning?.usableBestDepth != nil
     }
 
+    public var isExplicitlyBlocked: Bool {
+        guard let tuning = nativeMTPTuning else { return false }
+        return tuning.manualBlocked
+            || (tuning.blocked && !tuning.isSupersededQwen4ExpQ4RowParityBlock)
+    }
+
     public var runtimeCanSpeculativelyDecodeMTP: Bool {
         mode.hasSpeculativeAcceptReject || mode == .preservedEnabled
     }
 
     public var requiresNativeMTPTuningBeforeAutoLaunch: Bool {
-        hasCompleteMTPArtifact && runtimeCanSpeculativelyDecodeMTP && !hasUsableNativeMTPTuning
+        hasCompleteMTPArtifact && runtimeCanSpeculativelyDecodeMTP
+            && !hasUsableNativeMTPTuning && measuredFamilyAutoDepth == nil
     }
 
     public var speculativeDecodeEnabled: Bool {
-        hasCompleteMTPArtifact && runtimeCanSpeculativelyDecodeMTP && hasUsableNativeMTPTuning
+        hasCompleteMTPArtifact && runtimeCanSpeculativelyDecodeMTP
+            && !isExplicitlyBlocked
+            && (hasUsableNativeMTPTuning || measuredFamilyAutoDepth != nil)
     }
 
     public var canAutoLaunchMTP: Bool {
@@ -506,8 +558,14 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         if nativeMTPTuning?.manualBlocked == true {
             return "\(base), speculative=off, manual=blocked"
         }
+        if isExplicitlyBlocked {
+            return "\(base), speculative=off, tuning=blocked"
+        }
         if speculativeDecodeEnabled {
-            return "\(base)\(tuned), speculative=on"
+            let family = measuredFamilyAutoDepth.map { ", measured_family=d\($0)" } ?? ""
+            let superseded = nativeMTPTuning?.isSupersededQwen4ExpQ4RowParityBlock == true
+                ? ", legacy_block=superseded_by_row_parity_fix" : ""
+            return "\(base)\(tuned)\(family)\(superseded), speculative=on"
         }
         if requiresNativeMTPTuningBeforeAutoLaunch {
             return "\(base), speculative=off (\(NativeMTPTuning.fileName) tuning required)"
@@ -533,6 +591,7 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
             runtimeCanSpeculativelyDecodeMTP: runtimeCanSpeculativelyDecodeMTP,
             speculativeDecodeEnabled: speculativeDecodeEnabled,
             canAutoLaunch: canAutoLaunchMTP,
+            measuredFamilyAutoDepth: measuredFamilyAutoDepth,
             requiresAcceptRejectBeforeEnable: requiresAcceptRejectBeforeEnable,
             requiresNativeMTPTuningBeforeAutoLaunch: requiresNativeMTPTuningBeforeAutoLaunch,
             bundleHasVision: bundleHasVision,
@@ -708,7 +767,7 @@ public enum NativeMTPActivation {
         if isTuningMeasurementRun {
             return true
         }
-        guard status?.nativeMTPTuning?.manualBlocked != true else {
+        guard status?.isExplicitlyBlocked != true else {
             throw NativeMTPActivationError.requestedWithBlockedTuning(status)
         }
         // Manual-depth activation: the user pressed an explicit depth button.
@@ -719,9 +778,9 @@ public enum NativeMTPActivation {
         if manualDepthRequest != nil {
             return true
         }
-        guard status?.canAutoLaunchMTP == true else {
-            throw NativeMTPActivationError.requestedWithoutUsableTuning(status)
-        }
+        // The full recommendation owns Auto eligibility. Most families still
+        // require bundle-local tuning; Qwen3.8 Flash-Next is the narrow,
+        // measured exception. A status-only gate cannot see config.model_type.
         guard NativeMTPAutoDecodePolicy.recommendation(
             configData: configData,
             jangConfig: nil,
@@ -841,7 +900,7 @@ public enum NativeMTPAutoDecodePolicy {
     ) -> NativeMTPAutoDecodeRecommendation? {
         guard (1...3).contains(depth) else { return nil }
         guard let status, status.hasCompleteMTPArtifact else { return nil }
-        guard status.nativeMTPTuning?.manualBlocked != true else { return nil }
+        guard !status.isExplicitlyBlocked else { return nil }
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
@@ -867,12 +926,17 @@ public enum NativeMTPAutoDecodePolicy {
         requireVerifiedRuntime: Bool = true
     ) -> NativeMTPAutoDecodeRecommendation? {
         guard let status, status.hasCompleteMTPArtifact else { return nil }
-        guard !requireVerifiedRuntime || status.canAutoLaunchMTP else { return nil }
+        guard !requireVerifiedRuntime || status.runtimeCanSpeculativelyDecodeMTP else {
+            return nil
+        }
 
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
         guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
+        let familyColdStartDepth = measuredFamilyColdStartDepth(
+            config: config,
+            fallback: jangConfig?.sourceModel.architecture)
 
         let mode = quantizationMode(config: config, jangConfig: jangConfig)
         let bits = intValue((config?["quantization"] as? [String: Any])?["bits"])
@@ -890,8 +954,7 @@ public enum NativeMTPAutoDecodePolicy {
             "runtime_mode=\(status.mode.rawValue)",
         ]
 
-        if let tuning = status.nativeMTPTuning {
-            guard let depth = tuning.usableBestDepth else { return nil }
+        if let tuning = status.nativeMTPTuning, let depth = tuning.usableBestDepth {
             guard tuningMatchesBundleModelTypes(tuning, modelTypes: modelTypes) else {
                 return nil
             }
@@ -938,7 +1001,32 @@ public enum NativeMTPAutoDecodePolicy {
                 evidence: tuningEvidence)
         }
 
-        // Qwen native MTP is tuning-file driven. A complete tensor artifact
+        // Qwen3.8 Flash-Next has a source-matched measured D3 cold start.
+        // Current Python v1.6.47 (4S/4M) and Swift (2L/4S) both beat
+        // AR/D1/D2 with byte-identical greedy output. The request-local
+        // acceptance controller may still demote D3 for a bad workload.
+        // This is keyed from model_type, never a path/name. Bundle safety
+        // blocks remain authoritative except for the exact frozen 4M block
+        // whose recorded runtime limitation PR #365 removed.
+        if let familyColdStartDepth, !status.isExplicitlyBlocked {
+            let tuningState = status.nativeMTPTuning == nil ? "missing" : "present_unusable"
+            let supersededBlockEvidence =
+                status.nativeMTPTuning?.isSupersededQwen4ExpQ4RowParityBlock == true
+                ? ["legacy_block=superseded_by_qwen4_exp_q4_row_parity_fix"] : []
+            return NativeMTPAutoDecodeRecommendation(
+                depth: familyColdStartDepth,
+                verifierMode: nil,
+                reason:
+                    "Qwen3.8 Flash-Next uses measured family cold-start depth 3; live acceptance may adapt downward.",
+                evidence: evidence + [
+                    "activation=qwen4_exp_measured_family_cold_start",
+                    "family_cold_start_depth=\(familyColdStartDepth)",
+                    "tuning_state=\(tuningState)",
+                ] + supersededBlockEvidence)
+        }
+
+        // Other Qwen native-MTP families remain tuning-file driven. A complete
+        // tensor artifact
         // without `vmlx_mtp_tuning.json` is loadable, but it does not receive
         // automatic speculative launch because depth must come from measured
         // artifact-local proof, not from path/name/profile assumptions.
@@ -1018,6 +1106,23 @@ public enum NativeMTPAutoDecodePolicy {
             result.insert(normalize(text))
         }
         return Array(result)
+    }
+
+    static func measuredFamilyColdStartDepth(
+        config: [String: Any]?,
+        fallback: String?
+    ) -> Int? {
+        modelTypes(config: config, fallback: fallback).contains(where: isQwen4ExpModelType)
+            ? 3 : nil
+    }
+
+    private static func isQwen4ExpModelType(_ value: String) -> Bool {
+        switch normalize(value) {
+        case "qwen4_exp", "qwen4_exp_text", "qwen4exp", "qwen4exp_text":
+            return true
+        default:
+            return false
+        }
     }
 
     private static func quantizationMode(
@@ -1532,6 +1637,9 @@ public enum MTPBundleInspector {
             if case .loaded(let t) = tuningLoad { return t }
             return nil
         }()
+        let measuredFamilyAutoDepth = NativeMTPAutoDecodePolicy.measuredFamilyColdStartDepth(
+            config: config,
+            fallback: jangConfig?.sourceModel.architecture)
 
         let runtimeMode = jangConfig?.runtime.mtpMode ?? .none
         let runtimeBundleHasMTP = jangConfig?.runtime.bundleHasMTP ?? false
@@ -1588,7 +1696,8 @@ public enum MTPBundleInspector {
             tensorSamples: Array(mtpNames.sorted().prefix(8)),
             visionTensorSamples: Array(visionNames.sorted().prefix(8)),
             configEvidence: Array(Set(statusEvidence)).sorted(),
-            nativeMTPTuning: nativeMTPTuning)
+            nativeMTPTuning: nativeMTPTuning,
+            measuredFamilyAutoDepth: measuredFamilyAutoDepth)
     }
 
     private static func configuredMTPLayers(
