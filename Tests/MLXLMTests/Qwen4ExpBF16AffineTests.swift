@@ -123,6 +123,32 @@ struct Qwen4ExpBF16AffineTests {
         }
     }
 
+    @Test("dense affine output is exactly invariant to verifier row batching")
+    func denseRowBatchingIsExact() {
+        let input = (MLXArray(0 ..< 256, [4, 64]).asType(.float32) / 255)
+            .asType(.bfloat16)
+        let denseWeight =
+            (MLXArray(0 ..< 448, [7, 64]).asType(.float32) / 447) - 0.5
+        let (weight, scales, biases) = quantized(
+            denseWeight.asType(.float16), groupSize: 64, bits: 4, mode: .affine)
+
+        let batched = Qwen4ExpBF16Affine.dense(
+            input, weight, scales: scales, biases: biases,
+            groupSize: 64, bits: 4, mode: .affine)
+        let rowWise = concatenated(
+            (0 ..< 4).map { row in
+                Qwen4ExpBF16Affine.dense(
+                    input[row ..< (row + 1), 0...], weight,
+                    scales: scales, biases: biases,
+                    groupSize: 64, bits: 4, mode: .affine)
+            },
+            axis: 0)
+        MLX.eval(batched, rowWise)
+
+        #expect(batched.shape == rowWise.shape)
+        #expect(abs(batched - rowWise).max().item(Float.self) == 0)
+    }
+
     @Test("gathered routed projection keeps BF16 I/O")
     func gatheredParity() throws {
         let input = (MLXArray(0 ..< 128, [2, 64]).asType(.float32) / 127)
