@@ -417,6 +417,65 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("Qwen3.8 4M legacy pre-parity block is superseded without weakening other blocks")
+    func flashNextLegacyQ4RowParityBlockIsSuperseded() async throws {
+        let root = try makeTemporaryBundle(name: "qwen38-4m-legacy-block")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeJSON([
+            "model_type": "qwen4_exp",
+            "mtp_num_hidden_layers": 1,
+            "quantization": ["bits": 4, "group_size": 64],
+        ], to: root.appendingPathComponent("config.json"))
+        try writeJSON([
+            "weight_map": [
+                "mtp.fc.weight": "model-00001-of-00001.safetensors",
+                "mtp.layers.0.self_attn.q_proj.weight": "model-00001-of-00001.safetensors",
+                "model.layers.0.self_attn.q_proj.weight": "model-00001-of-00001.safetensors",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("model.safetensors.index.json"))
+        try writeJSON([
+            "native_mtp": [
+                "verifier_mode": "input_capture_staged",
+                "validated": true,
+                "output_equivalent": false,
+                "blocked": true,
+                "quantization_bits": 4,
+                "model_types": ["qwen4_exp", "qwen4_exp_text"],
+                "artifact": "measured on JANG_4M-aligned (identical tensors), binary commit 447a6a2b",
+                "baseline_tok_s": 39.1,
+                "best_tok_s": 27.1,
+                "speedup_vs_baseline": 0.69,
+                "note": "MTP net slowdown: verifier cannot use the decode-only fused MoE kernel.",
+                "reason": "measured slower than AR at all depths",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("vmlx_mtp_tuning.json"))
+
+        let config = try Data(contentsOf: root.appendingPathComponent("config.json"))
+        let status = try MTPBundleInspector.inspect(modelDirectory: root)
+        let recommendation = NativeMTPAutoDecodePolicy.recommendation(
+            configData: config,
+            jangConfig: nil,
+            status: status)
+
+        #expect(status.nativeMTPTuning?.blocked == true)
+        #expect(status.nativeMTPTuning?.isSupersededQwen4ExpQ4RowParityBlock == true)
+        #expect(!status.isExplicitlyBlocked)
+        #expect(status.canAutoLaunchMTP)
+        #expect(status.snapshot.tuning?.legacyBlockSuperseded == true)
+        #expect(status.statusLine.contains("legacy_block=superseded_by_row_parity_fix"))
+        #expect(recommendation?.depth == 3)
+        #expect(recommendation?.evidence.contains(
+            "legacy_block=superseded_by_qwen4_exp_q4_row_parity_fix") == true)
+
+        let loads = try await NativeMTPActivation.withExplicitRequest(true) {
+            try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                configData: config,
+                baseModelType: "qwen4_exp",
+                status: status)
+        }
+        #expect(loads)
+    }
+
     @Test("measured Flash-Next cold start is not inherited by other Qwen families")
     func flashNextMeasuredFamilyColdStartIsFamilyScoped() {
         let qwen35 = """

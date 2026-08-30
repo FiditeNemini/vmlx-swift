@@ -371,6 +371,57 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
+    @Test("server Auto supersedes only the frozen Qwen3.8 4M pre-parity block")
+    func serverRuntimeAutoSupersedesLegacyFlashNextQ4Block() {
+        let config = """
+        {
+          "model_type": "qwen4_exp",
+          "mtp_num_hidden_layers": 1,
+          "quantization": { "bits": 4, "group_size": 64 }
+        }
+        """.data(using: .utf8)!
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 57,
+            mode: .preservedEnabled,
+            nativeMTPTuning: NativeMTPTuning(
+                validated: true,
+                outputEquivalent: false,
+                blocked: true,
+                artifact: "measured on JANG_4M-aligned (identical tensors), binary commit 447a6a2b",
+                baselineTokensPerSecond: 39.1,
+                bestTokensPerSecond: 27.1,
+                speedupVsBaseline: 0.69,
+                quantizationBits: 4,
+                modelTypes: ["qwen4_exp", "qwen4_exp_text"],
+                note: "MTP net slowdown: verifier cannot use the decode-only fused MoE kernel.",
+                reason: "measured slower than AR at all depths"),
+            measuredFamilyAutoDepth: 3)
+        let settings = VMLXServerRuntimeSettings()
+
+        #expect(settings.resolvedMTPLaunch(
+            configData: config,
+            jangConfig: nil,
+            status: status).recommendation?.depth == 3)
+        #expect(settings.resolvedLoadConfiguration(
+            base: .default,
+            configData: config,
+            jangConfig: nil,
+            status: status).nativeMTP)
+        if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? =
+            settings.resolvedMTPDraftStrategy(
+                configData: config,
+                jangConfig: nil,
+                status: status)
+        {
+            #expect(depth == 3)
+            #expect(verifierMode == nil)
+        } else {
+            Issue.record("Legacy 4M sidecar should resolve server Auto to native MTP D3")
+        }
+    }
+
     @Test("MTP force-on requires complete tensor evidence and tuning")
     func mtpForceOnRequiresCompleteTensorEvidenceAndTuning() {
         var settings = VMLXServerRuntimeSettings()

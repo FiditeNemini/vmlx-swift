@@ -142,6 +142,34 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
         return bestDepth
     }
 
+    /// The released 4M Flash-Next sidecar blocked native MTP because runtime
+    /// commit `447a6a2b` could not run its verifier through the decode-only
+    /// fused MoE path. PR #365 removed that exact limitation and re-proved
+    /// q4/g64 AR/D3 byte parity plus a D3 wall-clock win. Recognize only that
+    /// frozen legacy measurement so already-downloaded bundles can use the
+    /// repaired runtime; every other block, and every manual block, remains
+    /// authoritative.
+    public var isSupersededQwen4ExpQ4RowParityBlock: Bool {
+        guard blocked,
+            !manualBlocked,
+            quantizationBits == 4,
+            modelTypes.map(Self.normalizeModelType).contains(where: {
+                ["qwen4_exp", "qwen4_exp_text", "qwen4exp", "qwen4exp_text"].contains($0)
+            }),
+            artifact?.lowercased().contains("binary commit 447a6a2b") == true,
+            reason?.lowercased() == "measured slower than ar at all depths",
+            note?.lowercased().contains("cannot use the decode-only fused moe kernel") == true
+        else { return false }
+        return true
+    }
+
+    private static func normalizeModelType(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: ".", with: "_")
+    }
+
     /// Auto is a global product policy, so a tuning row measured only for one
     /// prompt class must not silently govern unrelated chat, tool, or coding
     /// requests. A caller can still explicitly select a manual depth for a
@@ -244,6 +272,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
     public let outputEquivalent: Bool
     public let blocked: Bool
     public let manualBlocked: Bool
+    public let legacyBlockSuperseded: Bool
     public let cacheMode: String?
     public let promptClass: String?
     public let measuredAt: String?
@@ -266,6 +295,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         outputEquivalent: Bool,
         blocked: Bool,
         manualBlocked: Bool = false,
+        legacyBlockSuperseded: Bool = false,
         cacheMode: String? = nil,
         promptClass: String? = nil,
         measuredAt: String? = nil,
@@ -287,6 +317,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         self.outputEquivalent = outputEquivalent
         self.blocked = blocked
         self.manualBlocked = manualBlocked
+        self.legacyBlockSuperseded = legacyBlockSuperseded
         self.cacheMode = cacheMode
         self.promptClass = promptClass
         self.measuredAt = measuredAt
@@ -310,6 +341,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         case outputEquivalent = "output_equivalent"
         case blocked
         case manualBlocked = "manual_blocked"
+        case legacyBlockSuperseded = "legacy_block_superseded"
         case cacheMode = "cache_mode"
         case promptClass = "prompt_class"
         case measuredAt = "measured_at"
@@ -422,6 +454,7 @@ extension NativeMTPTuning {
             outputEquivalent: outputEquivalent,
             blocked: blocked,
             manualBlocked: manualBlocked,
+            legacyBlockSuperseded: isSupersededQwen4ExpQ4RowParityBlock,
             cacheMode: cacheMode,
             promptClass: promptClass,
             measuredAt: measuredAt,
@@ -450,7 +483,8 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
     public let configEvidence: [String]
     public let nativeMTPTuning: NativeMTPTuning?
     /// Narrow family-level cold start backed by current cross-runtime sweeps.
-    /// Bundle-local tuning, including an explicit block, remains authoritative.
+    /// Bundle-local blocks remain authoritative except for the exact frozen
+    /// 4M block whose recorded runtime limitation PR #365 removed.
     public let measuredFamilyAutoDepth: Int?
 
     public init(
@@ -486,7 +520,9 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
     }
 
     public var isExplicitlyBlocked: Bool {
-        nativeMTPTuning?.blocked == true || nativeMTPTuning?.manualBlocked == true
+        guard let tuning = nativeMTPTuning else { return false }
+        return tuning.manualBlocked
+            || (tuning.blocked && !tuning.isSupersededQwen4ExpQ4RowParityBlock)
     }
 
     public var runtimeCanSpeculativelyDecodeMTP: Bool {
@@ -522,12 +558,14 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         if nativeMTPTuning?.manualBlocked == true {
             return "\(base), speculative=off, manual=blocked"
         }
-        if nativeMTPTuning?.blocked == true {
+        if isExplicitlyBlocked {
             return "\(base), speculative=off, tuning=blocked"
         }
         if speculativeDecodeEnabled {
             let family = measuredFamilyAutoDepth.map { ", measured_family=d\($0)" } ?? ""
-            return "\(base)\(tuned)\(family), speculative=on"
+            let superseded = nativeMTPTuning?.isSupersededQwen4ExpQ4RowParityBlock == true
+                ? ", legacy_block=superseded_by_row_parity_fix" : ""
+            return "\(base)\(tuned)\(family)\(superseded), speculative=on"
         }
         if requiresNativeMTPTuningBeforeAutoLaunch {
             return "\(base), speculative=off (\(NativeMTPTuning.fileName) tuning required)"
@@ -729,7 +767,7 @@ public enum NativeMTPActivation {
         if isTuningMeasurementRun {
             return true
         }
-        guard status?.nativeMTPTuning?.manualBlocked != true else {
+        guard status?.isExplicitlyBlocked != true else {
             throw NativeMTPActivationError.requestedWithBlockedTuning(status)
         }
         // Manual-depth activation: the user pressed an explicit depth button.
@@ -862,7 +900,7 @@ public enum NativeMTPAutoDecodePolicy {
     ) -> NativeMTPAutoDecodeRecommendation? {
         guard (1...3).contains(depth) else { return nil }
         guard let status, status.hasCompleteMTPArtifact else { return nil }
-        guard status.nativeMTPTuning?.manualBlocked != true else { return nil }
+        guard !status.isExplicitlyBlocked else { return nil }
         let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
@@ -967,13 +1005,14 @@ public enum NativeMTPAutoDecodePolicy {
         // Current Python v1.6.47 (4S/4M) and Swift (2L/4S) both beat
         // AR/D1/D2 with byte-identical greedy output. The request-local
         // acceptance controller may still demote D3 for a bad workload.
-        // This is keyed from model_type, never a path/name, and an explicit
-        // bundle safety block remains authoritative.
-        if let familyColdStartDepth,
-            status.nativeMTPTuning?.blocked != true,
-            status.nativeMTPTuning?.manualBlocked != true
-        {
+        // This is keyed from model_type, never a path/name. Bundle safety
+        // blocks remain authoritative except for the exact frozen 4M block
+        // whose recorded runtime limitation PR #365 removed.
+        if let familyColdStartDepth, !status.isExplicitlyBlocked {
             let tuningState = status.nativeMTPTuning == nil ? "missing" : "present_unusable"
+            let supersededBlockEvidence =
+                status.nativeMTPTuning?.isSupersededQwen4ExpQ4RowParityBlock == true
+                ? ["legacy_block=superseded_by_qwen4_exp_q4_row_parity_fix"] : []
             return NativeMTPAutoDecodeRecommendation(
                 depth: familyColdStartDepth,
                 verifierMode: nil,
@@ -983,7 +1022,7 @@ public enum NativeMTPAutoDecodePolicy {
                     "activation=qwen4_exp_measured_family_cold_start",
                     "family_cold_start_depth=\(familyColdStartDepth)",
                     "tuning_state=\(tuningState)",
-                ])
+                ] + supersededBlockEvidence)
         }
 
         // Other Qwen native-MTP families remain tuning-file driven. A complete
