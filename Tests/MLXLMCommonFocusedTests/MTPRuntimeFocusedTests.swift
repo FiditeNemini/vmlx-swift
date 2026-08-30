@@ -339,6 +339,106 @@ struct MTPRuntimeFocusedTests {
         #expect(status.configEvidence.contains("tuning_file_missing=vmlx_mtp_tuning.json"))
     }
 
+    @Test("Qwen3.8 Flash-Next complete head starts Auto at measured D3 without a sidecar")
+    func flashNextMeasuredFamilyColdStartUsesD3() async throws {
+        let root = try makeTemporaryBundle(name: "qwen38-flash-next-family-d3")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeJSON([
+            "model_type": "qwen4_exp",
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "mtp_num_hidden_layers": 1,
+        ], to: root.appendingPathComponent("config.json"))
+        try writeJSON([
+            "weight_map": [
+                "mtp.fc.weight": "model-00001-of-00001.safetensors",
+                "mtp.layers.0.self_attn.q_proj.weight": "model-00001-of-00001.safetensors",
+                "model.layers.0.self_attn.q_proj.weight": "model-00001-of-00001.safetensors",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("model.safetensors.index.json"))
+
+        let config = try Data(contentsOf: root.appendingPathComponent("config.json"))
+        let status = try MTPBundleInspector.inspect(modelDirectory: root)
+
+        #expect(status.canAutoLaunchMTP)
+        #expect(status.measuredFamilyAutoDepth == 3)
+        #expect(status.statusLine.contains("measured_family=d3"))
+        #expect(status.snapshot.measuredFamilyAutoDepth == 3)
+
+        let recommendation = NativeMTPAutoDecodePolicy.recommendation(
+            configData: config,
+            jangConfig: nil,
+            status: status)
+
+        #expect(recommendation?.depth == 3)
+        #expect(recommendation?.verifierMode == nil)
+        #expect(recommendation?.evidence.contains(
+            "activation=qwen4_exp_measured_family_cold_start") == true)
+        #expect(recommendation?.evidence.contains("tuning_state=missing") == true)
+
+        let loads = try await NativeMTPActivation.withExplicitRequest(true) {
+            try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                configData: config,
+                baseModelType: "qwen4_exp",
+                status: status)
+        }
+        #expect(loads)
+    }
+
+    @Test("Qwen3.8 family cold start never overrides an explicit block")
+    func flashNextMeasuredFamilyColdStartHonorsBlock() async throws {
+        let config = """
+        { "model_type": "qwen4_exp", "mtp_num_hidden_layers": 1 }
+        """.data(using: .utf8)!
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 57,
+            mode: .preservedEnabled,
+            nativeMTPTuning: NativeMTPTuning(
+                bestDepth: 2,
+                blocked: true,
+                reason: "bundle owner blocked this artifact"),
+            measuredFamilyAutoDepth: 3)
+
+        #expect(!status.canAutoLaunchMTP)
+        #expect(status.statusLine.contains("tuning=blocked"))
+        #expect(NativeMTPAutoDecodePolicy.recommendation(
+            configData: config,
+            jangConfig: nil,
+            status: status) == nil)
+
+        await #expect(throws: NativeMTPActivationError.self) {
+            try await NativeMTPActivation.withExplicitRequest(true) {
+                try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                    configData: config,
+                    baseModelType: "qwen4_exp",
+                    status: status)
+            }
+        }
+    }
+
+    @Test("measured Flash-Next cold start is not inherited by other Qwen families")
+    func flashNextMeasuredFamilyColdStartIsFamilyScoped() {
+        let qwen35 = """
+        { "model_type": "qwen3_5", "mtp_num_hidden_layers": 1 }
+        """.data(using: .utf8)!
+        let qwen36 = """
+        { "model_type": "qwen3_6_moe", "mtp_num_hidden_layers": 1 }
+        """.data(using: .utf8)!
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 57,
+            mode: .preservedEnabled)
+
+        for config in [qwen35, qwen36] {
+            #expect(NativeMTPAutoDecodePolicy.recommendation(
+                configData: config,
+                jangConfig: nil,
+                status: status) == nil)
+        }
+    }
+
     @Test("MTP status snapshot exposes tuning gate fields for Osaurus")
     func mtpStatusSnapshotExposesTuningGateFieldsForOsaurus() throws {
         let status = MTPBundleStatus(

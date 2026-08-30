@@ -323,6 +323,54 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
+    @Test("server runtime Auto starts measured Qwen3.8 Flash-Next family at D3")
+    func serverRuntimeAutoStartsMeasuredFlashNextAtD3() {
+        let config = """
+        {
+          "model_type": "qwen4_exp",
+          "mtp_num_hidden_layers": 1,
+          "quantization": { "bits": 4, "group_size": 64 }
+        }
+        """.data(using: .utf8)!
+        let status = MTPBundleStatus(
+            bundleHasMTP: true,
+            configuredLayers: 1,
+            tensorCount: 57,
+            mode: .preservedEnabled,
+            measuredFamilyAutoDepth: 3)
+        let settings = VMLXServerRuntimeSettings()
+
+        let launch = settings.resolvedMTPLaunch(
+            configData: config,
+            jangConfig: nil,
+            status: status)
+        let loadConfiguration = settings.resolvedLoadConfiguration(
+            base: .default,
+            configData: config,
+            jangConfig: nil,
+            status: status)
+
+        #expect(settings.mtp.mode == .auto)
+        #expect(settings.validationIssues(
+            configData: config,
+            jangConfig: nil,
+            mtpStatus: status).isEmpty)
+        #expect(settings.effectiveMTPLaunchMode(for: status) == .speculative)
+        #expect(launch.launchMode == .speculative)
+        #expect(launch.recommendation?.depth == 3)
+        #expect(loadConfiguration.nativeMTP)
+        if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? = settings.resolvedMTPDraftStrategy(
+            configData: config,
+            jangConfig: nil,
+            status: status)
+        {
+            #expect(depth == 3)
+            #expect(verifierMode == nil)
+        } else {
+            Issue.record("Default server settings should resolve Flash-Next Auto to native MTP D3")
+        }
+    }
+
     @Test("MTP force-on requires complete tensor evidence and tuning")
     func mtpForceOnRequiresCompleteTensorEvidenceAndTuning() {
         var settings = VMLXServerRuntimeSettings()
