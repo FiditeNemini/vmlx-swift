@@ -1532,14 +1532,26 @@ struct MTPRuntimeFocusedTests {
             .canUseNativeMTP(for: textOnly))
         #expect(!GenerateParameters(maxTokens: 4, temperature: 0.7, repetitionPenalty: 1.05)
             .canUseNativeMTP(for: textOnly))
-        // Media and bounded KV windows stay ineligible regardless of sampling.
+        // Media stays ineligible regardless of sampling.
         #expect(!GenerateParameters(maxTokens: 4, temperature: 0)
             .canUseNativeMTP(for: imageInput))
         #expect(!GenerateParameters(maxTokens: 4, temperature: 0.7)
             .canUseNativeMTP(for: imageInput))
+        // A bounded window is eligible only when prompt + the declared output
+        // ceiling fits. The effective MTP parameters clear maxKVSize so the
+        // iterator constructs rollback-safe, non-rotating caches while
+        // retaining the same maxTokens ceiling.
         var bounded = GenerateParameters(maxTokens: 4, temperature: 0.7)
         bounded.maxKVSize = 1024
+        #expect(bounded.canUseNativeMTP(for: textOnly))
+        #expect(bounded.nativeMTPEffectiveParameters(for: textOnly)?.maxKVSize == nil)
+        bounded.maxKVSize = 6
         #expect(!bounded.canUseNativeMTP(for: textOnly))
+        var unboundedOutput = GenerateParameters(maxTokens: nil, temperature: 0.7)
+        unboundedOutput.maxKVSize = 1024
+        #expect(!unboundedOutput.canUseNativeMTP(for: textOnly))
+        #expect(!GenerateParameters(maxTokens: 1, temperature: 0)
+            .canUseNativeMTP(for: textOnly))
         // The greedy-lossless flag itself still means greedy: it gates the
         // token-identical parity contract, not general eligibility.
         #expect(!GenerateParameters(maxTokens: 4, temperature: 0.7)

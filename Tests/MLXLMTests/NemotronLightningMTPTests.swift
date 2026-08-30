@@ -171,12 +171,10 @@ struct NemotronLightningMTPTests {
     }
 }
 
-/// Speculation must decline a bounded KV window. `RotatingKVCache` overwrites
-/// evicted positions, so a rejected draft cannot be un-written once rotation
-/// wraps — and on a hybrid stack the Mamba state has no offset to rewind at
-/// all. Declining is the only sound answer; the alternative is subtly wrong
-/// text that no test would catch.
-@Suite("Native MTP requires an unbounded KV window")
+/// Speculation must decline a bounded KV window only when the request can
+/// actually reach rotation. If prompt + maxTokens fits, native MTP constructs
+/// non-rotating caches and retains maxTokens as the original position ceiling.
+@Suite("Native MTP bounded-window safety")
 struct NativeMTPWindowGuardTests {
 
     private func greedy(maxKVSize: Int?) -> GenerateParameters {
@@ -188,10 +186,33 @@ struct NativeMTPWindowGuardTests {
         #expect(greedy(maxKVSize: nil).canUseNativeMTP(for: LMInput(tokens: MLXArray([Int32(1)]))))
     }
 
-    @Test(arguments: [512, 4096, 262_144])
-    func boundedWindowDeclines(_ size: Int) {
-        #expect(!greedy(maxKVSize: size).canUseNativeMTP(for: LMInput(tokens: MLXArray([Int32(1)]))),
-            "maxKVSize \(size) must decline speculation")
+    @Test(arguments: [33, 512, 4096, 262_144])
+    func fittingBoundedWindowUsesNonRotatingCache(_ size: Int) throws {
+        let input = LMInput(tokens: MLXArray([Int32(1)]))
+        let effective = try #require(greedy(maxKVSize: size)
+            .nativeMTPEffectiveParameters(for: input))
+        #expect(effective.maxKVSize == nil)
+        #expect(effective.maxTokens == 32)
+    }
+
+    @Test("a bound below prompt plus output declines")
+    func undersizedBoundDeclines() {
+        let input = LMInput(tokens: MLXArray([Int32(1)]))
+        #expect(!greedy(maxKVSize: 32).canUseNativeMTP(for: input))
+    }
+
+    @Test("a finite bound with no output ceiling declines")
+    func finiteBoundWithoutOutputCeilingDeclines() {
+        let input = LMInput(tokens: MLXArray([Int32(1)]))
+        let parameters = GenerateParameters(maxTokens: nil, maxKVSize: 4096, temperature: 0)
+        #expect(!parameters.canUseNativeMTP(for: input))
+    }
+
+    @Test("a one-token probe stays autoregressive")
+    func oneTokenProbeDeclines() {
+        let input = LMInput(tokens: MLXArray([Int32(1)]))
+        let parameters = GenerateParameters(maxTokens: 1, maxKVSize: 4096, temperature: 0)
+        #expect(!parameters.canUseNativeMTP(for: input))
     }
 }
 

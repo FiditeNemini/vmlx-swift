@@ -523,18 +523,42 @@ public struct GenerateParameters: Sendable {
             && requestedReasoningBudgetTokens == nil
     }
 
+    /// Resolve parameters that are safe for native MTP, or nil when this
+    /// request must stay autoregressive.
+    ///
+    /// A configured `maxKVSize` normally selects `RotatingKVCache`. Rotation
+    /// cannot be rolled back after a rejected draft overwrites an old slot.
+    /// However, when the complete bounded request (prompt + declared output
+    /// ceiling) fits inside that window, rotation is provably unreachable.
+    /// In that case native MTP may use ordinary unbounded cache objects for
+    /// this request while the declared `maxTokens` keeps the same position
+    /// ceiling. This is important for hosts such as Osaurus, whose memory
+    /// safety policy supplies a large finite window even for a 1K-token run;
+    /// treating the mere presence of that cap as ineligible silently turned
+    /// every such MTP request into plain AR.
+    public func nativeMTPEffectiveParameters(for input: LMInput) -> GenerateParameters? {
+        guard isNativeMTPPenaltyFree, !input.hasMediaContent else { return nil }
+        // NativeMTPTokenIterator needs at least one draft/verify cycle. Treat
+        // one-token probes as ordinary AR here so callers do not select the
+        // exclusive MTP lane only for iterator construction to throw.
+        if let maxTokens, maxTokens <= 1 { return nil }
+
+        var resolved = self
+        if let maxKVSize {
+            guard let maxTokens, maxTokens >= 0 else { return nil }
+            let (requiredPositions, overflow) = input.text.tokens.size.addingReportingOverflow(
+                maxTokens)
+            guard !overflow, requiredPositions <= maxKVSize else { return nil }
+            // Avoid constructing RotatingKVCache when native MTP runs. The
+            // request cannot exceed the original bound because maxTokens is
+            // still enforced by the iterator.
+            resolved.maxKVSize = nil
+        }
+        return resolved
+    }
+
     public func canUseNativeMTP(for input: LMInput) -> Bool {
-        isNativeMTPPenaltyFree
-            && !input.hasMediaContent
-            // A bounded KV window makes attention slots `RotatingKVCache`, a
-            // ring buffer that OVERWRITES evicted positions. Once rotation
-            // wraps, a rejected draft cannot be un-written — rolling back by
-            // decrementing `offset` silently restores nothing. Hybrid stacks
-            // make it worse: Mamba state is updated in place and has no offset
-            // at all. Speculation therefore requires an unbounded window, and
-            // the honest response to a bounded one is to decline rather than
-            // emit subtly wrong text.
-            && maxKVSize == nil
+        nativeMTPEffectiveParameters(for: input) != nil
     }
 }
 
