@@ -243,6 +243,12 @@ struct Bench {
         //   BENCH_PERF_SEED    — deterministic stochastic-sampler seed
         //   BENCH_PERF_USE_GENERATION_CONFIG=1 — seed sampling from the
         //     bundle's generation_config.json before explicit env overrides.
+        //   BENCH_PERF_MAX_KV_SIZE — finite request KV window used to verify
+        //     speculative-window eligibility against production caps.
+        //   BENCH_PERF_ALLOCATOR_CACHE_BYTES / MEMORY_LIMIT_FRACTION — load-
+        //     scoped limits matching a production memory-safety plan.
+        //   BENCH_PERF_PERSISTENT_ALLOCATOR_CACHE_BYTES — post-load MLX
+        //     freed-buffer reuse limit for allocator-policy A/B measurements.
         if (env["BENCH_PERF"] ?? "0") == "1" {
             try await runPerfBench(
                 modelPath: modelPath, maxNew: maxNew,
@@ -8407,13 +8413,17 @@ func runPerfBench(
             context = loaded.0
             jangPressRuntime = loaded.1
         } else if nativeMTPRequestedAtLoad {
+            let allocatorCap: ResidentCap = env["BENCH_PERF_ALLOCATOR_CACHE_BYTES"]
+                .flatMap(UInt64.init).map(ResidentCap.absolute) ?? .unlimited
+            let memoryCap: ResidentCap = env["BENCH_PERF_MEMORY_LIMIT_FRACTION"]
+                .flatMap(Double.init).map(ResidentCap.fraction) ?? .unlimited
             let loaded = try await MLXLMCommon.loadModel(
                 from: modelDir,
                 using: #huggingFaceTokenizerLoader(),
                 loadConfiguration: LoadConfiguration(
                     jangPress: .disabled,
-                    maxResidentBytes: .unlimited,
-                    memoryLimit: .unlimited,
+                    maxResidentBytes: allocatorCap,
+                    memoryLimit: memoryCap,
                     useMmapSafetensors: useMmap,
                     nativeMTP: true))
             context = loaded.0
@@ -8431,6 +8441,11 @@ func runPerfBench(
                     from: modelDir, using: #huggingFaceTokenizerLoader())
                 jangPressRuntime = nil
             }
+        }
+        if let persistentAllocatorCap = env["BENCH_PERF_PERSISTENT_ALLOCATOR_CACHE_BYTES"]
+            .flatMap(Int.init)
+        {
+            MLX.Memory.cacheLimit = persistentAllocatorCap
         }
         let rssAfterLoad = currentRSSMiB()
         let footprintAfterLoad = currentPhysFootprintMiB()
@@ -8662,6 +8677,9 @@ func runPerfBench(
             }
             if let nativeMTPDepth = env["BENCH_PERF_NATIVE_MTP_DEPTH"].flatMap(Int.init) {
                 params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
+            }
+            if let maxKVSize = env["BENCH_PERF_MAX_KV_SIZE"].flatMap(Int.init) {
+                params.maxKVSize = maxKVSize
             }
             switch (env["BENCH_PERF_KV_MODE"] ?? "none").lowercased() {
             case "tq", "tq44", "turboquant":
