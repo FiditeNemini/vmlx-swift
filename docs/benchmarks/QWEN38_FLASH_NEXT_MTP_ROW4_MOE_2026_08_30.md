@@ -1,5 +1,11 @@
 # Qwen3.8 Flash-Next native-MTP row-4 MoE proof (2026-08-30)
 
+> Follow-up: the separate 4M whole-model parity blocker described below was
+> subsequently isolated and fixed. See
+> `QWEN38_FLASH_NEXT_4M_MTP_ROW_PARITY_2026_08_30.md` for the retained source
+> change and matched AR/D3 Release proof. The measurements in this document
+> remain the historical 2L row-4-kernel evidence.
+
 ## Scope and verdict
 
 Runtime source head: `c1162b43a6144349e630fb13894d495ce74faa7e`

@@ -1959,6 +1959,9 @@ enum Qwen35Language {
     }
 
     final class SparseMoeBlock: Module, UnaryLayer {
+        private static let rowIsolationLogLock = NSLock()
+        private nonisolated(unsafe) static var didReportRowIsolation = false
+
         let normTopkProb: Bool
         let numExperts: Int
         let topK: Int
@@ -2064,7 +2067,47 @@ enum Qwen35Language {
                 groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
         }
 
+        /// The released 4M Flash-Next routed bank is uniformly affine q4/g64.
+        /// Its greedy AR path evaluates one token at a time, while native MTP
+        /// verifies two to four positions together. Running the complete MoE
+        /// block per row preserves the AR router, expert and shared-expert
+        /// numerical contract instead of merely splitting the final routed
+        /// kernel after width-sensitive decisions have already been made.
+        ///
+        /// This stays deliberately topology-scoped: 2L/4S/6S use different
+        /// routed bit layouts and retain their measured multi-row verifier.
+        func requiresDecodeEquivalentRows(_ x: MLXArray) -> Bool {
+            let rows = x.size / x.dim(-1)
+            guard compileDecodeRegions, (2 ... 4).contains(rows),
+                let affine = switchMLP as? SwitchGLU
+            else { return false }
+            return affine.hasUniformAffineQuantization(bits: 4, groupSize: 64)
+        }
+
+        private func reportDecodeEquivalentRows() {
+            Self.rowIsolationLogLock.lock()
+            defer { Self.rowIsolationLogLock.unlock() }
+            guard !Self.didReportRowIsolation else { return }
+            Self.didReportRowIsolation = true
+            FileHandle.standardError.write(
+                Data(
+                    "[Qwen4Exp] moe_verify_rows=decode_equivalent topology=q4g64\n"
+                        .utf8))
+        }
+
         func callAsFunction(_ x: MLXArray) -> MLXArray {
+            if requiresDecodeEquivalentRows(x) {
+                let rows = x.size / x.dim(-1)
+                let hidden = x.dim(-1)
+                let rowInputs = MLX.split(
+                    x.reshaped(1, rows, hidden), parts: rows, axis: 1)
+                let result = MLX.concatenated(
+                    rowInputs.map { callAsFunction($0) }, axis: 1
+                ).reshaped(x.shape)
+                reportDecodeEquivalentRows()
+                return result
+            }
+
             let inds: MLXArray
             let scores: MLXArray
             if let compiled = compiledRouter(x) {

@@ -374,6 +374,20 @@ public class SwitchGLU: Module, SwitchGLULayer {
         return reducer(input, indices, scores)
     }
 
+    /// True only when all three resident affine expert projections use the
+    /// requested packing. Qwen3.8 Flash-Next uses this narrow topology probe
+    /// to distinguish its uniform 4M routed bank from the 2L/4S/6S layouts;
+    /// it does not infer model identity from a bundle name.
+    public func hasUniformAffineQuantization(bits: Int, groupSize: Int) -> Bool {
+        guard let gate = gateProj as? QuantizedSwitchLinear,
+            let up = upProj as? QuantizedSwitchLinear,
+            let down = downProj as? QuantizedSwitchLinear
+        else { return false }
+        return [gate, up, down].allSatisfy {
+            $0.bits == bits && $0.groupSize == groupSize && $0.mode == .affine
+        }
+    }
+
     /// Variant for model graphs that weight each routed activation before its
     /// expert down projection. The score tensor has the same leading shape as
     /// `indices`; sorting keeps scores aligned with the expert dispatch rows.

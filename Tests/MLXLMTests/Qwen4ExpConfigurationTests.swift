@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXNN
 import Testing
 
 @testable import MLXVLM
@@ -83,6 +84,39 @@ struct Qwen4ExpConfigurationTests {
             "language_model.layers.0.attn_hyper_connection.hc_norm.weight"]?.dtype == .bfloat16)
         #expect(sanitized["language_model.layers.0.linear_attn.A_log"]?.dtype == .float32)
 
+    }
+
+    @Test("4M q4g64 verifier isolates the complete MoE block by decode row")
+    func q4VerifierUsesDecodeEquivalentMoERows() throws {
+        let config = try JSONDecoder().decode(
+            Qwen4ExpConfiguration.self, from: configData(dtype: "bfloat16"))
+        var text = config.base.textConfiguration
+        text.moeIntermediateSize = 64
+        text.sharedExpertIntermediateSize = 64
+        let block = Qwen35Language.SparseMoeBlock(
+            text, layerIdx: 0,
+            allowFusedGateUpCache: false, compileDecodeRegions: true)
+        quantize(model: block, groupSize: 64, bits: 4)
+
+        let values = (0 ..< (4 * 64)).map { Float(($0 % 37) - 18) / 19 }
+        let input = MLXArray(values).reshaped(1, 4, 64).asType(.bfloat16)
+        #expect(block.requiresDecodeEquivalentRows(input))
+
+        let batched = block(input)
+        let rows = MLX.split(input, parts: 4, axis: 1)
+        let independent = MLX.concatenated(rows.map { block($0) }, axis: 1)
+        let error = max(
+            abs(batched.asType(.float32) - independent.asType(.float32)))
+        MLX.eval(error)
+        #expect(error.item(Float.self) == 0)
+
+        for bits in [2, 6] {
+            let nonFourBit = Qwen35Language.SparseMoeBlock(
+                text, layerIdx: 0,
+                allowFusedGateUpCache: false, compileDecodeRegions: true)
+            quantize(model: nonFourBit, groupSize: 64, bits: bits)
+            #expect(!nonFourBit.requiresDecodeEquivalentRows(input))
+        }
     }
 
     @Test("packed affine metadata preserves checkpoint storage dtype")
