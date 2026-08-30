@@ -1966,6 +1966,7 @@ enum Qwen35Language {
         let numExperts: Int
         let topK: Int
         let compileDecodeRegions: Bool
+        let decodeEquivalentVerifierRows: Bool
 
         @ModuleInfo(key: "gate") var gate: Linear
         @ModuleInfo(key: "switch_mlp") var switchMLP: Module
@@ -1977,12 +1978,14 @@ enum Qwen35Language {
             _ args: Qwen35Configuration.TextConfiguration,
             layerIdx: Int = -1,
             allowFusedGateUpCache: Bool = true,
-            compileDecodeRegions: Bool = false
+            compileDecodeRegions: Bool = false,
+            decodeEquivalentVerifierRows: Bool = false
         ) {
             self.normTopkProb = args.normTopkProb
             self.numExperts = args.numExperts
             self.topK = args.numExpertsPerTok
             self.compileDecodeRegions = compileDecodeRegions
+            self.decodeEquivalentVerifierRows = decodeEquivalentVerifierRows
 
             _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
             let weightFormat = args.weightFormat.lowercased()
@@ -2078,7 +2081,8 @@ enum Qwen35Language {
         /// routed bit layouts and retain their measured multi-row verifier.
         func requiresDecodeEquivalentRows(_ x: MLXArray) -> Bool {
             let rows = x.size / x.dim(-1)
-            guard compileDecodeRegions, (2 ... 4).contains(rows),
+            guard decodeEquivalentVerifierRows,
+                compileDecodeRegions, (2 ... 4).contains(rows),
                 let affine = switchMLP as? SwitchGLU
             else { return false }
             return affine.hasUniformAffineQuantization(bits: 4, groupSize: 64)
