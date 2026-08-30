@@ -380,6 +380,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         guard input.text.tokens.size > 0 else {
             throw NativeMTPRuntimeError.emptyPrompt
         }
+        try Task.checkCancellation()
         if NativeMTPGDNReplayDiagnostics.enabled {
             NativeMTPGDNReplayDiagnostics.reset()
         }
@@ -599,6 +600,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         let start = Date.timeIntervalSinceReferenceDate
+        try Task.checkCancellation()
         let prepared = try model.prepare(
             inputForPrepare,
             cache: self.cache,
@@ -621,6 +623,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 processor: &processor)
                 .token
             let syncStart = Date.timeIntervalSinceReferenceDate
+            try Task.checkCancellation()
             MLX.eval(firstToken)
             self.materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
             self.seedMainForwardTime += Date.timeIntervalSinceReferenceDate - seedStart
@@ -649,6 +652,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 processor: &processor)
                 .token
             let syncStart = Date.timeIntervalSinceReferenceDate
+            try Task.checkCancellation()
             MLX.eval(firstToken)
             self.materializeSyncTime += Date.timeIntervalSinceReferenceDate - syncStart
         }
@@ -659,6 +663,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         pendingTokens.append(firstID)
 
         let bridgeStart = Date.timeIntervalSinceReferenceDate
+        try Task.checkCancellation()
         let bridge = model.nativeBackboneForward(Self.tokenInput(firstToken), cache: self.cache)
         let secondToken = Self.sampleLast(
             logits: bridge.logits,
@@ -667,6 +672,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             processor: &processor)
             .token
         let secondSyncStart = Date.timeIntervalSinceReferenceDate
+        try Task.checkCancellation()
         MLX.eval(secondToken)
         self.materializeSyncTime += Date.timeIntervalSinceReferenceDate - secondSyncStart
         self.seedMainForwardTime += Date.timeIntervalSinceReferenceDate - bridgeStart
@@ -675,6 +681,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         nextMain = secondToken
         pendingTokens.append(recordMaterializeSync { secondToken.item(Int.self) })
         let draftStart = Date.timeIntervalSinceReferenceDate
+        try Task.checkCancellation()
         let draftBatch = Self.makeDrafts(
             model: model,
             hidden: Self.lastHidden(bridge.hiddenStates),

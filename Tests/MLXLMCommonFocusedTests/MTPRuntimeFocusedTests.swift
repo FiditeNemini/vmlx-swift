@@ -1426,6 +1426,92 @@ struct MTPRuntimeFocusedTests {
         }
     }
 
+    @Test("BatchEngine publishes a cancellable stream before native MTP prefill")
+    func batchEngineDefersNativeMTPIteratorConstruction() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repoRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
+            encoding: .utf8)
+        let nativeStart = try #require(source.range(
+            of: "case .nativeMTP(depth: let depth, verifierMode: _) = strategy"))
+        let arStart = try #require(source.range(
+            of: "// Defer TokenIterator construction",
+            range: nativeStart.upperBound..<source.endIndex))
+        let nativeBranch = String(source[nativeStart.lowerBound..<arStart.lowerBound])
+
+        #expect(nativeBranch.contains("generateTaskDeferred("))
+        #expect(nativeBranch.contains("try Task.checkCancellation()"))
+        #expect(nativeBranch.contains("let deferredInputs = SendableBox("))
+        #expect(!nativeBranch.contains("let iterator = try NativeMTPTokenIterator("))
+    }
+
+    @Test("BatchEngine publishes a cancellable stream before DFlash setup")
+    func batchEngineDefersDFlashIteratorConstruction() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repoRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift"),
+            encoding: .utf8)
+        let dflashStart = try #require(source.range(
+            of: "let drafterPath = strategy.dflash2DrafterPath"))
+        let nativeStart = try #require(source.range(
+            of: "case .nativeMTP(depth: let depth, verifierMode: _) = strategy",
+            range: dflashStart.upperBound..<source.endIndex))
+        let dflashBranch = String(source[dflashStart.lowerBound..<nativeStart.lowerBound])
+
+        #expect(dflashBranch.contains("generateTaskDeferred("))
+        #expect(dflashBranch.contains("try Task.checkCancellation()"))
+        #expect(dflashBranch.contains("let deferredInputs = SendableBox("))
+        #expect(!dflashBranch.contains("let iterator = try DFlash2TokenIterator("))
+    }
+
+    @Test("DFlash prefill checks cancellation around GPU materialization")
+    func dflashInitChecksCancellationBeforeGPUStages() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repoRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Libraries/MLXLMCommon/SpecDec/DFlash2TokenIterator.swift"),
+            encoding: .utf8)
+
+        #expect(source.contains(
+            "while start < tokens.count {\n            try Task.checkCancellation()"))
+        #expect(source.contains(
+            "try Task.checkCancellation()\n        MLX.eval(lastLogits, retained)"))
+    }
+
+    @Test("native MTP prefill has cancellation checkpoints around GPU materialization")
+    func nativeMTPInitChecksCancellationBeforeGPUStages() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repoRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Libraries/MLXLMCommon/SpecDec/NativeMTPTokenIterator.swift"),
+            encoding: .utf8)
+
+        #expect(source.contains(
+            "try Task.checkCancellation()\n        let prepared = try model.prepare("))
+        #expect(source.contains(
+            "try Task.checkCancellation()\n        let bridge = model.nativeBackboneForward"))
+        #expect(source.contains(
+            "try Task.checkCancellation()\n        let draftBatch = Self.makeDrafts("))
+    }
+
     @Test("BatchEngine.submit rejects native MTP instead of silently batching AR")
     func batchEngineSubmitRejectsNativeMTP() async throws {
         try await FocusedMLXTestSupport.withLock {
