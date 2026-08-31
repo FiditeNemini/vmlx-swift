@@ -874,6 +874,7 @@ let package = Package(
                 "DiskStoreOffsetConsistencyFocusedTests.swift",
                 "ExpertDownProjectionQuantOrderTests.swift",
                 "VMLXUmbrellaProductTests.swift",
+                "PEFTAdapterTranslationTests.swift",
                 "ZayaConfigDecodeFocusedTests.swift",
                 "VLShapeGuardFocusedTests.swift",
                 "JANGTQStreamingExpertDescriptorTests.swift",
