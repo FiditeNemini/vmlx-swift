@@ -869,6 +869,7 @@ let package = Package(
                 "NativeMTPActivationErrorTextTests.swift",
                 "HybridWarmupMemoScopeTests.swift",
                 "BatchEngineGrowingChatCacheSourceTests.swift",
+                "ProcessorPatchSizeShapeTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",
                 "VMLXUmbrellaProductTests.swift",
