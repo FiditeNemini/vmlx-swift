@@ -907,6 +907,7 @@ let package = Package(
                 "CompilableKVCacheSnapshotTests.swift",
                 "DFlash2DispatchReachabilityTests.swift",
                 "MixedGroupSizeQuantizationFocusedTests.swift",
+                "JangSamplingDefaultsTests.swift",
                 "MLXPressCLISourceContractsTests.swift",
                 "VMLXServerRuntimeSettingsTests.swift",
                 "VMLXMemorySafetySettingsTests.swift",
