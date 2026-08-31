@@ -2165,12 +2165,13 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
     }
 
-    /// The hybrid cross-turn reuse boundary: the index of the LAST turn-start
-    /// token (`<|im_start|>` / `<start_of_turn>`), i.e. the end of the prompt
-    /// once its trailing generation prompt is stripped. The next chat turn
-    /// replaces that generation prompt with the assistant's reply, so the
-    /// full-prompt key never matches again, but this boundary does — it is what
-    /// gives hybrid models cross-turn prefix reuse at all.
+    /// The hybrid cross-turn reuse boundary. Prefer the canonical history
+    /// boundary derived from the exact active chat template (including the
+    /// assistant-continuation LCP proof); fall back to the model-load suffix
+    /// heuristic only for raw/benchmark inputs that carry no canonical chat
+    /// boundaries. The next chat turn replaces the generation prompt with the
+    /// assistant's reply, so the full-prompt key never matches again, but this
+    /// boundary does — it is what gives hybrid models cross-turn prefix reuse.
     ///
     /// Returns `nil` when the boundary cannot pay for itself: dense models reuse
     /// via the post-answer boundary, media inputs are excluded, and with every
@@ -2181,12 +2182,16 @@ public struct TokenIterator: TokenIteratorProtocol {
         promptTokenIds: [Int],
         input: LMInput
     ) -> Int? {
+        let heuristicBoundary = coordinator?.genPromptSuffixTokens.first
+            .flatMap { promptTokenIds.lastIndex(of: $0) }
+        let canonicalBoundary = input.cachePrefixTokenCounts
+            .filter { $0 > 0 && $0 < promptTokenIds.count }
+            .max()
         guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
             let coordinator,
             coordinator.isHybrid,
             coordinator.canPersistBoundaries,
-            let turnStartTok = coordinator.genPromptSuffixTokens.first,
-            let stripAt = promptTokenIds.lastIndex(of: turnStartTok),
+            let stripAt = canonicalBoundary ?? heuristicBoundary,
             stripAt > 0, stripAt < promptTokenIds.count,
             input.canCaptureHybridStripBoundary(
                 promptTokenIds: promptTokenIds,

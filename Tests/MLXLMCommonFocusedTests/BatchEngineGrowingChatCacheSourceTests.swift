@@ -263,8 +263,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("coordinator.hasValidatedDiskEntry("))
     }
 
-    @Test("token iterator drains MLX around cache store before completion info")
-    func tokenIteratorDrainsMLXAroundCacheStoreBeforeCompletionInfo() throws {
+    @Test("token iterator publishes info early but finishes only after cache store drain")
+    func tokenIteratorFinishesOnlyAfterCacheStoreDrain() throws {
         let source = try String(
             contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
             encoding: .utf8)
@@ -273,31 +273,28 @@ struct BatchEngineGrowingChatCacheSourceTests {
 
         let onEnd = try #require(task.range(of: "handler.onGenerationEnd(emit: continuation.yield)"))
         let store = try #require(task.range(of: "iterator.storeCacheAfterGeneration("))
+        let info = try #require(task.range(
+            of: "handler.infoEvent(info)",
+            range: onEnd.upperBound..<store.lowerBound))
         let preStoreSync = try #require(task.range(
             of: "Stream().synchronize()",
-            range: onEnd.upperBound..<store.lowerBound))
+            range: info.upperBound..<store.lowerBound))
         let postStoreSync = try #require(task.range(
             of: "Stream().synchronize()",
             range: store.upperBound..<task.endIndex))
         let advisorDrain = try #require(task.range(
             of: "MLXPressCanonicalExpertAdvisor.shared.waitUntilIdle()",
             range: postStoreSync.upperBound..<task.endIndex))
-        let info = try #require(task.range(
-            of: "handler.infoEvent(info)",
-            range: advisorDrain.upperBound..<task.endIndex))
         let finish = try #require(task.range(
             of: "continuation.finish()",
-            range: info.upperBound..<task.endIndex))
+            range: advisorDrain.upperBound..<task.endIndex))
 
-        #expect(onEnd.lowerBound < preStoreSync.lowerBound)
+        #expect(onEnd.lowerBound < info.lowerBound)
+        #expect(info.lowerBound < preStoreSync.lowerBound)
         #expect(preStoreSync.lowerBound < store.lowerBound)
         #expect(store.lowerBound < postStoreSync.lowerBound)
         #expect(postStoreSync.lowerBound < advisorDrain.lowerBound)
-        #expect(advisorDrain.lowerBound < info.lowerBound)
-        #expect(info.lowerBound < finish.lowerBound)
-        #expect(task.range(
-            of: "handler.infoEvent(info)",
-            range: onEnd.upperBound..<store.lowerBound) == nil)
+        #expect(advisorDrain.lowerBound < finish.lowerBound)
     }
 
     @Test("token iterator materializes disk cache restores before prefill")

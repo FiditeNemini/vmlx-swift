@@ -249,6 +249,84 @@ struct CanonicalChatCacheBoundariesTests {
         }
     }
 
+    /// Raptor/Qwen-shaped separator rewrite: an open generation rail carries a
+    /// newline before `<role>`, while materialising the assistant continuation
+    /// removes that newline. A no-generation render alone therefore publishes
+    /// one token too far into history.
+    private struct RewrittenAssistantSeparatorTokenizer: GenerationPromptControllableTokenizer {
+        var bosToken: String? { nil }
+        var eosToken: String? { nil }
+        var unknownToken: String? { nil }
+
+        func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+        func convertTokenToId(_ token: String) -> Int? { nil }
+        func convertIdToToken(_ id: Int) -> String? { nil }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
+            try applyChatTemplate(
+                messages: messages, tools: tools,
+                additionalContext: additionalContext, addGenerationPrompt: true)
+        }
+
+        func applyChatTemplate(
+            messages: [[String: any Sendable]],
+            tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?,
+            addGenerationPrompt: Bool
+        ) throws -> [Int] {
+            var result = [1]
+            for message in messages {
+                switch message["role"] as? String {
+                case "system": result.append(10)
+                case "user": result.append(30)
+                case "assistant":
+                    result.append(157_151) // <role>
+                    let content = message["content"] as? String ?? ""
+                    result.append(content.first == "0" ? 60 : 61)
+                default: result.append(50)
+                }
+            }
+            if addGenerationPrompt {
+                result.append(198) // newline present only on the open rail
+                result.append(157_151)
+                result.append(40)
+            } else if messages.last?["role"] as? String == "user" {
+                result.append(198)
+            }
+            return result
+        }
+    }
+
+    @Test("history boundary excludes a separator rewritten by the next assistant continuation")
+    func rewrittenAssistantSeparatorIsExcludedFromHistoryBoundary() throws {
+        let tokenizer = RewrittenAssistantSeparatorTokenizer()
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "rules"],
+            ["role": "user", "content": "read two files"],
+        ]
+        let prompt = try tokenizer.applyChatTemplate(
+            messages: messages, tools: tools, additionalContext: nil,
+            addGenerationPrompt: true)
+        let boundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer,
+            messages: messages,
+            tools: tools,
+            additionalContext: nil,
+            promptTokens: prompt)
+
+        #expect(prompt == [1, 10, 30, 198, 157_151, 40])
+        // The old no-generation boundary was 4 and included token 198. The
+        // future structured assistant render has <role> at index 3, so only
+        // the first three tokens are cross-turn stable.
+        #expect(boundaries.all.contains(3))
+        #expect(!boundaries.all.contains(4))
+    }
+
     @Test("a trailing assistant continuation still publishes a history boundary")
     func trailingAssistantContinuationPublishesHistoryBoundary() {
         let tokenizer = ContinuationRailTokenizer()

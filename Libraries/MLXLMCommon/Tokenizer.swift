@@ -250,6 +250,63 @@ public func canonicalChatCacheBoundaries(
         return exactPrefixBoundary(messages: Array(messages.dropLast()))
     }
 
+    /// Prove that the newest history boundary survives the next assistant
+    /// continuation, rather than only proving that a no-generation render is
+    /// a prefix of the CURRENT prompt.
+    ///
+    /// Some templates rewrite the separator immediately before the assistant
+    /// rail when an assistant/tool message is materialised. Raptor/Qwen-shaped
+    /// tool history exposed the concrete failure: the current user prompt ended
+    /// in `\n<role>assistant`, while the next structured tool-call render used
+    /// `<role>assistant` at that same position. The old boundary included the
+    /// newline, so an otherwise identical growing prompt missed its just-written
+    /// SSD entry and fell back to the static system prefix.
+    ///
+    /// Render two divergent future assistant messages and retain only the LCP
+    /// shared by both renders AND the active prompt. Divergent contents prove
+    /// the boundary contains no assistant-controlled payload; comparison with
+    /// the active prompt preserves the exact-token KV invariant. This is
+    /// template-derived and model-family agnostic.
+    func assistantContinuationStableBoundary() -> Int? {
+        guard !messages.isEmpty else { return nil }
+
+        func renderProbe(_ content: String) -> [Int]? {
+            var probeMessages = messages
+            probeMessages.append(["role": "assistant", "content": content])
+            return try? controllable.applyChatTemplate(
+                messages: probeMessages,
+                tools: tools,
+                additionalContext: additionalContext,
+                addGenerationPrompt: false)
+        }
+
+        guard let probeA = renderProbe("0"),
+              let probeB = renderProbe("z"),
+              !probeA.isEmpty,
+              !probeB.isEmpty
+        else {
+            return nil
+        }
+
+        let limit = min(probeA.count, probeB.count, promptTokens.count)
+        var boundary = 0
+        while boundary < limit,
+              probeA[boundary] == probeB[boundary],
+              probeA[boundary] == promptTokens[boundary]
+        {
+            boundary += 1
+        }
+
+        guard boundary > 0,
+              boundary < probeA.count,
+              boundary < probeB.count,
+              boundary < promptTokens.count
+        else {
+            return nil
+        }
+        return boundary
+    }
+
     /// Intermediate turn-aligned rungs between the stable prefix and the
     /// newest history boundary.
     ///
@@ -292,7 +349,8 @@ public func canonicalChatCacheBoundaries(
         return rungs
     }
 
-    let historyTop = exactPrefixBoundary(messages: messages)
+    let historyTop = assistantContinuationStableBoundary()
+        ?? exactPrefixBoundary(messages: messages)
         ?? trailingContinuationBoundary()
     let history = historyTop.map { [$0] + historyLadder(below: $0) } ?? []
     let all = Array(Set(stable + history)).sorted()
