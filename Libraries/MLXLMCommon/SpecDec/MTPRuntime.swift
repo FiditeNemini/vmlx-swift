@@ -78,6 +78,9 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
     public let speedupVsBaseline: Double?
     public let quantizationMode: String?
     public let quantizationBits: Int?
+    /// Canonical per-tensor bit/group topology measured by the tuning row.
+    /// A scalar bit count cannot identify mixed JANG bundles.
+    public let quantizationFingerprint: String?
     public let modelTypes: [String]
     public let note: String?
     public let reason: String?
@@ -98,6 +101,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
         speedupVsBaseline: Double? = nil,
         quantizationMode: String? = nil,
         quantizationBits: Int? = nil,
+        quantizationFingerprint: String? = nil,
         modelTypes: [String] = [],
         note: String? = nil,
         reason: String? = nil
@@ -117,6 +121,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
         self.speedupVsBaseline = speedupVsBaseline
         self.quantizationMode = quantizationMode
         self.quantizationBits = quantizationBits
+        self.quantizationFingerprint = quantizationFingerprint
         self.modelTypes = modelTypes
         self.note = note
         self.reason = reason
@@ -236,6 +241,8 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
             speedupVsBaseline: try c.decodeIfPresent(Double.self, forKey: .speedupVsBaseline),
             quantizationMode: try c.decodeIfPresent(String.self, forKey: .quantizationMode),
             quantizationBits: try c.decodeIfPresent(Int.self, forKey: .quantizationBits),
+            quantizationFingerprint: try c.decodeIfPresent(
+                String.self, forKey: .quantizationFingerprint),
             modelTypes: try c.decodeIfPresent([String].self, forKey: .modelTypes) ?? [],
             note: try c.decodeIfPresent(String.self, forKey: .note),
             reason: try c.decodeIfPresent(String.self, forKey: .reason))
@@ -257,6 +264,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
         case speedupVsBaseline = "speedup_vs_baseline"
         case quantizationMode = "quantization_mode"
         case quantizationBits = "quantization_bits"
+        case quantizationFingerprint = "quantization_fingerprint"
         case modelTypes = "model_types"
         case note
         case reason
@@ -282,6 +290,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
     public let speedupVsBaseline: Double?
     public let quantizationMode: String?
     public let quantizationBits: Int?
+    public let quantizationFingerprint: String?
     public let modelTypes: [String]
     public let note: String?
     public let reason: String?
@@ -305,6 +314,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         speedupVsBaseline: Double? = nil,
         quantizationMode: String? = nil,
         quantizationBits: Int? = nil,
+        quantizationFingerprint: String? = nil,
         modelTypes: [String] = [],
         note: String? = nil,
         reason: String? = nil
@@ -327,6 +337,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         self.speedupVsBaseline = speedupVsBaseline
         self.quantizationMode = quantizationMode
         self.quantizationBits = quantizationBits
+        self.quantizationFingerprint = quantizationFingerprint
         self.modelTypes = modelTypes
         self.note = note
         self.reason = reason
@@ -351,6 +362,7 @@ public struct NativeMTPTuningSnapshot: Codable, Sendable, Equatable {
         case speedupVsBaseline = "speedup_vs_baseline"
         case quantizationMode = "quantization_mode"
         case quantizationBits = "quantization_bits"
+        case quantizationFingerprint = "quantization_fingerprint"
         case modelTypes = "model_types"
         case note
         case reason
@@ -376,6 +388,7 @@ public struct MTPBundleStatusSnapshot: Codable, Sendable, Equatable {
     public let tensorSamples: [String]
     public let visionTensorSamples: [String]
     public let configEvidence: [String]
+    public let quantizationFingerprint: String?
     public let tuning: NativeMTPTuningSnapshot?
 
     public init(
@@ -397,6 +410,7 @@ public struct MTPBundleStatusSnapshot: Codable, Sendable, Equatable {
         tensorSamples: [String] = [],
         visionTensorSamples: [String] = [],
         configEvidence: [String] = [],
+        quantizationFingerprint: String? = nil,
         tuning: NativeMTPTuningSnapshot? = nil
     ) {
         self.mode = mode
@@ -417,6 +431,7 @@ public struct MTPBundleStatusSnapshot: Codable, Sendable, Equatable {
         self.tensorSamples = tensorSamples
         self.visionTensorSamples = visionTensorSamples
         self.configEvidence = configEvidence
+        self.quantizationFingerprint = quantizationFingerprint
         self.tuning = tuning
     }
 
@@ -440,12 +455,17 @@ public struct MTPBundleStatusSnapshot: Codable, Sendable, Equatable {
         case tensorSamples = "tensor_samples"
         case visionTensorSamples = "vision_tensor_samples"
         case configEvidence = "config_evidence"
+        case quantizationFingerprint = "quantization_fingerprint"
         case tuning
     }
 }
 
 extension NativeMTPTuning {
     public var snapshot: NativeMTPTuningSnapshot {
+        makeSnapshot(legacyBlockSuperseded: false)
+    }
+
+    func makeSnapshot(legacyBlockSuperseded: Bool) -> NativeMTPTuningSnapshot {
         NativeMTPTuningSnapshot(
             bestDepth: bestDepth,
             usableBestDepth: usableBestDepth,
@@ -454,7 +474,7 @@ extension NativeMTPTuning {
             outputEquivalent: outputEquivalent,
             blocked: blocked,
             manualBlocked: manualBlocked,
-            legacyBlockSuperseded: isSupersededQwen4ExpQ4RowParityBlock,
+            legacyBlockSuperseded: legacyBlockSuperseded,
             cacheMode: cacheMode,
             promptClass: promptClass,
             measuredAt: measuredAt,
@@ -464,9 +484,61 @@ extension NativeMTPTuning {
             speedupVsBaseline: speedupVsBaseline,
             quantizationMode: quantizationMode,
             quantizationBits: quantizationBits,
+            quantizationFingerprint: quantizationFingerprint,
             modelTypes: modelTypes,
             note: note,
             reason: reason)
+    }
+}
+
+/// Stable identity for a mixed-quantization bundle. JANG configs carry a
+/// default plus per-tensor overrides, so `bits=4` or `bits=8` alone is not an
+/// artifact identity and can select tuning measured on different kernels.
+enum MTPQuantizationTopology {
+    static let qwen38FourM =
+        "default=8x64;all=3x32:96,4x32:32,4x64:157,8x64:519;"
+        + "mtp=4x64:13;expert=4x64:144;ple=3x32:96,4x32:32,8x64:2"
+
+    static func fingerprint(config: [String: Any]?) -> String? {
+        guard let quantization = config?["quantization"] as? [String: Any] else {
+            return nil
+        }
+        let defaultBits = intValue(quantization["bits"])
+        let defaultGroupSize = intValue(quantization["group_size"])
+        guard defaultBits != nil || defaultGroupSize != nil else { return nil }
+
+        var all: [String: Int] = [:]
+        var mtp: [String: Int] = [:]
+        var expert: [String: Int] = [:]
+        var ple: [String: Int] = [:]
+        for (name, raw) in quantization {
+            guard let override = raw as? [String: Any],
+                let bits = intValue(override["bits"]),
+                let groupSize = intValue(override["group_size"])
+            else { continue }
+            let key = "\(bits)x\(groupSize)"
+            all[key, default: 0] += 1
+            if name.hasPrefix("mtp.") { mtp[key, default: 0] += 1 }
+            if name.contains("switch_mlp") { expert[key, default: 0] += 1 }
+            if name.contains(".ple.") { ple[key, default: 0] += 1 }
+        }
+
+        func render(_ values: [String: Int]) -> String {
+            if values.isEmpty { return "none" }
+            return values.keys.sorted().map { "\($0):\(values[$0] ?? 0)" }
+                .joined(separator: ",")
+        }
+        let defaultLabel = "\(defaultBits.map(String.init) ?? "?")x"
+            + "\(defaultGroupSize.map(String.init) ?? "?")"
+        return "default=\(defaultLabel);all=\(render(all));mtp=\(render(mtp));"
+            + "expert=\(render(expert));ple=\(render(ple))"
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) }
+        return nil
     }
 }
 
@@ -482,6 +554,9 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
     public let visionTensorSamples: [String]
     public let configEvidence: [String]
     public let nativeMTPTuning: NativeMTPTuning?
+    /// Canonical topology from the active bundle's config, including mixed
+    /// per-tensor bit widths and group sizes.
+    public let quantizationFingerprint: String?
     /// Narrow family-level cold start backed by current cross-runtime sweeps.
     /// Bundle-local blocks remain authoritative except for the exact frozen
     /// 4M block whose recorded runtime limitation PR #365 removed.
@@ -497,6 +572,7 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         visionTensorSamples: [String] = [],
         configEvidence: [String] = [],
         nativeMTPTuning: NativeMTPTuning? = nil,
+        quantizationFingerprint: String? = nil,
         measuredFamilyAutoDepth: Int? = nil
     ) {
         self.bundleHasMTP = bundleHasMTP
@@ -508,6 +584,7 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         self.visionTensorSamples = visionTensorSamples
         self.configEvidence = configEvidence
         self.nativeMTPTuning = nativeMTPTuning
+        self.quantizationFingerprint = quantizationFingerprint
         self.measuredFamilyAutoDepth = measuredFamilyAutoDepth
     }
 
@@ -519,10 +596,15 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         nativeMTPTuning?.usableBestDepth != nil
     }
 
+    public var isLegacyBlockSuperseded: Bool {
+        nativeMTPTuning?.isSupersededQwen4ExpQ4RowParityBlock == true
+            && quantizationFingerprint == MTPQuantizationTopology.qwen38FourM
+    }
+
     public var isExplicitlyBlocked: Bool {
         guard let tuning = nativeMTPTuning else { return false }
         return tuning.manualBlocked
-            || (tuning.blocked && !tuning.isSupersededQwen4ExpQ4RowParityBlock)
+            || (tuning.blocked && !isLegacyBlockSuperseded)
     }
 
     public var runtimeCanSpeculativelyDecodeMTP: Bool {
@@ -563,7 +645,7 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         }
         if speculativeDecodeEnabled {
             let family = measuredFamilyAutoDepth.map { ", measured_family=d\($0)" } ?? ""
-            let superseded = nativeMTPTuning?.isSupersededQwen4ExpQ4RowParityBlock == true
+            let superseded = isLegacyBlockSuperseded
                 ? ", legacy_block=superseded_by_row_parity_fix" : ""
             return "\(base)\(tuned)\(family)\(superseded), speculative=on"
         }
@@ -599,7 +681,9 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
             tensorSamples: tensorSamples,
             visionTensorSamples: visionTensorSamples,
             configEvidence: configEvidence,
-            tuning: nativeMTPTuning?.snapshot)
+            quantizationFingerprint: quantizationFingerprint,
+            tuning: nativeMTPTuning?.makeSnapshot(
+                legacyBlockSuperseded: isLegacyBlockSuperseded))
     }
 }
 
@@ -942,12 +1026,14 @@ public enum NativeMTPAutoDecodePolicy {
         let bits = intValue((config?["quantization"] as? [String: Any])?["bits"])
             ?? Int(jangConfig?.quantization.targetBits.rounded() ?? 0)
         let profile = jangConfig?.quantization.profile.lowercased()
+        let quantizationFingerprint = MTPQuantizationTopology.fingerprint(config: config)
         let isMoE = modelTypes.contains { $0.contains("moe") }
             || (jangConfig?.architecture.hasMoE == true)
         let evidence = [
             "model_types=\(modelTypes.sorted().joined(separator: ","))",
             "quantization_mode=\(mode ?? "unknown")",
             "quantization_bits=\(bits)",
+            "quantization_fingerprint=\(quantizationFingerprint ?? "unknown")",
             "profile=\(profile ?? "none")",
             "moe=\(isMoE)",
             "mtp_tensors=\(status.tensorCount)",
@@ -958,7 +1044,9 @@ public enum NativeMTPAutoDecodePolicy {
             guard tuningMatchesBundleModelTypes(tuning, modelTypes: modelTypes) else {
                 return nil
             }
-            guard tuningMatchesBundleQuantization(tuning, mode: mode, bits: bits) else {
+            guard tuningMatchesBundleQuantization(
+                tuning, mode: mode, bits: bits, fingerprint: quantizationFingerprint)
+            else {
                 return nil
             }
             var tuningEvidence = evidence + [
@@ -974,6 +1062,9 @@ public enum NativeMTPAutoDecodePolicy {
             }
             if let quantizationBits = tuning.quantizationBits {
                 tuningEvidence.append("tuning.quantization_bits=\(quantizationBits)")
+            }
+            if let tuningFingerprint = tuning.quantizationFingerprint {
+                tuningEvidence.append("tuning.quantization_fingerprint=\(tuningFingerprint)")
             }
             if inferredMXFP8TuningFromArtifact(tuning, mode: mode, bits: bits) {
                 tuningEvidence.append("tuning.quantization_inferred_from_artifact=mxfp8")
@@ -1011,7 +1102,7 @@ public enum NativeMTPAutoDecodePolicy {
         if let familyColdStartDepth, !status.isExplicitlyBlocked {
             let tuningState = status.nativeMTPTuning == nil ? "missing" : "present_unusable"
             let supersededBlockEvidence =
-                status.nativeMTPTuning?.isSupersededQwen4ExpQ4RowParityBlock == true
+                status.isLegacyBlockSuperseded
                 ? ["legacy_block=superseded_by_qwen4_exp_q4_row_parity_fix"] : []
             return NativeMTPAutoDecodeRecommendation(
                 depth: familyColdStartDepth,
@@ -1085,7 +1176,10 @@ public enum NativeMTPAutoDecodePolicy {
         let mode = quantizationMode(config: config, jangConfig: jangConfig)
         let bits = intValue((config?["quantization"] as? [String: Any])?["bits"])
             ?? Int(jangConfig?.quantization.targetBits.rounded() ?? 0)
-        if let reason = quantizationMismatchReason(tuning, mode: mode, bits: bits) {
+        let fingerprint = MTPQuantizationTopology.fingerprint(config: config)
+        if let reason = quantizationMismatchReason(
+            tuning, mode: mode, bits: bits, fingerprint: fingerprint)
+        {
             return reason
         }
 
@@ -1145,9 +1239,11 @@ public enum NativeMTPAutoDecodePolicy {
     private static func tuningMatchesBundleQuantization(
         _ tuning: NativeMTPTuning,
         mode: String?,
-        bits: Int
+        bits: Int,
+        fingerprint: String?
     ) -> Bool {
-        quantizationMismatchReason(tuning, mode: mode, bits: bits) == nil
+        quantizationMismatchReason(
+            tuning, mode: mode, bits: bits, fingerprint: fingerprint) == nil
     }
 
     private static func tuningMatchesBundleModelTypes(
@@ -1173,8 +1269,14 @@ public enum NativeMTPAutoDecodePolicy {
     private static func quantizationMismatchReason(
         _ tuning: NativeMTPTuning,
         mode: String?,
-        bits: Int
+        bits: Int,
+        fingerprint: String?
     ) -> String? {
+        if let tuningFingerprint = tuning.quantizationFingerprint {
+            guard let fingerprint, tuningFingerprint == fingerprint else {
+                return "\(NativeMTPTuning.fileName) quantization_fingerprint does not match the active bundle's per-tensor bit/group topology."
+            }
+        }
         let bundleMode = mode.map(normalize)
         let tuningMode = tuning.quantizationMode.map(normalize)
         if bundleMode == "mxfp8" {
@@ -1640,6 +1742,7 @@ public enum MTPBundleInspector {
         let measuredFamilyAutoDepth = NativeMTPAutoDecodePolicy.measuredFamilyColdStartDepth(
             config: config,
             fallback: jangConfig?.sourceModel.architecture)
+        let quantizationFingerprint = MTPQuantizationTopology.fingerprint(config: config)
 
         let runtimeMode = jangConfig?.runtime.mtpMode ?? .none
         let runtimeBundleHasMTP = jangConfig?.runtime.bundleHasMTP ?? false
@@ -1648,6 +1751,9 @@ public enum MTPBundleInspector {
         var statusEvidence = evidence
         if runtimeBundleHasMTP {
             statusEvidence.append("jang_config.runtime.bundle_has_mtp=true")
+        }
+        if let quantizationFingerprint {
+            statusEvidence.append("quantization_fingerprint=\(quantizationFingerprint)")
         }
         if let nativeMTPTuning {
             statusEvidence.append("tuning_file=\(NativeMTPTuning.fileName)")
@@ -1659,6 +1765,9 @@ public enum MTPBundleInspector {
             }
             if let quantizationBits = nativeMTPTuning.quantizationBits {
                 statusEvidence.append("tuning.quantization_bits=\(quantizationBits)")
+            }
+            if let tuningFingerprint = nativeMTPTuning.quantizationFingerprint {
+                statusEvidence.append("tuning.quantization_fingerprint=\(tuningFingerprint)")
             }
             statusEvidence.append("tuning.validated=\(nativeMTPTuning.validated)")
             statusEvidence.append("tuning.output_equivalent=\(nativeMTPTuning.outputEquivalent)")
@@ -1697,6 +1806,7 @@ public enum MTPBundleInspector {
             visionTensorSamples: Array(visionNames.sorted().prefix(8)),
             configEvidence: Array(Set(statusEvidence)).sorted(),
             nativeMTPTuning: nativeMTPTuning,
+            quantizationFingerprint: quantizationFingerprint,
             measuredFamilyAutoDepth: measuredFamilyAutoDepth)
     }
 

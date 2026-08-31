@@ -190,6 +190,95 @@ struct MTPRuntimeFocusedTests {
         #expect(recommendation?.reason.contains("vmlx_mtp_tuning.json") == true)
     }
 
+    @Test("MTP tuning fingerprint distinguishes group size at the same bit width")
+    func mtpTuningFingerprintDistinguishesGroupSize() throws {
+        let root = try makeTemporaryBundle(name: "qwen-mtp-topology-tuning")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let matchingQuantization: [String: Any] = [
+            "mode": "mxfp4",
+            "bits": 8,
+            "group_size": 64,
+            "mtp.fc.weight": ["bits": 4, "group_size": 64],
+        ]
+        let matchingConfig: [String: Any] = [
+            "model_type": "qwen3_vl",
+            "text_config": [
+                "model_type": "qwen3_5_moe_text",
+                "num_hidden_layers": 48,
+                "mtp_num_hidden_layers": 1,
+            ] as [String: Any],
+            "quantization": matchingQuantization,
+        ]
+        let matchingFingerprint = try #require(
+            MTPQuantizationTopology.fingerprint(config: matchingConfig))
+        try writeJSON(matchingConfig, to: root.appendingPathComponent("config.json"))
+        try writeJSON([
+            "runtime": [
+                "bundle_has_mtp": true,
+                "mtp_layers": 1,
+                "mtp_mode": "preserved_enabled",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("jang_config.json"))
+        try writeJSON([
+            "weight_map": [
+                "mtp.fc.weight": "model-00001-of-00001.safetensors",
+                "mtp.layers.0.self_attn.q_proj.weight": "model-00001-of-00001.safetensors",
+                "model.layers.0.self_attn.q_proj.weight": "model-00001-of-00001.safetensors",
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("model.safetensors.index.json"))
+        try writeJSON([
+            "native_mtp": [
+                "best_depth": 2,
+                "validated": true,
+                "output_equivalent": true,
+                "quantization_mode": "mxfp4",
+                "quantization_bits": 8,
+                "quantization_fingerprint": matchingFingerprint,
+                "model_types": ["qwen3_5_moe_text"],
+                "artifact": "docs/internal/release-gates/qwen-topology/result.json",
+                "baseline_tok_s": 24.0,
+                "best_tok_s": 42.0,
+                "speedup_vs_baseline": 1.75,
+            ] as [String: Any],
+        ], to: root.appendingPathComponent("vmlx_mtp_tuning.json"))
+
+        let matchingStatus = try MTPBundleInspector.inspect(modelDirectory: root)
+        let matchingData = try Data(contentsOf: root.appendingPathComponent("config.json"))
+        #expect(matchingStatus.quantizationFingerprint == matchingFingerprint)
+        #expect(matchingStatus.snapshot.tuning?.quantizationFingerprint == matchingFingerprint)
+        #expect(NativeMTPAutoDecodePolicy.recommendation(
+            configData: matchingData,
+            jangConfig: try? JangLoader.loadConfig(at: root),
+            status: matchingStatus)?.depth == 2)
+
+        var mismatchedQuantization = matchingQuantization
+        mismatchedQuantization["mtp.fc.weight"] = ["bits": 4, "group_size": 32]
+        let mismatchedConfig: [String: Any] = [
+            "model_type": "qwen3_vl",
+            "text_config": [
+                "model_type": "qwen3_5_moe_text",
+                "num_hidden_layers": 48,
+                "mtp_num_hidden_layers": 1,
+            ] as [String: Any],
+            "quantization": mismatchedQuantization,
+        ]
+        try writeJSON(mismatchedConfig, to: root.appendingPathComponent("config.json"))
+        let mismatchedStatus = try MTPBundleInspector.inspect(modelDirectory: root)
+        let mismatchedData = try Data(contentsOf: root.appendingPathComponent("config.json"))
+        let rejection = NativeMTPAutoDecodePolicy.rejectionReason(
+            configData: mismatchedData,
+            jangConfig: try? JangLoader.loadConfig(at: root),
+            status: mismatchedStatus)
+
+        #expect(mismatchedStatus.quantizationFingerprint != matchingFingerprint)
+        #expect(NativeMTPAutoDecodePolicy.recommendation(
+            configData: mismatchedData,
+            jangConfig: try? JangLoader.loadConfig(at: root),
+            status: mismatchedStatus) == nil)
+        #expect(rejection?.contains("quantization_fingerprint") == true)
+    }
+
     @Test("MXFP8 MTP tuning must explicitly match bundle quantization")
     func mxfp8MTPTuningMustExplicitlyMatchBundleQuantization() throws {
         let root = try makeTemporaryBundle(name: "qwen-mxfp8-mtp-tuning")
@@ -421,10 +510,37 @@ struct MTPRuntimeFocusedTests {
     func flashNextLegacyQ4RowParityBlockIsSuperseded() async throws {
         let root = try makeTemporaryBundle(name: "qwen38-4m-legacy-block")
         defer { try? FileManager.default.removeItem(at: root) }
+        var quantization: [String: Any] = ["bits": 8, "group_size": 64]
+        for index in 0 ..< 96 {
+            quantization["language_model.layers.1.ple.ngram_embedding.shards.\(index)"] = [
+                "bits": 3, "group_size": 32,
+            ]
+        }
+        for index in 96 ..< 128 {
+            quantization["language_model.layers.1.ple.ngram_embedding.shards.\(index)"] = [
+                "bits": 4, "group_size": 32,
+            ]
+        }
+        for index in 0 ..< 2 {
+            quantization["language_model.layers.\(index).ple.key_proj"] = [
+                "bits": 8, "group_size": 64,
+            ]
+        }
+        for index in 0 ..< 144 {
+            quantization["language_model.layers.\(index).mlp.switch_mlp.proj"] = [
+                "bits": 4, "group_size": 64,
+            ]
+        }
+        for index in 0 ..< 13 {
+            quantization["mtp.projection.\(index)"] = ["bits": 4, "group_size": 64]
+        }
+        for index in 0 ..< 517 {
+            quantization["language_model.dense.\(index)"] = ["bits": 8, "group_size": 64]
+        }
         try writeJSON([
             "model_type": "qwen4_exp",
             "mtp_num_hidden_layers": 1,
-            "quantization": ["bits": 4, "group_size": 64],
+            "quantization": quantization,
         ], to: root.appendingPathComponent("config.json"))
         try writeJSON([
             "weight_map": [
@@ -459,6 +575,9 @@ struct MTPRuntimeFocusedTests {
 
         #expect(status.nativeMTPTuning?.blocked == true)
         #expect(status.nativeMTPTuning?.isSupersededQwen4ExpQ4RowParityBlock == true)
+        #expect(status.quantizationFingerprint ==
+            "default=8x64;all=3x32:96,4x32:32,4x64:157,8x64:519;mtp=4x64:13;expert=4x64:144;ple=3x32:96,4x32:32,8x64:2")
+        #expect(status.isLegacyBlockSuperseded)
         #expect(!status.isExplicitlyBlocked)
         #expect(status.canAutoLaunchMTP)
         #expect(status.snapshot.tuning?.legacyBlockSuperseded == true)
@@ -474,6 +593,23 @@ struct MTPRuntimeFocusedTests {
                 status: status)
         }
         #expect(loads)
+
+        // The artifact wording alone must not unblock a different mixed
+        // topology. One group-size change means different kernels and makes
+        // the old measurement inapplicable.
+        quantization["language_model.layers.0.mlp.switch_mlp.proj"] = [
+            "bits": 4, "group_size": 32,
+        ]
+        try writeJSON([
+            "model_type": "qwen4_exp",
+            "mtp_num_hidden_layers": 1,
+            "quantization": quantization,
+        ], to: root.appendingPathComponent("config.json"))
+        let changedStatus = try MTPBundleInspector.inspect(modelDirectory: root)
+        #expect(changedStatus.nativeMTPTuning?.isSupersededQwen4ExpQ4RowParityBlock == true)
+        #expect(!changedStatus.isLegacyBlockSuperseded)
+        #expect(changedStatus.isExplicitlyBlocked)
+        #expect(!changedStatus.canAutoLaunchMTP)
     }
 
     @Test("measured Flash-Next cold start is not inherited by other Qwen families")
