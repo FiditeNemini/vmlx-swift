@@ -352,7 +352,14 @@ class DeepseekV3MoE: Module, UnaryLayer {
         let (indices, scores) = gate(x)
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y = switchMLP(x, indices)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        // Router scores are float32 for numerical stability; cast back
+        // before applying so the f32 does not leak into the residual
+        // stream. Without the cast every layer past firstKDenseReplace ran
+        // — and cached KV — in float32 (observed live on a deepseek_v3 MoE
+        // bundle: 46/48 layers' disk cache entries stored F32 at exactly
+        // twice the bf16 size), doubling decode compute, KV bandwidth, and
+        // disk cache footprint.
+        y = (y * scores[.ellipsis, .newAxis].asType(y.dtype)).sum(axis: -2)
 
         if let shared = sharedExperts {
             y = y + shared(x)
