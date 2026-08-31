@@ -123,6 +123,15 @@ public final class DiskCache: @unchecked Sendable {
     /// an inherited file before it can take the fast path.
     private var validatedFiles: [String: ValidatedFileFingerprint] = [:]
 
+    /// Trace-only identity of the most recent boundary written by this cache
+    /// instance. Growing agent loops can store N tokens and immediately probe N
+    /// tokens under a different hash on the next turn; counts alone hide where
+    /// the prompt stopped being a prefix. Retain the IDs only while explicit
+    /// cache tracing is enabled so the miss log can report the first divergent
+    /// token without changing cache selection or normal-process memory use.
+    private var traceLastStoredTokens: [Int]?
+    private var traceLastStoredHash: String?
+
     /// Thread-safe copy of current disk-cache counters.
     public func snapshotStats() -> DiskCacheStats {
         lock.lock()
@@ -269,6 +278,10 @@ public final class DiskCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         stores += 1
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            traceLastStoredTokens = tokens
+            traceLastStoredHash = hash
+        }
 
         // A normal warm request fetches an L2 entry and then publishes the
         // same prompt boundary again at completion. Rewriting it used to
@@ -394,6 +407,23 @@ public final class DiskCache: @unchecked Sendable {
                     ("[vmlx][cache/disk-fetch] noFile count=\(tokens.count) "
                         + "hash=\(hash.prefix(12)) modelKey=\(modelKey ?? "nil") "
                         + "salt=\(mediaSalt.map { String($0.prefix(12)) } ?? "nil")\n").utf8))
+                if let stored = traceLastStoredTokens,
+                   stored.count == tokens.count,
+                   let storedHash = traceLastStoredHash,
+                   storedHash != hash
+                {
+                    var index = 0
+                    while index < tokens.count, stored[index] == tokens[index] {
+                        index += 1
+                    }
+                    let storedID = index < stored.count ? String(stored[index]) : "end"
+                    let requestedID = index < tokens.count ? String(tokens[index]) : "end"
+                    FileHandle.standardError.write(Data(
+                        ("[vmlx][cache/key-divergence] count=\(tokens.count) "
+                            + "storedHash=\(storedHash.prefix(12)) fetchHash=\(hash.prefix(12)) "
+                            + "firstDiff=\(index) storedToken=\(storedID) fetchToken=\(requestedID)\n")
+                            .utf8))
+                }
             }
             return nil
         }
