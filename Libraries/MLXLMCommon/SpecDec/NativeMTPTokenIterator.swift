@@ -827,6 +827,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         releaseCompiledVerify()
         if let coordinator = cacheCoordinator,
            !promptTokenIds.isEmpty,
+           // Auxiliary (title/suggestion/summary) prompts never store a
+           // boundary — see `CachePromptIntent.auxiliary`.
+           originalInput.cachePromptIntent != .auxiliary,
            let promptCacheSnapshot
         {
             // Shared with the solo and batched engines — see the note there.
