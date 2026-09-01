@@ -1855,11 +1855,22 @@ public enum MTPBundleInspector {
     }
 
     private static func loadTensorNames(from directory: URL) throws -> [String] {
+        // The index, when present, is a fast path — but it must never VETO
+        // tensors that are physically in the shards. Observed live
+        // (Qwen3.8-27B-JANG_4D): the stamping pipeline wrote 31 `mtp.*`
+        // tensors into the safetensors but omitted every one of them from
+        // `model.safetensors.index.json`'s 2,348-entry weight_map, so an
+        // index-only read reported `tensors=0 metadata_only_missing_weights`
+        // and refused both auto and manual MTP for a bundle whose head is
+        // complete. Union the index keys with the header scan; headers cost
+        // one small read per shard and this runs only at load-time
+        // inspection.
+        var names: Set<String> = []
         let indexURL = directory.appendingPathComponent("model.safetensors.index.json")
         if let index = try loadJSONObjectIfExists(indexURL),
             let weightMap = index["weight_map"] as? [String: Any]
         {
-            return Array(weightMap.keys)
+            names.formUnion(weightMap.keys)
         }
 
         let contents =
@@ -1869,11 +1880,10 @@ public enum MTPBundleInspector {
                 options: [.skipsHiddenFiles])) ?? []
         let safetensors = contents.filter { $0.pathExtension == "safetensors" }
 
-        var names: [String] = []
         for file in safetensors {
-            names.append(contentsOf: try safetensorsHeaderNames(file))
+            names.formUnion(try safetensorsHeaderNames(file))
         }
-        return names
+        return Array(names)
     }
 
     private struct NativeMTPTuningDocument: Decodable {
