@@ -279,15 +279,28 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private(set) var verifyPrefetchSubmitCount = 0
     private(set) var verifyPrefetchConsumedCount = 0
     private(set) var verifyPrefetchAbandonedCount = 0
-    // Default OFF pending the QSA-indexer interaction fix: measured on
-    // Qwen3.8-Flash-Next JANG_4M counting, prefetch ON is +10-18% below the
-    // QSA indexer budget (ctx<2048: 51.1 vs 43-49 tok/s baseline) but
-    // -15-18% once the indexer lanes engage (2.7-3.9k ctx: 38.0/36.6 vs
-    // 46.2/45.0), with materialize-sync growing from 5.2s to 20.2-20.8s per
-    // ~1120-token run — suspected per-op stream fences against the
-    // background scheduling thread. `VMLX_MTP_VERIFY_PREFETCH=1` opts in.
+    // Default ON, constrained by the regime gate below. Ungated, prefetch
+    // measured +10-18% below the QSA indexer budget but -15-18% once the
+    // indexer lanes engage (suspected stream fencing against the background
+    // scheduling thread — vmlx-swift#384 tracks lifting the gate). With the
+    // gate: 52.1 tok/s @1.4k (prefetch 151/151/0) vs ~46 off-curve, and
+    // byte-stable parity above the gate (counters 0/0/0, materialize-sync
+    // back to its baseline 4.9-5.3s). `VMLX_MTP_VERIFY_PREFETCH=0` disables.
     private static let verifyPrefetchEnabled =
-        ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] == "1"
+        ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] != "0"
+
+    /// Context ceiling for prefetch eligibility — see the regime gate in
+    /// `maybePrefetchNextVerify`. Default matches the qwen4_exp QSA
+    /// indexer budget.
+    private static let verifyPrefetchMaxContext: Int = {
+        if let raw = ProcessInfo.processInfo
+            .environment["VMLX_MTP_VERIFY_PREFETCH_MAX_CTX"],
+            let value = Int(raw), value > 0
+        {
+            return value
+        }
+        return 2048
+    }()
 
     private(set) var verifyCalls = 0
     private(set) var acceptedByDepth: [Int: Int] = [:]
@@ -1744,6 +1757,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             let primary = nextMain,
             !drafts.isEmpty
         else { return }
+        // Regime gate: prefetch measured +10-18% while the QSA sparse
+        // indexer is bypassed (short/medium context) but -15-18% once the
+        // indexer lanes engage — the background scheduling thread appears
+        // to fence against the indexer's extra cache lane (vmlx-swift#384).
+        // Until that interaction is fixed, only prefetch below the
+        // indexer-engagement region. Threshold matches qwen4_exp's
+        // indexer_budget (block 4 × top-512 = 2048); tunable for other
+        // topologies via VMLX_MTP_VERIFY_PREFETCH_MAX_CTX.
+        let contextOffset = cache.lazy.map(\.offset).max() ?? 0
+        if contextOffset + drafts.count + 1 > Self.verifyPrefetchMaxContext {
+            return
+        }
         // Nothing left in the token budget to overlap against.
         if let maxTokens, tokenCount + (pendingTokens.count - pendingIndex) >= maxTokens {
             return
