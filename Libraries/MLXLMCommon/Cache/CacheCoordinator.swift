@@ -103,6 +103,7 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// hybrid topology that owns its companion tensors inside the v2 layer
     /// payload and therefore sets this false.
     private var _requiresRecurrentSSMCompanion: Bool = false
+    private var _requiresSeparateRecurrentPayload: Bool = false
 
     /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
     /// Whether the model has hybrid pool caches (DeepseekV4 SWA+CSA+HSA)
@@ -215,12 +216,20 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///     then requires a sidecar rather than accepting a false disk hit.
     public func setHybrid(
         _ isHybrid: Bool,
-        requiresRecurrentSSMCompanion: Bool? = nil
+        requiresRecurrentSSMCompanion: Bool? = nil,
+        requiresSeparateRecurrentPayload: Bool? = nil
     ) {
         lock.withLock {
             _isHybrid = isHybrid
             _requiresRecurrentSSMCompanion = isHybrid
                 ? (requiresRecurrentSSMCompanion ?? true)
+                : false
+            // Callers that don't know the payload topology inherit the
+            // companion flag — the conservative pre-split behavior (persist
+            // and require the separate recurrent payload).
+            _requiresSeparateRecurrentPayload = isHybrid
+                ? (requiresSeparateRecurrentPayload
+                    ?? _requiresRecurrentSSMCompanion)
                 : false
         }
     }
@@ -234,6 +243,16 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// SSM/GDN snapshot at the exact matched prompt boundary.
     public var requiresRecurrentSSMCompanion: Bool {
         lock.withLock { _requiresRecurrentSSMCompanion }
+    }
+
+    /// Whether stores must persist recurrent state as a separate payload
+    /// (folded `ssm_*` + companion sidecar) because the v2 layer
+    /// serialization cannot round-trip it natively (ArraysCache/GDN).
+    /// MambaCache state round-trips in-file, so topologies without an
+    /// ArraysCache layer skip both extra copies. See
+    /// `ModelCacheTopologySnapshot.requiresSeparateRecurrentPayloadState`.
+    public var requiresSeparateRecurrentPayload: Bool {
+        lock.withLock { _requiresSeparateRecurrentPayload }
     }
 
     /// Whether a prompt-boundary store has any tier to land in. With both tiers
@@ -472,13 +491,17 @@ public final class CacheCoordinator: @unchecked Sendable {
             if !(states?.isEmpty ?? true) {
                 return true
             }
-            // Mamba/ArraysCache topologies require the separately keyed
-            // prompt-boundary sidecar. A generic format-v2 marker is not
-            // evidence that every recurrent layer is complete (ArraysCache
-            // is intentionally serialized as `.skip`). ZAYA CCA is topology-
-            // classified with this flag false because its v2 layer payload
-            // atomically owns KV + conv + previous-hidden state.
-            return !requiresRecurrentSSMCompanion
+            // ArraysCache topologies require the separately keyed
+            // prompt-boundary sidecar: v2 has no LayerKind for GDN state, so
+            // a format-v2 marker is not evidence those layers are complete.
+            // MambaCache state round-trips in the v2 payload itself
+            // (`mamba_{i}_state0/1`, applied by deserializeV2), so those
+            // topologies accept a v2 entry without any companion — matching
+            // the store side, which no longer persists the redundant copies
+            // for them. ZAYA CCA is topology-classified with this flag false
+            // because its v2 layer payload atomically owns KV + conv +
+            // previous-hidden state.
+            return !requiresSeparateRecurrentPayload
                 && diskArrays.map { TQDiskSerializer.formatVersion(of: $0) >= 2 } == true
         }
 
@@ -975,6 +998,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         // see `isPagedIncompatible` above). Recurrent-only/state-only caches
         // must not publish token hashes without any restorable KV payload;
         // doing so would suppress the valid typed disk fallback on fetch.
+        var publishedPagedPayload = false
         if !isPagedIncompatible,
            hasPagedKVPayload,
            hasRequiredPagedCompanion,
@@ -985,6 +1009,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                 layerData: blockLayerData,
                 boundaryCompanionData: pagedBoundaryCompanion,
                 mediaSalt: mediaSalt)
+            publishedPagedPayload = true
         }
 
         // Build the disk payload before entering the linked-store transaction.
@@ -1000,12 +1025,25 @@ public final class CacheCoordinator: @unchecked Sendable {
         // disk persistence for sliding-window models (Gemma3/Gemma4
         // SWA layers, Mistral4 with maxKVSize, MiMoV2Flash, BaichuanM1,
         // Qwen3.5-VL inherited sliding layers).
+        // Persist the separate recurrent payload (folded `ssm_*` + companion
+        // sidecar) only when something actually consumes it:
+        //  - ArraysCache/GDN topologies — the v2 layer serialization has no
+        //    LayerKind for that state, so the companion is its only carrier;
+        //  - a hybrid boundary that just published a PAGED payload — paged
+        //    blocks carry KV only, and the tier-1 hit path rejects hybrid
+        //    hits without `fetchCompleteSSMStates`.
+        // For disk-only MambaCache hybrids, the state round-trips in-file as
+        // `mamba_{i}_state0/1`; the extra copies tripled the recurrent bytes
+        // per stored boundary (~+300MB each on Qwen3.8-27B) without the
+        // restore path ever applying them.
+        let persistSeparateRecurrentPayload =
+            isHybrid && (requiresSeparateRecurrentPayload || publishedPagedPayload)
         var diskArrays: [String: MLXArray]?
         if diskCache != nil {
             if let cache {
                 let arrays = TQDiskSerializer.serialize(
                     cache: cache,
-                    ssmStates: isHybrid ? ssmStates : nil)
+                    ssmStates: persistSeparateRecurrentPayload ? ssmStates : nil)
                 if !arrays.isEmpty {
                     diskArrays = arrays
                 }
@@ -1031,7 +1069,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         storePersistentBoundary(
             tokens: promptTokens,
             diskArrays: diskArrays,
-            ssmStates: isHybrid ? ssmStates : nil,
+            ssmStates: persistSeparateRecurrentPayload ? ssmStates : nil,
             mediaSalt: mediaSalt)
     }
 

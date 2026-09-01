@@ -543,7 +543,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 coordinator.setHybrid(
                     true,
                     requiresRecurrentSSMCompanion:
-                        topology.requiresRecurrentSSMCompanionState)
+                        topology.requiresRecurrentSSMCompanionState,
+                    requiresSeparateRecurrentPayload:
+                        topology.requiresSeparateRecurrentPayloadState)
             }
             if !coordinator.isPagedIncompatible,
                cacheCannotUsePagedCoordinatorRestore(self.cache)

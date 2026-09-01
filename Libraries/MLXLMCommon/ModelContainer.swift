@@ -84,6 +84,26 @@ public struct ModelCacheTopologySnapshot: Codable, Sendable, Equatable {
         mambaLayerCount > 0 || arraysLayerCount > 0
     }
 
+    /// Whether any recurrent state needs a SEPARATELY persisted payload
+    /// (folded `ssm_*` arrays + the `ssm_companion` sidecar) because the v2
+    /// disk layer serialization cannot round-trip it natively.
+    ///
+    /// Only ArraysCache (GatedDeltaNet linear-attention) state is in that
+    /// position: v2 has no `LayerKind` for it, so `restoreFromDiskArrays`
+    /// leaves those layers at their initial value and the companion is the
+    /// sole carrier. MambaCache state round-trips in-file as
+    /// `mamba_{i}_state0/1` and is restored by `deserializeV2` directly —
+    /// measured live on Qwen3.8-27B (48 mamba layers), the companion copies
+    /// added ~300MB per stored boundary that the restore path never applied.
+    ///
+    /// This is deliberately narrower than
+    /// ``requiresRecurrentSSMCompanionState``, which also encodes
+    /// path-dependence semantics (exact-boundary persistence and stable
+    /// boundary re-derive policy) that apply to Mamba topologies too.
+    public var requiresSeparateRecurrentPayloadState: Bool {
+        arraysLayerCount > 0
+    }
+
     public var requiresDiskBackedCoordinatorRestore: Bool {
         requiresSSMCompanionState
             || rotatingKVLayerCount > 0
@@ -306,7 +326,8 @@ public final class ModelContainer: Sendable {
         let coordinator = CacheCoordinator(config: config)
         coordinator.setHybrid(
             isHybrid,
-            requiresRecurrentSSMCompanion: topology.requiresRecurrentSSMCompanionState)
+            requiresRecurrentSSMCompanion: topology.requiresRecurrentSSMCompanionState,
+            requiresSeparateRecurrentPayload: topology.requiresSeparateRecurrentPayloadState)
         coordinator.setGenPromptSuffixTokens(await computeGenPromptSuffixTokens())
 
         _cacheCoordinator.withLock { $0 = coordinator }

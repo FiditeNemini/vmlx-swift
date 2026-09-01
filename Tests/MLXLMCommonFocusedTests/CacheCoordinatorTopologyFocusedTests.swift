@@ -974,6 +974,100 @@ struct CacheCoordinatorTopologyFocusedTests {
         }
     }
 
+    @Test("mamba round-trip topology stores no separate recurrent payload")
+    func mambaRoundTripTopologySkipsSeparateRecurrentPayload() {
+        FocusedMLXTestSupport.withLock {
+        let tmp = makeTempDir("mamba-no-separate-payload")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let coordinator = makeCoordinator(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheDir: tmp,
+            modelKey: "mamba-no-separate-payload-focused")
+        coordinator.setHybrid(
+            true,
+            requiresRecurrentSSMCompanion: true,
+            requiresSeparateRecurrentPayload: false)
+
+        let tokens = Array(501...512)
+        let cache = makeNemotronOmniCache(tokenCount: tokens.count, populated: true)
+
+        coordinator.storeAfterGeneration(
+            promptTokens: tokens,
+            perLayerData: [],
+            ssmStates: extractSSMStates(from: cache),
+            cache: cache)
+
+        // No companion sidecar and no folded `ssm_*` copy — the mamba state
+        // lives in the v2 payload as `mamba_{i}_state0/1` only.
+        #expect(coordinator.ssmStateCache.fetchEntry(
+            tokens: tokens,
+            boundary: tokens.count,
+            requireComplete: false) == nil)
+
+        switch coordinator.fetch(tokens: tokens + [513]) {
+        case .hit(let matched, let remaining, let detail, let blocks, let ssm, let arrays):
+            #expect(matched == tokens.count)
+            #expect(remaining == [513])
+            #expect(detail == .disk)
+            #expect(blocks.isEmpty)
+            #expect(ssm == nil)
+            guard let arrays else {
+                Issue.record("disk hit should carry the v2 payload")
+                return
+            }
+            #expect(arrays["__ssm_count__"] == nil)
+            #expect(!arrays.keys.contains { $0.hasPrefix("ssm_") })
+            #expect(arrays.keys.contains { $0.hasPrefix("mamba_") })
+        case .miss:
+            Issue.record(
+                "mamba hybrid v2 entry must be accepted without a recurrent companion")
+        }
+        }
+    }
+
+    @Test("separate-payload topology still persists and requires the companion")
+    func separatePayloadTopologyKeepsCompanion() {
+        FocusedMLXTestSupport.withLock {
+        let tmp = makeTempDir("arrays-separate-payload")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let coordinator = makeCoordinator(
+            usePagedCache: false,
+            enableDiskCache: true,
+            diskCacheDir: tmp,
+            modelKey: "arrays-separate-payload-focused")
+        coordinator.setHybrid(
+            true,
+            requiresRecurrentSSMCompanion: true,
+            requiresSeparateRecurrentPayload: true)
+
+        let tokens = Array(601...612)
+        let cache = makeNemotronOmniCache(tokenCount: tokens.count, populated: true)
+        let states = extractSSMStates(from: cache)
+
+        coordinator.storeAfterGeneration(
+            promptTokens: tokens,
+            perLayerData: [],
+            ssmStates: states,
+            cache: cache)
+
+        #expect(coordinator.ssmStateCache.fetchEntry(
+            tokens: tokens,
+            boundary: tokens.count,
+            requireComplete: false) != nil)
+
+        switch coordinator.fetch(tokens: tokens + [613]) {
+        case .hit(let matched, _, let detail, _, let ssm, let arrays):
+            #expect(matched == tokens.count)
+            #expect(detail == .disk)
+            #expect(ssm?.count == states.count)
+            #expect(arrays?["__ssm_count__"] != nil)
+        case .miss:
+            Issue.record("separate-payload hybrid should hit with its companion")
+        }
+        }
+    }
+
     @Test("dynamic reasoning scope isolates every coordinator hash tier")
     func dynamicReasoningScopeIsolatesCoordinatorHashTiers() {
         let tokens = [101, 102, 103, 104]

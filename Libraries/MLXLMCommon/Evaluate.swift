@@ -1852,7 +1852,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                     coordinator.setHybrid(
                         true,
                         requiresRecurrentSSMCompanion:
-                            topology.requiresRecurrentSSMCompanionState)
+                            topology.requiresRecurrentSSMCompanionState,
+                        requiresSeparateRecurrentPayload:
+                            topology.requiresSeparateRecurrentPayloadState)
                     Self.logger.info(
                         "TokenIterator: coordinator flipped to isHybrid=true"
                     )
