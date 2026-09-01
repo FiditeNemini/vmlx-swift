@@ -2262,6 +2262,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         let canonicalBoundary = input.cachePrefixTokenCounts
             .filter { $0 > 0 && $0 < promptTokenIds.count }
             .max()
+        if ProcessInfo.processInfo.environment["VMLX_STRIP_BOUNDARY_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                ("[vmlx][strip-boundary] prompt=\(promptTokenIds.count) "
+                    + "canonical=\(canonicalBoundary.map(String.init) ?? "nil") "
+                    + "prefixCounts=\(input.cachePrefixTokenCounts) "
+                    + "stableCounts=\(input.cacheStablePrefixTokenCounts) "
+                    + "genSuffixTokens=\(coordinator?.genPromptSuffixTokens ?? []) "
+                    + "heuristic=\(heuristicBoundary.map(String.init) ?? "nil")\n").utf8))
+        }
         guard ProcessInfo.processInfo.environment["VMLX_HYBRID_STRIPPED_STORE"] != "0",
             let coordinator,
             coordinator.isHybrid,

@@ -839,6 +839,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 input: originalInput)
             let isReusablePrefixWarmup =
                 originalInput.cachePromptIntent == .reusablePrefixWarmup
+            // Same canonical-boundary policy as the solo TokenIterator,
+            // BatchEngine.finishSlot, and DFlash2 store paths: when a
+            // path-dependent hybrid has a proven cross-turn boundary, the
+            // full-prompt record is a boundary no later turn can match
+            // (the next turn replaces the generation suffix, and hybrid
+            // fetch skips exact boundaries by construction) — storing it
+            // costs a full synchronous snapshot write per turn for an
+            // entry that is never restored. MTP was the fourth store
+            // path; the first three were gated and this one was missed —
+            // measured live as an extra ~100ms + ~350-500MB record on
+            // EVERY tool-call cycle (exact 3446 beside canonical 3445).
+            let usesCanonicalHybridBoundary =
+                coordinator.isHybrid && sharedPromptStripBoundary != nil
             let shouldPersistExactWarmupPrompt = shouldPersistExactPromptBoundary(
                 cachePromptIntent: originalInput.cachePromptIntent,
                 requiresRecurrentSSMCompanion:
@@ -915,7 +928,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     mediaSalt: mediaSalt)
             }
 
-            if shouldPersistExactWarmupPrompt {
+            if shouldPersistExactWarmupPrompt, !usesCanonicalHybridBoundary {
                 store(
                     tokens: promptTokenIds,
                     snapshot: promptCacheSnapshot,
