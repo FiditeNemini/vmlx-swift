@@ -414,7 +414,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 let topology = ModelCacheTopologySnapshot(cache: self.cache)
                 coordinator.setHybrid(
                     true,
-                    requiresRecurrentSSMCompanion: topology.requiresRecurrentSSMCompanionState)
+                    requiresRecurrentSSMCompanion: topology.requiresRecurrentSSMCompanionState,
+                    requiresSeparateRecurrentPayload:
+                        topology.requiresSeparateRecurrentPayloadState)
             }
             if !coordinator.isPagedIncompatible, cacheCannotUsePagedCoordinatorRestore(self.cache) {
                 if cacheCanUsePagedWithRotatingCompanion(self.cache) {

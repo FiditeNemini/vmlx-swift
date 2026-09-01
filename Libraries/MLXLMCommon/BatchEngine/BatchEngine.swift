@@ -1810,7 +1810,9 @@ public actor BatchEngine {
                         coordinator.setHybrid(
                             true,
                             requiresRecurrentSSMCompanion:
-                                topology.requiresRecurrentSSMCompanionState)
+                                topology.requiresRecurrentSSMCompanionState,
+                            requiresSeparateRecurrentPayload:
+                                topology.requiresSeparateRecurrentPayloadState)
                         Self.logger.info(
                             "Coordinator flipped to isHybrid=true on first hybrid slot admission"
                         )
