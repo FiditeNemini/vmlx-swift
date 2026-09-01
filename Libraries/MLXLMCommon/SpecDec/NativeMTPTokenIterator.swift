@@ -1024,6 +1024,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// Idempotent: `storeCacheAfterGeneration` calls it as a backstop for
     /// callers that never ran the loop's early-finalize step.
     mutating func finalizeGenerationStats(generatedTokenIds: [Int]) {
+        // Generation is over by the time stats finalize; roll back any
+        // unconsumed prefetched verify NOW so (a) the `abandoned` counter on
+        // the summary line below is truthful — the early-finalize call the
+        // generate loop makes to stop the host spinner printed before
+        // `storeCacheAfterGeneration`'s abandon ran, reporting 0 for a
+        // mid-generation Stop that really did abandon one — and (b) the
+        // speculative rows leave the attention lanes at the earliest safe
+        // point. Idempotent; the store-path call remains as the backstop.
+        abandonPendingVerify()
         guard !generationStatsFinalized else { return }
         generationStatsFinalized = true
         let accepted = acceptedByDepth
