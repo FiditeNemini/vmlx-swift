@@ -154,10 +154,25 @@ private func debugDumpReasoningPrompt(
 private final class BatchStreamTerminationState: @unchecked Sendable {
     private let lock = NSLock()
     private var completed = false
+    private var toolCallEmitted = false
 
     func markCompleted() {
         lock.lock()
         completed = true
+        lock.unlock()
+    }
+
+    /// Record that the bridge surfaced a parsed `.toolCall` to the consumer.
+    /// A consumer that terminates AFTER this point has everything it needs —
+    /// the dispatched tool defines the turn's end — so termination routes to
+    /// ``BatchEngine/finishEarly(_:)`` (natural `.stop`, boundary stores run)
+    /// instead of ``BatchEngine/cancel(_:)`` (stores skipped). Without this,
+    /// a host that stops consuming at tool dispatch either loses the
+    /// boundary store or must drain the model's post-tool-call prose to EOS
+    /// at full decode cost (measured up to maxTokens=16384 of zombie decode).
+    func markToolCallEmitted() {
+        lock.lock()
+        toolCallEmitted = true
         lock.unlock()
     }
 
@@ -166,6 +181,13 @@ private final class BatchStreamTerminationState: @unchecked Sendable {
         let shouldCancel = !completed
         lock.unlock()
         return shouldCancel
+    }
+
+    func didEmitToolCall() -> Bool {
+        lock.lock()
+        let value = toolCallEmitted
+        lock.unlock()
+        return value
     }
 }
 
@@ -752,8 +774,16 @@ public actor BatchEngine {
         continuation.onTermination = {
             @Sendable [requestId, engineRef, terminationState] _ in
             guard terminationState.shouldCancelOnTermination() else { return }
+            let toolDispatch = terminationState.didEmitToolCall()
             Task {
-                await engineRef.cancel(requestId)
+                if toolDispatch {
+                    // The consumer stopped at tool dispatch: finish the slot
+                    // with a natural `.stop` so boundary stores run and the
+                    // tool continuation restores instead of re-prefilling.
+                    await engineRef.finishEarly(requestId)
+                } else {
+                    await engineRef.cancel(requestId)
+                }
             }
         }
 
@@ -848,6 +878,9 @@ public actor BatchEngine {
                         let tail = stopMatcher.flush()
                         if !tail.isEmpty { continuation.yield(.chunk(tail)) }
                     }
+                    // From here on, consumer termination means "tool
+                    // dispatched" — route it to finishEarly, not cancel.
+                    terminationState.markToolCallEmitted()
                     continuation.yield(event)
                 case .toolCallProgress:
                     continuation.yield(event)
@@ -1505,6 +1538,38 @@ public actor BatchEngine {
         if let idx = activeSlots.firstIndex(where: { $0.id == id }) {
             var slot = activeSlots[idx]
             finishSlot(&slot, reason: .cancelled)
+            slot.isFinished = true
+            activeSlots[idx] = slot
+        }
+    }
+
+    /// Finish a specific request early with a natural `.stop`.
+    ///
+    /// The consumer has everything it needs from this generation — the
+    /// canonical case is a parsed tool call that has already been
+    /// dispatched — and every further decode step is waste. Unlike
+    /// ``cancel(_:)``, this goes through the normal ``finishSlot`` path:
+    /// prompt-boundary stores run and the stream closes with `.stop`, so
+    /// the tool continuation restores the persisted boundary instead of
+    /// re-prefilling. Requests still in the wait queue have generated
+    /// nothing and are removed exactly as ``cancel(_:)`` removes them.
+    public func finishEarly(_ id: BatchRequestID) {
+        if let idx = waitQueue.firstIndex(where: { $0.id == id }) {
+            let request = waitQueue.remove(at: idx)
+            request.continuation.yield(.info(GenerateCompletionInfo(
+                promptTokenCount: request.input.text.tokens.size,
+                generationTokenCount: 0,
+                promptTime: 0,
+                generationTime: 0,
+                stopReason: .cancelled
+            )))
+            request.continuation.finish()
+            return
+        }
+
+        if let idx = activeSlots.firstIndex(where: { $0.id == id }) {
+            var slot = activeSlots[idx]
+            finishSlot(&slot, reason: .stop)
             slot.isFinished = true
             activeSlots[idx] = slot
         }
