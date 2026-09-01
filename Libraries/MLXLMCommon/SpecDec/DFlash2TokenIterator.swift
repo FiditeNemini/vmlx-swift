@@ -1310,6 +1310,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // Never persist a cache that still carries unverified draft rows.
         abandonInFlightVerify()
         guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else { return }
+        // Auxiliary (title/suggestion/summary) prompts never store a
+        // boundary — see `CachePromptIntent.auxiliary`.
+        guard originalInput.cachePromptIntent != .auxiliary else { return }
         defer {
             promptCacheSnapshot = nil
             hybridStripSnapshot = nil

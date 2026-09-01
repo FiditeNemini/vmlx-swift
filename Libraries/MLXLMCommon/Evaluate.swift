@@ -2823,6 +2823,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
             return
         }
+        // Auxiliary (title/suggestion/summary) prompts embed per-turn content
+        // and never prefix a future request — persisting their boundaries is
+        // pure write cost. They may restore; they never store.
+        guard originalInput.cachePromptIntent != .auxiliary else { return }
 
         var sharedPromptRederivedStates: [Int: [MLXArray]]?
         let sharedPromptAdditionalBoundaries = Array(Set(

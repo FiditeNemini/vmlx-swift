@@ -45,9 +45,17 @@ public struct LMInput {
     /// exact warmup checkpoint can replay the previous tool turn after a
     /// reasoning-mode change even though its token prefix matches. No warmup
     /// path may cache the throwaway decoded tokens.
+    /// ``auxiliary`` marks internal utility generations — chat titles,
+    /// follow-up suggestions, summaries — whose prompt embeds per-turn
+    /// content and is therefore never an exact prefix of any future request.
+    /// Persisting their boundaries is pure write cost: measured live, one
+    /// osaurus chat turn wrote six ~150MB hybrid boundary records for its
+    /// title/suggestion prompts alone. Auxiliary requests still RESTORE
+    /// whatever prefix the cache already holds; they just never store one.
     public enum CachePromptIntent: Sendable, Equatable {
         case generation
         case reusablePrefixWarmup
+        case auxiliary
     }
 
     /// Correctness policy for restoring a persisted prompt prefix.
@@ -274,6 +282,22 @@ public struct LMInput {
             cachePromptIntent: cachePromptIntent,
             cacheRestorePolicy: cacheRestorePolicy,
             toolSchemas: schemas)
+    }
+
+    /// Return an otherwise-identical input with an explicit prompt intent.
+    public func withCachePromptIntent(_ intent: CachePromptIntent) -> LMInput {
+        LMInput(
+            text: text,
+            image: image,
+            video: video,
+            audio: audio,
+            mediaTokenIds: mediaTokenIds,
+            cacheScopeSalt: cacheScopeSalt,
+            cachePrefixTokenCounts: cachePrefixTokenCounts,
+            cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
+            cachePromptIntent: intent,
+            cacheRestorePolicy: cacheRestorePolicy,
+            toolSchemas: toolSchemas)
     }
 
     /// Return an otherwise-identical input with an explicit restore policy.
