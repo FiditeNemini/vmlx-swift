@@ -4610,9 +4610,15 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             )
 
             while let token = iterator.next() {
-                // Check for cancellation on every loop iteration.
+                // Check for cancellation on every loop iteration. A consumer
+                // that stops after the handler surfaced a parsed tool call is
+                // not abandoning the turn — the dispatched tool defines its
+                // end — so that termination is a natural `.stop`, not a
+                // `.cancelled`. This is what lets hosts stop consuming at
+                // tool dispatch instead of draining the model's post-tool
+                // prose to EOS (measured up to maxTokens of zombie decode).
                 if Task.isCancelled {
-                    stopReason = .cancelled
+                    stopReason = handler.emittedToolCall ? .stop : .cancelled
                     break
                 }
 
@@ -4640,9 +4646,12 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     // Distinguish "downstream consumer terminated the
                     // stream" from "library-internal stop-sequence
                     // match" — the latter should report `stopReason =
-                    // .stop`, not `.cancelled`.
+                    // .stop`, not `.cancelled`. A consumer that stops
+                    // after an emitted tool call is likewise a natural
+                    // `.stop`: the dispatched tool ends the turn.
                     stopReason =
-                        (handler.stopSequenceHit || handler.haltedOnRepetition)
+                        (handler.stopSequenceHit || handler.haltedOnRepetition
+                            || handler.emittedToolCall)
                         ? .stop : .cancelled
                     break
                 }
@@ -4651,7 +4660,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
             if stopReason == nil {
                 if Task.isCancelled {
-                    stopReason = .cancelled
+                    stopReason = handler.emittedToolCall ? .stop : .cancelled
                 } else if let maxTokens = iterator.maxTokens, tokenCount >= maxTokens {
                     stopReason = .length
                 } else {
