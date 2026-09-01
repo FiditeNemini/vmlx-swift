@@ -241,6 +241,67 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var drafts: [MLXArray] = []
     private var draftProbabilities: [MLXArray] = []
 
+    // MARK: - Verify prefetch
+    //
+    // The consumer drains `pendingTokens` one `next()` call at a time, and
+    // between calls it detokenizes and streams each token — measured at
+    // roughly 5 ms of host work per queued token. Submitting the NEXT
+    // cycle's verify forward before that drain lets the verify GPU work run
+    // under the host-side emission instead of after it: the baseline
+    // measured ~19 ms/cycle of readback wait that this overlap absorbs
+    // (Flash-Next 4M counting: 289 cycles, 5.62 s of materialize-sync
+    // against 19.34 s of verify forwards; cycle 84 ms vs the Python
+    // engine's 65 ms with its verify prefetch on by default).
+    //
+    // Only the clean staged path prefetches: an unaccepted row can never
+    // reach committed state there, and the submit-time checkpoint below
+    // restores the attention lanes if the prefetch is abandoned (adaptive
+    // fallback to AR, terminal token inside the pending queue, or a depth
+    // change). `VMLX_MTP_VERIFY_PREFETCH=0` disables for A/B.
+    private struct PendingVerify {
+        let verifier: NativeMTPForwardResult
+        let requested: [MLXArray]
+        let requestedInputIds: [Int32]
+        let depth: Int
+        let checkpoint: NativeMTPCacheCheckpoint
+        /// Signalled when the background `asyncEval` has finished SCHEDULING
+        /// the verify graph. mlx-core throttles graph scheduling at
+        /// MAX_ACTIVE_TASKS=10 outstanding primitives, so scheduling a
+        /// hundreds-of-ops forward blocks its calling thread for most of the
+        /// graph's GPU time — done inline it just moves the wait. On a
+        /// background thread it overlaps the host-side token emission, which
+        /// performs no MLX work.
+        let scheduled: DispatchSemaphore
+    }
+    private static let prefetchQueue = DispatchQueue(
+        label: "vmlx.mtp.verify-prefetch", qos: .userInitiated)
+    private var pendingVerify: PendingVerify?
+    private(set) var verifyPrefetchSubmitCount = 0
+    private(set) var verifyPrefetchConsumedCount = 0
+    private(set) var verifyPrefetchAbandonedCount = 0
+    // Default ON, constrained by the regime gate below. Ungated, prefetch
+    // measured +10-18% below the QSA indexer budget but -15-18% once the
+    // indexer lanes engage (suspected stream fencing against the background
+    // scheduling thread — vmlx-swift#384 tracks lifting the gate). With the
+    // gate: 52.1 tok/s @1.4k (prefetch 151/151/0) vs ~46 off-curve, and
+    // byte-stable parity above the gate (counters 0/0/0, materialize-sync
+    // back to its baseline 4.9-5.3s). `VMLX_MTP_VERIFY_PREFETCH=0` disables.
+    private static let verifyPrefetchEnabled =
+        ProcessInfo.processInfo.environment["VMLX_MTP_VERIFY_PREFETCH"] != "0"
+
+    /// Context ceiling for prefetch eligibility — see the regime gate in
+    /// `maybePrefetchNextVerify`. Default matches the qwen4_exp QSA
+    /// indexer budget.
+    private static let verifyPrefetchMaxContext: Int = {
+        if let raw = ProcessInfo.processInfo
+            .environment["VMLX_MTP_VERIFY_PREFETCH_MAX_CTX"],
+            let value = Int(raw), value > 0
+        {
+            return value
+        }
+        return 2048
+    }()
+
     private(set) var verifyCalls = 0
     private(set) var acceptedByDepth: [Int: Int] = [:]
     private(set) var rejectedCount = 0
@@ -755,6 +816,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        // A prefetched verify that was never consumed left speculative rows
+        // in the attention lanes; roll it back before any boundary snapshot
+        // can capture them.
+        abandonPendingVerify()
         // Compiled traces capture the cache array; they must not outlive
         // the generation they were built for.
         releaseCompiledVerify()
@@ -1022,7 +1087,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             cacheMode: "private-mtp+verifier-prefix-commit")
         let line = String(
             format:
-                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
+                "[NativeMTP] depth=%d activeDepth=%d verifyCalls=%d outputTokens=%d arFallbackTokens=%d acceptedByDepth=%@ bonus=%d rejected=%d residualCorrection=%d prefixCommit=%d rollbackRepair=%d mtpCacheRefresh=%d targetForwards=%d verifyInputTokens=%d repairForwards=%d seedMainForwards=%d verifyMainForwards=%d replayMainForwards=%d mtpForwards=%d avgCommittedPerVerify=%.2f avgAcceptP=%.3f adaptiveDownshifts=%d adaptiveFallback=%@ targetVerifySec=%.3f verifyGpuWaitSec=%.3f seedMainSec=%.3f verifyMainSec=%.3f replayMainSec=%.3f mtpDraftSec=%.3f samplingSec=%.3f cacheCommitSec=%.3f materializeSyncSec=%.3f cacheStateSec=%.3f iteratorWallSec=%.3f gdnReplayCalls=%d gdnReplayStates=%d gdnReplaySec=%.3f prefetch[submit=%d,consumed=%d,abandoned=%d] phaseDiag=%@ samplingMode=%@ verifierMode=%@ cacheMode=private-mtp+verifier-prefix-commit\n",
             depth,
             currentDepth,
             verifyCalls,
@@ -1060,6 +1125,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             gdnReplay.calls,
             gdnReplay.prefixStates,
             gdnReplay.seconds,
+            verifyPrefetchSubmitCount,
+            verifyPrefetchConsumedCount,
+            verifyPrefetchAbandonedCount,
             phaseSummary,
             speculativeSampler.isGreedy ? "greedy" : "exact-pq",
             verifierMode)
@@ -1235,15 +1303,42 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        let requested = [primary] + drafts
-        // ONE batched materialization for every id this cycle needs. The old
-        // per-element `.item()` map cost one full pipeline drain per token,
-        // and the replay/audit/pending paths below each re-materialized the
-        // same ids again — 6-9 drains per verify cycle, which the sustained-D1
-        // measurement showed dominating the whole cycle cost (5.4s of
-        // materialize sync against 3.1s of actual forwards over 154 cycles).
-        let requestedInputIds = recordMaterializeSync {
-            stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
+        // Consume a prefetched verify when one matches this cycle exactly:
+        // same primary+drafts (nothing mutates them between cycles), same
+        // depth, staged path. Anything else abandons the prefetch, which
+        // restores the submit-time checkpoint before the fresh submit below.
+        var consumedPrefetch: PendingVerify?
+        if stagedVerify,
+            let prefetch = pendingVerify,
+            prefetch.depth == currentDepth,
+            prefetch.requested.count == drafts.count + 1
+        {
+            // Join the background scheduling before touching the graph; the
+            // remaining GPU wait lands in the acceptance readback as before.
+            recordMaterializeSync { prefetch.scheduled.wait() }
+            consumedPrefetch = prefetch
+            pendingVerify = nil
+            verifyPrefetchConsumedCount += 1
+        } else {
+            abandonPendingVerify()
+        }
+
+        let requested: [MLXArray]
+        let requestedInputIds: [Int32]
+        if let consumedPrefetch {
+            requested = consumedPrefetch.requested
+            requestedInputIds = consumedPrefetch.requestedInputIds
+        } else {
+            requested = [primary] + drafts
+            // ONE batched materialization for every id this cycle needs. The old
+            // per-element `.item()` map cost one full pipeline drain per token,
+            // and the replay/audit/pending paths below each re-materialized the
+            // same ids again — 6-9 drains per verify cycle, which the sustained-D1
+            // measurement showed dominating the whole cycle cost (5.4s of
+            // materialize sync against 3.1s of actual forwards over 154 cycles).
+            requestedInputIds = recordMaterializeSync {
+                stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
+            }
         }
         let input = MLXArray(requestedInputIds).reshaped(1, requested.count)
         let replayChunkCommit = !stagedVerify
@@ -1259,19 +1354,30 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             cache,
             speculativeSampler: speculativeSampler,
             verifierMode: verifierModeSetting)
-        let checkpointStart = Date.timeIntervalSinceReferenceDate
         let needsBatchedVerifierRecovery = speculativeSampler.isGreedy && processor == nil
-        let checkpoint =
-            (canCommitVerifierCache && !requiresSequentialRepair && !replayChunkCommit
-                && !lazyChunkRepair && !needsBatchedVerifierRecovery)
-            ? nil
-            : NativeMTPCacheCheckpoint(cache)
-        cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - checkpointStart
-        let verifyStart = Date.timeIntervalSinceReferenceDate
+        let checkpoint: NativeMTPCacheCheckpoint?
+        if let consumedPrefetch {
+            // The forward already ran at submit time; a checkpoint taken now
+            // would capture the speculative rows it appended. Use the one
+            // captured immediately before the prefetched forward.
+            checkpoint = consumedPrefetch.checkpoint
+        } else {
+            let checkpointStart = Date.timeIntervalSinceReferenceDate
+            checkpoint =
+                (canCommitVerifierCache && !requiresSequentialRepair && !replayChunkCommit
+                    && !lazyChunkRepair && !needsBatchedVerifierRecovery)
+                ? nil
+                : NativeMTPCacheCheckpoint(cache)
+            cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - checkpointStart
+        }
         let forwardVerifierMode = stagedVerify
             ? NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
             : verifierModeSetting
         let verifier: NativeMTPForwardResult
+        if let consumedPrefetch {
+            verifier = consumedPrefetch.verifier
+        } else {
+        let verifyStart = Date.timeIntervalSinceReferenceDate
         if stagedVerify, compiledVerifyEnabled,
             compiledVerifyWarmedSizes.contains(requested.count)
         {
@@ -1302,6 +1408,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let verifyElapsed = Date.timeIntervalSinceReferenceDate - verifyStart
         targetVerifyTime += verifyElapsed
         verifyMainForwardTime += verifyElapsed
+        }
         if Self.phaseTimersEnabled {
             let gpuStart = Date.timeIntervalSinceReferenceDate
             MLX.eval(verifier.logits)
@@ -1633,6 +1740,94 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
         mtpDraftTime += Date.timeIntervalSinceReferenceDate - draftStart
+
+        maybePrefetchNextVerify(stagedVerify: stagedVerify)
+    }
+
+    /// Submit the NEXT cycle's staged verify forward before the pending
+    /// tokens drain, so the verify GPU work overlaps the host-side
+    /// detokenize/stream of the queued tokens. Clean staged path only; the
+    /// submit-time checkpoint makes abandonment exact.
+    private mutating func maybePrefetchNextVerify(stagedVerify: Bool) {
+        guard Self.verifyPrefetchEnabled,
+            stagedVerify,
+            !compiledVerifyEnabled,
+            !Self.traceEnabled,
+            !forceAutoregressiveFallback,
+            let primary = nextMain,
+            !drafts.isEmpty
+        else { return }
+        // Regime gate: prefetch measured +10-18% while the QSA sparse
+        // indexer is bypassed (short/medium context) but -15-18% once the
+        // indexer lanes engage — the background scheduling thread appears
+        // to fence against the indexer's extra cache lane (vmlx-swift#384).
+        // Until that interaction is fixed, only prefetch below the
+        // indexer-engagement region. Threshold matches qwen4_exp's
+        // indexer_budget (block 4 × top-512 = 2048); tunable for other
+        // topologies via VMLX_MTP_VERIFY_PREFETCH_MAX_CTX.
+        let contextOffset = cache.lazy.map(\.offset).max() ?? 0
+        if contextOffset + drafts.count + 1 > Self.verifyPrefetchMaxContext {
+            return
+        }
+        // Nothing left in the token budget to overlap against.
+        if let maxTokens, tokenCount + (pendingTokens.count - pendingIndex) >= maxTokens {
+            return
+        }
+        let requested = [primary] + drafts
+        let requestedInputIds = recordMaterializeSync {
+            stacked(requested.map { $0.reshaped(-1) }).asArray(Int32.self)
+        }
+        let input = MLXArray(requestedInputIds).reshaped(1, requested.count)
+        let checkpointStart = Date.timeIntervalSinceReferenceDate
+        let checkpoint = NativeMTPCacheCheckpoint(cache)
+        cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - checkpointStart
+        let verifyStart = Date.timeIntervalSinceReferenceDate
+        let verifier = NativeMTPVerifierStatePolicy.withVerifierMode(
+            NativeMTPVerifierStatePolicy.Mode.inputCaptureStaged.rawValue
+        ) {
+            model.nativeBackboneMTPVerifyForward(input, cache: cache)
+        }
+        // Schedule the verify graph on a background thread. Scheduling — not
+        // just executing — a big graph blocks the caller once mlx-core's
+        // MAX_ACTIVE_TASKS throttle engages, so an inline asyncEval here
+        // measured ~83 ms/call and merely moved the readback wait. Emission
+        // of the queued tokens performs no MLX work, so the background
+        // schedule overlaps it fully; consume joins on `scheduled` first.
+        let logits = verifier.logits
+        let hidden = verifier.hiddenStates
+        let scheduled = DispatchSemaphore(value: 0)
+        Self.prefetchQueue.async {
+            asyncEval(logits, hidden)
+            scheduled.signal()
+        }
+        let verifyElapsed = Date.timeIntervalSinceReferenceDate - verifyStart
+        targetVerifyTime += verifyElapsed
+        verifyMainForwardTime += verifyElapsed
+        verifyPrefetchSubmitCount += 1
+        pendingVerify = PendingVerify(
+            verifier: verifier,
+            requested: requested,
+            requestedInputIds: requestedInputIds,
+            depth: currentDepth,
+            checkpoint: checkpoint,
+            scheduled: scheduled)
+    }
+
+    /// Roll back an unconsumed prefetched verify: restore the attention
+    /// lanes to their pre-submit state and clear the GDN staging slots so
+    /// committed state, boundary stores, and the AR fallback never see the
+    /// speculative rows.
+    private mutating func abandonPendingVerify() {
+        guard let prefetch = pendingVerify else { return }
+        pendingVerify = nil
+        verifyPrefetchAbandonedCount += 1
+        let restoreStart = Date.timeIntervalSinceReferenceDate
+        // The background thread may still be scheduling the graph; it must
+        // finish before the checkpoint restore rewrites the cache arrays.
+        prefetch.scheduled.wait()
+        prefetch.checkpoint.restore(into: &cache)
+        for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
+        cacheSnapshotRestoreTime += Date.timeIntervalSinceReferenceDate - restoreStart
     }
 
     /// Measurement-only escape hatch: `VMLX_NATIVE_MTP_DISABLE_ADAPTIVE=1`
@@ -1811,6 +2006,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private mutating func generateAutoregressiveToken() throws {
+        abandonPendingVerify()
         guard let primary = nextMain else {
             throw NativeMTPRuntimeError.verifierProducedNoTokens
         }
@@ -1843,6 +2039,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     }
 
     private mutating func verifyCycleSequential(primary: MLXArray) throws {
+        abandonPendingVerify()
         let requested = [primary] + drafts
         var accepted = 0
         var currentInput = primary
