@@ -848,6 +848,8 @@ let package = Package(
             path: "Tests/MLXLMCommonFocusedTests",
             sources: [
                 "DualPathFamiliesTests.swift",
+                "Qwen35FusedInputProjectionTests.swift",
+                "MLADecodeSDPADtypeTests.swift",
                 "DeepseekV4ChatTemplateFallbackFocusedTests.swift",
                 "MuseGlimmerNormFoldOwnershipTests.swift",
                 "DeepseekV4Step37RuntimeContractsTests.swift",
