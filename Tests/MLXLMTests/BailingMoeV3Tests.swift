@@ -60,8 +60,9 @@ struct BailingMoeV3Tests {
         }
         """.data(using: .utf8)!
 
-    /// Ling 2.6 (GLA) still resolves to the legacy runtime — a minimal
-    /// field set the legacy configuration accepts, with NO V3 markers.
+    /// Ling 2.6 (GLA) shaped config — a minimal field set naming the 2.6
+    /// architecture, with NO V3 markers. The GLA runtime is unreachable;
+    /// this fixture proves the refusal path.
     static let legacyConfigJSON = """
         {
           "model_type": "bailing_hybrid",
@@ -100,15 +101,53 @@ struct BailingMoeV3Tests {
         #expect(name.contains("BailingMoeV3"))
     }
 
-    @Test("a V2 config keeps resolving to the legacy GLA runtime")
-    func legacyDispatch() async throws {
+    @Test("a config naming the Ling 2.6 architecture is refused under bailing_hybrid (never GLA, never garbage-as-V3)")
+    func legacyArchitectureRefused() async throws {
+        // Raptor reports: a bundle that reached the GLA runtime under
+        // `bailing_hybrid` streamed `!` at 100+ tok/s. The GLA runtime is
+        // unreachable now; a genuine 2.6 bundle gets a named error.
+        let outcome: String = try await MLXMetalTestLock.withLock {
+            do {
+                let model = try await LLMTypeRegistry.shared.createModel(
+                    configuration: Self.legacyConfigJSON, modelType: "bailing_hybrid")
+                return "loaded:" + String(describing: type(of: model))
+            } catch let error as ModelFactoryError {
+                return "refused:" + String(describing: error)
+            }
+        }
+        #expect(outcome.hasPrefix("refused:"), Comment(rawValue: outcome))
+        #expect(outcome.contains("Ling 3.0"))
+        #expect(!outcome.contains("BailingHybridModel"))
+    }
+
+    @Test("no model_type reaches the Ling 2.6 GLA runtime (bailing_moe_v2_5 is unregistered)")
+    func noRouteToGLA() async throws {
+        let outcome: String = try await MLXMetalTestLock.withLock {
+            do {
+                let model = try await LLMTypeRegistry.shared.createModel(
+                    configuration: Self.legacyConfigJSON, modelType: "bailing_moe_v2_5")
+                return "loaded:" + String(describing: type(of: model))
+            } catch {
+                return "refused:" + String(describing: error)
+            }
+        }
+        #expect(outcome.hasPrefix("refused:"), Comment(rawValue: outcome))
+        #expect(!outcome.contains("BailingHybridModel"))
+    }
+
+    @Test("bailing_hybrid dispatches to V3 with every Ling 3 marker stripped from the config")
+    func v3DispatchWithoutMarkers() async throws {
+        var dict = try JSONSerialization.jsonObject(with: Self.v3ConfigJSON) as! [String: Any]
+        dict.removeValue(forKey: "architectures")
+        dict.removeValue(forKey: "linear_attention")
+        dict.removeValue(forKey: "kda_lower_bound")
+        let data = try JSONSerialization.data(withJSONObject: dict)
         let name = try await MLXMetalTestLock.withLock {
             let model = try await LLMTypeRegistry.shared.createModel(
-                configuration: Self.legacyConfigJSON, modelType: "bailing_hybrid")
+                configuration: data, modelType: "bailing_hybrid")
             return String(describing: type(of: model))
         }
-        #expect(name.contains("BailingHybridModel"))
-        #expect(!name.contains("V3"))
+        #expect(name.contains("BailingMoeV3"))
     }
 
     @Test("layer typing matches the reference rule for 24 layers / group 4")
