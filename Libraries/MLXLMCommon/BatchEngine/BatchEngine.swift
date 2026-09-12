@@ -1713,6 +1713,10 @@ public actor BatchEngine {
     private func ensureLoopRunning() {
         guard loopTask == nil else { return }
         loopTask = Task {
+            // The solo path owns its activity in generateLoopTask; the real
+            // batched scheduler needs the same finite-work protection.
+            let activity = GenerationActivity()
+            defer { activity.end() }
             // Give immediately-following submits a bounded coalescing window
             // before the scheduler enters a potentially long prefill. A plain
             // `Task.yield()` is not deterministic enough: the scheduler can

@@ -4592,6 +4592,10 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
+        // Cover deferred prefill and the final cache/GPU drains, not merely
+        // visible token emission. Cancellation/error paths also release it.
+        let activity = GenerationActivity()
+        defer { activity.end() }
         let performIteration = {
             var handler = handler.consume()
             let streamTiming = StreamTimingRecorder()

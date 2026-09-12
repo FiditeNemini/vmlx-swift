@@ -870,6 +870,7 @@ let package = Package(
                 "DeepseekV4DropThinkingCacheTests.swift",
                 "DeepseekV4AgentLoopBoundaryTests.swift",
                 "EarlyCompletionBeforeCachePersistTests.swift",
+                "GenerationActivityTests.swift",
                 "ToolCallProgressRoutingTests.swift",
                 "ModelConstructionPlanTests.swift",
                 "FocusedMLXTestSupport.swift",
