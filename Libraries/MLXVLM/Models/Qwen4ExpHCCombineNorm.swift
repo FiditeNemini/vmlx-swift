@@ -76,9 +76,13 @@ final class Qwen4ExpHCCombineNorm {
                 if (sg == 0) {
                     acc = simd_sum(partials[lane]);
                     if (lane == 0) {
-                        float mean = RECIPROCAL_MEAN
-                            ? acc * (1.0f / float(width[0])) : acc / width[0];
-                        inv_mean[0] = metal::precise::rsqrt(mean + eps[0]);
+                        // AOT fast RMS contracts its reciprocal multiply and
+                        // epsilon addition. A separately rounded mean is NOT
+                        // equivalent near BF16/FP16 normalization boundaries.
+                        float mean_eps = RECIPROCAL_MEAN
+                            ? fma(acc, (1.0f / float(width[0])), eps[0])
+                            : (acc / width[0] + eps[0]);
+                        inv_mean[0] = metal::precise::rsqrt(mean_eps);
                     }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -133,7 +137,7 @@ final class Qwen4ExpHCCombineNorm {
             let mode = matches.count == 1 ? matches[0] : nil
             NSLog(
                 "[HCCombineNorm] rms_mean_arithmetic=%@ qualification_rows=4 width=96 source=loaded_rms_library",
-                mode.map { $0 ? "reciprocal" : "division" } ?? "unqualified_fallback")
+                mode.map { $0 ? "reciprocal_fma" : "division" } ?? "unqualified_fallback")
             return mode
         }()
     #endif

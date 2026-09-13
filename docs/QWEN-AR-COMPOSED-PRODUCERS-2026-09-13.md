@@ -7,6 +7,83 @@ samplers, replace BF16 arithmetic with FP32, or begin sustained MTP.
 BATCH OWNER: HC residual/next-norm fusion plus GDN Q/K normalization.
 NEXT: Current-source numerical/cache tests, then counterbalanced app comparisons.
 
+## Loaded-model rounding correction — September 13, 16:34 PDT
+
+Status remains PARTIAL: no rebuilt-app speed or all-quant/media qualification
+for this correction yet. Both new fusion switches remain off by default.
+
+The eight same-binary2L app observations on engine85b8/app14638 are retained,
+including the slower rows. Order base/GDN/HC/both then reverse, with short/8K/35K
+context order also reversed. Actual counting prompt lengths34/8339/34939; all
+answers identical891tokens and natural stops. These rows restore27/8332/34932
+tokens and prefill7, so they are not fresh long-prefill proof.
+
+| Arm | First short / 8K / 35K tok/s | Reverse short / 8K / 35K tok/s |
+| --- | --- | --- |
+| Base | 47.6663 / 42.6306 / 41.8651 | 42.3999 / 42.1121 / 42.5946 |
+| GDN | 50.7089 / 44.2426 / 43.4688 | 42.0617 / 42.3082 / 43.0541 |
+| HC | 43.3211 / 36.9423 / 36.6960 | 42.5255 / 41.6852 / 43.2759 |
+| Both | 51.4184 / 47.4230 / 46.5251 | 43.1398 / 44.2818 / 44.2035 |
+
+Combined short raw1s first/min/peak51/50/52 on pass1,46/39/46 on pass2.
+Real visible explanation/followup: baseline37.78/37.41, combined39.42/38.58;
+different text/context prevents treating those UI rows as exact causal pairs.
+The fresh37266-token UI prefill hit the unchanged8GiB free-memory guard before
+output. No long-UI completion or speed claim. Full outputs, raw iterator traces,
+1s/5s windows, gaps, screenshots and all process receipts remain in private evidence.
+
+### Failure and bounded correction
+
+HC-enabled sampled references consistently had252tokens versus259 baseline.
+The full-model sampler-free replay of the actual3010native prefix/3017prompt
+reproduced a difference at decode step4: max logit delta0.3125, first changed
+cache layer11. Two baseline executions agreed. Receipt
+`SWIFTTEST_HCLoadedReferenceParityB0913__161025.log`.
+
+Temporary DEBUG-only observation (subsequently removed) captured operation401:
+residual unchanged, nine normalized BF16 values different. Isolated replay
+`SWIFTTEST_HCCapturedNormReduction0913__161839.log` reproduced those9differences
+with the old separately rounded reciprocal mean; explicit FMA for mean/epsilon
+matched the loaded AOT RMS result. Residual multiplication/addition rounding is
+unchanged. Strict-library mode retains division; no global math setting changes.
+The earlier four-row qualification/768fixtures were insufficient and are not
+represented as full-model proof.
+
+`Qwen4ExpHCCombineNorm.swift` now preserves this FMA in qualified reciprocal
+mode. `meanEpsilonRoundingBoundaries` adds1024 fully generated BF16/FP16 cases
+using xorshift seed0x9103401 across widths96/192/768/2560 and six magnitudes.
+The reference retains the entire combine/RMS/weight graph, including zero and
+unit operations. No model weights, private prompt, or sampler are in the test.
+
+- `SWIFTTEST_HCMeanFMASyntheticRedGreen0913__162324.log`: legacy mean fails11
+  of1024generated cases; corrected mean matches all1024, all768original cases,
+  and the captured model operation. No generation or throughput claim.
+- `SWIFTTEST_HCMeanFMARegression0913__162455.log`:8tests/3suites, exit0;
+  numerical boundaries, GDN Q/K and connected GDN/QSA/PLE/cache routing.
+- `SWIFTTEST_HCMeanFMABothRMSLibraries0913__163411.log`: identical arithmetic
+  executable with app5313and isolated strict-RMS e46116libraries; both match
+  768original+1024boundary cases and the captured operation, selecting
+  reciprocal_fma/division respectively. Peak0.91GiB, flat swap, cleanup0/0/0.
+- `SWIFTTEST_HCMeanFMALoaded2L0913__162925.log`: all260forced inputs match
+  baseline, all48layers' final native arrays match, disk continuation matches;
+  24795HC calls including the reopen step. Peak49.08GiB, swap flat.
+- `SWIFTTEST_HCMeanFMALoaded4SBounded0913__163242.log`: all293forced inputs,
+  final48-layer state and native disk continuation match;27930HC calls.
+  Peak56.08GiB, swap flat. The earlier163052three-cache diagnostic stopped
+  at7.9GiBfree, with no mismatch reported through step96. The retry clears
+  disposable allocator buffers BETWEEN diagnostic steps; it changes neither
+  production memory limit nor the8GiB guard and is not a timing run.
+
+All completed supervisors report zero remaining owned processes. The initial
+162059broader arithmetic probe skipped zero/unit operations in its reference
+and showed33tiny-FP16 discrepancies; the complete reference162214showsnone.
+That incomplete diagnostic remains retained, not relabeled as an app defect.
+
+Correction helper SHA256:
+`ec14f262579c437c0f2ff36a8986a97b45aaf0d247fbb3c04107b7b6930820d5`.
+Next: source-pinned dev-app rebuild and repeated visible/API2L/4S execution;
+then1L/4M/6S, fresh long-prefill memory, media and sustained MTP. No release.
+
 ## Source comparison
 
 Reviewed engine baseline `93baa9f2bd5299f0d9a36eacea9da0b5c3028a52`;

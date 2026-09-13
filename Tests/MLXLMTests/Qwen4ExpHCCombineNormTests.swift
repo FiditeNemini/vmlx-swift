@@ -83,6 +83,51 @@ struct Qwen4ExpHCCombineNormTests {
         }
     }
 
+    @Test("mean and epsilon preserve loaded RMS rounding at narrow cast boundaries")
+    func meanEpsilonRoundingBoundaries() throws {
+        try MLXMetalTestLock.withLock {
+            // Generated, reproducible inputs only: no model weights, installed
+            // bundle, private prompt, or sampler. With AOT fast RMS the old
+            // separately rounded reciprocal mean fails 11 of these cases.
+            var state: UInt64 = 0x9103_401
+            func next() -> Float {
+                state ^= state << 13
+                state ^= state >> 7
+                state ^= state << 17
+                return Float(Int32(truncatingIfNeeded: state)) / Float(Int32.max)
+            }
+            for ordinal in 0 ..< 1024 {
+                let width = [96, 192, 768, 2560][ordinal % 4]
+                let dtype: DType = (ordinal / 4) % 2 == 0 ? .bfloat16 : .float16
+                let magnitude: Float = [0.0001, 0.01, 0.1, 1, 8, 64][(ordinal / 8) % 6]
+                let values = (0 ..< (width * 4)).map { _ in next() * magnitude }
+                let residual = MLXArray(values).asType(dtype).reshaped(1, 1, -1)
+                let block = MLXArray.zeros([1, 1, width], dtype: dtype)
+                let injection = MLXArray.ones([1, 1, 4], dtype: dtype)
+                let weight = MLXArray.ones([width * 4], dtype: dtype)
+                // Preserve the COMPLETE ordinary graph, even for zero block
+                // and unit weight: do not assume tiny FP16 values survive an
+                // omitted arithmetic operation identically under fast math.
+                let product =
+                    expandedDimensions(block, axis: -2)
+                    * expandedDimensions(injection, axis: -1)
+                let expected = (residual + product.reshaped(residual.shape)).asType(dtype)
+                let normalized =
+                    MLXFast.rmsNorm(
+                        expected.reshaped(4, width), weight: .mlxNone, eps: 1e-6
+                    ).reshaped(residual.shape) * weight
+                let actual = try #require(
+                    Qwen4ExpHCCombineNorm(hiddenSize: width, eps: 1e-6)(
+                        residual: residual, block: block, injection: injection, weight: weight))
+                #expect(bits(actual.residual) == bits(expected), "ordinal=\(ordinal)")
+                #expect(bits(actual.normalized) == bits(normalized), "ordinal=\(ordinal)")
+            }
+            print(
+                "[HCCombineNorm] mean_epsilon_boundary_cases=1024 tokens_per_second=NA reason=no_generation"
+            )
+        }
+    }
+
     @Test("unsupported widths, dtypes, prefill, batch and tracing fall back")
     func fallback() throws {
         try MLXMetalTestLock.withLock {
