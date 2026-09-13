@@ -563,6 +563,11 @@ private final class Qwen4ExpGatedResidual: Module {
     }
 
     func combine(_ hyper: MLXArray, block: MLXArray, injection: MLXArray) -> MLXArray {
+        if let combined = Qwen4ExpHCCombine.call(
+            residual: hyper, block: block, injection: injection)
+        {
+            return combined
+        }
         let value = expandedDimensions(block, axis: -2) * expandedDimensions(injection, axis: -1)
         return (hyper + value.reshaped(hyper.shape)).asType(hyper.dtype)
     }

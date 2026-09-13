@@ -1,5 +1,81 @@
 # Qwen4Exp early AR submission checkpoint — PARTIAL
 
+## Current app evidence and renewed acceptance bar
+
+The isolated optimized local dev app at app `61e8e6d0`, engine `fe8b231d`,
+core `73312d3e` has now executed the guarded path. Binary SHA256
+`3b5c9f2ab86494b65f13f61e9768187931d70d9b2971b54829676ea18fc51638`,
+UUID `7BF7323C-373F-3203-9CEA-280A624F0F72`; no DEBUG test hooks.
+This is not a published release or an installed-app replacement.
+
+Two measured app API rows per arm, following excluded warmups, retained the
+same 891-token complete count, natural stop, request bytes, bundle sampler,
+seed 829 and MTP-off route:
+
+| Actual input tokens | Early off mean tok/s | Early on mean tok/s | Change |
+|---|---:|---:|---:|
+| 34 | 36.3948 | 45.3106 | +24.497% |
+| 8339 | 32.8596 | 39.0530 | +18.848% |
+
+On rolling one-second windows were 42–47 short and 36–41 at 8K. Reverse off
+controls were 34.5004/30.0555; they are retained, not used to inflate the gain.
+These app rows supersede the older runner-only timing for app performance,
+not its source attribution. **The user's above-45 tok/s bar at both short and
+long context is NOT met.** Repeated long rows restore a prefix, so their small
+prepare durations are not full-prefill throughput. Separate nonce-prefill
+rows are retained but are not an exact-wire comparison.
+
+The visible first answer completed coherently at 37.6832 tok/s, but a raw-free
+supervisor abort occurred before the GUI follow-up. Subsequent runs use the
+existing kernel-free metric with unchanged pressure/swap/footprint bounds.
+All API timing rows preceded that abort; it is not silently counted as a
+successful whole-app session. Connected image rows had identical off/on
+outputs including wrong OCR/science; they establish neither vision quality
+nor a fresh vision-encoder pass.
+
+Private receipts: `early-app-short-comparison-0912.json`,
+`early-app-8k-comparison-0912.json`, reverse-control comparisons, the app build
+log `QwenEarlySubmitAppRelease0912__182608`, and per-token stream traces.
+
+## Additional shared-AR candidates, not yet app-qualified
+
+A live native sample of the same app during 8K AR decode captured 391/6002
+observations rebuilding the entire Foundation environment dictionary in two
+GDN policy gates. `RuntimeEnvironment.value` now copies only the requested C
+environment value and preserves current/legacy precedence, explicit snapshot
+lookups and dynamic changes. Inclusive stack observations are not additive
+GPU timings or a predicted speedup.
+
+`Qwen4ExpQSA` retains score math and argPartition, specializing only the B1/S1
+fully-causal boolean membership/tail mask. Future-key, prefill and batch paths
+remain generic; `VMLX_QSA_DECODE_MASK=0` provides a same-binary control.
+
+`Qwen4ExpHCCombine` is opt-in via `VMLX_QWEN4_EXACT_HC_COMBINE=1`. It derives
+stream count, hidden width and dtype from actual tensors, preserves the
+low-precision multiply rounding before addition, and disables FP contraction
+and reassociation. No weight quant, norm, sigmoid or recurrent-state math is
+replaced. Non-single-row and compile-trace calls retain the original graph.
+
+The first QSA shader test failed compilation on an invalid scalar/metadata
+interface; the failure is retained and the interface corrected. Combined
+generated regression `QwenHostQSAHC0912b__193404` exited 0: 27 Swift Testing
+cases plus the native-governor XCTest, zero failures, peak 4.09 GiB, unchanged
+0.49 GiB swap and cleanup 0/0/0. QSA tests cover F16/BF16/F32, ratios 1/4/32,
+ties, threshold/tail crossings through 32769 keys, batch and future-key fallback.
+HC tests compare exact bit patterns for 54 shape/dtype/stride configurations
+and three rounding counterexamples that distinguish multiplication-then-add
+from FMA. Connected mixed-format cache and 240-token governor tests also ran
+with both candidates enabled. The test semaphore recovered the previous
+crashed runner's abandoned lock using its existing 90-second timeout.
+
+In synchronized generated-mask diagnostics, the 8339-key full-mask call
+averaged 0.5060 ms generic versus 0.3789 ms specialized; at32769 keys,
+0.6660 versus 0.4857 ms. The environment diagnostic measured approximately
+18.87 microseconds per snapshot lookup versus 0.317 microseconds direct.
+These are optimized unit-run diagnostics, not app throughput predictions or
+isolated GPU timings. The new app-performance, default-adoption and merge
+gates remain pending.
+
 ## Scope
 
 The opt-in `VMLX_QWEN4_EXP_EARLY_SUBMIT=1` submits each completed trunk
@@ -96,8 +172,9 @@ Peak tracked footprint was 3.96 GiB, swap remained 0.49 GiB, cleanup 0/0/0.
 
 ## Remaining gates
 
-- Rebuild Release without DEBUG test hooks; repeat affected live app/API rows
-  with current engine pin, executable UUID/hash and actual submission marker.
+- Qualify the additional candidates, then rebuild the optimized local dev app
+  without DEBUG test hooks; repeat short and long app/API rows with exact pins,
+  executable UUID/hash, actual dispatch markers and rolling stream rates.
 - Connected app history, real image/video and explicit MTP fallback/re-entry
   must retain their original output/cache contracts.
 - Longer contexts, other installed quants, cancellation and the default-on

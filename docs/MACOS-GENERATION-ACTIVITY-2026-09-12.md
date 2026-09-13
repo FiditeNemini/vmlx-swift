@@ -46,10 +46,30 @@ cleanup group/tracked/watchdog0/0/0. The warm test checkout contains other
 pre-existing changes; these tests exercise the identical new Foundation helper,
 not full model precision or throughput. Package.swift explicitly registers them.
 
-Pending: exact isolated-source Release app, same-binary hidden enabled/disabled
-and idle-return tests, real UI/API cancellation/continuation, batch/MTP routes,
-short/long contexts and remaining quant/media coverage. No merge-readiness or
-family-wide speed guarantee is claimed from the unit tests.
+## Same-binary live activity isolation
+
+Optimized local Osaurus app source `61e8e6d0`, engine `fe8b231d`, core
+`73312d3e`, binary SHA256
+`3b5c9f2ab86494b65f13f61e9768187931d70d9b2971b54829676ea18fc51638`:
+the identical 8,339-token request and exact 891-token natural-stop answer ran
+at 16.0468 tok/s with the activity disabled and 33.5298 tok/s enabled.
+Early per-layer submission was disabled in both activity arms. Both processes
+were hidden and nice 0. The disabled arm had 55/55 in-decode samples suppressed;
+the enabled arm had 0/27 suppressed and logged its scope end.
+
+The disabled arm's rolling one-second token windows were 13–19 tok/s, versus
+33–34 enabled. Longest token gap fell from 124.09 to 39.33 ms. These are raw
+iterator delivery observations, not display-rate or GPU-occupancy estimates.
+The exact-wire/output/stop checks and PID-start-bound kernel-flag correlation
+passed in private `early-app-activity-comparison-0912.json`; raw receipts are
+`early-app-activity-disabled-hidden-0912` and `early-app-control-a-hidden-0912`.
+The disabled supervisor `QwenActivityDisabled0912b__190126` exited 0 at a
+50 GB peak footprint, unchanged 0.49 GB swap and cleanup 0/0/0. Enabled control
+`QwenEarlyControlApp0912a__183836` exited 0 at 51 GB, same swap and cleanup.
+
+Pending: idle-return observation, real UI cancellation/continuation, batch/MTP
+routes and remaining quant/media coverage. The paired activity result is one
+bundle/workload, not a family-wide speed floor or complete model qualification.
 
 Apple's [app-level activity guidance](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/PrioritizeWorkAtTheAppLevel.html)
 describes scoped user-initiated activities; its

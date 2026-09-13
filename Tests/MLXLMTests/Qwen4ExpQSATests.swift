@@ -11,6 +11,86 @@ import Testing
 @Suite("qwen4_exp QSA block selection", .serialized)
 struct Qwen4ExpQSATests {
 
+    @Test("single-query fused mask exactly matches generic selection at short and long contexts")
+    func decodeMaskParity() throws {
+        try MLXMetalTestLock.withLock {
+            for dtype in [DType.float16, .bfloat16, .float32] {
+                for ratio in [1, 4, 32] {
+                    for keyLen in [2048, 2049, 2080, 8192, 8339, 32769] {
+                        for tied in [false, true] {
+                            MLXRandom.seed(37)
+                            let query = (tied ? MLXArray.zeros([1, 4, 1, 32])
+                                : MLXRandom.normal([1, 4, 1, 32])).asType(dtype)
+                            let pooled = MLXRandom.normal([1, 1, keyLen / ratio, 32]).asType(dtype)
+                            let reference = Qwen4ExpQSA.selectedTokenMask(
+                                query: query, pooledKeys: pooled, pastLen: keyLen - 1,
+                                compressRatio: ratio, blockTopK: 2048 / ratio,
+                                keyLen: keyLen, useDecodeMask: false)
+                            let candidate = Qwen4ExpQSA.selectedTokenMask(
+                                query: query, pooledKeys: pooled, pastLen: keyLen - 1,
+                                compressRatio: ratio, blockTopK: 2048 / ratio,
+                                keyLen: keyLen, useDecodeMask: true)
+                            #expect((candidate == nil) == (reference == nil))
+                            if let reference, let candidate {
+                                #expect(candidate.shape == reference.shape)
+                                #expect(candidate.dtype == .bool)
+                                #expect(candidate.asArray(Bool.self) == reference.asArray(Bool.self),
+                                    "dtype=\(dtype) ratio=\(ratio) keys=\(keyLen) tied=\(tied)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("single-query mask specialization preserves future-key and batch fallback")
+    func decodeMaskFallbackParity() throws {
+        try MLXMetalTestLock.withLock {
+            for (batch, queries, past, keyLen) in [(1, 1, 8190, 8193), (2, 1, 8192, 8193),
+                                                  (1, 4, 8189, 8193)] {
+                MLXRandom.seed(41)
+                let query = MLXRandom.normal([batch, 4, queries, 32])
+                let pooled = MLXRandom.normal([batch, 1, keyLen / 4, 32])
+                let reference = try #require(Qwen4ExpQSA.selectedTokenMask(
+                    query: query, pooledKeys: pooled, pastLen: past, compressRatio: 4,
+                    blockTopK: 512, keyLen: keyLen, useDecodeMask: false))
+                let candidate = try #require(Qwen4ExpQSA.selectedTokenMask(
+                    query: query, pooledKeys: pooled, pastLen: past, compressRatio: 4,
+                    blockTopK: 512, keyLen: keyLen, useDecodeMask: true))
+                #expect(candidate.asArray(Bool.self) == reference.asArray(Bool.self))
+            }
+        }
+    }
+
+    @Test("single-query full QSA mask synchronized cost diagnostic")
+    func decodeMaskHostCost() throws {
+        guard ProcessInfo.processInfo.environment["VMLX_QSA_DECODE_BENCH"] == "1" else { return }
+        try MLXMetalTestLock.withLock {
+            for keyLen in [2081, 8339, 32769] {
+                MLXRandom.seed(51)
+                let query = MLXRandom.normal([1, 4, 1, 128]).asType(.bfloat16)
+                let pooled = MLXRandom.normal([1, 1, keyLen / 4, 128]).asType(.bfloat16)
+                MLX.eval(query, pooled)
+                for candidate in [false, true, true, false] {
+                    let warm = try #require(Qwen4ExpQSA.selectedTokenMask(
+                        query: query, pooledKeys: pooled, pastLen: keyLen - 1,
+                        compressRatio: 4, blockTopK: 512, keyLen: keyLen, useDecodeMask: candidate))
+                    MLX.eval(warm)
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    for _ in 0..<50 {
+                        let mask = try #require(Qwen4ExpQSA.selectedTokenMask(
+                            query: query, pooledKeys: pooled, pastLen: keyLen - 1,
+                            compressRatio: 4, blockTopK: 512, keyLen: keyLen, useDecodeMask: candidate))
+                        MLX.eval(mask)
+                    }
+                    let elapsed = DispatchTime.now().uptimeNanoseconds - start
+                    print("QSA_DECODE_MASK_COST candidate=\(candidate) keys=\(keyLen) calls=50 ns=\(elapsed)")
+                }
+            }
+        }
+    }
+
     private func blockGridMembership(_ selected: MLXArray, keyLen: Int, ratio: Int) -> MLXArray {
         let blocks = (keyLen + ratio - 1) / ratio
         let ids = MLXArray((0..<blocks).map(Int32.init))
