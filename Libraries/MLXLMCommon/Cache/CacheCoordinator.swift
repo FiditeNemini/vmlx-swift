@@ -239,8 +239,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         lock.withLock { _isHybrid }
     }
 
-    /// Whether disk admission requires a separately persisted recurrent
-    /// SSM/GDN snapshot at the exact matched prompt boundary.
+    /// Whether exact-boundary persistence must preserve recurrent SSM/GDN
+    /// state. Native disk payloads may carry it without a separate sidecar.
     public var requiresRecurrentSSMCompanion: Bool {
         lock.withLock { _requiresRecurrentSSMCompanion }
     }
@@ -708,12 +708,15 @@ public final class CacheCoordinator: @unchecked Sendable {
         tokens: [Int],
         mediaSalt: String? = nil
     ) -> Bool {
+        let needsSeparate = isHybrid && requiresSeparateRecurrentPayload
+        let needsNative = isHybrid && requiresRecurrentSSMCompanion && !needsSeparate
         guard diskCache?.hasValidatedEntry(
-            tokens: tokens, mediaSalt: mediaSalt) == true
+            tokens: tokens, mediaSalt: mediaSalt,
+            requireNativeRecurrent: needsNative) == true
         else {
             return false
         }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        if needsSeparate {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,
@@ -730,9 +733,17 @@ public final class CacheCoordinator: @unchecked Sendable {
         tokens: [Int],
         mediaSalt: String? = nil
     ) -> Bool {
-        guard diskCache?.hasDurableEntry(tokens: tokens, mediaSalt: mediaSalt) == true
+        // Match the disk writer's ownership contract. Mamba state is already
+        // native in-file; ArraysCache and unknown topologies still need their
+        // complete sidecar. A paged hit has its own companion admission gate:
+        // these predicates certify only the durable disk boundary.
+        let needsSeparate = isHybrid && requiresSeparateRecurrentPayload
+        let needsNative = isHybrid && requiresRecurrentSSMCompanion && !needsSeparate
+        guard diskCache?.hasDurableEntry(
+            tokens: tokens, mediaSalt: mediaSalt,
+            requireNativeRecurrent: needsNative) == true
         else { return false }
-        if isHybrid, requiresRecurrentSSMCompanion {
+        if needsSeparate {
             return ssmStateCache.hasValidatedCompleteDiskEntry(
                 tokens: tokens,
                 boundary: tokens.count,

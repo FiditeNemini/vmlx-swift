@@ -99,16 +99,95 @@ public final class DiskCache: @unchecked Sendable {
     private struct ValidatedRecord {
         let file: ValidatedFileFingerprint
         let layout: [String]
-        let hasRecurrentGeometry: Bool
+        let recurrentGeometry: RecurrentGeometry
+
+        var hasRecurrentGeometry: Bool { recurrentGeometry != .incomplete }
     }
 
-    private static func hasRecurrentGeometry(_ names: Set<String>) -> Bool {
-        names.filter { $0.hasPrefix("mamba_") && $0.hasSuffix("_state0") }
-            .allSatisfy { name in
-                let prefix = String(name.dropLast("_state0".count))
-                return names.contains("__\(prefix)_slots__")
-                    && names.contains("__\(prefix)_occupied__")
+    private enum RecurrentGeometry {
+        case absent, native, incomplete
+    }
+
+    /// Validate declared Mamba occupancy without loading state tensors. The
+    /// same checks run on already-realized metadata at store/fetch and bounded
+    /// integer reads on a cold disk query. Presence of `_state0` alone cannot
+    /// certify missing PLE/GDN slots or an entirely missing declared layer.
+    private static func recurrentGeometry(
+        _ names: Set<String>, readInts: (String) -> [Int32]?
+    ) -> RecurrentGeometry {
+        var prefixes = Set<String>()
+        for name in names {
+            if name.hasPrefix("__layer_kind_"), name.hasSuffix("__"),
+               readInts(name) == [TQDiskSerializer.LayerKind.mamba.rawValue] {
+                prefixes.insert("mamba_" + name.dropFirst("__layer_kind_".count).dropLast(2))
+            } else if name.hasPrefix("__cache_list_"), name.hasSuffix("_kind__"),
+                      readInts(name) == [TQDiskSerializer.LayerKind.mamba.rawValue] {
+                prefixes.insert("mamba_" + name.dropFirst("__cache_list_".count).dropLast("_kind__".count))
+            } else if name.hasPrefix("mamba_"), let range = name.range(of: "_state") {
+                prefixes.insert(String(name[..<range.lowerBound]))
             }
+        }
+        guard !prefixes.isEmpty else { return .absent }
+        guard readInts(TQDiskSerializer.formatVersionKey) == [TQDiskSerializer.currentFormatVersion]
+        else { return .incomplete }
+        for prefix in prefixes {
+            let suffix = String(prefix.dropFirst("mamba_".count))
+            let kind = suffix.contains("_sub_")
+                ? "__cache_list_\(suffix)_kind__" : "__layer_kind_\(suffix)__"
+            guard readInts(kind) == [TQDiskSerializer.LayerKind.mamba.rawValue],
+                  let slots = readInts("__\(prefix)_slots__"), slots.count == 1, slots[0] > 0,
+                  let occupied = readInts("__\(prefix)_occupied__"), !occupied.isEmpty,
+                  occupied.count <= Int(slots[0]), Set(occupied).count == occupied.count,
+                  occupied.contains(0), occupied.allSatisfy({ $0 >= 0 && $0 < slots[0] }),
+                  let offset = readInts("__\(prefix)_offset__"), offset.count == 1, offset[0] >= 0,
+                  Set(names.filter { $0.hasPrefix("\(prefix)_state") })
+                    == Set(occupied.map { "\(prefix)_state\($0)" })
+            else { return .incomplete }
+        }
+        return .native
+    }
+
+    private static func recurrentGeometry(_ arrays: [String: MLXArray]) -> RecurrentGeometry {
+        recurrentGeometry(Set(arrays.keys)) { name in
+            guard let value = arrays[name], value.dtype == .int32,
+                  value.ndim <= 1, value.size <= arrays.count
+            else { return nil }
+            return value.asArray(Int32.self)
+        }
+    }
+
+    /// Header and tiny integer metadata only; never mmap/evaluate the cache
+    /// tensors just to decide whether another full prefill is necessary.
+    private static func recurrentGeometry(
+        url: URL, header: (length: Int, tensors: [String: Any])
+    ) -> RecurrentGeometry {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return .incomplete }
+        defer { try? handle.close() }
+        var metadataBudget = 64 * 1024
+        return recurrentGeometry(Set(header.tensors.keys)) { name in
+            guard let tensor = header.tensors[name] as? [String: Any],
+                  tensor["dtype"] as? String == "I32",
+                  let shape = tensor["shape"] as? [Int], shape.count <= 1,
+                  let offsets = tensor["data_offsets"] as? [Int], offsets.count == 2
+            else { return nil }
+            let count = shape.first ?? 1
+            guard count >= 0, count <= header.tensors.count,
+                  count <= metadataBudget / 4, offsets[0] >= 0,
+                  offsets[1] >= offsets[0], offsets[1] - offsets[0] == count * 4,
+                  offsets[0] <= Int.max - 8 - header.length
+            else { return nil }
+            metadataBudget -= count * 4
+            do {
+                try handle.seek(toOffset: UInt64(8 + header.length + offsets[0]))
+                guard let bytes = try handle.read(upToCount: count * 4), bytes.count == count * 4
+                else { return nil }
+                return bytes.withUnsafeBytes { raw in
+                    (0..<count).map {
+                        Int32(littleEndian: raw.loadUnaligned(fromByteOffset: $0 * 4, as: Int32.self))
+                    }
+                }
+            } catch { return nil }
+        }
     }
 
     /// Token identity alone cannot justify retaining an older representation.
@@ -452,7 +531,7 @@ public final class DiskCache: @unchecked Sendable {
             if let fingerprint = _fileFingerprint(url: finalURL), fingerprint.size > 0 {
                 validatedFiles[hash] = ValidatedRecord(
                     file: fingerprint, layout: Self.payloadLayout(arrays),
-                    hasRecurrentGeometry: Self.hasRecurrentGeometry(Set(arrays.keys)))
+                    recurrentGeometry: Self.recurrentGeometry(arrays))
             } else {
                 validatedFiles.removeValue(forKey: hash)
             }
@@ -549,7 +628,7 @@ public final class DiskCache: @unchecked Sendable {
             if let fingerprint = _fileFingerprint(url: url), fingerprint.size > 0 {
                 validatedFiles[hash] = ValidatedRecord(
                     file: fingerprint, layout: Self.payloadLayout(arrays),
-                    hasRecurrentGeometry: Self.hasRecurrentGeometry(Set(arrays.keys)))
+                    recurrentGeometry: Self.recurrentGeometry(arrays))
             }
             if touchRecency {
                 _touchEntryLocked(hash: hash)
@@ -599,7 +678,9 @@ public final class DiskCache: @unchecked Sendable {
     /// a successful store also validates it. Stable system/tool boundaries can
     /// use this to avoid a second architecture rederive and serialization at
     /// the end of every warm request without trusting inherited or stale files.
-    public func hasValidatedEntry(tokens: [Int], mediaSalt: String? = nil) -> Bool {
+    public func hasValidatedEntry(
+        tokens: [Int], mediaSalt: String? = nil, requireNativeRecurrent: Bool = false
+    ) -> Bool {
         let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
         let url = safetensorsURL(for: hash)
         lock.lock()
@@ -609,6 +690,7 @@ public final class DiskCache: @unchecked Sendable {
               let current = _fileFingerprint(url: url),
               current == validated.file,
               validated.hasRecurrentGeometry,
+              !requireNativeRecurrent || validated.recurrentGeometry == .native,
               current.size > 0,
               let indexed = _entryMetadataLocked(hash: hash),
               indexed.tokenCount == tokens.count,
@@ -632,7 +714,9 @@ public final class DiskCache: @unchecked Sendable {
     /// user Stop. The key is content-addressed over exactly these tokens, so an
     /// indexed row whose size matches the file on disk is the same bytes a
     /// rebuild would produce.
-    public func hasDurableEntry(tokens: [Int], mediaSalt: String? = nil) -> Bool {
+    public func hasDurableEntry(
+        tokens: [Int], mediaSalt: String? = nil, requireNativeRecurrent: Bool = false
+    ) -> Bool {
         let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
         let url = safetensorsURL(for: hash)
         lock.lock()
@@ -650,9 +734,11 @@ public final class DiskCache: @unchecked Sendable {
         // safetensors header; do not map or realize model state to decide.
         if let validated = validatedFiles[hash], validated.file == current {
             return validated.hasRecurrentGeometry
+                && (!requireNativeRecurrent || validated.recurrentGeometry == .native)
         }
         guard let header = Self.tensorHeader(url: url) else { return false }
-        return Self.hasRecurrentGeometry(Set(header.tensors.keys))
+        let geometry = Self.recurrentGeometry(url: url, header: header)
+        return geometry != .incomplete && (!requireNativeRecurrent || geometry == .native)
     }
 
     /// Candidate prompt-boundary lengths currently present in the disk index.

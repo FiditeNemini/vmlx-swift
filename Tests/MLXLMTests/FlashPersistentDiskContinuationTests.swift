@@ -251,9 +251,35 @@ struct FlashPersistentDiskContinuationTests {
                             try FileManager.default.createDirectory(
                                 at: snapshotDirectory, withIntermediateDirectories: true)
                             defer { try? FileManager.default.removeItem(at: snapshotDirectory) }
-                            let snapshotURL = snapshotDirectory.appendingPathComponent("cache.safetensors")
-                            try MLX.save(arrays: TQDiskSerializer.serialize(cache: cache), url: snapshotURL)
-                            let stored = try MLX.loadArrays(url: snapshotURL)
+                            let prefixIDs = Array(2..<31) + [31, 37, 41, 43, 47]
+                            let diskConfig = CacheCoordinatorConfig(
+                                usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 0.1,
+                                diskCacheDir: snapshotDirectory, modelKey: "flash-connected-state")
+                            let topology = ModelCacheTopologySnapshot(cache: cache)
+                            #expect(topology.requiresRecurrentSSMCompanionState)
+                            #expect(!topology.requiresSeparateRecurrentPayloadState)
+                            func makeCoordinator() -> CacheCoordinator {
+                                let coordinator = CacheCoordinator(config: diskConfig)
+                                coordinator.setHybrid(true,
+                                    requiresRecurrentSSMCompanion: topology.requiresRecurrentSSMCompanionState,
+                                    requiresSeparateRecurrentPayload: topology.requiresSeparateRecurrentPayloadState)
+                                return coordinator
+                            }
+                            let writer = makeCoordinator()
+                            writer.storeAfterGeneration(promptTokens: prefixIDs, perLayerData: [],
+                                ssmStates: extractSSMStates(from: cache), cache: cache)
+                            #expect(writer.hasValidatedDiskEntry(tokens: prefixIDs))
+                            let reader = makeCoordinator()
+                            #expect(reader.hasDurableDiskEntry(tokens: prefixIDs))
+                            #expect(!reader.hasValidatedDiskEntry(tokens: prefixIDs))
+                            guard case .hit(let matched, _, let detail, _, let ssm, let diskArrays) =
+                                reader.fetch(tokens: prefixIDs + [53]) else {
+                                Issue.record("Flash GDN/QSA/PLE boundary must survive coordinator reopen")
+                                return
+                            }
+                            #expect(matched == prefixIDs.count && detail == .disk && ssm == nil)
+                            let stored = try #require(diskArrays)
+                            #expect(reader.hasValidatedDiskEntry(tokens: prefixIDs))
                             var restored = model.newCache(parameters: nil)
                             #expect(restoreFromDiskArrays(stored, into: &restored) == cache.last?.offset)
                             #expect(restored.map(\.offset) == cache.map(\.offset))

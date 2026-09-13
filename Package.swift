@@ -890,6 +890,7 @@ let package = Package(
                 "BatchEngineGrowingChatCacheSourceTests.swift",
                 "ProcessorPatchSizeShapeTests.swift",
                 "CacheCoordinatorTopologyFocusedTests.swift",
+                "NativeDiskDurabilityTests.swift",
                 "DiskStoreOffsetConsistencyFocusedTests.swift",
                 "ExpertDownProjectionQuantOrderTests.swift",
                 "VMLXUmbrellaProductTests.swift",
