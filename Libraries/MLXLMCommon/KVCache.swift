@@ -597,16 +597,50 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
 /// KV cache for QSA (Qwen sparse attention, qwen4_exp) full-attention
 /// layers: the standard K/V buffers plus the layer's RAW indexer keys
-/// (pre-norm, pre-rope, `[B, T, indexerHeadDim]`). The indexer re-pools and
-/// re-ropes its key blocks every forward, so the raw keys are the only
-/// auxiliary state that must persist — and they must stay row-for-row in
+/// (pre-norm, pre-rope, `[B, T, indexerHeadDim]`). Completed pooled blocks
+/// are derived, so the raw keys are the only auxiliary state that must
+/// persist — and they must stay row-for-row in
 /// sync with `offset` across trim/rollback or block selection reads keys
 /// from the wrong positions.
 public class QSAKVCache: KVCacheSimple {
+    private var indexerKeyStorage: MLXArray?
+    private var indexerKeyCount = 0
+    private let useIndexerCapacity: Bool
+    private var reportIndexerStorage = RuntimeEnvironment.flag("VMLX_QSA_RAW_STORAGE_TRACE")
+
+    // Counts explicit backing-store growth, not physical Metal allocations.
+    // Retained views can still prevent donation; benchmark the actual workload.
+    internal private(set) var indexerStorageGrowths = 0
+    internal var indexerStorageCapacity: Int { indexerKeyStorage?.dim(1) ?? 0 }
+
+    public override init() {
+        useIndexerCapacity = RuntimeEnvironment.value("VMLX_QSA_RAW_CAPACITY") != "0"
+        super.init()
+    }
+
+    internal init(useIndexerCapacity: Bool) {
+        self.useIndexerCapacity = useIndexerCapacity
+        super.init()
+    }
+
+    private func traceIndexerUpdate() {
+        guard reportIndexerStorage else { return }
+        reportIndexerStorage = false
+        NSLog(
+            "[QSAKVCache] raw_storage=%@ committed=%d logical=%d capacity=%d step=%d dtype=%@",
+            useIndexerCapacity ? "capacity" : "concat", offset, indexerKeyCount,
+            indexerStorageCapacity, step, String(describing: indexerKeyStorage?.dtype))
+    }
+
     /// Raw indexer keys covering `[0, offset + pending)` — the layer calls
     /// `updateIndexerKeys` BEFORE `update(keys:values:)` advances `offset`,
-    /// matching the reference forward order.
-    public private(set) var indexerKeys: MLXArray?
+    /// matching the reference forward order. Spare capacity is never visible.
+    /// Do not retain a second cached view: that would block buffer donation.
+    public var indexerKeys: MLXArray? {
+        guard let storage = indexerKeyStorage else { return nil }
+        return indexerKeyCount == storage.dim(1)
+            ? storage : storage[0..., ..<indexerKeyCount, 0...]
+    }
 
     /// DERIVED pooled-index lane: kNorm+rope-processed block keys
     /// `[B, blockCount, indexerHeadDim]`, processed left-to-right by the
@@ -629,20 +663,60 @@ public class QSAKVCache: KVCacheSimple {
     }
 
     public func updateIndexerKeys(_ rawKeys: MLXArray) -> MLXArray {
-        if let existing = indexerKeys, existing.dim(1) > 0 {
-            // Stale rows beyond `offset` (a trim/rollback that happened
-            // between forwards) must not survive into the concat.
-            let valid = existing.dim(1) > offset
-                ? existing[0..., ..<offset, 0...] : existing
-            indexerKeys = concatenated([valid, rawKeys], axis: 1)
-        } else {
-            indexerKeys = rawKeys
+        precondition(rawKeys.ndim == 3, "QSA indexer keys must be [B, T, D]")
+        // offset still describes committed K/V. Replace any pending suffix,
+        // including a second indexer call before update(keys:values:).
+        // A damaged short lane must remain short, not gain fabricated rows.
+        let previous = min(offset, indexerKeyCount)
+        let end = previous + rawKeys.dim(1)
+
+        if indexerKeyCount > 0, let storage = indexerKeyStorage {
+            precondition(
+                storage.dim(0) == rawKeys.dim(0) && storage.dim(2) == rawKeys.dim(2),
+                "QSA indexer update geometry changed")
         }
+
+        // Retain the original concat as the A/B control and for unusual dtype
+        // transitions: slice assignment alone would silently cast new rows to
+        // the old dtype instead of preserving concatenate's type promotion.
+        if !useIndexerCapacity || (indexerKeyCount > 0 && indexerKeyStorage?.dtype != rawKeys.dtype)
+        {
+            if indexerKeyCount > 0, let storage = indexerKeyStorage {
+                indexerKeyStorage = concatenated(
+                    [storage[0..., ..<previous, 0...], rawKeys], axis: 1)
+            } else {
+                indexerKeyStorage = rawKeys
+            }
+            indexerKeyCount = end
+            traceIndexerUpdate()
+            return indexerKeys!
+        }
+
+        let sameLayout =
+            indexerKeyStorage?.dim(0) == rawKeys.dim(0)
+            && indexerKeyStorage?.dim(2) == rawKeys.dim(2)
+            && indexerKeyStorage?.dtype == rawKeys.dtype
+        if !sameLayout || end > indexerStorageCapacity {
+            let quantum = max(1, step)
+            let capacity = ((end + quantum - 1) / quantum) * quantum
+            var storage = MLXArray.zeros(
+                [rawKeys.dim(0), capacity, rawKeys.dim(2)], dtype: rawKeys.dtype)
+            if previous > 0, let old = indexerKeyStorage {
+                storage[0..., ..<previous, 0...] = old[0..., ..<previous, 0...]
+            }
+            indexerKeyStorage = storage
+            indexerStorageGrowths += 1
+        }
+        if end > previous {
+            indexerKeyStorage?[0..., previous ..< end, 0...] = rawKeys
+        }
+        indexerKeyCount = end
+        traceIndexerUpdate()
         return indexerKeys!
     }
 
     public override func innerState() -> [MLXArray] {
-        super.innerState() + [indexerKeys, derivedPooledBlocks].compactMap { $0 }
+        super.innerState() + [indexerKeyStorage, derivedPooledBlocks].compactMap { $0 }
     }
 
     public override var state: [MLXArray] {
@@ -658,11 +732,14 @@ public class QSAKVCache: KVCacheSimple {
         set {
             if newValue.count == 3 {
                 super.state = Array(newValue[0 ..< 2])
-                indexerKeys = newValue[2]
+                indexerKeyStorage = newValue[2]
+                indexerKeyCount = newValue[2].dim(1)
             } else {
                 super.state = newValue
-                indexerKeys = nil
+                indexerKeyStorage = nil
+                indexerKeyCount = 0
             }
+            indexerStorageGrowths = 0
             // A restored cache may hold any raw-lane content; the derived
             // pooled lane is rebuilt from it on the next forward.
             dropDerivedPooledBlocks()
@@ -673,9 +750,7 @@ public class QSAKVCache: KVCacheSimple {
     public override func trim(_ n: Int) -> Int {
         let trimmed = super.trim(n)
         if trimmed > 0 {
-            if let existing = indexerKeys, existing.dim(1) > offset {
-                indexerKeys = existing[0..., ..<offset, 0...]
-            }
+            indexerKeyCount = min(indexerKeyCount, offset)
             // Rollback invalidates trailing blocks; rebuild from raw keys.
             dropDerivedPooledBlocks()
         }
@@ -683,7 +758,7 @@ public class QSAKVCache: KVCacheSimple {
     }
 
     public override func copy() -> any KVCache {
-        let new = QSAKVCache()
+        let new = QSAKVCache(useIndexerCapacity: useIndexerCapacity)
         new.step = self.step
         new.offset = self.offset
         let s = self.state
