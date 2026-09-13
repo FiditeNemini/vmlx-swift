@@ -910,7 +910,10 @@ private final class Qwen4ExpQSAIndexer: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray, cache: QSAKVCache?) -> MLXArray? {
+    func callAsFunction(
+        _ x: MLXArray, cache: QSAKVCache?,
+        rotaryContext: Qwen4ExpRotaryContext? = nil
+    ) -> MLXArray? {
         let B = x.dim(0), S = x.dim(1)
         precondition(B == 1, "qwen4_exp QSA currently supports batch size 1")
         let past = cache?.offset ?? 0
@@ -943,11 +946,20 @@ private final class Qwen4ExpQSAIndexer: Module {
                 .reshaped(B, range.count, ratio, extras.indexerHeadDim)
                 .asType(.float32).mean(axis: 2).asType(allKeys.dtype)
             chunk = kNorm(chunk)
-            let positions = MLXArray(stride(
-                from: range.lowerBound * ratio, to: range.upperBound * ratio,
-                by: ratio)).asType(.int32).reshaped(1, range.count)
             let chunk4 = expandedDimensions(chunk, axis: 1)
-            let (kCos, kSin) = rotary(x: chunk4, positionIds: positions)
+            let factors: (MLXArray, MLXArray)
+            if let rotaryContext {
+                factors = rotaryContext.factors(
+                    rotary: rotary, like: chunk4,
+                    start: range.lowerBound * ratio, end: range.upperBound * ratio,
+                    step: ratio)
+            } else {
+                let positions = MLXArray(stride(
+                    from: range.lowerBound * ratio, to: range.upperBound * ratio,
+                    by: ratio)).asType(.int32).reshaped(1, range.count)
+                factors = rotary(x: chunk4, positionIds: positions)
+            }
+            let (kCos, kSin) = factors
             return Qwen35Language.applyMultimodalRotaryPosEmb(
                 q: chunk4, k: chunk4, cos: kCos, sin: kSin).0[0..., 0, 0..., 0...]
         }
@@ -976,8 +988,15 @@ private final class Qwen4ExpQSAIndexer: Module {
             pooled = processBlocks(0 ..< blocks)
         }
 
-        let qPositions = MLXArray(past ..< (past + S)).asType(.int32).reshaped(1, S)
-        let (qCos, qSin) = rotary(x: query, positionIds: qPositions)
+        let queryFactors: (MLXArray, MLXArray)
+        if let rotaryContext {
+            queryFactors = rotaryContext.factors(
+                rotary: rotary, like: query, start: past, end: past + S)
+        } else {
+            let qPositions = MLXArray(past ..< (past + S)).asType(.int32).reshaped(1, S)
+            queryFactors = rotary(x: query, positionIds: qPositions)
+        }
+        let (qCos, qSin) = queryFactors
         query = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: query, k: query, cos: qCos, sin: qSin).0
         return Qwen4ExpQSA.selectedTokenMask(
@@ -1021,11 +1040,12 @@ private final class Qwen4ExpAttention: Module {
     func callAsFunction(
         _ x: MLXArray, cache: QSAKVCache?,
         positionIds explicitPositions: MLXArray? = nil,
-        positionOffset: Int = 0
+        positionOffset: Int = 0,
+        rotaryContext: Qwen4ExpRotaryContext? = nil
     ) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
         let past = cache?.offset ?? 0
-        let sparseMask = indexer(x, cache: cache)
+        let sparseMask = indexer(x, cache: cache, rotaryContext: rotaryContext)
         let headDim = text.headDim ?? (text.hiddenSize / text.attentionHeads)
         // Verify-tile (workplan W2a): the projections are row-independent
         // weight matmuls, so their M dimension may be padded to the NAX tile
@@ -1045,10 +1065,18 @@ private final class Qwen4ExpAttention: Module {
         // Media prefill passes explicit 3-channel M-RoPE positions from
         // getRopeIndex; decode after media continues from past + ropeDelta.
         // Text-only keeps the sequential cache-offset positions (offset 0).
-        let positions = explicitPositions
-            ?? MLXArray((past + positionOffset) ..< (past + positionOffset + S))
-                .asType(.int32).reshaped(1, S)
-        let (cos, sin) = rotary(x: value, positionIds: positions)
+        let factors: (MLXArray, MLXArray)
+        if explicitPositions == nil, let rotaryContext {
+            factors = rotaryContext.factors(
+                rotary: rotary, like: value,
+                start: past + positionOffset, end: past + positionOffset + S)
+        } else {
+            let positions = explicitPositions
+                ?? MLXArray((past + positionOffset) ..< (past + positionOffset + S))
+                    .asType(.int32).reshaped(1, S)
+            factors = rotary(x: value, positionIds: positions)
+        }
+        let (cos, sin) = factors
         (query, key) = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: query, k: key, cos: cos, sin: sin)
 
@@ -1131,7 +1159,8 @@ private final class Qwen4ExpDecoderLayer: Module {
         pleEmbedding: MLXArray? = nil,
         recordPrefixCommitStates: Bool = false,
         positionIds: MLXArray? = nil,
-        positionOffset: Int = 0
+        positionOffset: Int = 0,
+        rotaryContext: Qwen4ExpRotaryContext? = nil
     ) -> MLXArray {
         if Self.profiledLayer == layerIndex,
             inputIds.size == Self.profileSequenceLength,
@@ -1173,7 +1202,8 @@ private final class Qwen4ExpDecoderLayer: Module {
                         recordPrefixCommitStates: recordPrefixCommitStates)
                     : attention!(
                         attentionMix.0, cache: cache as? QSAKVCache,
-                        positionIds: positionIds, positionOffset: positionOffset)
+                        positionIds: positionIds, positionOffset: positionOffset,
+                        rotaryContext: rotaryContext)
                 return (result, [result])
             }
             hyper = evaluated("attention_combine") {
@@ -1219,7 +1249,8 @@ private final class Qwen4ExpDecoderLayer: Module {
                 recordPrefixCommitStates: recordPrefixCommitStates)
             : attention!(
                 attentionInput, cache: cache as? QSAKVCache,
-                positionIds: positionIds, positionOffset: positionOffset)
+                positionIds: positionIds, positionOffset: positionOffset,
+                rotaryContext: rotaryContext)
         hyper = attentionResidual.combine(hyper, block: attentionOutput, injection: inject!)
         let (mlpInput, mlpInject) = mlpResidual.mix(hyper)
         return mlpResidual.combine(hyper, block: mlp(mlpInput), injection: mlpInject!)
@@ -1368,6 +1399,9 @@ private final class Qwen4ExpTextModel: Module {
     // Read once per instance, not from ProcessInfo on every layer/token.
     var earlySubmissionEnabled = Qwen4ExpEarlySubmission.parse(
         RuntimeEnvironment.value("VMLX_QWEN4_EXP_EARLY_SUBMIT"))
+    private var rotaryReuseEnabled = Qwen4ExpEarlySubmission.parse(
+        RuntimeEnvironment.value("VMLX_QWEN4_AR_ROTARY_REUSE"))
+    private var reportedRotaryReuseShapes: Set<String> = []
     private(set) var earlySubmissionCount = 0
     private var reportedEarlySubmit = false
 
@@ -1406,6 +1440,11 @@ private final class Qwen4ExpTextModel: Module {
             enabled: earlySubmissionEnabled, shape: inputIds.shape,
             autoregressive: autoregressive, recordingPrefix: recordPrefixCommitStates,
             externalPLE: pleEmbeddings != nil, compiledTrace: CompiledDecodeTrace.isActive)
+        let rotaryContext = Qwen4ExpEarlySubmission.allows(
+            enabled: rotaryReuseEnabled, shape: inputIds.shape,
+            autoregressive: autoregressive, recordingPrefix: recordPrefixCommitStates,
+            externalPLE: pleEmbeddings != nil, compiledTrace: CompiledDecodeTrace.isActive)
+            ? Qwen4ExpRotaryContext() : nil
         if earlySubmit, !reportedEarlySubmit {
             reportedEarlySubmit = true
             NSLog("[Qwen4Exp] early-submit active stride=1 rows=1 layers=%d caller_stream=1 outer_compile=0 ar_only=1",
@@ -1436,7 +1475,8 @@ private final class Qwen4ExpTextModel: Module {
                 pleEmbedding: pleEmbeddings?[index],
                 recordPrefixCommitStates: recordPrefixCommitStates,
                 positionIds: positionIds,
-                positionOffset: positionOffset)
+                positionOffset: positionOffset,
+                rotaryContext: rotaryContext)
             if earlySubmit {
                 asyncEval(hidden)
                 earlySubmissionCount += 1
@@ -1450,6 +1490,13 @@ private final class Qwen4ExpTextModel: Module {
             if auditDTypes { layerDTypes.append(hidden.dtype) }
         }
         let result = mixer.mix(hidden).0
+        if let rotaryContext {
+            let shape = "\(rotaryContext.factorCount)|\(rotaryContext.reuseCount)"
+            if reportedRotaryReuseShapes.insert(shape).inserted {
+                NSLog("[Qwen4Exp] ar_rotary_reuse=active unique_factors=%d reused=%d lifetime=forward original_math=1",
+                    rotaryContext.factorCount, rotaryContext.reuseCount)
+            }
+        }
         if auditDTypes {
             Qwen4ExpDTypeTrace.logTextAudit(
                 rawEmbedding: rawEmbeddingDType, computeEmbedding: computeEmbeddingDType,

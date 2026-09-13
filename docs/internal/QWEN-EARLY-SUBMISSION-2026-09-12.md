@@ -1,5 +1,61 @@
 # Qwen4Exp early AR submission checkpoint — PARTIAL
 
+## Latest shared-AR app measurements
+
+App `05ab691fc`, engine `75ce953e`, unchanged core `73312d3e`, binary
+SHA256 `8fca0c9c43f58373d7f760526c907f10a2c4850d3bc5dd2acebb1f0f6307ef67`
+executed the new environment lookup and separately controlled QSA/HC paths.
+All rows below use early submission, unchanged bundle sampler settings,
+explicit test seed829/thinking-off, MTP off, and 891 naturally stopped output
+tokens. Two measured rows per cell exclude the initial warmup. Values are
+app `genTps`; independent iterator and SSE timings are retained separately.
+
+| Actual input | QSA/HC off | QSA only | QSA + HC | QSA + HC, serial PLE |
+|---|---:|---:|---:|---:|
+| 34 | 45.9133 | 45.0724 | 46.3210 | 38.5121 |
+| 8339 | 39.3775 | 42.9496 | 42.0010 | 35.3378 |
+
+Serial PLE scheduling is rejected by these same-binary observations. Do not
+copy the reference C/Python small-row scheduling threshold into Swift as a
+default. The isolated HC effect is small/noisy here; it is still opt-in.
+
+At34953 actual input, a new-prefix request took63924ms to prepare and decoded
+41.7517tok/s. Its exact-byte repeat restored the prefix in219ms and decoded
+42.2351tok/s. Both outputs matched. Rolling one-second iterator rates were
+39–43 and41–44. The earlier `host-qsa-32k-cold-0912` directory is misnamed:
+its own log records a disk prefix hit, so it is not cold-prefill evidence.
+
+Private receipts: `host-all-short-components-0912.json`,
+`host-all-8k-components-0912.json`, `host-35k-prefix-comparison-0912.json`,
+and `QwenHostQSAApp0912a__200627.log`. Last app supervisor exited0 after an
+observed AX Quit at20:21:12; peak56GiB, flat0.49GiB swap, cleanup0/0/0.
+**Above45 at short AND long context is still not met.**
+
+## Forward-local rotary common subexpressions — candidate
+
+`VMLX_QWEN4_AR_ROTARY_REUSE=1` is opt-in. A fresh `Qwen4ExpRotaryContext`
+is owned by one explicit single-token AR forward. Equivalent layers share
+the original position-product, cos/sin and dtype-cast graph, keyed by the
+complete rotary configuration, output dtype, start/end and stride. This is
+not a new approximation or a persistent KV/SSM/prefix-cache entry. The same
+AR-only call-site exclusions as early submission apply. Explicit media
+position arrays bypass factor reuse; real sequential post-media offsets
+remain part of the key. No global model table or compiled weight capture.
+
+The motivating native sample `host-qsa-hotpath-decode-sample-0912.txt`
+observed repeated QSA position-factor construction and2497/3896 inclusive
+samples in per-layer MLX submission,1076 in layer construction. These are
+CPU observations, not additive GPU costs or a predicted application gain.
+`QwenRotaryReuse0912__202136` completed25 Swift Testing cases and the
+native-governor XCTest with zero failures, peak4.28GiB, flat0.49GiB swap,
+cleanup0/0/0. This includes72 exact-factor configurations, evaluated
+cross-layer reuse, key/lifetime and phase exclusions, plus QSA/HC and
+mixed-cache regressions. `QwenRotaryMedia0912__202832` completed all five
+existing text/batch/explicit-three-channel-media/resumed-rotary tests with
+zero failures and cleanup0/0/0. The optimized unit build uses DEBUG only for
+an existing unrelated host-read test hook; the dev app does not.
+Real-app comparison is pending; these tests are not a speed result.
+
 ## Current app evidence and renewed acceptance bar
 
 The isolated optimized local dev app at app `61e8e6d0`, engine `fe8b231d`,

@@ -1139,6 +1139,16 @@ enum Qwen35Language {
     }
 
     final class RotaryEmbedding {
+        /// Everything that determines the position factors, excluding the
+        /// output dtype and positions themselves. No model/layer name is used.
+        struct FactorSignature: Hashable {
+            let dimension: Int
+            let baseBits: UInt32
+            let sections: [Int]
+            let textFastPath: Bool
+        }
+
+        let factorSignature: FactorSignature
         private let invFreq: MLXArray
         private let mropeSection: [Int]
         private let textPositionFastPath: Bool
@@ -1154,6 +1164,9 @@ enum Qwen35Language {
             self.mropeSection =
                 mropeSection.count >= 3 ? mropeSection : [11, 11, 10]
             self.textPositionFastPath = textPositionFastPath
+            self.factorSignature = FactorSignature(
+                dimension: safeDim, baseBits: base.bitPattern,
+                sections: self.mropeSection, textFastPath: textPositionFastPath)
         }
 
         private func applyInterleavedMRope(_ freqs: MLXArray) -> MLXArray {
