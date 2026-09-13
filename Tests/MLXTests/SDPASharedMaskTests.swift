@@ -102,6 +102,7 @@ final class SDPASharedMaskTests: XCTestCase {
                 if kind == "strided" {
                     let bits = sharedMask.asArray(Bool.self).flatMap { [$0, false] }
                     sharedMask = MLXArray(bits)[.stride(by: 2)].reshaped(1, 1, 1, length)
+                    eval(sharedMask)
                     XCTAssertEqual(sharedMask.strides[3], 2)
                 }
                 let sinks = kind == "sinks" ? MLXRandom.normal([8]).asType(dtype) : nil

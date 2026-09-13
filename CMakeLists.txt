@@ -33,6 +33,11 @@ FetchContent_Declare(
   GIT_TAG "v0.6.0")
 FetchContent_MakeAvailable(mlx-c)
 
+# Swift's Stream.runWith uses this local C bridge. SwiftPM already compiles it
+# through the Cmlx source tree; the CMake target must link the same definition.
+target_sources(mlxc PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx-generated/stream_run_with.cpp)
+
 # swift-numerics
 set(swift_numerics_patch git apply
                          ${CMAKE_CURRENT_SOURCE_DIR}/cmake/swift-numerics.patch)
