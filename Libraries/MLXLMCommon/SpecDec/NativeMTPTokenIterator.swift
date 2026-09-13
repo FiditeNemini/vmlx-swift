@@ -2615,7 +2615,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         let verifyStart = NativeMTPClock.now()
-        let output = model.nativeBackboneForward(Self.tokenInput(primary), cache: cache)
+        let output: NativeMTPForwardResult
+        if let arModel = model as? any NativeMTPAutoregressiveBackboneModel {
+            output = arModel.nativeAutoregressiveBackboneForward(
+                Self.tokenInput(primary), cache: cache)
+        } else {
+            output = model.nativeBackboneForward(Self.tokenInput(primary), cache: cache)
+        }
         MLX.eval(output.logits, output.hiddenStates)
         let elapsed = NativeMTPClock.now() - verifyStart
         targetVerifyTime += elapsed

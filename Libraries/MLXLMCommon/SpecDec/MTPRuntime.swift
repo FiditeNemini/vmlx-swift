@@ -744,6 +744,16 @@ public extension NativeMTPModel {
     }
 }
 
+/// Optional target scheduling specialization used only by the iterator's
+/// explicit AR-fallback step. Seed, draft, verification and re-entry must
+/// continue through their existing forwards. The result retains the same
+/// hidden-state and cache contract as `nativeBackboneForward`.
+public protocol NativeMTPAutoregressiveBackboneModel: NativeMTPModel {
+    func nativeAutoregressiveBackboneForward(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> NativeMTPForwardResult
+}
+
 public enum NativeMTPActivationError: Error, LocalizedError, CustomStringConvertible {
     case requestedButMissingArtifact(MTPBundleStatus?)
     case requestedWithoutUsableTuning(MTPBundleStatus?)

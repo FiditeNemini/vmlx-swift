@@ -1343,7 +1343,29 @@ private final class Qwen4ExpMTPModule: Module {
     }
 }
 
+/// Submission is scheduling, not a new arithmetic or quantization path. Keep
+/// it opt-in while app and broader context/quant qualification is outstanding.
+/// Larger layer groups are deliberately not admitted: a four-layer diagnostic
+/// improved short decode but regressed sparse-QSA decode at longer context.
+enum Qwen4ExpEarlySubmission {
+    static func parse(_ value: String?) -> Bool { value == "1" }
+
+    static func allows(
+        enabled: Bool, shape: [Int], autoregressive: Bool,
+        recordingPrefix: Bool, externalPLE: Bool, compiledTrace: Bool
+    ) -> Bool {
+        enabled && shape == [1, 1] && autoregressive
+            && !recordingPrefix && !externalPLE && !compiledTrace
+    }
+}
+
 private final class Qwen4ExpTextModel: Module {
+    // Read once per instance, not from ProcessInfo on every layer/token.
+    var earlySubmissionEnabled = Qwen4ExpEarlySubmission.parse(
+        RuntimeEnvironment.value("VMLX_QWEN4_EXP_EARLY_SUBMIT"))
+    private(set) var earlySubmissionCount = 0
+    private var reportedEarlySubmit = false
+
     struct ForwardResult {
         let mixed: MLXArray
         let preMixer: MLXArray
@@ -1371,9 +1393,19 @@ private final class Qwen4ExpTextModel: Module {
         pleEmbeddings: [Int: MLXArray]? = nil,
         recordPrefixCommitStates: Bool = false,
         positionIds: MLXArray? = nil,
-        positionOffset: Int = 0
+        positionOffset: Int = 0,
+        autoregressive: Bool = false
     ) -> ForwardResult {
         let auditDTypes = Qwen4ExpDTypeTrace.claimTextAudit()
+        let earlySubmit = Qwen4ExpEarlySubmission.allows(
+            enabled: earlySubmissionEnabled, shape: inputIds.shape,
+            autoregressive: autoregressive, recordingPrefix: recordPrefixCommitStates,
+            externalPLE: pleEmbeddings != nil, compiledTrace: CompiledDecodeTrace.isActive)
+        if earlySubmit, !reportedEarlySubmit {
+            reportedEarlySubmit = true
+            NSLog("[Qwen4Exp] early-submit active stride=1 rows=1 layers=%d caller_stream=1 outer_compile=0 ar_only=1",
+                layers.count)
+        }
         var plePrefetches: [Int: Qwen4ExpPLE.Prefetch] = [:]
         for (index, layer) in layers.enumerated() {
             if pleEmbeddings?[index] == nil, let ple = layer.ple {
@@ -1400,12 +1432,14 @@ private final class Qwen4ExpTextModel: Module {
                 recordPrefixCommitStates: recordPrefixCommitStates,
                 positionIds: positionIds,
                 positionOffset: positionOffset)
-            if inputIds.dim(1) > 1, plePrefetches[index + 1] != nil {
+            if earlySubmit {
+                asyncEval(hidden)
+                earlySubmissionCount += 1
+            } else if inputIds.dim(1) > 1, plePrefetches[index + 1] != nil {
                 // Commit the resident layer immediately so its Metal work can
                 // overlap the already-running SSD row prefetch during prefill.
-                // Decode row reads finish before the PLE layer needs them; a
-                // one-token barrier here only splits every decode graph into a
-                // second command buffer and reduces steady-state throughput.
+                // Preserve the existing multi-token prefill schedule separately
+                // from opt-in, per-layer autoregressive submission above.
                 asyncEval(hidden)
             }
             if auditDTypes { layerDTypes.append(hidden.dtype) }
@@ -1422,11 +1456,13 @@ private final class Qwen4ExpTextModel: Module {
 
     func callAsFunction(
         _ inputIds: MLXArray, embeddings: MLXArray? = nil, cache: [KVCache]?,
-        positionIds: MLXArray? = nil, positionOffset: Int = 0
+        positionIds: MLXArray? = nil, positionOffset: Int = 0,
+        autoregressive: Bool = false
     ) -> MLXArray {
         forward(
             inputIds, embeddings: embeddings, cache: cache,
-            positionIds: positionIds, positionOffset: positionOffset
+            positionIds: positionIds, positionOffset: positionOffset,
+            autoregressive: autoregressive
         ).mixed
     }
 }
@@ -1436,13 +1472,22 @@ protocol Qwen4ExpModelDirectoryConfigurable: AnyObject {
 }
 
 public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurable,
-    SafetensorsLoadKeyExcluding, NativeMTPModel, DFlash2StagedVerifyRollbackModel,
+    SafetensorsLoadKeyExcluding, NativeMTPModel, NativeMTPAutoregressiveBackboneModel,
+    DFlash2StagedVerifyRollbackModel,
     CompiledDecodeExternalInputModel, ModalityBearing, ModelComponentMapping
 {
     /// QSA index selection and its path-dependent cache currently require a
     /// single sequence. Keep concurrent requests queued until a B-wide QSA
     /// cache/indexer contract is implemented and proven.
     public var maximumSupportedDecodeBatchSize: Int? { 1 }
+
+    // Internal qualification controls/counter. No process-global mutation and
+    // no claim that an enabled flag by itself proves the submission executed.
+    var earlySubmissionEnabled: Bool {
+        get { textModel.earlySubmissionEnabled }
+        set { textModel.earlySubmissionEnabled = newValue }
+    }
+    var earlySubmissionCount: Int { textModel.earlySubmissionCount }
 
     public let config: Qwen4ExpConfiguration
     @ModuleInfo(key: "language_model") private var textModel: Qwen4ExpTextModel
@@ -1593,7 +1638,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             if step > 0 {
                 while count - offset > step {
                     try Task.checkCancellation()
-                    _ = callAsFunction(tokens[0..., offset..<(offset + step)], cache: cache)
+                    _ = forwardTokens(tokens[0..., offset..<(offset + step)], cache: cache)
                     MLX.eval(cache)
                     offset += step
                     PrefillProgressReporter.reportCompletedUnits(offset)
@@ -1601,7 +1646,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
                 }
             }
             try Task.checkCancellation()
-            return .logits(LMOutput(logits: callAsFunction(tokens[0..., offset...], cache: cache)))
+            return .logits(LMOutput(logits: forwardTokens(tokens[0..., offset...], cache: cache)))
         }
 
         // Media arrived at a model that carries no vision tower. Refuse rather than embed the
@@ -1725,8 +1770,15 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        forwardTokens(inputs, cache: cache, autoregressive: true)
+    }
+
+    private func forwardTokens(
+        _ inputs: MLXArray, cache: [KVCache]?, autoregressive: Bool = false
+    ) -> MLXArray {
         let headInput = textModel(
-            inputs, cache: cache, positionOffset: ropeDelta(for: cache))
+            inputs, cache: cache, positionOffset: ropeDelta(for: cache),
+            autoregressive: autoregressive)
         return projectToLogits(headInput)
     }
 
@@ -1798,6 +1850,14 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         return NativeMTPForwardResult(
             logits: projectToLogits(forward.mixed),
             hiddenStates: forward.preMixer)
+    }
+
+    public func nativeAutoregressiveBackboneForward(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> NativeMTPForwardResult {
+        let forward = textModel.forward(inputs, cache: cache, autoregressive: true)
+        return NativeMTPForwardResult(
+            logits: projectToLogits(forward.mixed), hiddenStates: forward.preMixer)
     }
 
     public func nativeBackboneMTPVerifyForward(
