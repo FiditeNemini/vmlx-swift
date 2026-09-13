@@ -1,5 +1,10 @@
 # Qwen4Exp early AR submission checkpoint — PARTIAL
 
+Final-default executable, UI, adverse rows and merge evidence are now recorded
+in [the default-app checkpoint](../QWEN-AR-CHECKPOINT-2026-09-12.md).
+It supersedes the pending-adoption statements in the historical records below;
+it does not turn factual failures or interrupted sessions into passes.
+
 ## Current 2L/4S checkpoint and default policy
 
 The source now enables eligible early submission, forward-local rotary reuse
@@ -79,8 +84,11 @@ loader materializes4S BF16 (`mmap=false`) but preserves2L affine metadata
 (`mmap=true`); do not claim identical dtype policy across these bundles.
 
 Python references `b8dac820`/`171e4788` retain2L56.53/4S44.09/4M43.17/6S45.85
-tok/s for their specific essay workloads. Python2L is a different CRACK bundle;
-sampling, contexts, streaming, cache policy and4S materialization also differ.
+tok/s for their specific essay workloads. Python2L and Swift2L have matching
+config, tensor-index and generation-config hashes despite different folder
+names; full shard payload identity has not been established. Do not infer a
+different quant from the CRACK/JANG folder names. Sampling, contexts, streaming,
+cache policy and4S materialization still require matched attribution.
 Those receipts motivate further AR work but do not supply Swift speed proof.
 The user keeps AR improvement ahead of sustained MTP. No release/tag/install
 is authorized. Remaining final-default UI continuation/Stop/load-cancel and

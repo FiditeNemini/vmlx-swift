@@ -1,5 +1,14 @@
 # Scoped macOS generation activity — PARTIAL
 
+Final default-app UI/cancellation observations and their limits are in
+[the AR checkpoint](QWEN-AR-CHECKPOINT-2026-09-12.md).
+2L visible multi-turn/Stop/recovery and 4S cache-tail/tool-continuation
+cancellation/recovery emitted scope ends on engine `67ccb4b3`. The final 4S
+session logged six begins and six ends before normal AX Quit. Its prefix
+checkpoint rederive was interrupted with `CancellationError`; inference then
+returned empty and a 47-token follow-up completed at 43.0065 tok/s. This does
+not close live batch/MTP, idle-App-Nap-return or all-model qualification.
+
 Runtime change commit: `3bcafad49d880ea21958f9a90322b4102beda84d`.
 
 ## Observed failure
