@@ -159,6 +159,47 @@ struct QSAKVCacheStorageTests {
         }
     }
 
+    @Test("exact-capacity snapshots survive rollback without mutating restored source state")
+    func exactCapacitySnapshotOwnership() throws {
+        try MLXMetalTestLock.withLock {
+            for capacity in [false, true] {
+                for dtype in [DType.bfloat16, .float16, .float32] {
+                    for prefix in [256, 512] {
+                        for materialized in [false, true] {
+                            let cache = QSAKVCache(useIndexerCapacity: capacity)
+                            let input = rows(prefix, dtype: dtype)
+                            let expected = bits(input)
+                            commit(cache, input)
+                            let retained = try #require(cache.indexerKeys)
+                            let payload = cache.state
+                            if materialized { MLX.eval(cache.innerState()) }
+
+                            // A restored cache must not adopt the same mutable
+                            // MLXArray wrapper as either the payload or source.
+                            let restored = QSAKVCache(useIndexerCapacity: capacity)
+                            restored.state = payload
+                            #expect(restored.trim(8) == 8)
+                            commit(restored, rows(4, start: 99, dtype: dtype))
+                            MLX.eval(restored.innerState())
+                            #expect(bits(payload[2]) == expected)
+                            #expect(bits(try #require(cache.indexerKeys)) == expected)
+
+                            // Reuse without growing: the old full-capacity
+                            // public view must retain all original prefix rows.
+                            #expect(cache.trim(8) == 8)
+                            commit(cache, rows(4, start: 71, dtype: dtype))
+                            MLX.eval(cache.innerState())
+                            #expect(bits(retained) == expected)
+                            #expect(bits(payload[2]) == expected)
+                            #expect(cache.indexerKeys?.dim(1) == prefix - 4)
+                            #expect(bits(cache.state[2]) != bits(restored.state[2]))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     @Test("empty raw updates never expose reserved rows or preserve an old pending suffix")
     func emptyUpdates() throws {
         try MLXMetalTestLock.withLock {

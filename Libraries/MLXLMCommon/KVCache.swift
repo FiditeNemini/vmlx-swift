@@ -638,8 +638,10 @@ public class QSAKVCache: KVCacheSimple {
     /// Do not retain a second cached view: that would block buffer donation.
     public var indexerKeys: MLXArray? {
         guard let storage = indexerKeyStorage else { return nil }
-        return indexerKeyCount == storage.dim(1)
-            ? storage : storage[0..., ..<indexerKeyCount, 0...]
+        // MLXArray is a mutable reference wrapper. Even at exact capacity,
+        // return a fresh view so later slice assignment cannot replace a
+        // caller's retained array context during rollback or pending reuse.
+        return storage[0..., ..<indexerKeyCount, 0...]
     }
 
     /// DERIVED pooled-index lane: kNorm+rope-processed block keys
@@ -732,7 +734,10 @@ public class QSAKVCache: KVCacheSimple {
         set {
             if newValue.count == 3 {
                 super.state = Array(newValue[0 ..< 2])
-                indexerKeyStorage = newValue[2]
+                // Adopt the data, not the caller's mutable Swift wrapper.
+                // Retained serialized/source state must survive in-capacity
+                // writes after trimming the restored cache.
+                indexerKeyStorage = newValue[2][0..., 0..., 0...]
                 indexerKeyCount = newValue[2].dim(1)
             } else {
                 super.state = newValue
