@@ -9,8 +9,12 @@ import MLXLMCommon
 /// This is deliberately not a fused multiply-add. Quantization is irrelevant:
 /// the dimensions and dtype come from this layer's actual activation tensors.
 enum Qwen4ExpHCCombine {
-    private static let enabled =
-        RuntimeEnvironment.value("VMLX_QWEN4_EXACT_HC_COMBINE") == "1"
+    // Preserve an explicit opt-out (including malformed diagnostic values).
+    // Admission below still comes from the actual activation shape and dtype.
+    static func parse(_ value: String?) -> Bool { value == nil || value == "1" }
+
+    private static let enabled = parse(
+        RuntimeEnvironment.value("VMLX_QWEN4_EXACT_HC_COMBINE"))
 
     #if canImport(Metal)
     private static let kernel = MLXFast.metalKernel(

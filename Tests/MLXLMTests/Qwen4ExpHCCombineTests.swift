@@ -7,6 +7,15 @@ import Testing
 
 @Suite("qwen4_exp exact HC residual combine", .serialized)
 struct Qwen4ExpHCCombineTests {
+    @Test("default HC combine retains strict explicit opt-out semantics")
+    func defaultPolicy() {
+        #expect(Qwen4ExpHCCombine.parse(nil))
+        #expect(Qwen4ExpHCCombine.parse("1"))
+        for value in ["", "0", "true", "2", "garbage"] {
+            #expect(!Qwen4ExpHCCombine.parse(value))
+        }
+    }
+
     private func reference(_ residual: MLXArray, _ block: MLXArray, _ injection: MLXArray) -> MLXArray {
         let product = expandedDimensions(block, axis: -2) * expandedDimensions(injection, axis: -1)
         MLX.eval(product)

@@ -1379,12 +1379,12 @@ private final class Qwen4ExpMTPModule: Module {
     }
 }
 
-/// Submission is scheduling, not a new arithmetic or quantization path. Keep
-/// it opt-in while app and broader context/quant qualification is outstanding.
+/// Submission is scheduling, not a new arithmetic or quantization path. The
+/// qualified single-row AR path is enabled by default; explicit opt-outs remain.
 /// Larger layer groups are deliberately not admitted: a four-layer diagnostic
 /// improved short decode but regressed sparse-QSA decode at longer context.
 enum Qwen4ExpEarlySubmission {
-    static func parse(_ value: String?) -> Bool { value == "1" }
+    static func parse(_ value: String?) -> Bool { value == nil || value == "1" }
 
     static func allows(
         enabled: Bool, shape: [Int], autoregressive: Bool,

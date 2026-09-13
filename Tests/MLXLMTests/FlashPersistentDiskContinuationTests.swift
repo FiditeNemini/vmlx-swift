@@ -155,9 +155,10 @@ struct FlashPersistentDiskContinuationTests {
         try body(model)
     }
 
-    @Test("early submission is opt-in and excludes batch, prefill, trace and speculative paths")
+    @Test("default early submission retains opt-out and excludes batch, prefill, trace and speculative paths")
     func earlySubmissionEligibility() {
-        for value: String? in [nil, "", "0", "4", "64", "true", "garbage"] {
+        #expect(Qwen4ExpEarlySubmission.parse(nil))
+        for value: String? in ["", "0", "4", "64", "true", "garbage"] {
             #expect(!Qwen4ExpEarlySubmission.parse(value))
         }
         #expect(Qwen4ExpEarlySubmission.parse("1"))
