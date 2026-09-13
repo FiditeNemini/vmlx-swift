@@ -1450,6 +1450,8 @@ enum Qwen35Language {
     }
 
     final class GatedDeltaNet: Module {
+        private var qkNormalization: Qwen4ExpGDNQKNorm?
+        private(set) var qkNormalizationCallCount = 0
         private static let fusionDiagnosticLock = NSLock()
         private nonisolated(unsafe) static var didReportDecodeInputFusion = false
 
@@ -1831,7 +1833,8 @@ enum Qwen35Language {
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
             cache: MambaCache? = nil,
-            recordPrefixCommitStates: Bool = false
+            recordPrefixCommitStates: Bool = false,
+            fuseQKNormalization: Bool = false
         ) -> MLXArray {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
@@ -1914,13 +1917,33 @@ enum Qwen35Language {
                 let q = split[0].reshaped(B, S, numKHeads, headKDim)
                 let k = split[1].reshaped(B, S, numKHeads, headKDim)
                 v = split[2].reshaped(B, S, numVHeads, headVDim)
-                let invScale = pow(Float(headKDim), -0.5)
-                qNormed =
-                    MLXArray(pow(invScale, 2), dtype: q.dtype)
-                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-                kNormed =
-                    MLXArray(invScale, dtype: k.dtype)
-                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                var groupedNorm: MLXArray?
+                if fuseQKNormalization, mask == nil, !recordPrefixCommitStates,
+                    Qwen4ExpGDNQKNorm.eligible(shape: convOut.shape, dtype: convOut.dtype,
+                                             heads: numKHeads, headDimension: headKDim)
+                {
+                    if qkNormalization == nil {
+                        qkNormalization = Qwen4ExpGDNQKNorm(heads: numKHeads, headDimension: headKDim)
+                    }
+                    groupedNorm = qkNormalization?(convOut)
+                }
+                if let groupedNorm {
+                    qNormed = groupedNorm[0..., 0..., ..<numKHeads, 0...]
+                    kNormed = groupedNorm[0..., 0..., numKHeads..., 0...]
+                    if qkNormalizationCallCount == 0 {
+                        NSLog("[Qwen4Exp] gdn_qk_norm=active heads=%d width=%d dtype=%@ ar_only=1 intermediate_rounding=preserved",
+                              numKHeads, headKDim, String(describing: convOut.dtype))
+                    }
+                    qkNormalizationCallCount += 1
+                } else {
+                    let invScale = pow(Float(headKDim), -0.5)
+                    qNormed =
+                        MLXArray(pow(invScale, 2), dtype: q.dtype)
+                        * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                    kNormed =
+                        MLXArray(invScale, dtype: k.dtype)
+                        * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                }
             }
 
             // Same defense as the conv slot: a mis-restored recurrent state

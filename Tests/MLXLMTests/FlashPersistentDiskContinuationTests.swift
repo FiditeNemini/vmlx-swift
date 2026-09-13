@@ -27,8 +27,12 @@ struct FlashPersistentDiskContinuationTests {
     }
 
     private func withFixture(routedBits: [Int] = [], routedGroupSize: Int = 64, mtpEnabled: Bool = false,
-                             inputProjectionBits: Int? = nil, _ body: (Qwen4Exp) throws -> Void) throws {
+                             inputProjectionBits: Int? = nil, gdnHeadDimension: Int = 16,
+                             pleLayerIDs: [Int] = [1], additionalLinearLayer: Bool = false,
+                             distinctHCNorms: Bool = false,
+                             _ body: (Qwen4Exp) throws -> Void) throws {
         // Entire geometry is bounded before construction; no installed model is read.
+        let layerCount = additionalLinearLayer ? 3 : 2
         let data = Data(
             """
             {
@@ -54,6 +58,21 @@ struct FlashPersistentDiskContinuationTests {
             }
             """.utf8)
         var fixtureData = data
+        if gdnHeadDimension != 16 || pleLayerIDs != [1] || additionalLinearLayer {
+            try #require([16, 128].contains(gdnHeadDimension))
+            try #require(!pleLayerIDs.isEmpty && pleLayerIDs.allSatisfy { (1...2).contains($0) })
+            try #require(!pleLayerIDs.contains(2) || additionalLinearLayer,
+                         "PLE companion state requires a linear-attention layer")
+            var root = try #require(JSONSerialization.jsonObject(with: fixtureData) as? [String: Any])
+            var text = try #require(root["text_config"] as? [String: Any])
+            text["linear_key_head_dim"] = gdnHeadDimension
+            text["ple_layer_ids"] = pleLayerIDs
+            text["num_hidden_layers"] = layerCount
+            text["layer_types"] = Array(repeating: "linear_attention", count: layerCount - 1)
+                + ["full_attention"]
+            root["text_config"] = text
+            fixtureData = try JSONSerialization.data(withJSONObject: root)
+        }
         if mtpEnabled {
             var root = try #require(JSONSerialization.jsonObject(with: fixtureData) as? [String: Any])
             var text = try #require(root["text_config"] as? [String: Any])
@@ -72,7 +91,7 @@ struct FlashPersistentDiskContinuationTests {
             text["shared_expert_intermediate_size"] = 64
             root["text_config"] = text
             var quantization: [String: Any] = ["bits": 8, "group_size": routedGroupSize]
-            for layer in 0..<2 {
+            for layer in 0..<layerCount {
                 for (projection, bits) in zip(["gate_proj", "up_proj", "down_proj"], routedBits) {
                     if bits == 0 { continue } // BF16 dense control, same geometry.
                     let path = "language_model.layers.\(layer).mlp.switch_mlp.\(projection)"
@@ -93,7 +112,7 @@ struct FlashPersistentDiskContinuationTests {
         }
         let config = try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: fixtureData)
         let text = config.base.textConfiguration
-        try #require(text.hiddenSize == 64 && text.hiddenLayers == 2)
+        try #require(text.hiddenSize == 64 && text.hiddenLayers == layerCount)
         try #require(text.vocabularySize == 128 && text.numExperts == 8)
         MLXRandom.seed(0)
         let model = Qwen4Exp(config)
@@ -125,6 +144,18 @@ struct FlashPersistentDiskContinuationTests {
                 }))
         }
 
+        if distinctHCNorms {
+            let norms = model.parameters().flattened()
+                .filter { $0.0.hasSuffix(".hc_norm.weight") }.sorted { $0.0 < $1.0 }
+            try #require(norms.count == layerCount * 2 + 1)
+            model.update(parameters: ModuleParameters.unflattened(norms.enumerated().map { ordinal, leaf in
+                let (path, value) = leaf
+                let coordinates = MLXArray(0..<value.size).asType(.float32)
+                let varied = 1 + 0.25 * sin(coordinates * 0.013 + Float(ordinal + 1))
+                return (path, varied.asType(value.dtype).reshaped(value.shape))
+            }))
+        }
+
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("flash-prefill-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -132,19 +163,28 @@ struct FlashPersistentDiskContinuationTests {
         var arrays: [String: MLXArray] = [:]
         var map: [String: String] = [:]
         var specs: [String: [String: Int]] = [:]
-        for shard in 0 ..< 4 {
-            let base = "language_model.layers.0.ple.ngram_embedding.shards.\(shard)"
+        for (pleOrdinal, layerID) in pleLayerIDs.enumerated() {
+          let layout = Qwen4ExpNGramHash.headVocabLayout(
+              ngramHeads: 4, pleLayerIndex: pleOrdinal, ngramVocabSizeBase: 101)
+          let paddedRows = ((layout.sizes.reduce(0, +) + 127) / 128) * 128
+          let shardRows = paddedRows / 4
+          try #require(shardRows > 0 && shardRows <= 256)
+          for shard in 0 ..< 4 {
+            let base = "language_model.layers.\(layerID - 1).ple.ngram_embedding.shards.\(shard)"
             arrays[base + ".weight"] = MLXArray(
-                (0 ..< (128 * 2)).map { UInt32(truncatingIfNeeded: ($0 + shard) * 0x12345) }
-            ).reshaped(128, 2)
-            arrays[base + ".scales"] = MLXArray.full([128, 4], values: MLXArray(Float(0.01)))
+                (0 ..< (shardRows * 2)).map {
+                    UInt32(truncatingIfNeeded: ($0 + shard + pleOrdinal) * 0x12345)
+                }
+            ).reshaped(shardRows, 2)
+            arrays[base + ".scales"] = MLXArray.full([shardRows, 4], values: MLXArray(Float(0.01)))
                 .asType(.float16)
-            arrays[base + ".biases"] = MLXArray.full([128, 4], values: MLXArray(Float(-0.05)))
+            arrays[base + ".biases"] = MLXArray.full([shardRows, 4], values: MLXArray(Float(-0.05)))
                 .asType(.float16)
             specs[base + ".weight"] = ["bits": 4, "group_size": 4]
             for suffix in [".weight", ".scales", ".biases"] {
                 map[base + suffix] = "model.safetensors"
             }
+          }
         }
         try MLX.save(arrays: arrays, url: directory.appendingPathComponent("model.safetensors"))
         try JSONSerialization.data(withJSONObject: ["weight_map": map])
@@ -328,6 +368,103 @@ struct FlashPersistentDiskContinuationTests {
                 let ar = model.nativeAutoregressiveBackboneForward(input, cache: arCache)
                 MLX.eval(ar.logits, ar.hiddenStates, arCache)
                 #expect(model.earlySubmissionCount == model.config.base.textConfiguration.hiddenLayers)
+                #expect(SubmissionTensor(ar.logits) == SubmissionTensor(seed.logits))
+                #expect(SubmissionTensor(ar.hiddenStates) == SubmissionTensor(seed.hiddenStates))
+                #expect(arCache.map(SubmissionCache.init) == seedCache.map(SubmissionCache.init))
+            }
+        }
+    }
+
+    @Test("composed HC and GDN normalization preserve mixed-quant logits, PLE, cache and disk continuation",
+          arguments: [[1], [2], [1, 2]])
+    func gdnQKNormConnectedState(pleLayerIDs: [Int]) throws {
+        try MLXMetalTestLock.withLock {
+            for (bits, group) in [([2, 3, 4], 32), ([4, 4, 4], 64), ([6, 4, 6], 64)] {
+                try withFixture(routedBits: bits, routedGroupSize: group,
+                                gdnHeadDimension: 128, pleLayerIDs: pleLayerIDs,
+                                additionalLinearLayer: true, distinctHCNorms: true) { model in
+                    var referenceLogits: [SubmissionTensor] = []
+                    var referenceStates: [[SubmissionCache]] = []
+                    for (enabled, hcEnabled) in [(false, false), (true, false), (false, true), (true, true)] {
+                        model.gdnQKNormEnabled = enabled
+                        model.hcCombineNormEnabled = hcEnabled
+                        let cache = model.newCache(parameters: nil)
+                        var logits: [SubmissionTensor] = []
+                        var states: [[SubmissionCache]] = []
+                        for ids in [Array(2..<31), [31], [37, 41, 43], [47]] {
+                            let before = model.gdnQKNormCallCount
+                            let hcBefore = model.hcCombineNormCallCount
+                            let output = model(MLXArray(ids.map(Int32.init)).reshaped(1, ids.count), cache: cache)
+                            MLX.eval(output, cache)
+                            // Two generated GDN layers, no prefill dispatch.
+                            #expect(model.gdnQKNormCallCount - before ==
+                                (enabled && ids.count == 1 ? 2 : 0))
+                            // Three intra-layer pairs plus the next/final mixers. Preparing
+                            // the next attention norm is forbidden across PLE.
+                            let hcPairs = pleLayerIDs.contains(2) ? 5 : 6
+                            #expect(model.hcCombineNormCallCount - hcBefore ==
+                                (hcEnabled && ids.count == 1 ? hcPairs : 0))
+                            logits.append(SubmissionTensor(output))
+                            states.append(cache.map(SubmissionCache.init))
+                        }
+                        let directory = FileManager.default.temporaryDirectory
+                            .appendingPathComponent("flash-gdn-norm-\(UUID().uuidString)")
+                        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                        defer { try? FileManager.default.removeItem(at: directory) }
+                        let saved = cache.map { $0.copy() }
+                        MLX.eval(saved)
+                        let payload = TQDiskSerializer.serialize(cache: saved)
+                        MLX.eval(Array(payload.values))
+                        let path = directory.appendingPathComponent("prefix.safetensors")
+                        try MLX.save(arrays: payload, url: path)
+                        var restored = model.newCache(parameters: nil)
+                        let offset = restoreFromDiskArrays(try MLX.loadArrays(url: path), into: &restored)
+                        #expect(validateRestoredCacheBoundary(restored, matchedTokens: 34, restoredTokens: offset))
+                        let next = MLXArray([Int32(53)]).reshaped(1, 1)
+                        let continued = model(next, cache: cache)
+                        let resumed = model(next, cache: restored)
+                        MLX.eval(continued, resumed, cache, restored)
+                        #expect(SubmissionTensor(continued) == SubmissionTensor(resumed))
+                        #expect(cache.map(SubmissionCache.init) == restored.map(SubmissionCache.init))
+                        logits.append(SubmissionTensor(resumed))
+                        states.append(restored.map(SubmissionCache.init))
+                        if enabled || hcEnabled {
+                            #expect(logits == referenceLogits, "bits=\(bits) group=\(group)")
+                            #expect(states == referenceStates, "bits=\(bits) group=\(group)")
+                        } else {
+                            referenceLogits = logits
+                            referenceStates = states
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("GDN Q/K norm only runs in explicit AR, never seed, prepare or verify")
+    func gdnQKNormNativeRouting() throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture(routedBits: [2, 3, 4], gdnHeadDimension: 128,
+                            distinctHCNorms: true) { model in
+                model.gdnQKNormEnabled = true
+                model.hcCombineNormEnabled = true
+                let input = MLXArray([Int32(2)]).reshaped(1, 1)
+                let prepared = try model.prepare(
+                    LMInput(tokens: input), cache: model.newCache(parameters: nil), windowSize: 1)
+                if case .logits(let output) = prepared { MLX.eval(output.logits) }
+                let seedCache = model.newCache(parameters: nil)
+                let seed = model.nativeBackboneForward(input, cache: seedCache)
+                MLX.eval(seed.logits, seed.hiddenStates, seedCache)
+                let verifyCache = model.newCache(parameters: nil)
+                let verify = model.nativeBackboneMTPVerifyForward(input, cache: verifyCache)
+                MLX.eval(verify.logits, verify.hiddenStates, verifyCache)
+                #expect(model.gdnQKNormCallCount == 0)
+                #expect(model.hcCombineNormCallCount == 0)
+                let arCache = model.newCache(parameters: nil)
+                let ar = model.nativeAutoregressiveBackboneForward(input, cache: arCache)
+                MLX.eval(ar.logits, ar.hiddenStates, arCache)
+                #expect(model.gdnQKNormCallCount == 1)
+                #expect(model.hcCombineNormCallCount == 4)
                 #expect(SubmissionTensor(ar.logits) == SubmissionTensor(seed.logits))
                 #expect(SubmissionTensor(ar.hiddenStates) == SubmissionTensor(seed.hiddenStates))
                 #expect(arCache.map(SubmissionCache.init) == seedCache.map(SubmissionCache.init))
