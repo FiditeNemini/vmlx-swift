@@ -53,6 +53,7 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
             var iterator = try NativeMTPTokenIterator(
                 input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
                 parameters: parameters, depth: 3)
+            XCTAssertEqual(model.autoregressiveBackboneCalls, 0, "initial seed must not use the AR specialization")
             let start = ProcessInfo.processInfo.systemUptime
             var tokens: [Int] = []
             var widthsAtChange = 0
@@ -87,6 +88,7 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
             var iterator = try NativeMTPTokenIterator(
                 input: LMInput(tokens: MLXArray([1, 1, 1])), model: model,
                 parameters: parameters, depth: 3)
+            XCTAssertEqual(model.autoregressiveBackboneCalls, 0, "initial seed must not use the AR specialization")
             let start = ProcessInfo.processInfo.systemUptime
             var tokens: [Int] = []
             var previousAR = 0
@@ -103,6 +105,8 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
                 }
             }
             XCTAssertEqual(tokens, (0..<240).map { (2 + $0) % 32 })
+            XCTAssertEqual(model.autoregressiveBackboneCalls, iterator.autoregressiveFallbackTokenCount,
+                           "only explicit AR steps may use the specialization")
             XCTAssertGreaterThan(iterator.stagedVerifierCommitCount, 0)
             XCTAssertGreaterThan(iterator.arSafetyTrips, 0)
             XCTAssertGreaterThan(iterator.autoregressiveFallbackTokenCount, 2)
@@ -160,6 +164,7 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
 }
 
 private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
+    NativeMTPAutoregressiveBackboneModel,
     KVCacheDimensionProvider, DFlash2StagedVerifyRollbackModel, @unchecked Sendable
 {
     var kvHeads: [Int] { sequence ? [1, 1] : [1] }
@@ -169,6 +174,8 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
     var verifyWidths: [Int] { timingLock.withLock { widths } }
     private var delaysByWidth: [Int: TimeInterval] = [:]
     private var wrongDraft = false
+    private var arCalls = 0
+    var autoregressiveBackboneCalls: Int { timingLock.withLock { arCalls } }
     let sequence: Bool
     let verifyDelay: TimeInterval
     let backboneDelay: TimeInterval
@@ -196,6 +203,10 @@ private final class DepthDispatchTarget: Module, LanguageModel, NativeMTPModel,
         if backboneDelay > 0 { Thread.sleep(forTimeInterval: backboneDelay) }
         appendKV(inputs, cache: cache)
         return result(inputs)
+    }
+    func nativeAutoregressiveBackboneForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
+        timingLock.withLock { arCalls += 1 }
+        return nativeBackboneForward(inputs, cache: cache)
     }
     func nativeBackboneMTPVerifyForward(_ inputs: MLXArray, cache: [KVCache]?) -> NativeMTPForwardResult {
         let width = inputs.ndim >= 2 ? inputs.dim(1) : inputs.size

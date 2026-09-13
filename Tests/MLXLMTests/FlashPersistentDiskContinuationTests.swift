@@ -26,7 +26,7 @@ struct FlashPersistentDiskContinuationTests {
         }
     }
 
-    private func withFixture(routedBits: [Int] = [], mtpEnabled: Bool = false,
+    private func withFixture(routedBits: [Int] = [], routedGroupSize: Int = 64, mtpEnabled: Bool = false,
                              inputProjectionBits: Int? = nil, _ body: (Qwen4Exp) throws -> Void) throws {
         // Entire geometry is bounded before construction; no installed model is read.
         let data = Data(
@@ -63,6 +63,7 @@ struct FlashPersistentDiskContinuationTests {
         }
         var routedSpecs: [String: Int] = [:]
         if !routedBits.isEmpty {
+            try #require([32, 64].contains(routedGroupSize))
             try #require(routedBits.count == 3 && (routedBits == [0, 0, 0] || routedBits.allSatisfy { [2, 3, 4, 6].contains($0) }))
             var root = try #require(JSONSerialization.jsonObject(with: fixtureData) as? [String: Any])
             var text = try #require(root["text_config"] as? [String: Any])
@@ -70,13 +71,13 @@ struct FlashPersistentDiskContinuationTests {
             text["moe_intermediate_size"] = 64
             text["shared_expert_intermediate_size"] = 64
             root["text_config"] = text
-            var quantization: [String: Any] = ["bits": 8, "group_size": 64]
+            var quantization: [String: Any] = ["bits": 8, "group_size": routedGroupSize]
             for layer in 0..<2 {
                 for (projection, bits) in zip(["gate_proj", "up_proj", "down_proj"], routedBits) {
                     if bits == 0 { continue } // BF16 dense control, same geometry.
                     let path = "language_model.layers.\(layer).mlp.switch_mlp.\(projection)"
                     routedSpecs[path] = bits
-                    quantization[path] = ["bits": bits, "group_size": 64]
+                    quantization[path] = ["bits": bits, "group_size": routedGroupSize]
                 }
             }
             if let bits = inputProjectionBits {
@@ -84,7 +85,7 @@ struct FlashPersistentDiskContinuationTests {
                 for name in ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"] {
                     let path = "language_model.layers.0.linear_attn.\(name)"
                     routedSpecs[path] = bits
-                    quantization[path] = ["bits": bits, "group_size": 64]
+                    quantization[path] = ["bits": bits, "group_size": routedGroupSize]
                 }
             }
             if !routedSpecs.isEmpty { root["quantization"] = quantization }
@@ -110,12 +111,12 @@ struct FlashPersistentDiskContinuationTests {
         if !routedSpecs.isEmpty {
             quantize(model: model, filter: { path, _ in
                 guard let bits = routedSpecs[path] else { return nil }
-                return (groupSize: 64, bits: bits, mode: QuantizationMode.affine)
+                return (groupSize: routedGroupSize, bits: bits, mode: QuantizationMode.affine)
             })
             let leaves = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
             for (path, bits) in routedSpecs {
                 let projection = try #require(leaves[path] as? any Quantized)
-                try #require(projection.bits == bits && projection.groupSize == 64)
+                try #require(projection.bits == bits && projection.groupSize == routedGroupSize)
             }
             model.update(parameters: ModuleParameters.unflattened(
                 model.parameters().flattened().compactMap { path, value in
@@ -152,6 +153,160 @@ struct FlashPersistentDiskContinuationTests {
             .write(to: directory.appendingPathComponent("config.json"))
         try model.configure(modelDirectory: directory)
         try body(model)
+    }
+
+    @Test("default early submission retains opt-out and excludes batch, prefill, trace and speculative paths")
+    func earlySubmissionEligibility() {
+        #expect(Qwen4ExpEarlySubmission.parse(nil))
+        for value: String? in ["", "0", "4", "64", "true", "garbage"] {
+            #expect(!Qwen4ExpEarlySubmission.parse(value))
+        }
+        #expect(Qwen4ExpEarlySubmission.parse("1"))
+        func permits(_ enabled: Bool = true, _ shape: [Int] = [1, 1],
+                     ar: Bool = true, recording: Bool = false,
+                     externalPLE: Bool = false, trace: Bool = false) -> Bool {
+            Qwen4ExpEarlySubmission.allows(
+                enabled: enabled, shape: shape, autoregressive: ar,
+                recordingPrefix: recording, externalPLE: externalPLE, compiledTrace: trace)
+        }
+        #expect(permits())
+        #expect(!permits(false))
+        for shape in [[1], [2, 1], [1, 0], [1, 2], [1, 64], [1, 8192]] {
+            #expect(!permits(true, shape))
+        }
+        #expect(!permits(ar: false))
+        #expect(!permits(recording: true))
+        #expect(!permits(externalPLE: true))
+        #expect(!permits(trace: true))
+    }
+
+    private struct SubmissionTensor: Equatable {
+        let shape: [Int]
+        let dtype: String
+        let bits: [UInt32]
+
+        init(_ value: MLXArray) {
+            shape = value.shape
+            dtype = String(describing: value.dtype)
+            let values = value.asType(.float32).asArray(Float.self)
+            #expect(values.allSatisfy { $0.isFinite })
+            bits = values.map(\.bitPattern)
+        }
+    }
+
+    private struct SubmissionCache: Equatable {
+        let offset: Int
+        let metadata: [String]
+        let state: [SubmissionTensor]
+        let pooled: SubmissionTensor?
+        let pooledCount: Int
+
+        init(_ cache: any KVCache) {
+            offset = cache.offset
+            metadata = cache.metaState
+            state = cache.state.map(SubmissionTensor.init)
+            let qsa = cache as? QSAKVCache
+            pooled = qsa?.derivedPooledBlocks.map(SubmissionTensor.init)
+            pooledCount = qsa?.derivedPooledBlockCount ?? 0
+        }
+    }
+
+    @Test("early submission preserves exact mixed-quant logits and GDN/QSA/PLE continuation state")
+    func earlySubmissionConnectedState() throws {
+        try MLXMetalTestLock.withLock {
+            // Existing generated fixture and real selective SSD table reader;
+            // these are numerical/state checks, not installed-quant speed rows.
+            for (bits, group) in [([], 64), ([2, 3, 4], 32), ([4, 4, 4], 64), ([6, 4, 6], 64)] {
+                try withFixture(routedBits: bits, routedGroupSize: group) { model in
+                    try Stream.withNewDefaultStream(device: .gpu) {
+                        var baselineLogits: [SubmissionTensor] = []
+                        var baselineStates: [[SubmissionCache]] = []
+                        for enabled in [false, true] {
+                            print("EARLY-SUBMIT-STATE bits=\(bits) group=\(group) enabled=\(enabled)")
+                            model.earlySubmissionEnabled = enabled
+                            let cache = model.newCache(parameters: nil)
+                            var observedLogits: [SubmissionTensor] = []
+                            var observedStates: [[SubmissionCache]] = []
+                            // Cross the fixture's actual QSA budget32 during
+                            // connected history, then decode with the sparse lane.
+                            for ids in [Array(2..<31), [31], [37, 41, 43], [47]] {
+                                let before = model.earlySubmissionCount
+                                let logits = model(MLXArray(ids.map(Int32.init)).reshaped(1, ids.count), cache: cache)
+                                MLX.eval(logits, cache)
+                                #expect(model.earlySubmissionCount - before ==
+                                    (enabled && ids.count == 1 ? model.config.base.textConfiguration.hiddenLayers : 0))
+                                observedLogits.append(SubmissionTensor(logits))
+                                observedStates.append(cache.map(SubmissionCache.init))
+                            }
+                            let qsa = try #require(cache.last as? QSAKVCache)
+                            #expect(qsa.derivedPooledBlockCount > 0)
+
+                            // Use the production serialization contract, not
+                            // raw `state`/`metaState` assignment: Mamba also
+                            // requires its offset and occupied-slot indices.
+                            // Disk round-trip gives the restored tensors their
+                            // own storage before the live cache advances.
+                            let snapshotDirectory = FileManager.default.temporaryDirectory
+                                .appendingPathComponent("flash-early-state-\(UUID().uuidString)")
+                            try FileManager.default.createDirectory(
+                                at: snapshotDirectory, withIntermediateDirectories: true)
+                            defer { try? FileManager.default.removeItem(at: snapshotDirectory) }
+                            let snapshotURL = snapshotDirectory.appendingPathComponent("cache.safetensors")
+                            try MLX.save(arrays: TQDiskSerializer.serialize(cache: cache), url: snapshotURL)
+                            let stored = try MLX.loadArrays(url: snapshotURL)
+                            var restored = model.newCache(parameters: nil)
+                            #expect(restoreFromDiskArrays(stored, into: &restored) == cache.last?.offset)
+                            #expect(restored.map(\.offset) == cache.map(\.offset))
+                            #expect((restored.last as? QSAKVCache)?.derivedPooledBlockCount == 0)
+                            let next = MLXArray([Int32(53)]).reshaped(1, 1)
+                            let continued = model(next, cache: cache)
+                            let resumed = model(next, cache: restored)
+                            MLX.eval(continued, resumed, cache, restored)
+                            let restoredLogitsMatch = SubmissionTensor(continued) == SubmissionTensor(resumed)
+                            let restoredStatesMatch = cache.map(SubmissionCache.init) == restored.map(SubmissionCache.init)
+                            #expect(restoredLogitsMatch, "bits=\(bits) group=\(group) enabled=\(enabled)")
+                            #expect(restoredStatesMatch, "bits=\(bits) group=\(group) enabled=\(enabled)")
+                            observedLogits.append(SubmissionTensor(resumed))
+                            observedStates.append(restored.map(SubmissionCache.init))
+                            if enabled {
+                                let allLogitsMatch = observedLogits == baselineLogits
+                                let allStatesMatch = observedStates == baselineStates
+                                #expect(allLogitsMatch, "bits=\(bits) group=\(group)")
+                                #expect(allStatesMatch, "bits=\(bits) group=\(group)")
+                            } else {
+                                baselineLogits = observedLogits
+                                baselineStates = observedStates
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("early submission runs only for explicit AR, not native seed or one-token prepare")
+    func earlySubmissionNativeRouting() throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture { model in
+                model.earlySubmissionEnabled = true
+                let input = MLXArray([Int32(2)]).reshaped(1, 1)
+                let prepared = try model.prepare(
+                    LMInput(tokens: input), cache: model.newCache(parameters: nil), windowSize: 1)
+                if case .logits(let output) = prepared { MLX.eval(output.logits) }
+                #expect(model.earlySubmissionCount == 0)
+                let seedCache = model.newCache(parameters: nil)
+                let seed = model.nativeBackboneForward(input, cache: seedCache)
+                MLX.eval(seed.logits, seed.hiddenStates, seedCache)
+                #expect(model.earlySubmissionCount == 0)
+                let arCache = model.newCache(parameters: nil)
+                let ar = model.nativeAutoregressiveBackboneForward(input, cache: arCache)
+                MLX.eval(ar.logits, ar.hiddenStates, arCache)
+                #expect(model.earlySubmissionCount == model.config.base.textConfiguration.hiddenLayers)
+                #expect(SubmissionTensor(ar.logits) == SubmissionTensor(seed.logits))
+                #expect(SubmissionTensor(ar.hiddenStates) == SubmissionTensor(seed.hiddenStates))
+                #expect(arCache.map(SubmissionCache.init) == seedCache.map(SubmissionCache.init))
+            }
+        }
     }
 
     @Test("native Flash token cap never publishes pending tokens under an emitted-prefix key",

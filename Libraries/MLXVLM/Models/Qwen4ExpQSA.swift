@@ -12,8 +12,41 @@
 
 import Foundation
 import MLX
+import MLXLMCommon
 
 enum Qwen4ExpQSA {
+    private static let decodeMaskEnabled =
+        RuntimeEnvironment.value("VMLX_QSA_DECODE_MASK") != "0"
+
+    #if canImport(Metal)
+    // One SIMD group owns a block. Lanes test disjoint selected IDs, then
+    // write all tokens in that block. No score, norm, RoPE or top-k arithmetic
+    // is changed; the output is exactly the original integer membership/tail
+    // predicate. KEY_LENGTH is an input, not a per-context shader variant.
+    private static let decodeMaskKernel = MLXFast.metalKernel(
+        name: "vmlx_qsa_decode_block_mask",
+        inputNames: ["selected", "limits"], outputNames: ["mask"],
+        source: """
+            const uint block = thread_position_in_grid.x / 32u;
+            const uint lane = thread_index_in_simdgroup;
+            const uint key_length = uint(limits[0]);
+            bool member = block == key_length / RATIO;
+            for (uint i = lane; i < uint(limits[1]); i += 32u) {
+                member = member || selected[i] == block;
+            }
+            member = simd_any(member);
+            for (uint i = lane; i < RATIO; i += 32u) {
+                const uint token = block * RATIO + i;
+                if (token < key_length) mask[token] = member;
+            }
+            """)
+
+    private static let reportDecodeMask: Void = {
+        FileHandle.standardError.write(Data(
+            "[Qwen4Exp] qsa_decode_mask=active score_math=unchanged selection=unchanged\n".utf8))
+    }()
+    #endif
+
     /// Boolean attention mask [B, 1, T, keyLen] from indexer scores.
     ///
     /// - Parameters:
@@ -31,7 +64,8 @@ enum Qwen4ExpQSA {
         pastLen: Int,
         compressRatio: Int,
         blockTopK: Int,
-        keyLen: Int
+        keyLen: Int,
+        useDecodeMask: Bool? = nil
     ) -> MLXArray? {
         let seqLen = query.dim(2)
         let maxCompleteBlocks = keyLen / compressRatio
@@ -42,6 +76,27 @@ enum Qwen4ExpQSA {
         scores = maximum(scores.asType(.float32), MLXArray(Float(0))).sum(axis: 1)
         scores = scores / sqrt(Float(query.dim(3)))
         // scores: [B, T, numBlocks]
+
+        #if canImport(Metal)
+        if useDecodeMask ?? decodeMaskEnabled,
+            query.dim(0) == 1, seqLen == 1, pastLen + 1 == keyLen,
+            Device.defaultDevice().deviceType == .gpu
+        {
+            // Every complete block is behind this single query. The generic
+            // valid-block where() would retain every score unchanged. Keep the
+            // same partition and tie handling, and fuse only boolean mask work.
+            let selected = argPartition(scores, kth: -blockTopK, axis: -1)[
+                .ellipsis, (-blockTopK)...]
+            let blocks = (keyLen + compressRatio - 1) / compressRatio
+            let result = decodeMaskKernel(
+                [selected, MLXArray([Int32(keyLen), Int32(blockTopK)])],
+                template: [("RATIO", compressRatio)],
+                grid: (blocks * 32, 1, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[1, 1, 1, keyLen]], outputDTypes: [.bool])[0]
+            _ = reportDecodeMask
+            return result
+        }
+        #endif
 
         // Only blocks fully behind each query are candidates.
         let queryEnds = MLXArray(
