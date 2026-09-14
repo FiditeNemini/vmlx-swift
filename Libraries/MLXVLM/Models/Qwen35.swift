@@ -349,8 +349,16 @@ enum Qwen4ExpCompiledGDNInputs {
     }
 }
 
-private enum Qwen4ExpCompiledMoE {
+enum Qwen4ExpCompiledMoE {
     typealias Region = @Sendable ([MLXArray]) -> [MLXArray]
+
+    private struct DenseRouterKey: Hashable {
+        let hiddenSize: Int
+        let experts: Int
+        let topK: Int
+        let normTopK: Bool
+        let weightDType: DType
+    }
 
     static let enabled: Bool = {
         let value = RuntimeEnvironment.value("VMLX_QWEN4_EXP_COMPILE_MOE") ?? "1"
@@ -358,6 +366,7 @@ private enum Qwen4ExpCompiledMoE {
     }()
     private static let lock = NSLock()
     nonisolated(unsafe) private static var routerRegions: [String: Region] = [:]
+    nonisolated(unsafe) private static var denseRouterRegions: [DenseRouterKey: Region] = [:]
     nonisolated(unsafe) private static var sharedRegions: [String: Region] = [:]
     nonisolated(unsafe) private static var didReportRouter = false
     nonisolated(unsafe) private static var didReportShared = false
@@ -409,13 +418,24 @@ private enum Qwen4ExpCompiledMoE {
     static func denseRouter(
         _ x: MLXArray, weight: MLXArray, topK: Int, normTopK: Bool
     ) -> (indices: MLXArray, scores: MLXArray)? {
-        guard enabled, !CompiledDecodeTrace.isActive, x.dim(1) == 1,
-            x.dtype == .bfloat16, weight.dtype == .bfloat16
+        // JANG's loader materializes routing weights in F32. Preserve those
+        // weights and matmul promotion instead of rounding them to fit the
+        // BF16 trunk. Keep prefill/verify and outer compiled traces unchanged.
+        guard enabled, !CompiledDecodeTrace.isActive,
+            x.ndim == 3, x.dim(0) > 0, x.dim(1) == 1,
+            x.dtype == .bfloat16, weight.ndim == 2,
+            weight.dtype == .bfloat16 || weight.dtype == .float32,
+            x.dim(2) > 0, weight.dim(1) == x.dim(2),
+            topK > 0, topK <= weight.dim(0)
         else { return nil }
         let experts = weight.dim(0)
-        let key = "dense|\(experts)|\(topK)|\(normTopK)"
+        // This lookup runs once per MoE layer per decoded token. Avoid
+        // formatting geometry/dtype strings on the very path being shortened.
+        let key = DenseRouterKey(
+            hiddenSize: x.dim(2), experts: experts, topK: topK,
+            normTopK: normTopK, weightDType: weight.dtype)
         lock.lock()
-        var region = routerRegions[key]
+        var region = denseRouterRegions[key]
         if region == nil {
             region = vmlxTrustedCompile { (args: [MLXArray]) -> [MLXArray] in
                 let gates = MLX.softmax(
@@ -429,13 +449,13 @@ private enum Qwen4ExpCompiledMoE {
                 }
                 return [indices, scores]
             }
-            routerRegions[key] = region
+            denseRouterRegions[key] = region
         }
         if !didReportRouter {
             didReportRouter = true
             FileHandle.standardError.write(
                 Data(
-                    "[Qwen4Exp] compiled_moe_router=active kind=dense shared_weight_inputs=true dtype=bfloat16\n"
+                    "[Qwen4Exp] compiled_moe_router=active kind=dense shared_weight_inputs=true input_dtype=\(x.dtype) weight_dtype=\(weight.dtype)\n"
                         .utf8))
         }
         lock.unlock()
