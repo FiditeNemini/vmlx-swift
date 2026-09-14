@@ -77,6 +77,10 @@ target_include_directories(MLX
 # Note: mlxc is target name exported by mlx-c
 target_link_libraries(MLX PUBLIC mlxc Numerics)
 target_compile_options(MLX PRIVATE -package-name MLX)
+if(NOT MLX_BUILD_METAL)
+  # The macOS SDK can import Metal even when this target excludes GPU+Metal.
+  target_compile_options(MLX PRIVATE -DMLX_SWIFT_NO_METAL)
+endif()
 
 # MLXRandom package
 file(GLOB MLXRandom-src ${CMAKE_CURRENT_LIST_DIR}/Source/MLXRandom/*.swift)
