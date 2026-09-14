@@ -8,6 +8,35 @@ import Testing
 
 @Suite("VMLX server runtime settings")
 struct VMLXServerRuntimeSettingsTests {
+    @Test("shared MTP defaults remain Auto; explicit Off round-trips unchanged")
+    func sharedMTPDefaultsDoNotDisableNonFlashModels() throws {
+        #expect(VMLXServerMTPSettings().mode == .auto)
+        #expect(try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode == .auto)
+        let explicitOff = VMLXServerMTPSettings(mode: .off)
+        #expect(try JSONDecoder().decode(
+            VMLXServerMTPSettings.self, from: JSONEncoder().encode(explicitOff)) == explicitOff)
+    }
+
+    @Test("explicit Off prevents native MTP launch without changing capability")
+    func explicitOffPreventsNativeMTPLaunch() {
+        for type in ["qwen4_exp", "qwen3_5"] {
+            let config = Data("{\"model_type\":\"\(type)\",\"mtp_num_hidden_layers\":1}".utf8)
+            let status = MTPBundleStatus(
+                bundleHasMTP: true, configuredLayers: 1, tensorCount: 57,
+                mode: .preservedEnabled, measuredFamilyAutoDepth: 3)
+            let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .off))
+            var base = LoadConfiguration.default
+            base.nativeMTP = true
+            #expect(settings.resolvedMTPLaunch(
+                configData: config, jangConfig: nil, status: status).launchMode == .off)
+            #expect(settings.resolvedMTPDraftStrategy(
+                configData: config, jangConfig: nil, status: status) == nil)
+            #expect(!settings.resolvedLoadConfiguration(
+                base: base, configData: config, jangConfig: nil, status: status).nativeMTP)
+            #expect(status.bundleHasMTP)
+        }
+    }
+
     @Test("defaults preserve engine and bundle sampling decisions")
     func defaultsPreserveEngineAndBundleSamplingDecisions() {
         let settings = VMLXServerRuntimeSettings()
@@ -397,6 +426,11 @@ struct VMLXServerRuntimeSettingsTests {
                 modelTypes: ["qwen4_exp", "qwen4_exp_text"],
                 note: "MTP net slowdown: verifier cannot use the decode-only fused MoE kernel.",
                 reason: "measured slower than AR at all depths"),
+            // The legacy exception is keyed to the complete mixed topology,
+            // not the marketing label or a bare default bits=4.
+            quantizationFingerprint:
+                "default=8x64;all=3x32:96,4x32:32,4x64:157,8x64:519;"
+                + "mtp=4x64:13;expert=4x64:144;ple=3x32:96,4x32:32,8x64:2",
             measuredFamilyAutoDepth: 3)
         let settings = VMLXServerRuntimeSettings()
 
