@@ -17,8 +17,13 @@ the local development bundle before promotion.
   ([MLX0.32.2](https://github.com/ml-explore/mlx/releases/tag/v0.32.2)).
 - C ABI starting point: `7bede8f1491384bb580f87d1d510f80cbd53660d`;
   integration target `c74db5307cc8ce122f48d97ef951b30578674e7f`.
-- Integrated core: `1c4fcf773c00aa544bcddade6281fbd311a599c7`;
+- Integrated core merge: `1c4fcf773c00aa544bcddade6281fbd311a599c7`;
   C ABI: `2d783ac38713458eae2067ffff9ef8ebbff2ec70`.
+- Core follow-up `118b983596b634409315fee46b36dcda2245e12a` applies the
+  repository's clang-format21.1.8 rules and makes the invalid-enum path in
+  cold-memory advice explicit for GCC. Valid advice mappings are unchanged.
+  Core CI run34840230692 reports lint, both Linux sanitizer jobs and both
+  Fedora architectures successful; macOS/CUDA jobs are skipped, not proof.
 - Upstream Swift comparison: [#450](https://github.com/ml-explore/mlx-swift/pull/450).
   Keep this engine's Swift-tools6.1 manifest and integrated runtime products.
 
@@ -72,6 +77,19 @@ The fresh metallib hash is unchanged. The bounded supervisor recorded4.20GiB
 peak tracked footprint, flat0.49GiB swap and zero owned survivors.
 
 ## Remaining acceptance gates
+
+Fork PRs: core [#9](https://github.com/osaurus-ai/mlx/pull/9), C ABI
+[#1](https://github.com/osaurus-ai/mlx-c/pull/1), engine
+[#474](https://github.com/osaurus-ai/vmlx-swift/pull/474), consuming app
+[#2745](https://github.com/osaurus-ai/osaurus/pull/2745).
+
+The first development build at engine73e8d811/appd9f10ed57 stopped at the
+16GiB compiler cap: `SWIFTTEST_MLX0322DevApp0914__044128.log`, exit124,
+16.49GiB tracked footprint,47.5GiB free, normal pressure and flat0.49GiB swap.
+It confirmed actual WMO compiler threads2 and zero owned survivors. No app
+runtime row exists from this build. The final revision will retry with the
+prior28GiB build cap while preserving40GiB free-memory and pressure/swap gates;
+these are compiler-process limits, not changed inference memory settings.
 
 1. Retain the bounded extended test receipt above; no test driver remains active.
 2. Source-checkpoint and consume exact core/C/engine revisions in all six app pins.
