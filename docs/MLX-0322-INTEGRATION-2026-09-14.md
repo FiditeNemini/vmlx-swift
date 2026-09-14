@@ -11,6 +11,10 @@ the local development bundle before promotion.
 
 ## Source lineage
 
+- Core stream follow-up: `c0a51a085b9252dc6469afe1aed772b1f538c9b0`.
+  Pass the requested stream to all three affine quantized-matmul fallback
+  casts. This changes scheduling only, not promotion or kernel eligibility.
+
 - Engine starting point: `9e48d907e45f3d721b3faa42d9f6500bab16224b`.
 - Core fork starting point: `be526f81f5534b3447d4882871cac279af2ad14a`.
 - Core release integrated: `1f8e74e3f12f31365464a6867c6579f0e9b29d85`
@@ -41,6 +45,30 @@ the local development bundle before promotion.
 | Alternate builds | CMake consumes the same pinned core/C ABI, not stock mlx-c0.6.0 or the removed stream shim. Framework membership/public headers regenerate from actual SwiftPM sources, with the framework owning its distributed C entry points directly. Linux CMake CI initializes the pinned submodules. |
 
 ## Live numerical evidence so far
+
+The first local development app exposed a regression: matched 2L short AR
+measured28.8559/28.4262tok/s against retained control46.8573. Instrumented
+captures showed about321command buffers/token and two queues versus199
+and one queue. The secondary queue's observed kernels were BF16-to-F32 casts.
+Core `mlx/ops.cpp` omitted `s` in the three affine fallback casts although
+the quantized matmul itself selected `s`. The explicit Swift stream no longer
+coincides with the native default under the new thread-local runtime.
+
+`SWIFTTEST_AffineStreamNegativeB0914__061714.log` reproduced144wrong-stream
+assertions across48CPU/GPU cases (bits2/3/4/5/6/8,groups32/64,rows1/3).
+Numerical equality still held. With only those three stream arguments added,
+`SWIFTTEST_AffineStreamFixedFull0914__061831.log` ended exit0:674native
+assertions,52XCTest cases,24/21/24Swift Testing selections, and the separate
+strict TF32-disabled384-case matrix. No tolerance was loosened. Test binary
+SHA256`20b1a455dbb9a0c9d6442175e2deea32df3468094205aebb0e27db33779717b3`;
+metallib unchanged below. Peak tracked2.25GiB,swap flat.49GiB,zero survivors.
+The native regression is registered in core CMake tests. Formatting then
+wrapped one test expression only; product source was unchanged.
+
+**App speed correction remains unproven until the rebuilt app is replayed.**
+The old and new apps both hit the8GiB free-memory floor in long runs; this
+does not establish a new memory regression. Real-image OCR was incorrect in
+both apps, so those rows are not full VLM passes. No release or merge claim.
 
 Private evidence root:
 `/Users/eric/vmlx-private-evidence/mtp-swift-2026-09-04/logs`.
