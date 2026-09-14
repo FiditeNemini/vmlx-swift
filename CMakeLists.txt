@@ -26,17 +26,19 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
 endif()
 
-# mlx-c
+# Use the same checked-out core/C ABI as SwiftPM. A stock mlx-c release
+# omits the fork's mmap and compiler-cache lifetime entry points.
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx/CMakeLists.txt" OR
+   NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx-c/CMakeLists.txt")
+  message(FATAL_ERROR "Initialize the pinned dependencies with git submodule update --init --recursive")
+endif()
+FetchContent_Declare(
+  mlx
+  SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx")
 FetchContent_Declare(
   mlx-c
-  GIT_REPOSITORY "https://github.com/ml-explore/mlx-c.git"
-  GIT_TAG "v0.6.0")
+  SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx-c")
 FetchContent_MakeAvailable(mlx-c)
-
-# Swift's Stream.runWith uses this local C bridge. SwiftPM already compiles it
-# through the Cmlx source tree; the CMake target must link the same definition.
-target_sources(mlxc PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/Source/Cmlx/mlx-generated/stream_run_with.cpp)
 
 # swift-numerics
 set(swift_numerics_patch git apply

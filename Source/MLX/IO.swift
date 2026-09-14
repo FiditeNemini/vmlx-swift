@@ -276,7 +276,7 @@ private func new_mlx_io_vtable_dataIO() -> mlx_io_vtable {
         case SEEK_CUR:
             state.offset += Int(offset)
         case SEEK_END:
-            state.offset = state.offset - Int(offset)
+            state.offset = state.data.count + Int(offset)
         default:
             break
         }
