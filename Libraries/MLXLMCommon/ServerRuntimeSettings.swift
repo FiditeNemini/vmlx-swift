@@ -1608,7 +1608,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     public var dflash2BlockSize: Int?
 
     public init(
-        mode: VMLXMTPServerMode = .auto,
+        mode: VMLXMTPServerMode = .off,
         draftTokenLimit: Int? = nil,
         keepDraftCacheSeparate: Bool = true,
         acceptedTokensOnlyEnterBaseCache: Bool = true,
@@ -1639,7 +1639,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     /// failing the whole settings load.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.mode = try c.decodeIfPresent(VMLXMTPServerMode.self, forKey: .mode) ?? .auto
+        self.mode = try c.decodeIfPresent(VMLXMTPServerMode.self, forKey: .mode) ?? .off
         self.draftTokenLimit = try c.decodeIfPresent(Int.self, forKey: .draftTokenLimit)
         self.keepDraftCacheSeparate =
             try c.decodeIfPresent(Bool.self, forKey: .keepDraftCacheSeparate) ?? true

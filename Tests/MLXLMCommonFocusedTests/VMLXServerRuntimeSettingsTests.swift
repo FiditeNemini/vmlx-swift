@@ -28,10 +28,40 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.generation.topK == nil)
         #expect(settings.generation.minP == nil)
         #expect(settings.generation.repetitionPenalty == nil)
-        #expect(settings.mtp.mode == .auto)
+        #expect(settings.mtp.mode == .off)
         #expect(settings.mtp.keepDraftCacheSeparate)
         #expect(settings.mtp.acceptedTokensOnlyEnterBaseCache)
         #expect(settings.effectivePerformance.deepseekV4ActivationQAT == false)
+    }
+
+    @Test("missing MTP mode decodes Off while explicit activation survives")
+    func missingMTPModeDecodesOff() throws {
+        let decoder = JSONDecoder()
+        #expect(try decoder.decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode == .off)
+        for mode in VMLXMTPServerMode.allCases {
+            let original = VMLXServerMTPSettings(mode: mode)
+            #expect(try decoder.decode(
+                VMLXServerMTPSettings.self,
+                from: JSONEncoder().encode(original)) == original)
+        }
+    }
+
+    @Test("default Off does not launch MTP even with complete measured Qwen heads")
+    func defaultOffOverridesNativeMTPLoadRequest() {
+        let config = Data(#"{"model_type":"qwen4_exp","mtp_num_hidden_layers":1}"#.utf8)
+        let status = MTPBundleStatus(
+            bundleHasMTP: true, configuredLayers: 1, tensorCount: 57,
+            mode: .preservedEnabled, measuredFamilyAutoDepth: 3)
+        let settings = VMLXServerRuntimeSettings()
+        var base = LoadConfiguration.default
+        base.nativeMTP = true
+        #expect(settings.effectiveMTPLaunchMode(for: status) == .off)
+        #expect(settings.resolvedMTPLaunch(
+            configData: config, jangConfig: nil, status: status).launchMode == .off)
+        #expect(settings.resolvedMTPDraftStrategy(
+            configData: config, jangConfig: nil, status: status) == nil)
+        #expect(!settings.resolvedLoadConfiguration(
+            base: base, configData: config, jangConfig: nil, status: status).nativeMTP)
     }
 
     @Test("Osaurus production preset keeps MLXPress opt-in while preserving MTP resolution")
@@ -268,8 +298,8 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.validationIssues(mtpStatus: tuned).isEmpty)
     }
 
-    @Test("server runtime defaults auto-launch tuned native MTP bundles")
-    func serverRuntimeDefaultsAutoLaunchTunedNativeMTPBundles() {
+    @Test("explicit server Auto launches tuned native MTP bundles")
+    func serverRuntimeExplicitAutoLaunchesTunedNativeMTPBundles() {
         let config = """
         {
           "model_type": "qwen3_vl",
@@ -293,7 +323,7 @@ struct VMLXServerRuntimeSettingsTests {
                 speedupVsBaseline: 1.5,
                 quantizationMode: "mxfp8",
                 quantizationBits: 8))
-        let settings = VMLXServerRuntimeSettings()
+        let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .auto))
 
         let launch = settings.resolvedMTPLaunch(
             configData: config,
@@ -319,7 +349,7 @@ struct VMLXServerRuntimeSettingsTests {
             // "chunk_lazy_repair" filler overrode that and collapsed acceptance.
             #expect(verifierMode == nil)
         } else {
-            Issue.record("Default server settings should auto-resolve tuned native MTP")
+            Issue.record("Explicit Auto should resolve tuned native MTP")
         }
     }
 
@@ -338,7 +368,7 @@ struct VMLXServerRuntimeSettingsTests {
             tensorCount: 57,
             mode: .preservedEnabled,
             measuredFamilyAutoDepth: 3)
-        let settings = VMLXServerRuntimeSettings()
+        let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .auto))
 
         let launch = settings.resolvedMTPLaunch(
             configData: config,
@@ -367,7 +397,7 @@ struct VMLXServerRuntimeSettingsTests {
             #expect(depth == 3)
             #expect(verifierMode == nil)
         } else {
-            Issue.record("Default server settings should resolve Flash-Next Auto to native MTP D3")
+            Issue.record("Explicit Auto should resolve Flash-Next to native MTP D3")
         }
     }
 
@@ -397,8 +427,13 @@ struct VMLXServerRuntimeSettingsTests {
                 modelTypes: ["qwen4_exp", "qwen4_exp_text"],
                 note: "MTP net slowdown: verifier cannot use the decode-only fused MoE kernel.",
                 reason: "measured slower than AR at all depths"),
+            // The legacy exception is keyed to the complete mixed topology,
+            // not the marketing label or a bare default bits=4.
+            quantizationFingerprint:
+                "default=8x64;all=3x32:96,4x32:32,4x64:157,8x64:519;"
+                + "mtp=4x64:13;expert=4x64:144;ple=3x32:96,4x32:32,8x64:2",
             measuredFamilyAutoDepth: 3)
-        let settings = VMLXServerRuntimeSettings()
+        let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .auto))
 
         #expect(settings.resolvedMTPLaunch(
             configData: config,
