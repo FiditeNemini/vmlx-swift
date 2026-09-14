@@ -128,13 +128,15 @@ public final class Stream: @unchecked Sendable, Equatable {
     /// on this thread only, not Swift's explicit StreamOrDevice defaults.
     /// Do not span an async suspension; use withNewDefaultStream for Tasks.
     ///
-    /// Use with `restoreDefault()` to bracket generation loops:
+    /// For native calls that omit their stream, bracket a synchronous scope
+    /// with ``runWith(_:)``. For Swift model operations use
+    /// ``withNewDefaultStream(device:_:)-5bwc3`` instead:
     /// ```swift
-    /// let genStream = Stream(Device.defaultDevice())
-    /// Stream.setDefault(genStream)  // model ops → generation stream
-    /// asyncEval(token)              // submitted to generation stream
-    /// Stream.restoreDefault()       // item() → default stream (no contention)
-    /// let value = token.item(Int.self)
+    /// Stream.withNewDefaultStream {
+    ///     let result = model(input)  // Swift defaults select this Task's stream
+    ///     asyncEval(result)
+    ///     StreamOrDevice.default.stream.synchronize()
+    /// }
     /// ```
     public static func setDefault(_ stream: Stream) {
         _ = evalLock.withLock { mlx_set_default_stream(stream.ctx) }
@@ -170,10 +172,17 @@ public final class Stream: @unchecked Sendable, Equatable {
         self.ctx = ctx
     }
 
-    /// Default stream on the default device.
+    /// The effective Swift default stream, including a scoped Task default.
+    ///
+    /// This shares the existing stream; it does not allocate a new queue.
+    /// Use `Stream(device)` to create a new stream on a specified device.
     public init() {
-        let device = Device.defaultDevice()
-        self.ctx = evalLock.withLock { mlx_stream_new_thread_unsafe(device.ctx) }
+        let selected = StreamOrDevice.default.stream
+        self.ctx = evalLock.withLock {
+            var ctx = mlx_stream_new()
+            _ = mlx_stream_set(&ctx, selected.ctx)
+            return ctx
+        }
     }
 
     @available(*, deprecated, message: "use init(Device) -- index not supported")

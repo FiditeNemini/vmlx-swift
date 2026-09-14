@@ -41,6 +41,46 @@ final class MLX0322IntegrationTests: XCTestCase {
         stream.synchronize()
     }
 
+    func testDefaultStreamSelectionAndDrain() {
+        func checkCurrentDefault() {
+            let expected = StreamOrDevice.default.stream
+            let selected = MLX.Stream()
+            // Queue identity makes the negative control deterministic: an
+            // unrelated queue may finish first, but cannot be our drain.
+            XCTAssertEqual(selected, expected)
+            let input = MLXArray((0 ..< 8192).map { Float($0 % 7) })
+            let output = input + 3
+            asyncEval(output)
+            selected.synchronize()
+            var available = false
+            XCTAssertEqual(_mlx_array_is_available(&available, output.ctx), 0)
+            XCTAssertTrue(available, "Default-stream drain must finish submitted work")
+            // Cleanup even in the failing control; readback must not disguise
+            // the missing drain because availability was checked first.
+            expected.synchronize()
+            XCTAssertEqual(output.asArray(Float.self),
+                           (0 ..< 8192).map { Float($0 % 7) + 3 })
+        }
+        for device in [Device.cpu, Device.gpu] {
+            Device.withDefaultDevice(device) {
+                let original = StreamOrDevice.default.stream
+                checkCurrentDefault()
+                Stream.withNewDefaultStream(device: device) {
+                    let scoped = StreamOrDevice.default.stream
+                    XCTAssertNotEqual(scoped, original)
+                    checkCurrentDefault()
+                    Stream.withNewDefaultStream(device: device) {
+                        XCTAssertNotEqual(StreamOrDevice.default.stream, scoped)
+                        checkCurrentDefault()
+                    }
+                    XCTAssertEqual(StreamOrDevice.default.stream, scoped)
+                }
+                XCTAssertEqual(StreamOrDevice.default.stream, original)
+            }
+        }
+        print("MLX0322 default_stream_drain cpu_gpu_nested_cases=6")
+    }
+
     func testRunWithRestoresTargetDeviceAndNestedDefaults() {
         func nativeDefault(_ device: Device) -> MLX.Stream {
             var result = mlx_stream_new()

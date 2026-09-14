@@ -33,7 +33,7 @@ the local development bundle before promotion.
 |---|---|
 | Quantized kernels | Preserve affine1 inference packing, mixed q4/q8 metadata, raw-F32 q6 and Metal-only admission. Preserve the32-lane exact q6 reduction for eligible promoted verifier rows; leave other wide and matrix paths intact. |
 | mmap | Retain the fork's regions/advice, excluded keys, safe unaligned handling and array-owned mappings. No model-weight rewrite. |
-| Stream lifetime | Use upstream cross-thread stream handles under the Swift evaluation lock; native defaults are now thread-local. Restore the target device's previous default. |
+| Stream lifetime | Use upstream cross-thread stream handles under the Swift evaluation lock; native defaults are now thread-local. Restore the target device's previous default. Preserve zero-argument Stream() as the effective Swift default, including TaskLocal scopes; generation/cache/cancellation drains explicitly select that same stream. |
 | Compiler cache | Acquire evalLock before the recursive instance lock. Record stable identities and weak handles for every native worker cache used, then erase the function from those caches on destruction. Preserve the compile trust policy. |
 | Custom kernels | Adopt source/options-hashed libraries; retain bound buffers through command completion and retired library/pipeline owners. Preserve output shapes in both common Metal and CUDA factories. CUDA is not execution-qualified here. |
 | C/Swift surface | Adapt cumulative-axis, FFT normalization, SDPA forceFused defaultfalse, median/trace and Data SEEK_END. Update distributed-group output-parameter ABI with owned typed handles; multi-host execution remains untested. |
@@ -77,6 +77,27 @@ The fresh metallib hash is unchanged. The bounded supervisor recorded4.20GiB
 peak tracked footprint, flat0.49GiB swap and zero owned survivors.
 
 ## Remaining acceptance gates
+
+Final caller review caught a regression before app promotion: engine f7883254
+made zero-argument Stream() allocate a new queue. Eight cleanup sites drained
+that unrelated queue. The live negative control
+`SWIFTTEST_MLX0322DrainNegativeB0914__051251.log` reproduced six wrong native
+stream identities and three GPU arrays still unavailable after the false drain.
+The replacement tests CPU/GPU, nested TaskLocal defaults, availability before
+readback, and exact values. Build B was stopped (exit130) with zero owned
+survivors; it must not be used as application evidence. No connection to earlier
+speed or crash reports is established by this newly introduced defect.
+
+The corrected full selection is
+`SWIFTTEST_MLX0322DrainFixedFullI0914__051403.log`, exit0 at05:21:05.
+It records52 XCTest cases (including the six-case default-stream regression)
+and the24/21/24 focused Swift Testing selections with zero failures/issues,
+plus the separate strict TF32-disabled384-case matrix. Test executable SHA256:
+`23dbb00f6d5dd906ad6f6723d0e481e3aad746dbeb5de4baebf9dfa9ad8bd3b4`.
+Fresh macOS14 metallib SHA256 remains
+`02ea075fab6e847ba1f5cc8c410657506b63309257a24efbc7eb6f69380dbe6f`.
+Tracked peak4.01GiB, swap flat0.49GiB and zero owned survivors. Opt-in
+installed-model branches are still not full-model execution evidence.
 
 Fork PRs: core [#9](https://github.com/osaurus-ai/mlx/pull/9), C ABI
 [#1](https://github.com/osaurus-ai/mlx-c/pull/1), engine

@@ -3777,7 +3777,7 @@ private func runSynchronousGenerationLoop(
     let now = Date.timeIntervalSinceReferenceDate
     let generateTime = now - start
 
-    Stream().synchronize()
+    StreamOrDevice.default.stream.synchronize()
 
     return SynchronousGenerationLoopResult(
         generatedTokenIds: generatedTokenIds,
@@ -4626,7 +4626,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 // "command encoder is already encoding" / end_encoding races.
                 // The normal completion path below drains twice for the same
                 // reason; the early-exit paths must match it.
-                Stream().synchronize()
+                StreamOrDevice.default.stream.synchronize()
                 handler.onGenerationEnd(emit: continuation.yield)
                 _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
                     promptTokenCount: promptTokenCount,
@@ -4643,7 +4643,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     "Iterator construction failed: \(error.localizedDescription, privacy: .public)")
                 // Drain any prefill work enqueued before the failure before
                 // closing the stream (see the CancellationError branch above).
-                Stream().synchronize()
+                StreamOrDevice.default.stream.synchronize()
                 handler.onGenerationEnd(emit: continuation.yield)
                 _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
                     promptTokenCount: promptTokenCount,
@@ -4791,7 +4791,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             let genTailTrace =
                 ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
             let tailT0 = Date()
-            Stream().synchronize()
+            StreamOrDevice.default.stream.synchronize()
             let tailT1 = Date()
             iterator.storeCacheAfterGeneration(
                 generatedTokenIds: generatedTokenIds,
@@ -4799,7 +4799,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     && !handler.stopSequenceHit
                     && !handler.emittedToolCall)
             let tailT2 = Date()
-            Stream().synchronize()
+            StreamOrDevice.default.stream.synchronize()
             let tailT3 = Date()
 
             // Router-advice readback runs on its own Dispatch queue. Drain it

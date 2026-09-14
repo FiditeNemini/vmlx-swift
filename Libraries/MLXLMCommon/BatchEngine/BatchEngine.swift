@@ -1473,7 +1473,7 @@ public actor BatchEngine {
 
     private func finishSoloFastPath(id: UUID) {
         guard soloFastPathID == id else { return }
-        Stream().synchronize()
+        StreamOrDevice.default.stream.synchronize()
         let shouldPurgeMediaWorkingSet = soloFastPathHadMedia
         soloFastPathID = nil
         soloFastPathTask = nil
@@ -1633,7 +1633,7 @@ public actor BatchEngine {
 
         // Final fence: producers submit via `asyncEval`, so their last
         // command buffers may still be in flight when the tasks return.
-        Stream().synchronize()
+        StreamOrDevice.default.stream.synchronize()
         if shouldPurgeSoloMediaWorkingSet {
             Memory.clearCache()
             stepsSinceMemoryPurge = 0
@@ -3766,7 +3766,7 @@ public actor BatchEngine {
         // THIS thread — which owns the command buffers — drains them in order
         // with no foreign-commit hazard, so "stream finished" provably means
         // "GPU idle." Mirrors the solo-fast-path drain in `finishSoloFastPath`.
-        Stream().synchronize()
+        StreamOrDevice.default.stream.synchronize()
 
         slot.continuation.finish()
 
