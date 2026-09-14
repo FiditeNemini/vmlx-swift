@@ -2,12 +2,115 @@
 
 NOW: Integrate pinned core0.32.2, the matching C ABI and Swift compatibility in
 `feat/mlx0322-integration`. Preserve the JANG/mmap fork and the existing Qwen
-AR optimizations. No application speed claim yet.
+AR optimizations. The affine stream regression has app evidence; full-family
+qualification and the engine/application merge remain incomplete.
 DO NOT: Release, change native sampling/precision, replace the fork with stock
 MLX, or mix a larger prefill chunk into the dependency-control measurement.
-BATCH OWNER: Core/C/Swift compatibility, then local development-app evidence.
-NEXT: Checkpoint the tested sources, repin all six Osaurus locations and rebuild
-the local development bundle before promotion.
+BATCH OWNER: Exact-source compatibility, development-app evidence and merge gates.
+NEXT: Complete the final wrapper regression run, consume the final engine pin,
+and rebuild locally. Keep engine/application PRs draft while runtime gates remain open.
+
+## Current checkpoint — September 14
+
+Core [#9](https://github.com/osaurus-ai/mlx/pull/9) and C ABI
+[#1](https://github.com/osaurus-ai/mlx-c/pull/1) are merged. Fetched heads
+`0b9bdfb5858ecfac30916aeb23cc7c595d157a4f` and
+`ab37d9dce0b74c48ff1948145efdb6c59e678627` contain the tested pins
+`c0a51a085b9252dc6469afe1aed772b1f538c9b0` and
+`2d783ac38713458eae2067ffff9ef8ebbff2ec70`, respectively, with identical trees.
+Engine #474 and Osaurus #2745 are still draft/unmerged. No release/tag/install.
+
+Development build G, receipt `SWIFTTEST_MLX0322AffineStreamDevAppG0914__064628.log`,
+bound app `de65c71c82dbbfc8e972d76f9ddb7a5f0c37bcf9`, engine
+`4d01ed7832e62c73ae1477aa11faefa471c9d4f2`, and those exact native pins.
+Binary SHA256 `e4bb60b696b44fa27b68d6f0a908b57b8197252616a9ef835e1080a0155f5cb3`,
+UUID `564FEC05-4CBF-3EBF-A1B2-8F2A33CA10C7`, metallib
+`02ea075fab6e847ba1f5cc8c410657506b63309257a24efbc7eb6f69380dbe6f`.
+Build, dependency identity, ABI symbols and ad-hoc strict signature checks ended
+exit0; compiler peak21.46GiB, swap unchanged0.49GiB, zero owned survivors.
+The compiler free-memory floor was explicitly lowered40 to32GiB after two
+unnecessary aborts; cap28GiB/two WMO threads remained. This is NOT a change to
+the inference8GiB free floor/66GiB tracked cap or pressure/swap gates.
+
+Clean app-owned AR, MTP off, native temperature1/top-p0.95/top-k20, no repetition:
+
+| Quant/workload | Retained old-stack control tok/s | G candidate tok/s |
+| --- | --- | --- |
+| 2L short,34 input/891 generated | 46.854816;47.539888 | 51.372102;49.895430 |
+| 2L8K,8339 input/891 generated | No completed matching old8K row in this series | 47.921805;47.282857 |
+| 1L short,34 input/891 generated | 47.805748;47.289407 | 47.047354;47.115732 |
+| 1L8K,8339 input/891 generated | 44.845929;44.994549 | 45.056578;44.909111 |
+| Fresh2L short follow-up control | 47.206161 | 47.238209 |
+
+These count rows were exact1..250 with natural EOS. Candidate1s windows:
+2L short48..52,8K46..49;1L short46..48,8K43..46; no empty windows.
+Warm8K restore reported8332+7,12KV+36Mamba layers, required native disk-backed
+SSM state, zero TurboQuant/paged layers. Do not relabel these as fresh long prefill.
+Real osascript/Accessibility UI2L explanation/follow-up ran45.156/44.976tok/s,
+screenshots and complete answers inspected. UI1L first turn44.761, but its
+follow-up29.566 is a retained performance failure, not just the displayed rate.
+Scientific inaccuracies in some answers are not quality passes.
+
+Fresh1L exact3536-token submitted-input replays also slowed on the unchanged
+old binary: old27.337/24.167/23.890, new29.025/28.063/27.720tok/s. Later2L
+controls returned to47+. The cause of that variability is not established.
+Do not claim stable50tok/s, universal parity, or transfer Python timings.
+
+Instrumented G capture separately restored one queue and exactly199command
+buffers/token across16complete intervals, versus the broken integration's two
+queues/~320.889. Observed G rate51.668911 is instrumented, not a clean benchmark.
+The source correction is the three explicit cast streams in core `mlx/ops.cpp`;
+the negative/numerical receipts below isolate it without changing dtype or math.
+
+### Unclosed runtime gates
+
+- Both old/new4S attempts aborted before a final speed receipt at the unchanged
+  8GiB free floor:6.9/6.7GiB free,57.29GiB peak each,normal pressure,flat0.49swap.
+  Receipts `SWIFTTEST_mlx0322_4s_control_a_affineg1__074647.log` and
+  `SWIFTTEST_mlx0322_4s_candidate_a_affineg1__074756.log`, zero survivors.
+  This does not establish an OOM or a new-version memory regression.4M/6S unmeasured.
+- Matched fresh35K long-context runs lack completed old/new qualification under
+  the same memory guard. Earlier failed/partial observations remain retained.
+- Actual UI cancellation metadata failed to settle within30s in BOTH binaries,
+  despite idle backend. The candidate once ended its recovery after53tokens,
+  midword, on actual native EOS. That is an unresolved semantic failure.
+  Three exact-submitted3391-token raw replays per engine all ended complete;
+  they do not reproduce Stop scheduling or matched RNG. Old44.82/45.16/44.54,
+  new43.19/44.60/40.29tok/s; keep the slower repeat. Raw route emits no decoded
+  prompt dump, so equal submitted bytes/count do not assert exact runtime token IDs.
+- Actual-image OCR failed in both previous/new stacks; no blanket VLM claim.
+- Concurrent RNG, CUDA and multi-host distributed execution remain unqualified.
+
+### Final diff/build review
+
+`27ff9205` excludes the new native stream regression test from standalone Xcode
+framework membership. `SWIFTTEST_MLX0322AlternateBuildsB0914__075126.log`
+then records `BUILD SUCCEEDED` at line86125. The subsequent CPU CMake build
+caught a macOS-SDK/backend mismatch at `WiredMemory.swift:722`.
+`cebccaef` makes the conditional follow CMake's Metal-disabled source selection;
+ordinary SwiftPM/Xcode memory policy is unchanged. `bd832e02` prevents the CPU
+example from eagerly creating the unused GPU stream.
+`SWIFTTEST_MLX0322CMakeCPUExample0914__080130.log` builds and executes the CPU
+example with exact arrays/index value4,exit0/zero survivors. Earlier failures
+are not counted as passes. Full proposed diffs were whitespace-checked.
+
+Full wrapper receipt `SWIFTTEST_MLX0322FullWrappers0914__074430.log` had one
+compiled-RNG failure because public `compile()` is intentionally eager without
+opt-in. Same binary20b1a455 with explicit test-process compiler opt-in in
+`SWIFTTEST_MLX0322FullWrappersCompileOptIn0914__074608.log` reported544XCTest,
+two existing concurrent-RNG skips,zero failures,plus83SwiftTesting passes.
+`f80dac25` scopes that RNG test to the existing trusted compiler API, preserves
+both RNG assertions, and adds an actual call/trace-count check for public policy.
+`SWIFTTEST_MLX0322FinalWrappersB0914__080818.log` rebuilt engine`f80dac25`:
+both default and opt-in runs reported545XCTest,2existing skips,0failures,
+plus83SwiftTesting passes each. A separate hard-disable-over-opt-in process
+passed the public-policy assertion. The linked-version test executed0.32.2.
+Executable SHA256`719112f85ef8c97f2ad3cec9e3efd6d2c0c14d283b715a700cb1fa81b24a616a`;
+metallib remains02ea075f. Exit0,4.18GiB peak,flat0.49swap,zero survivors.
+The first rebuild invocation omitted the established DEBUG-only test hooks
+and failed to compile; the corrected invocation restores those test flags.
+The actual development app has no such test flags. App policy and numerical
+tolerances are unchanged. The next engine commit only records this document.
 
 ## Source lineage
 
@@ -65,10 +168,10 @@ metallib unchanged below. Peak tracked2.25GiB,swap flat.49GiB,zero survivors.
 The native regression is registered in core CMake tests. Formatting then
 wrapped one test expression only; product source was unchanged.
 
-**App speed correction remains unproven until the rebuilt app is replayed.**
+This was the pre-G status; the current G app receipts above supersede it.
 The old and new apps both hit the8GiB free-memory floor in long runs; this
 does not establish a new memory regression. Real-image OCR was incorrect in
-both apps, so those rows are not full VLM passes. No release or merge claim.
+both apps, so those rows are not full VLM passes. No engine/app merge claim.
 
 Private evidence root:
 `/Users/eric/vmlx-private-evidence/mtp-swift-2026-09-04/logs`.
