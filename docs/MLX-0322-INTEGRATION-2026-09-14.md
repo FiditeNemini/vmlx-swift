@@ -12,6 +12,12 @@ and rebuild locally. Keep engine/application PRs draft while runtime gates remai
 
 ## Current checkpoint — September 14
 
+Eric accepted the retained model checkpoint and requested repinning with one
+scope correction: only Flash Next should start MTP Off, with selectors visible;
+Qwen27B must retain existing behavior. The shared engine default remains Auto.
+Osaurus owns the metadata-scoped picker default and preserves explicit choices.
+This scope correction does not claim the broader limitations below resolved.
+
 Core [#9](https://github.com/osaurus-ai/mlx/pull/9) and C ABI
 [#1](https://github.com/osaurus-ai/mlx-c/pull/1) are merged. Fetched heads
 `0b9bdfb5858ecfac30916aeb23cc7c595d157a4f` and

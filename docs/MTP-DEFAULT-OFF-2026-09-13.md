@@ -1,5 +1,22 @@
 # Native MTP default Off checkpoint — PARTIAL
 
+## Superseded scope — September 14
+
+The September 13 global-Off proposal below is superseded by Eric's request:
+**Flash Next only starts Off; 27B must not be affected.** Shared engine init
+and missing-mode decoding therefore remain Auto. Osaurus applies the family
+default from top-level/nested `model_type=qwen4_exp`, independently of quant
+name and selector capability. Real heads retain Off/Auto/D1/D2/D3 controls;
+explicit choices are preserved. Family-owned Off is reversed on leaving Flash
+Next, including restoration of the existing eligible Qwen27B D3 picker default.
+This is not a ban on manually activating Flash Next MTP, nor a change to API
+callers explicitly requesting Auto. No sampler or activation gate is weakened.
+
+The new scoped app tests/build/UI receipts are pending. September 13 global-Off
+tests below are historical evidence, not proof of the corrected policy.
+
+## Historical proposal (not the current product policy)
+
 The requested product policy is AR until a user selects Auto or a depth.
 MTP capability remains a property of bundle tensors, independent of activation.
 
