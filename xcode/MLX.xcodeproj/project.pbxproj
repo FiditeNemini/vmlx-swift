@@ -1198,6 +1198,7 @@
 				tests/load_tests.cpp,
 				tests/metal_buffer_lifetime_tests.cpp,
 				tests/ops_tests.cpp,
+				tests/quantized_stream_tests.cpp,
 				tests/random_tests.cpp,
 				tests/residency_tests.cpp,
 				tests/scheduler_tests.cpp,
