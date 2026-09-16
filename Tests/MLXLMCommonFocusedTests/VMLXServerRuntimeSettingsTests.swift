@@ -11,13 +11,16 @@ struct VMLXServerRuntimeSettingsTests {
     @Test("native MTP is opt-in on initialization and missing-mode decode")
     func sharedMTPDefaultsOffAndPreservesExplicitChoices() throws {
         #expect(VMLXServerMTPSettings().mode == .off)
-        #expect(try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode == .off)
+        #expect(
+            try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode == .off
+        )
         for settings in [
             VMLXServerMTPSettings(mode: .off), .init(mode: .auto),
             .init(mode: .forceOn, explicitDepth: 3),
         ] {
-            #expect(try JSONDecoder().decode(
-                VMLXServerMTPSettings.self, from: JSONEncoder().encode(settings)) == settings)
+            #expect(
+                try JSONDecoder().decode(
+                    VMLXServerMTPSettings.self, from: JSONEncoder().encode(settings)) == settings)
         }
     }
 

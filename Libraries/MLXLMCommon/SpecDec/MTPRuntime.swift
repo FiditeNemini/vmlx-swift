@@ -985,7 +985,8 @@ public enum NativeMTPAutoDecodePolicy {
     public static func supportsModel(configData: Data) -> Bool {
         guard let config = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any]
         else { return false }
-        return modelTypes(config: config, fallback: nil).contains(where: isSupportedQwenMTPModelType)
+        return modelTypes(config: config, fallback: nil).contains(
+            where: isSupportedQwenMTPModelType)
     }
 
     /// Manual-depth recommendation: validates the same family/tensor evidence

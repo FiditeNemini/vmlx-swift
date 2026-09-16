@@ -1626,7 +1626,9 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
 
     /// Legacy explicit-greedy preset. Native MTP does not apply this preset;
     /// callers must preserve the bundle or user-selected sampler.
-    @available(*, deprecated, message: "Native MTP preserves request sampling; do not coerce it to greedy.")
+    @available(
+        *, deprecated, message: "Native MTP preserves request sampling; do not coerce it to greedy."
+    )
     public static var mtpEnforcedGreedySampling:
         (temperature: Float, topP: Float, topK: Int, minP: Float)
     { (0, 1, 0, 0) }
