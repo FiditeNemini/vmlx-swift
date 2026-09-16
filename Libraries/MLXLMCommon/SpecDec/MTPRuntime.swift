@@ -867,8 +867,8 @@ public enum NativeMTPActivation {
         // Manual-depth activation: the user pressed an explicit depth button.
         // Like measurement mode, a complete tensor artifact loads without a
         // usable tuning file — the intent differs: the caller is a product
-        // surface and must also enforce greedy sampling for that
-        // model+session and report the engine's actual active depth.
+        // surface and must preserve request sampling and report the engine's
+        // actual active depth.
         if manualDepthRequest != nil {
             return true
         }
@@ -979,6 +979,16 @@ public struct NativeMTPAutoDecodeRecommendation: Codable, Sendable, Equatable {
 /// supported Qwen bundles resolve to a production launch recommendation only
 /// when their bundle-local `vmlx_mtp_tuning.json` row is usable.
 public enum NativeMTPAutoDecodePolicy {
+    /// Architecture support for the server's Auto/manual-depth launch policy.
+    /// Hosts combine this with real bundle tensor evidence before displaying
+    /// controls. A model's display name is not architecture evidence.
+    public static func supportsModel(configData: Data) -> Bool {
+        guard let config = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any]
+        else { return false }
+        return modelTypes(config: config, fallback: nil).contains(
+            where: isSupportedQwenMTPModelType)
+    }
+
     /// Manual-depth recommendation: validates the same family/tensor evidence
     /// as the auto path but takes the user's explicit depth instead of a
     /// measured tuning artifact. A tuning file, when present, contributes its

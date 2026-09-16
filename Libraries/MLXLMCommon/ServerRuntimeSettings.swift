@@ -1589,9 +1589,8 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     /// from a measured, usable `vmlx_mtp_tuning.json`, while an explicit
     /// depth is a deliberate user activation that requires tensor-complete
     /// MTP evidence for a supported runtime but NOT a tuning artifact —
-    /// the user is the measurement. Any active MTP launch (auto or manual)
-    /// forces greedy sampling for that model+session; see
-    /// ``mtpEnforcedGreedySampling``.
+    /// the user is the measurement. The request's sampler remains authoritative;
+    /// the iterator selects greedy or exact sampled verification accordingly.
     public var explicitDepth: Int?
 
     /// Folder holding a downloaded DFlash 2 drafter, or `nil` for none.
@@ -1608,7 +1607,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     public var dflash2BlockSize: Int?
 
     public init(
-        mode: VMLXMTPServerMode = .auto,
+        mode: VMLXMTPServerMode = .off,
         draftTokenLimit: Int? = nil,
         keepDraftCacheSeparate: Bool = true,
         acceptedTokensOnlyEnterBaseCache: Bool = true,
@@ -1625,11 +1624,11 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
         self.explicitDepth = explicitDepth
     }
 
-    /// The sampler override every active MTP launch enforces, scoped to the
-    /// requests of the model+session that runs speculative decode: greedy
-    /// (temperature 0, top-p 1, top-k 0, min-p 0). Measured on JANG_2L:
-    /// greedy MTP 41.4 tok/s with byte-exact AR parity; sampled MTP loses
-    /// ~10% and forfeits the parity guarantee.
+    /// Legacy explicit-greedy preset. Native MTP does not apply this preset;
+    /// callers must preserve the bundle or user-selected sampler.
+    @available(
+        *, deprecated, message: "Native MTP preserves request sampling; do not coerce it to greedy."
+    )
     public static var mtpEnforcedGreedySampling:
         (temperature: Float, topP: Float, topK: Int, minP: Float)
     { (0, 1, 0, 0) }
@@ -1639,7 +1638,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     /// failing the whole settings load.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.mode = try c.decodeIfPresent(VMLXMTPServerMode.self, forKey: .mode) ?? .auto
+        self.mode = try c.decodeIfPresent(VMLXMTPServerMode.self, forKey: .mode) ?? .off
         self.draftTokenLimit = try c.decodeIfPresent(Int.self, forKey: .draftTokenLimit)
         self.keepDraftCacheSeparate =
             try c.decodeIfPresent(Bool.self, forKey: .keepDraftCacheSeparate) ?? true

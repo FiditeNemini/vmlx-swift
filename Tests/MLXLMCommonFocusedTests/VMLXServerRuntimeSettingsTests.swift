@@ -8,23 +8,45 @@ import Testing
 
 @Suite("VMLX server runtime settings")
 struct VMLXServerRuntimeSettingsTests {
-    @Test("shared MTP defaults remain Auto; explicit Off round-trips unchanged")
-    func sharedMTPDefaultsDoNotDisableNonFlashModels() throws {
-        #expect(VMLXServerMTPSettings().mode == .auto)
-        #expect(try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode == .auto)
-        let explicitOff = VMLXServerMTPSettings(mode: .off)
-        #expect(try JSONDecoder().decode(
-            VMLXServerMTPSettings.self, from: JSONEncoder().encode(explicitOff)) == explicitOff)
+    @Test("native MTP is opt-in on initialization and missing-mode decode")
+    func sharedMTPDefaultsOffAndPreservesExplicitChoices() throws {
+        #expect(VMLXServerMTPSettings().mode == .off)
+        #expect(
+            try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode == .off
+        )
+        for settings in [
+            VMLXServerMTPSettings(mode: .off), .init(mode: .auto),
+            .init(mode: .forceOn, explicitDepth: 3),
+        ] {
+            #expect(
+                try JSONDecoder().decode(
+                    VMLXServerMTPSettings.self, from: JSONEncoder().encode(settings)) == settings)
+        }
     }
 
-    @Test("explicit Off prevents native MTP launch without changing capability")
-    func explicitOffPreventsNativeMTPLaunch() {
+    @Test("selection capability shares the launch policy across architecture aliases")
+    func selectionCapabilityMatchesLaunchPolicy() {
+        for type in ["qwen4_exp", "qwen3_5", "qwen3_5_moe", "qwen3_6_moe_text", "qwen35"] {
+            for config in [
+                "{\"model_type\":\"\(type)\"}",
+                "{\"model_type\":\"vlm\",\"text_config\":{\"model_type\":\"\(type)\"}}",
+            ] {
+                #expect(NativeMTPAutoDecodePolicy.supportsModel(configData: Data(config.utf8)))
+            }
+        }
+        for config in ["{}", "bad", #"{"model_type":"glm5_next","name":"qwen4_exp"}"#] {
+            #expect(!NativeMTPAutoDecodePolicy.supportsModel(configData: Data(config.utf8)))
+        }
+    }
+
+    @Test("default Off prevents native MTP launch without changing capability")
+    func defaultOffPreventsNativeMTPLaunch() {
         for type in ["qwen4_exp", "qwen3_5"] {
             let config = Data("{\"model_type\":\"\(type)\",\"mtp_num_hidden_layers\":1}".utf8)
             let status = MTPBundleStatus(
                 bundleHasMTP: true, configuredLayers: 1, tensorCount: 57,
                 mode: .preservedEnabled, measuredFamilyAutoDepth: 3)
-            let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .off))
+            let settings = VMLXServerRuntimeSettings()
             var base = LoadConfiguration.default
             base.nativeMTP = true
             #expect(settings.resolvedMTPLaunch(
@@ -57,7 +79,7 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.generation.topK == nil)
         #expect(settings.generation.minP == nil)
         #expect(settings.generation.repetitionPenalty == nil)
-        #expect(settings.mtp.mode == .auto)
+        #expect(settings.mtp.mode == .off)
         #expect(settings.mtp.keepDraftCacheSeparate)
         #expect(settings.mtp.acceptedTokensOnlyEnterBaseCache)
         #expect(settings.effectivePerformance.deepseekV4ActivationQAT == false)
@@ -297,8 +319,8 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.validationIssues(mtpStatus: tuned).isEmpty)
     }
 
-    @Test("server runtime defaults auto-launch tuned native MTP bundles")
-    func serverRuntimeDefaultsAutoLaunchTunedNativeMTPBundles() {
+    @Test("server runtime explicit Auto launches tuned native MTP bundles")
+    func serverRuntimeExplicitAutoLaunchesTunedNativeMTPBundles() {
         let config = """
         {
           "model_type": "qwen3_vl",
@@ -322,7 +344,7 @@ struct VMLXServerRuntimeSettingsTests {
                 speedupVsBaseline: 1.5,
                 quantizationMode: "mxfp8",
                 quantizationBits: 8))
-        let settings = VMLXServerRuntimeSettings()
+        let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .auto))
 
         let launch = settings.resolvedMTPLaunch(
             configData: config,
@@ -367,7 +389,7 @@ struct VMLXServerRuntimeSettingsTests {
             tensorCount: 57,
             mode: .preservedEnabled,
             measuredFamilyAutoDepth: 3)
-        let settings = VMLXServerRuntimeSettings()
+        let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .auto))
 
         let launch = settings.resolvedMTPLaunch(
             configData: config,
@@ -432,7 +454,7 @@ struct VMLXServerRuntimeSettingsTests {
                 "default=8x64;all=3x32:96,4x32:32,4x64:157,8x64:519;"
                 + "mtp=4x64:13;expert=4x64:144;ple=3x32:96,4x32:32,8x64:2",
             measuredFamilyAutoDepth: 3)
-        let settings = VMLXServerRuntimeSettings()
+        let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .auto))
 
         #expect(settings.resolvedMTPLaunch(
             configData: config,
