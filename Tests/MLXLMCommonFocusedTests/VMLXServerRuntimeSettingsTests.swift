@@ -451,7 +451,7 @@ struct VMLXServerRuntimeSettingsTests {
                 "default=8x64;all=3x32:96,4x32:32,4x64:157,8x64:519;"
                 + "mtp=4x64:13;expert=4x64:144;ple=3x32:96,4x32:32,8x64:2",
             measuredFamilyAutoDepth: 3)
-        let settings = VMLXServerRuntimeSettings()
+        let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .auto))
 
         #expect(settings.resolvedMTPLaunch(
             configData: config,
