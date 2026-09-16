@@ -127,311 +127,236 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         var issues: [VMLXServerSettingsIssue] = []
 
         if network.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            issues.append(
-                .error(
-                    field: "network.host",
-                    message: "Server host cannot be empty."))
+            issues.append(.error(
+                field: "network.host",
+                message: "Server host cannot be empty."))
         }
         if let port = network.port,
-            !(1 ... 65_535).contains(port)
-        {
-            issues.append(
-                .error(
-                    field: "network.port",
-                    message: "Server port must be between 1 and 65535."))
+           !(1...65_535).contains(port) {
+            issues.append(.error(
+                field: "network.port",
+                message: "Server port must be between 1 and 65535."))
         }
         if let rateLimit = network.rateLimitRequestsPerMinute,
-            rateLimit <= 0
-        {
-            issues.append(
-                .error(
-                    field: "network.rateLimitRequestsPerMinute",
-                    message: "Rate limit must be positive. Use nil to disable rate limiting."))
+           rateLimit <= 0 {
+            issues.append(.error(
+                field: "network.rateLimitRequestsPerMinute",
+                message: "Rate limit must be positive. Use nil to disable rate limiting."))
         }
         if let timeout = network.timeoutSeconds,
-            timeout <= 0
-        {
-            issues.append(
-                .error(
-                    field: "network.timeoutSeconds",
-                    message: "Timeout must be positive. Use nil for no timeout."))
+           timeout <= 0 {
+            issues.append(.error(
+                field: "network.timeoutSeconds",
+                message: "Timeout must be positive. Use nil for no timeout."))
         }
         if let maxConcurrent = concurrency.maxConcurrentSequences,
-            maxConcurrent <= 0
-        {
-            issues.append(
-                .error(
-                    field: "concurrency.maxConcurrentSequences",
-                    message: "Max concurrent sequences must be positive."))
+           maxConcurrent <= 0 {
+            issues.append(.error(
+                field: "concurrency.maxConcurrentSequences",
+                message: "Max concurrent sequences must be positive."))
         }
         if let diffusionSteps = generation.diffusionMaxDenoisingSteps {
             if diffusionSteps < 1 {
-                issues.append(
-                    .error(
-                        field: "generation.diffusionMaxDenoisingSteps",
-                        message:
-                            "Diffusion denoising steps must be at least 1. Use nil for the bundle default."
-                    ))
+                issues.append(.error(
+                    field: "generation.diffusionMaxDenoisingSteps",
+                    message: "Diffusion denoising steps must be at least 1. Use nil for the bundle default."))
             } else if diffusionSteps < 12 {
-                issues.append(
-                    .warning(
-                        field: "generation.diffusionMaxDenoisingSteps",
-                        message:
-                            "Diffusion budgets below 12 steps measurably break coherency on diffusiongemma-26B-A4B (8 steps produces word-salad spans)."
-                    ))
+                issues.append(.warning(
+                    field: "generation.diffusionMaxDenoisingSteps",
+                    message: "Diffusion budgets below 12 steps measurably break coherency on diffusiongemma-26B-A4B (8 steps produces word-salad spans)."))
             }
         }
         if let prefillBatchSize = concurrency.prefillBatchSize,
-            prefillBatchSize <= 0
-        {
-            issues.append(
-                .error(
-                    field: "concurrency.prefillBatchSize",
-                    message: "Prefill batch size must be positive."))
+           prefillBatchSize <= 0 {
+            issues.append(.error(
+                field: "concurrency.prefillBatchSize",
+                message: "Prefill batch size must be positive."))
         }
         if let prefillStepSize = concurrency.prefillStepSize,
-            prefillStepSize <= 0
-        {
-            issues.append(
-                .error(
-                    field: "concurrency.prefillStepSize",
-                    message: "Prefill step size must be positive."))
+           prefillStepSize <= 0 {
+            issues.append(.error(
+                field: "concurrency.prefillStepSize",
+                message: "Prefill step size must be positive."))
         }
         if let completionBatchSize = concurrency.completionBatchSize,
-            completionBatchSize <= 0
-        {
-            issues.append(
-                .error(
-                    field: "concurrency.completionBatchSize",
-                    message: "Completion batch size must be positive."))
+           completionBatchSize <= 0 {
+            issues.append(.error(
+                field: "concurrency.completionBatchSize",
+                message: "Completion batch size must be positive."))
         }
         if cache.pagedKV.enabled && cache.legacyDisk.enabled {
-            issues.append(
-                .error(
-                    field: "cache.legacyDisk.enabled",
-                    message:
-                        "Legacy disk cache cannot run at the same time as paged KV cache. Use block disk L2 for paged cache persistence."
-                ))
+            issues.append(.error(
+                field: "cache.legacyDisk.enabled",
+                message: "Legacy disk cache cannot run at the same time as paged KV cache. Use block disk L2 for paged cache persistence."))
         }
-        if !concurrency.continuousBatching
-            && (cache.prefix.enabled || cache.pagedKV.enabled || cache.blockDisk.enabled)
-        {
-            issues.append(
-                .warning(
-                    field: "concurrency.continuousBatching",
-                    message:
-                        "Continuous batching is off, so prefix/paged/block-disk cache reuse will be limited or disabled."
-                ))
+        if !concurrency.continuousBatching &&
+            (cache.prefix.enabled || cache.pagedKV.enabled || cache.blockDisk.enabled) {
+            issues.append(.warning(
+                field: "concurrency.continuousBatching",
+                message: "Continuous batching is off, so prefix/paged/block-disk cache reuse will be limited or disabled."))
         }
         if let light = power.lightSleepAfterSeconds,
-            light <= 0
-        {
-            issues.append(
-                .error(
-                    field: "power.lightSleepAfterSeconds",
-                    message: "Light sleep must be positive. Use nil to disable light sleep."))
+           light <= 0 {
+            issues.append(.error(
+                field: "power.lightSleepAfterSeconds",
+                message: "Light sleep must be positive. Use nil to disable light sleep."))
         }
         if let deep = power.deepSleepAfterSeconds,
-            deep <= 0
-        {
-            issues.append(
-                .error(
-                    field: "power.deepSleepAfterSeconds",
-                    message: "Deep sleep must be positive. Use nil to disable deep sleep."))
+           deep <= 0 {
+            issues.append(.error(
+                field: "power.deepSleepAfterSeconds",
+                message: "Deep sleep must be positive. Use nil to disable deep sleep."))
         }
         if let light = power.lightSleepAfterSeconds,
-            let deep = power.deepSleepAfterSeconds,
-            light > 0,
-            deep > 0,
-            deep <= light
-        {
-            issues.append(
-                .error(
-                    field: "power.deepSleepAfterSeconds",
-                    message: "Deep sleep must be later than light sleep."))
+           let deep = power.deepSleepAfterSeconds,
+           light > 0,
+           deep > 0,
+           deep <= light {
+            issues.append(.error(
+                field: "power.deepSleepAfterSeconds",
+                message: "Deep sleep must be later than light sleep."))
         }
         if let streamInterval = generation.streamInterval,
-            streamInterval < 1
-        {
-            issues.append(
-                .error(
-                    field: "generation.streamInterval",
-                    message: "Stream interval must be at least 1."))
+           streamInterval < 1 {
+            issues.append(.error(
+                field: "generation.streamInterval",
+                message: "Stream interval must be at least 1."))
         }
         if let temperature = generation.temperature,
-            temperature < 0
-        {
-            issues.append(
-                .error(
-                    field: "generation.temperature",
-                    message: "Temperature cannot be negative."))
+           temperature < 0 {
+            issues.append(.error(
+                field: "generation.temperature",
+                message: "Temperature cannot be negative."))
         }
         if let topP = generation.topP,
-            !(0 ... 1).contains(topP)
-        {
-            issues.append(
-                .error(
-                    field: "generation.topP",
-                    message: "Top-P must be between 0 and 1."))
+           !(0...1).contains(topP) {
+            issues.append(.error(
+                field: "generation.topP",
+                message: "Top-P must be between 0 and 1."))
         }
         if let minP = generation.minP,
-            !(0 ... 1).contains(minP)
-        {
-            issues.append(
-                .error(
-                    field: "generation.minP",
-                    message: "Min-P must be between 0 and 1."))
+           !(0...1).contains(minP) {
+            issues.append(.error(
+                field: "generation.minP",
+                message: "Min-P must be between 0 and 1."))
         }
         if let topK = generation.topK,
-            topK < 0
-        {
-            issues.append(
-                .error(
-                    field: "generation.topK",
-                    message:
-                        "Top-K cannot be negative. Use nil for model default or 0 for disabled when supported."
-                ))
+           topK < 0 {
+            issues.append(.error(
+                field: "generation.topK",
+                message: "Top-K cannot be negative. Use nil for model default or 0 for disabled when supported."))
         }
         if let repetitionPenalty = generation.repetitionPenalty,
-            repetitionPenalty <= 0
-        {
-            issues.append(
-                .error(
-                    field: "generation.repetitionPenalty",
-                    message: "Repetition penalty must be positive."))
+           repetitionPenalty <= 0 {
+            issues.append(.error(
+                field: "generation.repetitionPenalty",
+                message: "Repetition penalty must be positive."))
         }
         if let memoryLimit = cache.prefix.memoryLimitMB, memoryLimit <= 0 {
-            issues.append(
-                .error(
-                    field: "cache.prefix.memoryLimitMB",
-                    message: "Prefix cache memory limit must be positive."))
+            issues.append(.error(
+                field: "cache.prefix.memoryLimitMB",
+                message: "Prefix cache memory limit must be positive."))
         }
         if let memoryPercent = cache.prefix.memoryPercent,
-            memoryPercent <= 0 || memoryPercent > 100
-        {
-            issues.append(
-                .error(
-                    field: "cache.prefix.memoryPercent",
-                    message: "Prefix cache memory percent must be greater than 0 and at most 100."))
+           memoryPercent <= 0 || memoryPercent > 100 {
+            issues.append(.error(
+                field: "cache.prefix.memoryPercent",
+                message: "Prefix cache memory percent must be greater than 0 and at most 100."))
         }
         if let ttl = cache.prefix.ttlMinutes, ttl <= 0 {
-            issues.append(
-                .error(
-                    field: "cache.prefix.ttlMinutes",
-                    message: "Prefix cache TTL must be positive. Use nil for no expiration."))
+            issues.append(.error(
+                field: "cache.prefix.ttlMinutes",
+                message: "Prefix cache TTL must be positive. Use nil for no expiration."))
         }
         if let blockSize = cache.pagedKV.blockSize, blockSize <= 0 {
-            issues.append(
-                .error(
-                    field: "cache.pagedKV.blockSize",
-                    message: "Paged KV block size must be positive."))
+            issues.append(.error(
+                field: "cache.pagedKV.blockSize",
+                message: "Paged KV block size must be positive."))
         }
         if let maxBlocks = cache.pagedKV.maxBlocks, maxBlocks <= 0 {
-            issues.append(
-                .error(
-                    field: "cache.pagedKV.maxBlocks",
-                    message: "Paged KV max blocks must be positive."))
+            issues.append(.error(
+                field: "cache.pagedKV.maxBlocks",
+                message: "Paged KV max blocks must be positive."))
         }
         if let maxSize = cache.blockDisk.maxSizeGB, maxSize <= 0 {
-            issues.append(
-                .error(
-                    field: "cache.blockDisk.maxSizeGB",
-                    message: "Block disk L2 cache size must be positive."))
+            issues.append(.error(
+                field: "cache.blockDisk.maxSizeGB",
+                message: "Block disk L2 cache size must be positive."))
         }
         if let maxSize = cache.legacyDisk.maxSizeGB, maxSize <= 0 {
-            issues.append(
-                .error(
-                    field: "cache.legacyDisk.maxSizeGB",
-                    message: "Legacy disk cache size must be positive."))
+            issues.append(.error(
+                field: "cache.legacyDisk.maxSizeGB",
+                message: "Legacy disk cache size must be positive."))
         }
         if cache.liveKVCodec == .turboQuant {
             if cache.turboQuantKeyBits == nil || cache.turboQuantValueBits == nil {
-                issues.append(
-                    .error(
-                        field: "cache.liveKVCodec",
-                        message: "TurboQuant KV requires explicit key and value bit widths."))
+                issues.append(.error(
+                    field: "cache.liveKVCodec",
+                    message: "TurboQuant KV requires explicit key and value bit widths."))
             }
         }
         if !multimodal.requireMediaSaltForCache
             && (cache.prefix.enabled
                 || cache.pagedKV.enabled
                 || cache.blockDisk.enabled
-                || cache.legacyDisk.enabled)
-        {
-            issues.append(
-                .error(
-                    field: "multimodal.requireMediaSaltForCache",
-                    message:
-                        "Media salt is required when any prompt or KV cache reuse tier is enabled.")
-            )
+                || cache.legacyDisk.enabled) {
+            issues.append(.error(
+                field: "multimodal.requireMediaSaltForCache",
+                message: "Media salt is required when any prompt or KV cache reuse tier is enabled."))
         }
-        if let keyBits = cache.turboQuantKeyBits, !(2 ... 8).contains(keyBits) {
-            issues.append(
-                .error(
-                    field: "cache.turboQuantKeyBits",
-                    message: "TurboQuant key bits must be between 2 and 8."))
+        if let keyBits = cache.turboQuantKeyBits, !(2...8).contains(keyBits) {
+            issues.append(.error(
+                field: "cache.turboQuantKeyBits",
+                message: "TurboQuant key bits must be between 2 and 8."))
         }
-        if let valueBits = cache.turboQuantValueBits, !(2 ... 8).contains(valueBits) {
-            issues.append(
-                .error(
-                    field: "cache.turboQuantValueBits",
-                    message: "TurboQuant value bits must be between 2 and 8."))
+        if let valueBits = cache.turboQuantValueBits, !(2...8).contains(valueBits) {
+            issues.append(.error(
+                field: "cache.turboQuantValueBits",
+                message: "TurboQuant value bits must be between 2 and 8."))
         }
         if let override = Self.nonEmptyOverride(tools.toolParserOverride),
-            !Self.isNoopParserOverride(override),
-            ToolCallFormat.fromCapabilityName(override) == nil
-        {
-            issues.append(
-                .error(
-                    field: "tools.toolParserOverride",
-                    message: "Tool parser override is not a known parser alias."))
+           !Self.isNoopParserOverride(override),
+           ToolCallFormat.fromCapabilityName(override) == nil {
+            issues.append(.error(
+                field: "tools.toolParserOverride",
+                message: "Tool parser override is not a known parser alias."))
         }
         if let override = Self.nonEmptyOverride(tools.reasoningParserOverride),
-            !Self.isNoopParserOverride(override),
-            ReasoningParser.fromCapabilityName(override) == nil
-        {
-            issues.append(
-                .error(
-                    field: "tools.reasoningParserOverride",
-                    message: "Reasoning parser override is not a known parser alias."))
+           !Self.isNoopParserOverride(override),
+           ReasoningParser.fromCapabilityName(override) == nil {
+            issues.append(.error(
+                field: "tools.reasoningParserOverride",
+                message: "Reasoning parser override is not a known parser alias."))
         }
         if let draftTokenLimit = mtp.draftTokenLimit, draftTokenLimit <= 0 {
-            issues.append(
-                .error(
-                    field: "mtp.draftTokenLimit",
-                    message: "MTP draft token limit must be positive."))
+            issues.append(.error(
+                field: "mtp.draftTokenLimit",
+                message: "MTP draft token limit must be positive."))
         }
         if !mtp.keepDraftCacheSeparate {
-            issues.append(
-                .error(
-                    field: "mtp.keepDraftCacheSeparate",
-                    message:
-                        "Native MTP draft cache must stay separate from the verifier/base cache."))
+            issues.append(.error(
+                field: "mtp.keepDraftCacheSeparate",
+                message: "Native MTP draft cache must stay separate from the verifier/base cache."))
         }
         if !mtp.acceptedTokensOnlyEnterBaseCache {
-            issues.append(
-                .error(
-                    field: "mtp.acceptedTokensOnlyEnterBaseCache",
-                    message:
-                        "Native MTP may commit only accepted verifier tokens to the base cache."))
+            issues.append(.error(
+                field: "mtp.acceptedTokensOnlyEnterBaseCache",
+                message: "Native MTP may commit only accepted verifier tokens to the base cache."))
         }
         if let defaultMaxKVSize = cache.defaultMaxKVSize, defaultMaxKVSize <= 0 {
-            issues.append(
-                .error(
-                    field: "cache.defaultMaxKVSize",
-                    message: "Default max KV size must be positive."))
+            issues.append(.error(
+                field: "cache.defaultMaxKVSize",
+                message: "Default max KV size must be positive."))
         }
         if cache.longPromptMultiplier <= 0 {
-            issues.append(
-                .error(
-                    field: "cache.longPromptMultiplier",
-                    message: "Long-prompt multiplier must be positive."))
+            issues.append(.error(
+                field: "cache.longPromptMultiplier",
+                message: "Long-prompt multiplier must be positive."))
         }
-        if let depth = mtp.explicitDepth, !(1 ... 3).contains(depth) {
-            issues.append(
-                .error(
-                    field: "mtp.explicitDepth",
-                    message: "MTP explicit depth must be 1, 2, or 3."))
+        if let depth = mtp.explicitDepth, !(1...3).contains(depth) {
+            issues.append(.error(
+                field: "mtp.explicitDepth",
+                message: "MTP explicit depth must be 1, 2, or 3."))
         }
         if mtp.mode == .forceOn {
             if let status = mtpStatus {
@@ -442,33 +367,23 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                     // block still wins; a user request is not permission to
                     // bypass a known-bad production result.
                     if status.nativeMTPTuning?.manualBlocked == true {
-                        issues.append(
-                            .error(
-                                field: "mtp.mode",
-                                message:
-                                    "MTP is explicitly blocked by this bundle's tuning metadata: \(status.nativeMTPTuning?.reason ?? "no reason recorded")"
-                            ))
+                        issues.append(.error(
+                            field: "mtp.mode",
+                            message: "MTP is explicitly blocked by this bundle's tuning metadata: \(status.nativeMTPTuning?.reason ?? "no reason recorded")"))
                     } else if !status.hasCompleteMTPArtifact {
-                        issues.append(
-                            .error(
-                                field: "mtp.mode",
-                                message:
-                                    "MTP manual depth requires complete MTP tensor evidence in the bundle (this bundle's artifact is absent or incomplete)."
-                            ))
+                        issues.append(.error(
+                            field: "mtp.mode",
+                            message: "MTP manual depth requires complete MTP tensor evidence in the bundle (this bundle's artifact is absent or incomplete)."))
                     }
                 } else if !status.canAutoLaunchMTP {
-                    issues.append(
-                        .error(
-                            field: "mtp.mode",
-                            message:
-                                "MTP cannot be forced on until the bundle has complete tensor evidence and usable vmlx_mtp_tuning.json metadata for a supported native-MTP runtime."
-                        ))
+                    issues.append(.error(
+                        field: "mtp.mode",
+                        message: "MTP cannot be forced on until the bundle has complete tensor evidence and usable vmlx_mtp_tuning.json metadata for a supported native-MTP runtime."))
                 }
             } else {
-                issues.append(
-                    .warning(
-                        field: "mtp.mode",
-                        message: "MTP force-on was requested without a bundle status snapshot."))
+                issues.append(.warning(
+                    field: "mtp.mode",
+                    message: "MTP force-on was requested without a bundle status snapshot."))
             }
         }
         issues.append(contentsOf: memorySafety.validationIssues())
@@ -492,9 +407,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     ) -> [VMLXServerSettingsIssue] {
         var issues = validationIssues(mtpStatus: mtpStatus)
         guard mtp.mode == .forceOn,
-            !issues.contains(where: {
-                $0.severity == .error && $0.field == "mtp.mode"
-            })
+              !issues.contains(where: {
+                  $0.severity == .error && $0.field == "mtp.mode"
+              })
         else {
             return issues
         }
@@ -504,10 +419,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             jangConfig: jangConfig,
             status: mtpStatus)
         if launch.launchMode == .blocked {
-            issues.append(
-                .error(
-                    field: "mtp.mode",
-                    message: "MTP force-on is blocked for this bundle profile: \(launch.reason)"))
+            issues.append(.error(
+                field: "mtp.mode",
+                message: "MTP force-on is blocked for this bundle profile: \(launch.reason)"))
         }
         return issues
     }
@@ -524,8 +438,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             if mtp.explicitDepth != nil {
                 // Manual depth can bypass missing measurement, never an
                 // explicit bundle safety block.
-                return
-                    (status?.hasCompleteMTPArtifact == true
+                return (status?.hasCompleteMTPArtifact == true
                     && status?.nativeMTPTuning?.manualBlocked != true) ? .speculative : .blocked
             }
             return (status?.canAutoLaunchMTP == true) ? .speculative : .blocked
@@ -544,8 +457,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         status: MTPBundleStatus?
     ) -> VMLXResolvedMTPLaunch {
         guard mtp.mode != .off else {
-            return .init(
-                launchMode: .off, recommendation: nil, reason: "MTP disabled by server settings.")
+            return .init(launchMode: .off, recommendation: nil, reason: "MTP disabled by server settings.")
         }
         if let limit = mtp.draftTokenLimit, limit <= 0 {
             return .init(
@@ -559,7 +471,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         // the measured-tuning gate), the requested depth replaces the tuned
         // recommendation, and greedy sampling is enforced for the session.
         if mtp.mode == .forceOn, let depth = mtp.explicitDepth {
-            guard (1 ... 3).contains(depth) else {
+            guard (1...3).contains(depth) else {
                 return .init(
                     launchMode: .blocked,
                     recommendation: nil,
@@ -569,24 +481,20 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 return .init(
                     launchMode: .blocked,
                     recommendation: nil,
-                    reason:
-                        "MTP is explicitly blocked by this bundle's tuning metadata: \(status?.nativeMTPTuning?.reason ?? "no reason recorded")"
-                )
+                    reason: "MTP is explicitly blocked by this bundle's tuning metadata: \(status?.nativeMTPTuning?.reason ?? "no reason recorded")")
             }
-            guard
-                let manual = NativeMTPAutoDecodePolicy.manualRecommendation(
-                    depth: depth,
-                    configData: configData,
-                    jangConfig: jangConfig,
-                    status: status)
+            guard let manual = NativeMTPAutoDecodePolicy.manualRecommendation(
+                depth: depth,
+                configData: configData,
+                jangConfig: jangConfig,
+                status: status)
             else {
                 return .init(
                     launchMode: .blocked,
                     recommendation: nil,
                     reason: status?.hasCompleteMTPArtifact == true
                         ? "Manual MTP depth is unsupported for this model family."
-                        : "Manual MTP depth requires complete MTP tensor evidence in the bundle (this bundle's artifact is absent or incomplete)."
-                )
+                        : "Manual MTP depth requires complete MTP tensor evidence in the bundle (this bundle's artifact is absent or incomplete).")
             }
             return .init(
                 launchMode: .speculative,
@@ -594,20 +502,18 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 reason: manual.reason)
         }
 
-        guard
-            let recommendation = NativeMTPAutoDecodePolicy.recommendation(
+        guard let recommendation = NativeMTPAutoDecodePolicy.recommendation(
+            configData: configData,
+            jangConfig: jangConfig,
+            status: status,
+            requireVerifiedRuntime: true)
+        else {
+            let mode = mtp.mode == .forceOn ? VMLXMTPLaunchMode.blocked : .off
+            let reason = NativeMTPAutoDecodePolicy.rejectionReason(
                 configData: configData,
                 jangConfig: jangConfig,
                 status: status,
                 requireVerifiedRuntime: true)
-        else {
-            let mode = mtp.mode == .forceOn ? VMLXMTPLaunchMode.blocked : .off
-            let reason =
-                NativeMTPAutoDecodePolicy.rejectionReason(
-                    configData: configData,
-                    jangConfig: jangConfig,
-                    status: status,
-                    requireVerifiedRuntime: true)
                 ?? "No supported tensor-proven native-MTP recommendation for this bundle."
             return .init(
                 launchMode: mode,
@@ -620,8 +526,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             resolvedRecommendation = NativeMTPAutoDecodeRecommendation(
                 depth: limit,
                 verifierMode: recommendation.verifierMode,
-                reason:
-                    "\(recommendation.reason) Server draft-token limit capped depth from \(recommendation.depth) to \(limit).",
+                reason: "\(recommendation.reason) Server draft-token limit capped depth from \(recommendation.depth) to \(limit).",
                 evidence: recommendation.evidence + ["server_draft_token_limit=\(limit)"])
         } else {
             resolvedRecommendation = recommendation
@@ -662,7 +567,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 blockSize: mtp.dflash2BlockSize)
         }
         guard launch.launchMode == .speculative,
-            let depth = launch.recommendation?.depth
+              let depth = launch.recommendation?.depth
         else {
             return nil
         }
@@ -739,21 +644,18 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         request: VMLXMemoryRequestEstimate? = nil
     ) -> VMLXResolvedMemorySafetyPlan {
         let profile = memorySafety.profile
-        let physicalMemory =
-            host?.physicalMemory
+        let physicalMemory = host?.physicalMemory
             ?? bundleFacts?.physicalMemory
             ?? ProcessInfo.processInfo.physicalMemory
-        let requestedFraction =
-            memorySafety.customPhysicalMemoryFraction
+        let requestedFraction = memorySafety.customPhysicalMemoryFraction
             ?? profile.loadFraction
         let loadCap = ResidentCap.fraction(requestedFraction)
         let requestedAllocatorCap =
             memorySafety.customAllocatorCacheBytes.map(ResidentCap.absolute)
             ?? profile.allocatorCap
-        let allocatorCap =
-            bundleFacts?.resolveMLXAllocatorCacheLimit(
-                requested: requestedAllocatorCap
-            ) ?? requestedAllocatorCap
+        let allocatorCap = bundleFacts?.resolveMLXAllocatorCacheLimit(
+            requested: requestedAllocatorCap
+        ) ?? requestedAllocatorCap
 
         var loadConfiguration = baseLoadConfiguration
         // Performance choices captured by the loaded model graph must survive
@@ -768,6 +670,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         loadConfiguration.jangPress = resolvedMemorySafetyJangPress(
             base: baseLoadConfiguration.jangPress,
             facts: bundleFacts)
+
 
         var resolvedConcurrency = concurrency
         resolvedConcurrency.maxConcurrentSequences =
@@ -850,56 +753,41 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         var blockingIssues: [VMLXServerSettingsIssue] = []
 
         if case .diagnosticDangerous = memorySafety.mode {
-            warnings.append(
-                "Diagnostic memory mode uses caller-supplied limits and may exceed the host working set."
-            )
+            warnings.append("Diagnostic memory mode uses caller-supplied limits and may exceed the host working set.")
         }
         if !memorySafety.allowExperimentalMLXPress,
-            baseLoadConfiguration.jangPress != .disabled
-        {
-            warnings.append(
-                "MLXPress/JangPress was not selected by the memory slider. It remains disabled unless the host enables a proven routed-bundle lane explicitly."
-            )
+           baseLoadConfiguration.jangPress != .disabled {
+            warnings.append("MLXPress/JangPress was not selected by the memory slider. It remains disabled unless the host enables a proven routed-bundle lane explicitly.")
         }
 
         let resolvedBudgetBytes = loadCap.resolve(physicalMemory: physicalMemory)
         if let estimate = request {
             if estimate.workingSetBytes == nil,
-                memorySafety.failClosedWhenEstimateUnknown || profile.failClosedWhenEstimateUnknown
-            {
-                blockingIssues.append(
-                    .error(
-                        field: "memorySafety.requestEstimate",
-                        message:
-                            "Strict memory safety requires a request working-set estimate before launch."
-                    ))
+               memorySafety.failClosedWhenEstimateUnknown || profile.failClosedWhenEstimateUnknown {
+                blockingIssues.append(.error(
+                    field: "memorySafety.requestEstimate",
+                    message: "Strict memory safety requires a request working-set estimate before launch."))
             }
             if let budget = resolvedBudgetBytes,
-                let estimateBytes = estimate.workingSetBytes,
-                estimateBytes > budget
-            {
-                var message =
-                    "Estimated request working set \(estimateBytes) bytes exceeds resolved memory budget \(budget) bytes."
+               let estimateBytes = estimate.workingSetBytes,
+               estimateBytes > budget {
+                var message = "Estimated request working set \(estimateBytes) bytes exceeds resolved memory budget \(budget) bytes."
                 if cache.liveKVCodec != .turboQuant {
-                    message +=
-                        " To fit without truncating context, enable TurboQuant KV cache (3-bit, ~5\u{00D7} smaller KV) in the cache settings, or reduce the context length / lower the memory-safety slider."
+                    message += " To fit without truncating context, enable TurboQuant KV cache (3-bit, ~5\u{00D7} smaller KV) in the cache settings, or reduce the context length / lower the memory-safety slider."
                 } else {
-                    message +=
-                        " TurboQuant KV is already enabled; reduce the context length or lower the memory-safety slider to fit."
+                    message += " TurboQuant KV is already enabled; reduce the context length or lower the memory-safety slider to fit."
                 }
                 if profile.blocksOverBudget {
-                    blockingIssues.append(
-                        .error(
-                            field: "memorySafety.requestEstimate",
-                            message: message))
+                    blockingIssues.append(.error(
+                        field: "memorySafety.requestEstimate",
+                        message: message))
                 } else {
                     warnings.append(message)
                 }
             }
         }
 
-        let displaySummary =
-            "mode=\(memorySafety.mode.rawValue) slider=\(memorySafety.slider) load_cap=\(requestedFraction) allocator_cap=\(allocatorCap.displayValue) max_concurrent=\(resolvedConcurrency.maxConcurrentSequences ?? 0) kv_cap=\(resolvedCache.defaultMaxKVSize ?? 0)"
+        let displaySummary = "mode=\(memorySafety.mode.rawValue) slider=\(memorySafety.slider) load_cap=\(requestedFraction) allocator_cap=\(allocatorCap.displayValue) max_concurrent=\(resolvedConcurrency.maxConcurrentSequences ?? 0) kv_cap=\(resolvedCache.defaultMaxKVSize ?? 0)"
 
         return VMLXResolvedMemorySafetyPlan(
             loadConfiguration: loadConfiguration,
@@ -920,8 +808,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             return .disabled
         }
         guard let facts,
-            facts.isRouted,
-            facts.hasJangConfig || facts.hasJangTQRuntime
+              facts.isRouted,
+              facts.hasJangConfig || facts.hasJangTQRuntime
         else {
             return .disabled
         }
@@ -939,9 +827,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     ) -> ModelConfiguration {
         var resolved = base
         if let override = Self.nonEmptyOverride(tools.toolParserOverride),
-            !Self.isNoopParserOverride(override),
-            let format = ToolCallFormat.fromCapabilityName(override)
-        {
+           !Self.isNoopParserOverride(override),
+           let format = ToolCallFormat.fromCapabilityName(override) {
             resolved.toolCallFormat = format
         }
         if let override = Self.nonEmptyOverride(tools.reasoningParserOverride) {
@@ -1093,8 +980,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             diskMaxSizeGB = nil
             diskDirectory = nil
         }
-        let diskDir =
-            diskCacheDirectory
+        let diskDir = diskCacheDirectory
             ?? VMLXServerRuntimeSettings.resolvedDirectory(diskDirectory)
         // The cap is a PERCENT of the cache volume, not a flat constant: KV
         // cost scales with the model, so one GB figure is wrong for every
@@ -1384,7 +1270,7 @@ public struct VMLXServerCacheSettings: Codable, Sendable, Equatable {
             return .none
         case .turboQuant:
             guard let keyBits = turboQuantKeyBits,
-                let valueBits = turboQuantValueBits
+                  let valueBits = turboQuantValueBits
             else {
                 return .none
             }
@@ -1442,18 +1328,15 @@ public struct VMLXServerPerformanceSettings: Codable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.tiedHeadCodec =
-            try container.decodeIfPresent(
-                VMLXTiedHeadCodec.self, forKey: .tiedHeadCodec
-            ) ?? .fp16Passthrough
-        self.compiledDecode =
-            try container.decodeIfPresent(
-                Bool.self, forKey: .compiledDecode
-            ) ?? false
-        self.deepseekV4ActivationQAT =
-            try container.decodeIfPresent(
-                Bool.self, forKey: .deepseekV4ActivationQAT
-            ) ?? false
+        self.tiedHeadCodec = try container.decodeIfPresent(
+            VMLXTiedHeadCodec.self, forKey: .tiedHeadCodec
+        ) ?? .fp16Passthrough
+        self.compiledDecode = try container.decodeIfPresent(
+            Bool.self, forKey: .compiledDecode
+        ) ?? false
+        self.deepseekV4ActivationQAT = try container.decodeIfPresent(
+            Bool.self, forKey: .deepseekV4ActivationQAT
+        ) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1743,9 +1626,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
 
     /// Legacy explicit-greedy preset. Native MTP does not apply this preset;
     /// callers must preserve the bundle or user-selected sampler.
-    @available(
-        *, deprecated, message: "Native MTP preserves request sampling; do not coerce it to greedy."
-    )
+    @available(*, deprecated, message: "Native MTP preserves request sampling; do not coerce it to greedy.")
     public static var mtpEnforcedGreedySampling:
         (temperature: Float, topP: Float, topK: Int, minP: Float)
     { (0, 1, 0, 0) }
@@ -1922,31 +1803,25 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         // `slider` no longer needs a range check: it is a projection of `mode`,
         // and its setter clamps into `allCases`, so it cannot leave 0...4.
         if let fraction = customPhysicalMemoryFraction,
-            fraction <= 0 || fraction > 1
-        {
-            issues.append(
-                .error(
-                    field: "memorySafety.customPhysicalMemoryFraction",
-                    message: "Custom physical-memory fraction must be greater than 0 and at most 1."
-                ))
+           fraction <= 0 || fraction > 1 {
+            issues.append(.error(
+                field: "memorySafety.customPhysicalMemoryFraction",
+                message: "Custom physical-memory fraction must be greater than 0 and at most 1."))
         }
         if let bytes = customAllocatorCacheBytes, bytes == 0 {
-            issues.append(
-                .error(
-                    field: "memorySafety.customAllocatorCacheBytes",
-                    message: "Custom allocator cache bytes must be positive."))
+            issues.append(.error(
+                field: "memorySafety.customAllocatorCacheBytes",
+                message: "Custom allocator cache bytes must be positive."))
         }
         if let kv = customDefaultMaxKVSize, kv <= 0 {
-            issues.append(
-                .error(
-                    field: "memorySafety.customDefaultMaxKVSize",
-                    message: "Custom max KV size must be positive."))
+            issues.append(.error(
+                field: "memorySafety.customDefaultMaxKVSize",
+                message: "Custom max KV size must be positive."))
         }
         if let maxConcurrent = customMaxConcurrentSequences, maxConcurrent <= 0 {
-            issues.append(
-                .error(
-                    field: "memorySafety.customMaxConcurrentSequences",
-                    message: "Custom max concurrent sequences must be positive."))
+            issues.append(.error(
+                field: "memorySafety.customMaxConcurrentSequences",
+                message: "Custom max concurrent sequences must be positive."))
         }
         return issues
     }
@@ -1964,15 +1839,12 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
                 defaultMaxKVSize: customDefaultMaxKVSize ?? 131072,
                 failClosedWhenEstimateUnknown: false,
                 blocksOverBudget: false,
-                warnings: [
-                    "Performance memory mode may allow macOS compression or swap before refusing a request."
-                ])
+                warnings: ["Performance memory mode may allow macOS compression or swap before refusing a request."])
         case .balanced:
             return .init(
                 loadFraction: customPhysicalMemoryFraction ?? 0.75,
                 allowsNearRAMScaleMaterialization: true,
-                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute)
-                    ?? .absolute(1 << 30),
+                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .absolute(1 << 30),
                 maxConcurrentSequences: customMaxConcurrentSequences ?? 2,
                 prefixMemoryLimitMB: 512,
                 prefixMemoryPercent: 15,
@@ -1984,8 +1856,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
             return .init(
                 loadFraction: customPhysicalMemoryFraction ?? 0.70,
                 allowsNearRAMScaleMaterialization: true,
-                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute)
-                    ?? .absolute(128 << 20),
+                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .absolute(128 << 20),
                 maxConcurrentSequences: customMaxConcurrentSequences ?? 1,
                 prefixMemoryLimitMB: 128,
                 prefixMemoryPercent: 15,
@@ -1996,8 +1867,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
         case .strict:
             return .init(
                 loadFraction: customPhysicalMemoryFraction ?? 0.60,
-                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute)
-                    ?? .absolute(128 << 20),
+                allocatorCap: customAllocatorCacheBytes.map(ResidentCap.absolute) ?? .absolute(128 << 20),
                 maxConcurrentSequences: customMaxConcurrentSequences ?? 1,
                 prefixMemoryLimitMB: 128,
                 prefixMemoryPercent: 10,
@@ -2020,7 +1890,7 @@ public struct VMLXMemorySafetySettings: Codable, Sendable, Equatable {
     }
 }
 
-private struct VMLXMemorySafetyProfile: Sendable, Equatable {
+fileprivate struct VMLXMemorySafetyProfile: Sendable, Equatable {
     var loadFraction: Double
     /// Whether this profile may switch a near-RAM-scale bundle from mmap to
     /// a materialized load (and raise the load fraction to cover it). The
@@ -2113,8 +1983,8 @@ public struct VMLXServerSettingsIssue: Codable, Sendable, Equatable {
     }
 }
 
-extension ResidentCap {
-    fileprivate var displayValue: String {
+private extension ResidentCap {
+    var displayValue: String {
         switch self {
         case .unlimited:
             return "unlimited"

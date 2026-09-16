@@ -129,18 +129,18 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
 
     public var usableBestDepth: Int? {
         guard !blocked,
-            !manualBlocked,
-            validated,
-            outputEquivalent,
-            isWorkloadGeneral,
-            let bestDepth,
-            bestDepth > 0,
-            let baselineTokensPerSecond,
-            let bestTokensPerSecond,
-            let speedupVsBaseline,
-            baselineTokensPerSecond > 0,
-            bestTokensPerSecond > baselineTokensPerSecond,
-            speedupVsBaseline > 1
+              !manualBlocked,
+              validated,
+              outputEquivalent,
+              isWorkloadGeneral,
+              let bestDepth,
+              bestDepth > 0,
+              let baselineTokensPerSecond,
+              let bestTokensPerSecond,
+              let speedupVsBaseline,
+              baselineTokensPerSecond > 0,
+              bestTokensPerSecond > baselineTokensPerSecond,
+              speedupVsBaseline > 1
         else {
             return nil
         }
@@ -182,8 +182,7 @@ public struct NativeMTPTuning: Codable, Sendable, Equatable {
     /// tuning files; newly scoped rows must declare a workload-general class.
     public var isWorkloadGeneral: Bool {
         guard let promptClass else { return true }
-        let normalized =
-            promptClass
+        let normalized = promptClass
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: "-", with: "_")
@@ -529,8 +528,7 @@ enum MTPQuantizationTopology {
             return values.keys.sorted().map { "\($0):\(values[$0] ?? 0)" }
                 .joined(separator: ",")
         }
-        let defaultLabel =
-            "\(defaultBits.map(String.init) ?? "?")x"
+        let defaultLabel = "\(defaultBits.map(String.init) ?? "?")x"
             + "\(defaultGroupSize.map(String.init) ?? "?")"
         return "default=\(defaultLabel);all=\(render(all));mtp=\(render(mtp));"
             + "expert=\(render(expert));ple=\(render(ple))"
@@ -647,8 +645,7 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         }
         if speculativeDecodeEnabled {
             let family = measuredFamilyAutoDepth.map { ", measured_family=d\($0)" } ?? ""
-            let superseded =
-                isLegacyBlockSuperseded
+            let superseded = isLegacyBlockSuperseded
                 ? ", legacy_block=superseded_by_row_parity_fix" : ""
             return "\(base)\(tuned)\(family)\(superseded), speculative=on"
         }
@@ -738,8 +735,8 @@ public protocol NativeMTPModel: LanguageModel {
     ) -> NativeMTPForwardResult
 }
 
-extension NativeMTPModel {
-    public func nativeBackboneMTPVerifyForward(
+public extension NativeMTPModel {
+    func nativeBackboneMTPVerifyForward(
         _ inputs: MLXArray,
         cache: [KVCache]?
     ) -> NativeMTPForwardResult {
@@ -772,18 +769,14 @@ public enum NativeMTPActivationError: Error, LocalizedError, CustomStringConvert
     public var description: String {
         switch self {
         case .requestedButMissingArtifact(let status):
-            return
-                "native MTP was requested but this bundle does not have complete MTP tensor evidence: \(status?.statusLine ?? "no status")"
+            return "native MTP was requested but this bundle does not have complete MTP tensor evidence: \(status?.statusLine ?? "no status")"
         case .requestedWithoutUsableTuning(let status):
-            return
-                "native MTP was requested but this bundle does not have usable \(NativeMTPTuning.fileName) metadata: \(status?.statusLine ?? "no status")"
+            return "native MTP was requested but this bundle does not have usable \(NativeMTPTuning.fileName) metadata: \(status?.statusLine ?? "no status")"
         case .requestedWithBlockedTuning(let status):
             let reason = status?.nativeMTPTuning?.reason ?? "no block reason recorded"
-            return
-                "native MTP was requested but this bundle explicitly blocks it: \(reason) (\(status?.statusLine ?? "no status"))"
+            return "native MTP was requested but this bundle explicitly blocks it: \(reason) (\(status?.statusLine ?? "no status"))"
         case .requestedForUnsupportedModel(let types):
-            return
-                "native MTP was requested for unsupported model type(s): \(types.joined(separator: ", "))"
+            return "native MTP was requested for unsupported model type(s): \(types.joined(separator: ", "))"
         case .invalidConfigData:
             return "native MTP config rewrite failed"
         }
@@ -806,14 +799,14 @@ public enum NativeMTPActivation {
     /// then `VMLX_MTP_MANUAL_DEPTH` / `VMLINUX_MTP_MANUAL_DEPTH`.
     public static var manualDepthRequest: Int? {
         if let manualDepthOverride {
-            return (1 ... 3).contains(manualDepthOverride) ? manualDepthOverride : nil
+            return (1...3).contains(manualDepthOverride) ? manualDepthOverride : nil
         }
         let env = ProcessInfo.processInfo.environment
         guard
             let raw = (env["VMLX_MTP_MANUAL_DEPTH"] ?? env["VMLINUX_MTP_MANUAL_DEPTH"])?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
             let depth = Int(raw),
-            (1 ... 3).contains(depth)
+            (1...3).contains(depth)
         else { return nil }
         return depth
     }
@@ -823,8 +816,7 @@ public enum NativeMTPActivation {
             return explicitRequestOverride
         }
         let env = ProcessInfo.processInfo.environment
-        let raw =
-            (env["VMLX_NATIVE_MTP"] ?? env["VMLINUX_NATIVE_MTP"])?
+        let raw = (env["VMLX_NATIVE_MTP"] ?? env["VMLINUX_NATIVE_MTP"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? "0"
         return ["1", "true", "yes", "on"].contains(raw)
@@ -847,8 +839,7 @@ public enum NativeMTPActivation {
     /// Auto-launch (no explicit request) is unaffected — it still requires
     /// measured tuning, so no user-facing path gets an unmeasured MTP session.
     public static var isTuningMeasurementRun: Bool {
-        let raw =
-            ProcessInfo.processInfo.environment["VMLX_MTP_TUNING_MEASUREMENT"]?
+        let raw = ProcessInfo.processInfo.environment["VMLX_MTP_TUNING_MEASUREMENT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? "0"
         return ["1", "true", "yes", "on"].contains(raw)
@@ -884,12 +875,11 @@ public enum NativeMTPActivation {
         // The full recommendation owns Auto eligibility. Most families still
         // require bundle-local tuning; Qwen3.8 Flash-Next is the narrow,
         // measured exception. A status-only gate cannot see config.model_type.
-        guard
-            NativeMTPAutoDecodePolicy.recommendation(
-                configData: configData,
-                jangConfig: nil,
-                status: status,
-                requireVerifiedRuntime: true) != nil
+        guard NativeMTPAutoDecodePolicy.recommendation(
+            configData: configData,
+            jangConfig: nil,
+            status: status,
+            requireVerifiedRuntime: true) != nil
         else {
             throw NativeMTPActivationError.requestedWithoutUsableTuning(status)
         }
@@ -942,9 +932,9 @@ public enum NativeMTPActivation {
         case "qwen4_exp", "qwen4_exp_text", "qwen4exp", "qwen4exp_text":
             return true
         case "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
-            "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
-            "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
-            "qwen36", "qwen36_text", "qwen36_moe", "qwen36_moe_text":
+             "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
+             "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
+             "qwen36", "qwen36_text", "qwen36_moe", "qwen36_moe_text":
             return true
         case "nemotron_h", "nemotronh", "nemotron_h_text", "nemotronh_text":
             return true
@@ -991,13 +981,11 @@ public struct NativeMTPAutoDecodeRecommendation: Codable, Sendable, Equatable {
 public enum NativeMTPAutoDecodePolicy {
     /// Architecture support for the server's Auto/manual-depth launch policy.
     /// Hosts combine this with real bundle tensor evidence before displaying
-    /// controls. Keep UI capability discovery and launch eligibility on the
-    /// same registry; a model's display name is not architecture evidence.
+    /// controls. A model's display name is not architecture evidence.
     public static func supportsModel(configData: Data) -> Bool {
         guard let config = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any]
         else { return false }
-        return modelTypes(config: config, fallback: nil).contains(
-            where: isSupportedQwenMTPModelType)
+        return modelTypes(config: config, fallback: nil).contains(where: isSupportedQwenMTPModelType)
     }
 
     /// Manual-depth recommendation: validates the same family/tensor evidence
@@ -1013,11 +1001,10 @@ public enum NativeMTPAutoDecodePolicy {
         jangConfig: JangConfig?,
         status: MTPBundleStatus?
     ) -> NativeMTPAutoDecodeRecommendation? {
-        guard (1 ... 3).contains(depth) else { return nil }
+        guard (1...3).contains(depth) else { return nil }
         guard let status, status.hasCompleteMTPArtifact else { return nil }
         guard !status.isExplicitlyBlocked else { return nil }
-        let config =
-            (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
+        let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
         guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
@@ -1046,8 +1033,7 @@ public enum NativeMTPAutoDecodePolicy {
             return nil
         }
 
-        let config =
-            (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
+        let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
         guard modelTypes.contains(where: isSupportedQwenMTPModelType) else { return nil }
@@ -1056,13 +1042,11 @@ public enum NativeMTPAutoDecodePolicy {
             fallback: jangConfig?.sourceModel.architecture)
 
         let mode = quantizationMode(config: config, jangConfig: jangConfig)
-        let bits =
-            intValue((config?["quantization"] as? [String: Any])?["bits"])
+        let bits = intValue((config?["quantization"] as? [String: Any])?["bits"])
             ?? Int(jangConfig?.quantization.targetBits.rounded() ?? 0)
         let profile = jangConfig?.quantization.profile.lowercased()
         let quantizationFingerprint = MTPQuantizationTopology.fingerprint(config: config)
-        let isMoE =
-            modelTypes.contains { $0.contains("moe") }
+        let isMoE = modelTypes.contains { $0.contains("moe") }
             || (jangConfig?.architecture.hasMoE == true)
         let evidence = [
             "model_types=\(modelTypes.sorted().joined(separator: ","))",
@@ -1079,21 +1063,19 @@ public enum NativeMTPAutoDecodePolicy {
             guard tuningMatchesBundleModelTypes(tuning, modelTypes: modelTypes) else {
                 return nil
             }
-            guard
-                tuningMatchesBundleQuantization(
-                    tuning, mode: mode, bits: bits, fingerprint: quantizationFingerprint)
+            guard tuningMatchesBundleQuantization(
+                tuning, mode: mode, bits: bits, fingerprint: quantizationFingerprint)
             else {
                 return nil
             }
-            var tuningEvidence =
-                evidence + [
-                    "tuning_file=\(NativeMTPTuning.fileName)",
-                    "tuning.validated=\(tuning.validated)",
-                    "tuning.output_equivalent=\(tuning.outputEquivalent)",
-                    "tuning.blocked=\(tuning.blocked)",
-                    "tuning.best_depth=\(depth)",
-                    "tuning.verifier_mode=\(tuning.explicitVerifierMode ?? "iterator_default")",
-                ]
+            var tuningEvidence = evidence + [
+                "tuning_file=\(NativeMTPTuning.fileName)",
+                "tuning.validated=\(tuning.validated)",
+                "tuning.output_equivalent=\(tuning.outputEquivalent)",
+                "tuning.blocked=\(tuning.blocked)",
+                "tuning.best_depth=\(depth)",
+                "tuning.verifier_mode=\(tuning.explicitVerifierMode ?? "iterator_default")",
+            ]
             if let quantizationMode = tuning.quantizationMode {
                 tuningEvidence.append("tuning.quantization_mode=\(normalize(quantizationMode))")
             }
@@ -1108,8 +1090,7 @@ public enum NativeMTPAutoDecodePolicy {
             }
             if !tuning.modelTypes.isEmpty {
                 tuningEvidence.append(
-                    "tuning.model_types=\(tuning.modelTypes.map(normalize).sorted().joined(separator: ","))"
-                )
+                    "tuning.model_types=\(tuning.modelTypes.map(normalize).sorted().joined(separator: ","))")
             }
             if let cacheMode = tuning.cacheMode {
                 tuningEvidence.append("tuning.cache_mode=\(cacheMode)")
@@ -1197,8 +1178,7 @@ public enum NativeMTPAutoDecodePolicy {
             return "Bundle does not have usable \(NativeMTPTuning.fileName) production tuning."
         }
 
-        let config =
-            (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
+        let config = (configData.flatMap { try? JSONSerialization.jsonObject(with: $0) })
             as? [String: Any]
         let modelTypes = modelTypes(config: config, fallback: jangConfig?.sourceModel.architecture)
         guard modelTypes.contains(where: isSupportedQwenMTPModelType) else {
@@ -1213,8 +1193,7 @@ public enum NativeMTPAutoDecodePolicy {
         }
 
         let mode = quantizationMode(config: config, jangConfig: jangConfig)
-        let bits =
-            intValue((config?["quantization"] as? [String: Any])?["bits"])
+        let bits = intValue((config?["quantization"] as? [String: Any])?["bits"])
             ?? Int(jangConfig?.quantization.targetBits.rounded() ?? 0)
         let fingerprint = MTPQuantizationTopology.fingerprint(config: config)
         if let reason = quantizationMismatchReason(
@@ -1301,8 +1280,7 @@ public enum NativeMTPAutoDecodePolicy {
         let bundleTypes = Set(modelTypes.map(normalize))
         let tuningTypes = Set(tuning.modelTypes.map(normalize))
         guard !bundleTypes.isDisjoint(with: tuningTypes) else {
-            return
-                "\(NativeMTPTuning.fileName) model_types=\(tuningTypes.sorted().joined(separator: ",")) do not match bundle model_types=\(bundleTypes.sorted().joined(separator: ","))."
+            return "\(NativeMTPTuning.fileName) model_types=\(tuningTypes.sorted().joined(separator: ",")) do not match bundle model_types=\(bundleTypes.sorted().joined(separator: ","))."
         }
         return nil
     }
@@ -1315,28 +1293,23 @@ public enum NativeMTPAutoDecodePolicy {
     ) -> String? {
         if let tuningFingerprint = tuning.quantizationFingerprint {
             guard let fingerprint, tuningFingerprint == fingerprint else {
-                return
-                    "\(NativeMTPTuning.fileName) quantization_fingerprint does not match the active bundle's per-tensor bit/group topology."
+                return "\(NativeMTPTuning.fileName) quantization_fingerprint does not match the active bundle's per-tensor bit/group topology."
             }
         }
         let bundleMode = mode.map(normalize)
         let tuningMode = tuning.quantizationMode.map(normalize)
         if bundleMode == "mxfp8" {
-            guard
-                (tuningMode == "mxfp8" && tuning.quantizationBits == 8)
-                    || inferredMXFP8TuningFromArtifact(tuning, mode: mode, bits: bits)
+            guard (tuningMode == "mxfp8" && tuning.quantizationBits == 8)
+                || inferredMXFP8TuningFromArtifact(tuning, mode: mode, bits: bits)
             else {
-                return
-                    "\(NativeMTPTuning.fileName) must match quantization_mode=mxfp8 and quantization_bits=8, either explicitly or through a bundle-local MXFP8 tuning artifact, before MXFP8 native MTP can launch."
+                return "\(NativeMTPTuning.fileName) must match quantization_mode=mxfp8 and quantization_bits=8, either explicitly or through a bundle-local MXFP8 tuning artifact, before MXFP8 native MTP can launch."
             }
         }
         if let tuningMode, let bundleMode, tuningMode != bundleMode {
-            return
-                "\(NativeMTPTuning.fileName) quantization_mode=\(tuningMode) does not match bundle quantization_mode=\(bundleMode)."
+            return "\(NativeMTPTuning.fileName) quantization_mode=\(tuningMode) does not match bundle quantization_mode=\(bundleMode)."
         }
         if let tuningBits = tuning.quantizationBits, bits > 0, tuningBits != bits {
-            return
-                "\(NativeMTPTuning.fileName) quantization_bits=\(tuningBits) does not match bundle quantization_bits=\(bits)."
+            return "\(NativeMTPTuning.fileName) quantization_bits=\(tuningBits) does not match bundle quantization_bits=\(bits)."
         }
         return nil
     }
@@ -1359,9 +1332,9 @@ public enum NativeMTPAutoDecodePolicy {
         case "qwen4_exp", "qwen4_exp_text", "qwen4exp", "qwen4exp_text":
             return true
         case "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text",
-            "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
-            "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
-            "qwen36", "qwen36_text", "qwen36_moe", "qwen36_moe_text":
+             "qwen3_6", "qwen3_6_text", "qwen3_6_moe", "qwen3_6_moe_text",
+             "qwen35", "qwen35_text", "qwen35_moe", "qwen35_moe_text",
+             "qwen36", "qwen36_text", "qwen36_moe", "qwen36_moe_text":
             return true
         default:
             return false
@@ -1500,8 +1473,7 @@ public enum NativeMTPPhaseDiagnostics {
     public static func summary(limit: Int = 8) -> String {
         let snap = snapshot()
         let rows = snap.seconds
-            .sorted { lhs, rhs in lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value
-            }
+            .sorted { lhs, rhs in lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value }
             .prefix(limit)
             .map { key, seconds in
                 let calls = snap.calls[key, default: 0]
@@ -1544,11 +1516,11 @@ public enum NativeMTPVerifierStatePolicy {
         let env = ProcessInfo.processInfo.environment
         let raw =
             (requestedMode
-            ?? env["VMLX_NATIVE_MTP_STATE_COMMIT"]
-            ?? env["VMLINUX_NATIVE_MTP_STATE_COMMIT"]
-            ?? env["VMLX_NATIVE_MTP_HYBRID_VERIFY"]
-            ?? env["VMLINUX_NATIVE_MTP_HYBRID_VERIFY"]
-            ?? "")
+                ?? env["VMLX_NATIVE_MTP_STATE_COMMIT"]
+                ?? env["VMLINUX_NATIVE_MTP_STATE_COMMIT"]
+                ?? env["VMLX_NATIVE_MTP_HYBRID_VERIFY"]
+                ?? env["VMLINUX_NATIVE_MTP_HYBRID_VERIFY"]
+                ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: "-", with: "_")
@@ -1773,8 +1745,7 @@ public enum MTPBundleInspector {
         modelDirectory: URL,
         jangConfig suppliedJangConfig: JangConfig? = nil
     ) throws -> MTPBundleStatus {
-        let config = try loadJSONObjectIfExists(
-            modelDirectory.appendingPathComponent("config.json"))
+        let config = try loadJSONObjectIfExists(modelDirectory.appendingPathComponent("config.json"))
         let jangConfig = suppliedJangConfig ?? (try? JangLoader.loadConfig(at: modelDirectory))
         let (configuredLayers, evidence, mtpLayerPrefixes) = configuredMTPLayers(
             config: config,
@@ -1888,8 +1859,7 @@ public enum MTPBundleInspector {
             let topBaseLayers = intValue(config["num_hidden_layers"])
             let textConfig = config["text_config"] as? [String: Any]
             let textBaseLayers = intValue(textConfig?["num_hidden_layers"])
-            for baseLayer in [topBaseLayers, textBaseLayers].compactMap({ $0 }) where baseLayer > 0
-            {
+            for baseLayer in [topBaseLayers, textBaseLayers].compactMap({ $0 }) where baseLayer > 0 {
                 layerPrefixes.append("model.layers.\(baseLayer).")
                 layerPrefixes.append("language_model.model.layers.\(baseLayer).")
             }
