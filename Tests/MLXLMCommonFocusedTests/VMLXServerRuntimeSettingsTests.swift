@@ -8,31 +8,58 @@ import Testing
 
 @Suite("VMLX server runtime settings")
 struct VMLXServerRuntimeSettingsTests {
-    @Test("shared MTP defaults remain Auto; explicit Off round-trips unchanged")
-    func sharedMTPDefaultsDoNotDisableNonFlashModels() throws {
-        #expect(VMLXServerMTPSettings().mode == .auto)
-        #expect(try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode == .auto)
-        let explicitOff = VMLXServerMTPSettings(mode: .off)
-        #expect(try JSONDecoder().decode(
-            VMLXServerMTPSettings.self, from: JSONEncoder().encode(explicitOff)) == explicitOff)
+    @Test("native MTP is opt-in on initialization and missing-mode decode")
+    func sharedMTPDefaultsOffAndPreservesExplicitChoices() throws {
+        #expect(VMLXServerMTPSettings().mode == .off)
+        #expect(
+            try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode == .off
+        )
+        for settings in [
+            VMLXServerMTPSettings(mode: .off), .init(mode: .auto),
+            .init(mode: .forceOn, explicitDepth: 3),
+        ] {
+            #expect(
+                try JSONDecoder().decode(
+                    VMLXServerMTPSettings.self, from: JSONEncoder().encode(settings)) == settings)
+        }
     }
 
-    @Test("explicit Off prevents native MTP launch without changing capability")
-    func explicitOffPreventsNativeMTPLaunch() {
+    @Test("selection capability shares the actual launch policy across architecture aliases")
+    func selectionCapabilityMatchesLaunchPolicy() {
+        for type in ["qwen4_exp", "qwen3_5", "qwen3_5_moe", "qwen3_6_moe_text", "qwen35"] {
+            for config in [
+                "{\"model_type\":\"\(type)\"}",
+                "{\"model_type\":\"vlm\",\"text_config\":{\"model_type\":\"\(type)\"}}",
+            ] {
+                #expect(NativeMTPAutoDecodePolicy.supportsModel(configData: Data(config.utf8)))
+            }
+        }
+        for config in ["{}", "bad", "{\"model_type\":\"glm5_next\",\"name\":\"qwen4_exp\"}"] {
+            #expect(!NativeMTPAutoDecodePolicy.supportsModel(configData: Data(config.utf8)))
+        }
+    }
+
+    @Test("default Off prevents native MTP launch without changing capability")
+    func defaultOffPreventsNativeMTPLaunch() {
         for type in ["qwen4_exp", "qwen3_5"] {
             let config = Data("{\"model_type\":\"\(type)\",\"mtp_num_hidden_layers\":1}".utf8)
             let status = MTPBundleStatus(
                 bundleHasMTP: true, configuredLayers: 1, tensorCount: 57,
                 mode: .preservedEnabled, measuredFamilyAutoDepth: 3)
-            let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .off))
+            let settings = VMLXServerRuntimeSettings()
             var base = LoadConfiguration.default
             base.nativeMTP = true
-            #expect(settings.resolvedMTPLaunch(
-                configData: config, jangConfig: nil, status: status).launchMode == .off)
-            #expect(settings.resolvedMTPDraftStrategy(
-                configData: config, jangConfig: nil, status: status) == nil)
-            #expect(!settings.resolvedLoadConfiguration(
-                base: base, configData: config, jangConfig: nil, status: status).nativeMTP)
+            #expect(
+                settings.resolvedMTPLaunch(
+                    configData: config, jangConfig: nil, status: status
+                ).launchMode == .off)
+            #expect(
+                settings.resolvedMTPDraftStrategy(
+                    configData: config, jangConfig: nil, status: status) == nil)
+            #expect(
+                !settings.resolvedLoadConfiguration(
+                    base: base, configData: config, jangConfig: nil, status: status
+                ).nativeMTP)
             #expect(status.bundleHasMTP)
         }
     }
@@ -57,7 +84,7 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.generation.topK == nil)
         #expect(settings.generation.minP == nil)
         #expect(settings.generation.repetitionPenalty == nil)
-        #expect(settings.mtp.mode == .auto)
+        #expect(settings.mtp.mode == .off)
         #expect(settings.mtp.keepDraftCacheSeparate)
         #expect(settings.mtp.acceptedTokensOnlyEnterBaseCache)
         #expect(settings.effectivePerformance.deepseekV4ActivationQAT == false)
@@ -167,9 +194,10 @@ struct VMLXServerRuntimeSettingsTests {
         settings.cache.legacyDisk.enabled = true
 
         let issues = settings.validationIssues()
-        #expect(issues.contains {
-            $0.severity == .error && $0.field == "cache.legacyDisk.enabled"
-        })
+        #expect(
+            issues.contains {
+                $0.severity == .error && $0.field == "cache.legacyDisk.enabled"
+            })
     }
 
     @Test("bundle generation config applies before server overrides")
@@ -219,7 +247,8 @@ struct VMLXServerRuntimeSettingsTests {
             let params = settings.resolvedGenerateParameters(generationConfig: bundle)
             let sampler = SpeculativeSamplingController(parameters: params)
             let logits =
-                MLXArray([0.0 as Float, 4.0 as Float, 3.0 as Float, 1.0 as Float])[.newAxis, .ellipsis]
+                MLXArray([0.0 as Float, 4.0 as Float, 3.0 as Float, 1.0 as Float])[
+                    .newAxis, .ellipsis]
 
             let probabilities = sampler.probabilities(logits: logits)[0].asArray(Float.self)
 
@@ -297,15 +326,15 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.validationIssues(mtpStatus: tuned).isEmpty)
     }
 
-    @Test("server runtime defaults auto-launch tuned native MTP bundles")
-    func serverRuntimeDefaultsAutoLaunchTunedNativeMTPBundles() {
+    @Test("server runtime explicit Auto launches tuned native MTP bundles")
+    func serverRuntimeExplicitAutoLaunchesTunedNativeMTPBundles() {
         let config = """
-        {
-          "model_type": "qwen3_vl",
-          "text_config": { "model_type": "qwen3_5", "mtp_num_hidden_layers": 1 },
-          "quantization": { "mode": "mxfp8", "bits": 8 }
-        }
-        """.data(using: .utf8)!
+            {
+              "model_type": "qwen3_vl",
+              "text_config": { "model_type": "qwen3_5", "mtp_num_hidden_layers": 1 },
+              "quantization": { "mode": "mxfp8", "bits": 8 }
+            }
+            """.data(using: .utf8)!
         let tuned = MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 1,
@@ -322,7 +351,7 @@ struct VMLXServerRuntimeSettingsTests {
                 speedupVsBaseline: 1.5,
                 quantizationMode: "mxfp8",
                 quantizationBits: 8))
-        let settings = VMLXServerRuntimeSettings()
+        let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .auto))
 
         let launch = settings.resolvedMTPLaunch(
             configData: config,
@@ -337,10 +366,11 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.mtp.mode == .auto)
         #expect(launch.launchMode == .speculative)
         #expect(loadConfiguration.nativeMTP)
-        if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? = settings.resolvedMTPDraftStrategy(
-            configData: config,
-            jangConfig: nil,
-            status: tuned)
+        if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? =
+            settings.resolvedMTPDraftStrategy(
+                configData: config,
+                jangConfig: nil,
+                status: tuned)
         {
             #expect(depth == 3)
             // A silent artifact must yield NO verifier mode: the iterator picks
@@ -355,19 +385,19 @@ struct VMLXServerRuntimeSettingsTests {
     @Test("server runtime Auto starts measured Qwen3.8 Flash-Next family at D3")
     func serverRuntimeAutoStartsMeasuredFlashNextAtD3() {
         let config = """
-        {
-          "model_type": "qwen4_exp",
-          "mtp_num_hidden_layers": 1,
-          "quantization": { "bits": 4, "group_size": 64 }
-        }
-        """.data(using: .utf8)!
+            {
+              "model_type": "qwen4_exp",
+              "mtp_num_hidden_layers": 1,
+              "quantization": { "bits": 4, "group_size": 64 }
+            }
+            """.data(using: .utf8)!
         let status = MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 1,
             tensorCount: 57,
             mode: .preservedEnabled,
             measuredFamilyAutoDepth: 3)
-        let settings = VMLXServerRuntimeSettings()
+        let settings = VMLXServerRuntimeSettings(mtp: .init(mode: .auto))
 
         let launch = settings.resolvedMTPLaunch(
             configData: config,
@@ -380,18 +410,21 @@ struct VMLXServerRuntimeSettingsTests {
             status: status)
 
         #expect(settings.mtp.mode == .auto)
-        #expect(settings.validationIssues(
-            configData: config,
-            jangConfig: nil,
-            mtpStatus: status).isEmpty)
+        #expect(
+            settings.validationIssues(
+                configData: config,
+                jangConfig: nil,
+                mtpStatus: status
+            ).isEmpty)
         #expect(settings.effectiveMTPLaunchMode(for: status) == .speculative)
         #expect(launch.launchMode == .speculative)
         #expect(launch.recommendation?.depth == 3)
         #expect(loadConfiguration.nativeMTP)
-        if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? = settings.resolvedMTPDraftStrategy(
-            configData: config,
-            jangConfig: nil,
-            status: status)
+        if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? =
+            settings.resolvedMTPDraftStrategy(
+                configData: config,
+                jangConfig: nil,
+                status: status)
         {
             #expect(depth == 3)
             #expect(verifierMode == nil)
@@ -403,12 +436,12 @@ struct VMLXServerRuntimeSettingsTests {
     @Test("server Auto supersedes only the frozen Qwen3.8 4M pre-parity block")
     func serverRuntimeAutoSupersedesLegacyFlashNextQ4Block() {
         let config = """
-        {
-          "model_type": "qwen4_exp",
-          "mtp_num_hidden_layers": 1,
-          "quantization": { "bits": 4, "group_size": 64 }
-        }
-        """.data(using: .utf8)!
+            {
+              "model_type": "qwen4_exp",
+              "mtp_num_hidden_layers": 1,
+              "quantization": { "bits": 4, "group_size": 64 }
+            }
+            """.data(using: .utf8)!
         let status = MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 1,
@@ -434,15 +467,19 @@ struct VMLXServerRuntimeSettingsTests {
             measuredFamilyAutoDepth: 3)
         let settings = VMLXServerRuntimeSettings()
 
-        #expect(settings.resolvedMTPLaunch(
-            configData: config,
-            jangConfig: nil,
-            status: status).recommendation?.depth == 3)
-        #expect(settings.resolvedLoadConfiguration(
-            base: .default,
-            configData: config,
-            jangConfig: nil,
-            status: status).nativeMTP)
+        #expect(
+            settings.resolvedMTPLaunch(
+                configData: config,
+                jangConfig: nil,
+                status: status
+            ).recommendation?.depth == 3)
+        #expect(
+            settings.resolvedLoadConfiguration(
+                base: .default,
+                configData: config,
+                jangConfig: nil,
+                status: status
+            ).nativeMTP)
         if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? =
             settings.resolvedMTPDraftStrategy(
                 configData: config,
@@ -485,13 +522,15 @@ struct VMLXServerRuntimeSettingsTests {
             mode: .metadataOnlyMissingWeights)
 
         #expect(settings.effectiveMTPLaunchMode(for: metadataOnly) == .blocked)
-        #expect(settings.validationIssues(mtpStatus: metadataOnly).contains {
-            $0.severity == .error && $0.field == "mtp.mode"
-        })
+        #expect(
+            settings.validationIssues(mtpStatus: metadataOnly).contains {
+                $0.severity == .error && $0.field == "mtp.mode"
+            })
         #expect(settings.effectiveMTPLaunchMode(for: tensorProven) == .blocked)
-        #expect(settings.validationIssues(mtpStatus: tensorProven).contains {
-            $0.severity == .error && $0.field == "mtp.mode"
-        })
+        #expect(
+            settings.validationIssues(mtpStatus: tensorProven).contains {
+                $0.severity == .error && $0.field == "mtp.mode"
+            })
         #expect(settings.effectiveMTPLaunchMode(for: tuned) == .speculative)
         #expect(settings.validationIssues(mtpStatus: tuned).isEmpty)
     }
@@ -511,12 +550,12 @@ struct VMLXServerRuntimeSettingsTests {
     @Test("MTP launch resolution uses config policy and draft limit")
     func mtpLaunchResolutionUsesConfigPolicyAndDraftLimit() {
         let config = """
-        {
-          "model_type": "qwen3_5_moe",
-          "text_config": { "model_type": "qwen3_5_moe_text", "mtp_num_hidden_layers": 1 },
-          "quantization": { "mode": "mxfp8", "bits": 8 }
-        }
-        """.data(using: .utf8)!
+            {
+              "model_type": "qwen3_5_moe",
+              "text_config": { "model_type": "qwen3_5_moe_text", "mtp_num_hidden_layers": 1 },
+              "quantization": { "mode": "mxfp8", "bits": 8 }
+            }
+            """.data(using: .utf8)!
         let verified = MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 1,
@@ -545,10 +584,11 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(launch.recommendation?.depth == 2)
         #expect(launch.recommendation?.verifierMode == nil)
         #expect(launch.recommendation?.evidence.contains("server_draft_token_limit=2") == true)
-        if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? = settings.resolvedMTPDraftStrategy(
-            configData: config,
-            jangConfig: nil,
-            status: verified)
+        if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? =
+            settings.resolvedMTPDraftStrategy(
+                configData: config,
+                jangConfig: nil,
+                status: verified)
         {
             #expect(depth == 2)
             // A silent artifact must yield NO verifier mode: the iterator picks
@@ -563,12 +603,12 @@ struct VMLXServerRuntimeSettingsTests {
     @Test("MXFP8 MTP launch requires quantization-matched tuning")
     func mxfp8MTPLaunchRequiresQuantizationMatchedTuning() {
         let config = """
-        {
-          "model_type": "qwen3_5_moe",
-          "text_config": { "model_type": "qwen3_5_moe_text", "mtp_num_hidden_layers": 1 },
-          "quantization": { "mode": "mxfp8", "bits": 8 }
-        }
-        """.data(using: .utf8)!
+            {
+              "model_type": "qwen3_5_moe",
+              "text_config": { "model_type": "qwen3_5_moe_text", "mtp_num_hidden_layers": 1 },
+              "quantization": { "mode": "mxfp8", "bits": 8 }
+            }
+            """.data(using: .utf8)!
         let genericTuning = MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 1,
@@ -593,10 +633,12 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(launch.launchMode == .blocked)
         #expect(launch.recommendation == nil)
         #expect(launch.reason.contains("quantization_mode=mxfp8"))
-        #expect(settings.validationIssues(
-            configData: config,
-            jangConfig: nil,
-            mtpStatus: genericTuning).contains {
+        #expect(
+            settings.validationIssues(
+                configData: config,
+                jangConfig: nil,
+                mtpStatus: genericTuning
+            ).contains {
                 $0.severity == .error
                     && $0.field == "mtp.mode"
                     && $0.message.contains("quantization_mode=mxfp8")
@@ -606,12 +648,12 @@ struct VMLXServerRuntimeSettingsTests {
     @Test("tensor-proven Qwen MTP auto-launch resolves D3 load and draft settings")
     func tensorProvenQwenMTPAutoLaunchResolvesD3LoadAndDraftSettings() {
         let config = """
-        {
-          "model_type": "qwen3_vl",
-          "text_config": { "model_type": "qwen3_5_moe_text", "mtp_num_hidden_layers": 1 },
-          "quantization": { "mode": "mxfp4", "bits": 4 }
-        }
-        """.data(using: .utf8)!
+            {
+              "model_type": "qwen3_vl",
+              "text_config": { "model_type": "qwen3_5_moe_text", "mtp_num_hidden_layers": 1 },
+              "quantization": { "mode": "mxfp4", "bits": 4 }
+            }
+            """.data(using: .utf8)!
         let preserved = MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 1,
@@ -649,10 +691,11 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.effectiveMTPLaunchMode(for: preserved) == .speculative)
         #expect(launch.launchMode == .speculative)
         #expect(loadConfiguration.nativeMTP)
-        if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? = settings.resolvedMTPDraftStrategy(
-            configData: config,
-            jangConfig: nil,
-            status: preserved)
+        if case .nativeMTP(depth: let depth, verifierMode: let verifierMode)? =
+            settings.resolvedMTPDraftStrategy(
+                configData: config,
+                jangConfig: nil,
+                status: preserved)
         {
             #expect(depth == 3)
             // A silent artifact must yield NO verifier mode: the iterator picks
@@ -662,21 +705,23 @@ struct VMLXServerRuntimeSettingsTests {
         } else {
             Issue.record("Tensor-proven Qwen MTP should resolve a native-MTP draft strategy")
         }
-        #expect(settings.validationIssues(
-            configData: config,
-            jangConfig: nil,
-            mtpStatus: preserved).isEmpty)
+        #expect(
+            settings.validationIssues(
+                configData: config,
+                jangConfig: nil,
+                mtpStatus: preserved
+            ).isEmpty)
     }
 
     @Test("MTP launch resolution blocks unsupported verified profiles")
     func mtpLaunchResolutionBlocksUnsupportedVerifiedProfiles() {
         let config = """
-        {
-          "model_type": "qwen3_5_moe",
-          "text_config": { "model_type": "qwen3_5_moe_text", "mtp_num_hidden_layers": 1 },
-          "quantization": { "mode": "affine", "bits": 2 }
-        }
-        """.data(using: .utf8)!
+            {
+              "model_type": "qwen3_5_moe",
+              "text_config": { "model_type": "qwen3_5_moe_text", "mtp_num_hidden_layers": 1 },
+              "quantization": { "mode": "affine", "bits": 2 }
+            }
+            """.data(using: .utf8)!
         let verified = MTPBundleStatus(
             bundleHasMTP: true,
             configuredLayers: 1,
@@ -701,25 +746,30 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.effectiveMTPLaunchMode(for: verified) == .blocked)
         #expect(launch.launchMode == .blocked)
         #expect(launch.recommendation == nil)
-        #expect(settings.validationIssues(
-            configData: config,
-            jangConfig: JangConfig(
-                quantization: JangQuantization(
-                    method: "jang",
-                    profile: "JANG_2K",
-                    targetBits: 2,
-                    actualBits: 2,
-                    bitWidthsUsed: [2, 3, 6, 8]),
-                sourceModel: JangSourceModel(architecture: "qwen3_5_moe"),
-                architecture: JangArchitecture(hasMoE: true)),
-            mtpStatus: verified).contains {
+        #expect(
+            settings.validationIssues(
+                configData: config,
+                jangConfig: JangConfig(
+                    quantization: JangQuantization(
+                        method: "jang",
+                        profile: "JANG_2K",
+                        targetBits: 2,
+                        actualBits: 2,
+                        bitWidthsUsed: [2, 3, 6, 8]),
+                    sourceModel: JangSourceModel(architecture: "qwen3_5_moe"),
+                    architecture: JangArchitecture(hasMoE: true)),
+                mtpStatus: verified
+            ).contains {
                 $0.severity == .error && $0.field == "mtp.mode"
             })
         if settings.resolvedMTPDraftStrategy(
             configData: config,
             jangConfig: nil,
-            status: verified) != nil {
-            Issue.record("Unsupported verified JANG_2K profile should not resolve a native-MTP draft strategy")
+            status: verified) != nil
+        {
+            Issue.record(
+                "Unsupported verified JANG_2K profile should not resolve a native-MTP draft strategy"
+            )
         }
     }
 
@@ -772,11 +822,12 @@ struct VMLXServerRuntimeSettingsTests {
         let result = settings.validateRequest(request, capabilitySnapshot: snapshot)
 
         #expect(!result.allowed)
-        #expect(result.issues.map(\.code) == [
-            "server_modality_disabled",
-            "server_modality_disabled",
-            "server_modality_disabled",
-        ])
+        #expect(
+            result.issues.map(\.code) == [
+                "server_modality_disabled",
+                "server_modality_disabled",
+                "server_modality_disabled",
+            ])
         #expect(result.issues.map(\.modality) == [.vision, .video, .audio])
         #expect(result.issues.first?.redactedLogFields["field"] == "multimodal.vlmMode")
         let encoded = String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
@@ -795,15 +846,17 @@ struct VMLXServerRuntimeSettingsTests {
         let result = settings.validateRequest(request)
 
         #expect(!result.allowed)
-        #expect(result.issues.map(\.code) == [
-            "server_modality_disabled",
-            "server_modality_disabled",
-        ])
+        #expect(
+            result.issues.map(\.code) == [
+                "server_modality_disabled",
+                "server_modality_disabled",
+            ])
         #expect(result.issues.map(\.modality) == [.video, .audio])
-        #expect(result.issues.map { $0.redactedLogFields["field"] ?? "" } == [
-            "multimodal.enableVideo",
-            "multimodal.enableAudio",
-        ])
+        #expect(
+            result.issues.map { $0.redactedLogFields["field"] ?? "" } == [
+                "multimodal.enableVideo",
+                "multimodal.enableAudio",
+            ])
     }
 
     @Test("request validation rejects native MTP when server mode is off")
@@ -894,18 +947,20 @@ struct VMLXServerRuntimeSettingsTests {
         var settings = VMLXServerRuntimeSettings()
         settings.multimodal.requireMediaSaltForCache = false
 
-        #expect(settings.validationIssues().contains {
-            $0.severity == .error && $0.field == "multimodal.requireMediaSaltForCache"
-        })
+        #expect(
+            settings.validationIssues().contains {
+                $0.severity == .error && $0.field == "multimodal.requireMediaSaltForCache"
+            })
 
         settings.cache.prefix.enabled = false
         settings.cache.pagedKV.enabled = false
         settings.cache.blockDisk.enabled = false
         settings.cache.legacyDisk.enabled = false
 
-        #expect(!settings.validationIssues().contains {
-            $0.field == "multimodal.requireMediaSaltForCache"
-        })
+        #expect(
+            !settings.validationIssues().contains {
+                $0.field == "multimodal.requireMediaSaltForCache"
+            })
     }
 
     @Test("turboquant KV requires explicit bit widths")
@@ -913,9 +968,10 @@ struct VMLXServerRuntimeSettingsTests {
         var settings = VMLXServerRuntimeSettings()
         settings.cache.liveKVCodec = .turboQuant
 
-        #expect(settings.validationIssues().contains {
-            $0.severity == .error && $0.field == "cache.liveKVCodec"
-        })
+        #expect(
+            settings.validationIssues().contains {
+                $0.severity == .error && $0.field == "cache.liveKVCodec"
+            })
         if case .none = settings.cacheCoordinatorConfig().defaultKVMode {
             // Expected: do not silently choose hidden TQ bit widths.
         } else {
@@ -1039,14 +1095,17 @@ struct RuntimeMoETopKOverrideFocusedTests {
 
     @Test("MoE top-k override scopes cache keys and ignores invalid values")
     func overrideScopesCacheKeys() {
-        #expect(RuntimeMoETopKOverride.cacheScopedModelKey(
-            "hy3",
-            environment: ["VMLX_MOE_TOPK_OVERRIDE": "4"]) == "hy3|moeTopK=4")
-        #expect(RuntimeMoETopKOverride.cacheScopedModelKey(
-            "hy3",
-            environment: ["VMLINUX_MOE_TOPK_OVERRIDE": "2"]) == "hy3|moeTopK=2")
-        #expect(RuntimeMoETopKOverride.cacheScopedModelKey(
-            "hy3",
-            environment: ["VMLX_MOE_TOPK_OVERRIDE": "0"]) == "hy3")
+        #expect(
+            RuntimeMoETopKOverride.cacheScopedModelKey(
+                "hy3",
+                environment: ["VMLX_MOE_TOPK_OVERRIDE": "4"]) == "hy3|moeTopK=4")
+        #expect(
+            RuntimeMoETopKOverride.cacheScopedModelKey(
+                "hy3",
+                environment: ["VMLINUX_MOE_TOPK_OVERRIDE": "2"]) == "hy3|moeTopK=2")
+        #expect(
+            RuntimeMoETopKOverride.cacheScopedModelKey(
+                "hy3",
+                environment: ["VMLX_MOE_TOPK_OVERRIDE": "0"]) == "hy3")
     }
 }
