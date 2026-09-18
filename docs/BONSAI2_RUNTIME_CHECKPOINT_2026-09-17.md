@@ -115,6 +115,114 @@ legitimately produce no durable entry. Do not claim “every tool always writes
 to disk,” or use a cache-write screenshot as proof of a valid subsequent hit.
 No cache/parser rewrite is justified by the new storage format alone.
 
+## Tool/cache ordering trace and executable proof plan
+
+Source-only trace, after local implementation commit
+`a942bcb87028729e2a39a3d8ff9cc3ecbcbbf397`; no cache code changed.
+The app remains at the HEAD above. The inspected working-file SHA-256 values
+are `49c8ed60e0cdae5937745840fc1cb472b06939fe3ce82a85a18ae1c356bb9799`
+for `MLXBatchAdapter.swift` and
+`75d0707daa144be6cb3f9601e6e4a2c9eb77aea1ccb526b3020d79415c46a506`
+for `ModelRuntime.swift`. These bind the trace even if the parent later edits
+the app worktree.
+
+| Stage | Source binding | Meaning and limit |
+| --- | --- | --- |
+| Tool parsed / preview | App `ModelRuntime.swift:5866` appends each invocation; preview is immediate | Not execution and not a persisted boundary |
+| Core completion info | `Evaluate.swift:4785`; batched `BatchEngine.swift:3299` | CPU stats precede the synchronous store; direct engine consumers must wait for EOF before reusing the model |
+| Eligible canonical store | `Evaluate.swift:2886`, `:2995`, `:3105`, `:3132`; batched `BatchEngine.swift:3442` | Captured canonical and safe stable prefixes, not a generated tool-call checkpoint |
+| Typed linked persistence | `CacheCoordinator.swift:915`, `:1095` | Refuses offset/key mismatch; stores typed KV plus the required recurrent representation, then enforces combined quota |
+| File/index operation | `DiskCache.swift:381`, `:498`, `:530` | Synchronous under the process-wide IO lock; complete temporary file is renamed before index insertion; errors are best-effort logged, not thrown to the model request |
+| Engine EOF | `Evaluate.swift:4823`; `BatchEngine.swift:3772` | Follows store return and GPU drain, not proof that storage succeeded or survived quota |
+| App terminal info | App `MLXBatchAdapter.swift:1676`, `:1741` | Holds engine info until upstream EOF and allocator teardown |
+| Native batch publication | App `ModelRuntime.swift:5785`, `:5828` | Publishes the full ordered tool batch at held completion info; complete-response mode waits for its EOF |
+| Next solo prefill | App `MLXBatchAdapter.swift:1375`, `:1747` | Next request acquires the process-wide solo lease after prior stream completion; input preparation follows acquisition |
+
+For native B=1 the source ordering to exercise is:
+
+```text
+tool previews / core info
+  -> eligible store returns + quota pass + GPU drain
+  -> engine EOF -> app allocator teardown -> held completion info
+  -> executable tool batch -> tool result -> next request's prefill
+```
+
+The next request must also acquire the prior solo lease. This is not a promise
+that its acquisition comes after the batch-publication log: the lease and
+consumer tasks can interleave after held completion info; both are already
+after engine/store drain. In B>1, `BatchEngine` is an actor and `finishSlot`
+is synchronous through storage/EOF; the adapter still holds completion info.
+Concurrent independent slots are intentionally not the same invariant as a
+single agent's sequential tool continuation.
+
+The literal requirement “a new complete generated-tool checkpoint is written
+after every tool call” is **not provided by this source**. Tool turns explicitly
+exclude the generated boundary at `Evaluate.swift:4799`, and Qwen's canonical
+hybrid boundary excludes full prompt/post-answer duplicates at `:2909` and
+`:3220`. This preserves existing correctness guards; making generated
+tool-call states reusable would be a separate cache-boundary parity change,
+not something to infer from adding a weight storage format.
+
+Required-tool and warmup exclusions apply equally to both Bonsai bundles:
+
+- App `MLXBatchAdapter.swift:2238` sets `.freshRequiredToolSelection` for
+  required/named tool choice. `Evaluate.swift:1765` preserves it in iterator
+  restore/store policy. `:1891` skips disk-backed restore and logs that warm
+  restore is not proven safe for this topology. Batched entry applies the
+  same guard (`BatchEngine.swift:2028`). A required-tool success is therefore
+  not a disk-hit row. This guard is not removed by the Bonsai implementation.
+- Qwen constructs Mamba state for linear-attention layers
+  (`MLXVLM/Models/Qwen35.swift:3169`; text `Qwen35.swift:1430`). With the actual
+  64-layer / interval-4 configs, that is 48 Mamba and 16 attention caches at
+  construction. `maxKVSize` chooses rotating instead of simple attention;
+  later KV quantization/promotion must be reported from live effective state.
+  `CacheHelpers.swift:188` and `:210` require typed disk restore for Mamba.
+- Exact recurrent reusable-prefix warmup persistence is gated by
+  `CacheHelpers.swift:257` and `Evaluate.swift:3034`. Processor-proven stable
+  prefixes retain their safe N-1 path. Do not relax the guard to get a hit.
+- For disk-only Qwen Mamba, the recurrent state is in the typed safetensors
+  payload (`TQDiskSerializer.swift:285`, `:476`), not obligatorily in a second
+  SSM sidecar. `CacheCoordinator.swift:1050` writes separate recurrent state
+  only when that topology or a published paged payload requires it.
+
+The concrete reproducible invariant/test matrix, still **unexecuted**, is:
+
+1. Run the existing delayed-store test
+   `infoArrivesWhileDelayedCacheStoreStillRunning` (included in `Package.swift`
+   at 872), plus the app's `LocalToolBatchBridgeTests` and solo-gate tests.
+   Compose the actual adapter/bridge in a bounded app fixture: release two
+   parsed calls, block the engine store, assert previews but zero executable
+   calls and no next-prefill acquisition, release the store, then assert both
+   ordered calls and continuation. Existing tests cover these pieces, not a
+   whole Bonsai adapter/model run.
+2. For each storage format, use the same actual small Qwen hybrid graph with
+   at least one GDN and one attention layer, loaded through the corresponding
+   contract. Capture a processor-declared canonical boundary, store into an
+   isolated temporary disk root, destroy the coordinator, reopen it, restore,
+   and continue with identical token IDs. Assert all cache layer counts,
+   types, offsets, state-array counts/contents and continuation logits against
+   the cold reference. Repeat attention with an explicit rotating bound.
+   Build on `HybridStripBoundaryPrefillTests` and `TQDiskSerializerTests`; do
+   not count just a no-exception round trip as parity.
+3. On each real bundle, normal tool-choice/auto rows must capture the actual
+   rendered prompt/schema/media/cache salt, canonical key and offset,
+   complete file plus index after the quota pass, `TOOL-BATCH published`, and
+   a subsequent **accepted** disk restore before measuring reduced prefill.
+   Required-tool rows instead assert the explicit fresh-selection skip and
+   complete coherent tool execution. Reasoning-mode or media changes require
+   their own key identity; no cross-mode/media hit is assumed.
+4. Include disabled cache, insufficient store budget, failing storage and
+   quota-pressure rows as graceful no-durability cases, not positive cache
+   rows. `DiskCache.stores` increments before save at 442; it is not a success
+   counter. A validated existing entry may skip rewriting at 455, and a quota
+   pass can remove a new entry. `hasDurableDiskEntry` checks native recurrent
+   geometry (`CacheCoordinator.swift:732`), but accepted restore plus state
+   parity is still the stronger proof. No power-loss/fsync durability promise
+   is made by this checkpoint.
+
+No new timing delay, cache-policy override, forced tool directive, reasoning
+coercion or allocator limit is proposed to make these rows pass.
+
 ## Metadata/header checks actually run, 2026-09-17
 
 Read-only Node check: parse config/JANG/Prism/generation/index JSON; for each
