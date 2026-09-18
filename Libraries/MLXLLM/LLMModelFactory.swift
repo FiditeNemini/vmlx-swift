@@ -1320,7 +1320,7 @@ internal func llmMergedAdditionalContext(
     )
 }
 
-private struct LLMUserInputProcessor: UserInputProcessor {
+struct LLMUserInputProcessor: UserInputProcessor {
 
     let tokenizer: Tokenizer
     let configuration: ModelConfiguration
