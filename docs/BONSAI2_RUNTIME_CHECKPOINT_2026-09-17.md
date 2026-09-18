@@ -1,8 +1,39 @@
 # Bonsai2 Hadamard / packed ternary runtime checkpoint
 
-Status: **PARTIAL — implementation and tests authored, no Swift execution yet.**
+Status: **PARTIAL — focused runtime tests executed; full-model/app proof missing.**
 This is a private, local implementation checkpoint, not permission to publish
 the model repositories, merge a runtime PR, or advertise working model support.
+
+## Current execution checkpoint — 20:36 PDT
+
+SOURCE EVIDENCE: `fc5fc19c2c6e23b82a24b93d7f646264a5df4bca`, runtime files and
+four new contract/runtime/routing/cache test files described below. Production
+code is unchanged from the initial implementation; later fixes corrected new
+fixture assertion macros and initialized-parameter assignment to use MLXNN's
+public update API.
+
+LIVE EVIDENCE: retained command/results under
+`/Users/eric/vmlx-private-evidence/bonsai2-swift-2026-09-17/unit-7e1a13f4/`:
+`SWIFTTEST_bonsai2_fc5fc19c_focused__203236.log` and
+`results-fc5fc19c-swift-testing.xml`: **37 tests, seven suites, zero failures or
+skips**, 99.75s. The guard exited0 at20:34:31 and recorded zero owned survivors
+at20:34:32; peak tracked physical footprint1.16GiB, swap1.81GiB unchanged.
+Source-built metallib SHA256 `9ce1a2ab8d82e73152c2570176a1bdd45773dc7e33d37b8cd3dab18fa0699e6d`.
+The command used exact24dependency pins, local-only dependency resolution and
+serial test execution. Earlier failed attempts remain in `RUN.md`.
+
+This covers independent packed/native expansion and tiny loader logits,
+Hadamard normalization/sign order, wrapper/raw-fusion isolation, retained
+ordinary-affine behavior, and cold versus disk-reopened hybrid continuation
+state/logits with simple and rotating attention. It does **not** establish
+complete27B model output, speed, app controls or image-forward correctness.
+
+`Bonsai2ProtocolTests.swift` is now authored for the actual installed bundle
+tokenizers, native reasoning/schema/history semantics, two-image processor
+payloads, and fragmented tool-stream fidelity. These new tests have **not yet
+executed** at this checkpoint. Their local-bundle rows are opt-in using
+`BONSAI2_PROTOCOL_BUNDLE_ROOT`, open no weights, and must not be counted when
+skipped. Full real-model acceptance remains listed at the end of this document.
 
 ## Isolation and source bindings
 
@@ -185,7 +216,7 @@ Required-tool and warmup exclusions apply equally to both Bonsai bundles:
   SSM sidecar. `CacheCoordinator.swift:1050` writes separate recurrent state
   only when that topology or a published paged payload requires it.
 
-The concrete reproducible invariant/test matrix, still **unexecuted**, is:
+The concrete reproducible invariant/test matrix is:
 
 1. Run the existing delayed-store test
    `infoArrivesWhileDelayedCacheStoreStillRunning` (included in `Package.swift`
@@ -204,8 +235,8 @@ The concrete reproducible invariant/test matrix, still **unexecuted**, is:
    the cold reference. Repeat attention with an explicit rotating bound.
    Build on `HybridStripBoundaryPrefillTests` and `TQDiskSerializerTests`; do
    not count just a no-exception round trip as parity. This engine-level row
-   is now authored in `Qwen35HadamardCacheTests` (details below), but has not
-   been compiled or executed. The app adapter/bridge composition in row 1
+   passed in `Qwen35HadamardCacheTests` at the current execution checkpoint.
+   The app adapter/bridge composition in row 1
    remains a proposed follow-up, not implemented by this port.
 3. On each real bundle, normal tool-choice/auto rows must capture the actual
    rendered prompt/schema/media/cache salt, canonical key and offset,
@@ -256,7 +287,7 @@ Metadata SHA-256 receipts:
 
 ## Tests and remaining proof
 
-Authored, **unexecuted**:
+Executed at `fc5fc19c` in the focused run above:
 
 - `JangHadamardContractTests`: native/packed declarations, fallback owners,
   strict flags, malformed sidecar/manifest/coverage, checked width arithmetic,
@@ -307,7 +338,11 @@ For the later cache regression, the separate command
 and `git diff --check` also returned exit 0. Formatting is not executable
 verification of the new assertions.
 
-### Private test-build preparation (planned, not executed)
+### Original private test-build preparation (historical plan)
+
+The plan below was subsequently executed; current results supersede its
+future-tense status. Exact command and every environment/test correction are
+retained in the run directory above.
 
 The full-Xcode path exists, while the machine's global developer selection is
 Command Line Tools. Use a per-command `DEVELOPER_DIR`; do not change the global
@@ -345,8 +380,8 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test \
   --filter 'JangHadamardContractTests|JangHadamardRuntimeTests|Qwen35HadamardRoutingTests|Qwen35HadamardCacheTests|JangAffine1RuntimeContractTests|Qwen35FusedInputProjectionTests|NormConventionResolverTests|EarlyCompletionBeforeCachePersistTests'
 ```
 
-Missing acceptance evidence: Swift compilation and the focused tests; exact
-four-prompt Python parity and native-vs-packed logits; both real bundles'
+Missing acceptance evidence: actual-tokenizer/protocol tests; exact
+four-prompt Python parity and complete native-vs-packed logits; both real bundles'
 coherent natural-stop multi-turn output with tok/s, TTFT/prefill and physical
 footprint; native reasoning controls; real tool schema/round-trip/batch calls;
 per-tool canonical disk persistence plus next-turn restore and SSM/KV state;
