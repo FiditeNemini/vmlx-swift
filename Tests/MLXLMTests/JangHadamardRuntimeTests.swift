@@ -221,7 +221,10 @@ struct JangHadamardRuntimeTests {
                 weight: values["projection.weight"]!, scales: values["projection.scales"]!,
                 biases: values["projection.biases"], groupSize: 128, bits: 2)
             let rotated = HadamardQuantizedLinear(plain, blockSize: 512)
-            rotated.signs = MLXArray(JangHadamardFixture.signs)
+            rotated.update(
+                parameters: ModuleParameters.unflattened([
+                    ("signs", MLXArray(JangHadamardFixture.signs))
+                ]))
             #expect(rotated.weight === plain.weight)
             #expect(rotated.scales === plain.scales)
             #expect(rotated.biases === plain.biases)
@@ -236,7 +239,7 @@ struct JangHadamardRuntimeTests {
                 weight: values["embedding.weight"]!, scales: values["embedding.scales"]!,
                 biases: values["embedding.biases"], groupSize: 128, bits: 2)
             let embedding = HadamardQuantizedEmbedding(ordinaryEmbedding, blockSize: 512)
-            embedding.signs = rotated.signs
+            embedding.update(parameters: ModuleParameters.unflattened([("signs", rotated.signs)]))
             #expect(embedding.weight === ordinaryEmbedding.weight)
             #expect(embedding.scales === ordinaryEmbedding.scales)
             let ids = MLXArray([Int32(1), 3], [1, 2])

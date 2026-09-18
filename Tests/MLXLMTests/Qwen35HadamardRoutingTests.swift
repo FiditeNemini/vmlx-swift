@@ -131,7 +131,10 @@ struct Qwen35HadamardRoutingTests {
                 try contract.install(model: layer)
                 for (_, module) in layer.namedModules() {
                     if let rotated = module as? HadamardQuantizedLinear {
-                        rotated.signs = MLXArray(JangHadamardFixture.signs)
+                        rotated.update(
+                            parameters: ModuleParameters.unflattened([
+                                ("signs", MLXArray(JangHadamardFixture.signs))
+                            ]))
                     }
                 }
             }
@@ -176,7 +179,10 @@ struct Qwen35HadamardRoutingTests {
                 try contract.install(model: layer)
                 for (_, module) in layer.namedModules() {
                     if let rotated = module as? HadamardQuantizedLinear {
-                        rotated.signs = MLXArray(JangHadamardFixture.signs)
+                        rotated.update(
+                            parameters: ModuleParameters.unflattened([
+                                ("signs", MLXArray(JangHadamardFixture.signs))
+                            ]))
                     }
                 }
             }
