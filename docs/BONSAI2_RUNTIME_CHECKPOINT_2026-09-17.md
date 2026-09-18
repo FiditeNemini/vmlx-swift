@@ -4,7 +4,40 @@ Status: **PARTIAL — focused runtime tests executed; full-model/app proof missi
 This is a private, local implementation checkpoint, not permission to publish
 the model repositories, merge a runtime PR, or advertise working model support.
 
-## Current protocol checkpoint — 20:44 PDT
+## Current combined checkpoint — 20:57 PDT
+
+SOURCE EVIDENCE: `4c6bec46f316f7c4c63ea1c4c580ad968bb37a52`, based on current
+mainbfb34ff1 (remote checked20:53). `git diff --check` returned0.
+LIVE EVIDENCE: `unit-7e1a13f4/SWIFTTEST_bonsai2_4c6bec46_combined__205407.log`
+and `results-4c6bec46-combined-swift-testing.xml`: **146 executed tests, zero
+failures, one explicitly skipped legacy Flash-Next installed-bundle test**
+(147 discovered in19suites). The skipped row is not Bonsai coverage. Guard
+exit0/zero survivors20:54:24, peak sampled tracked footprint0.38GiB, unchanged
+swap1.81GiB. This incremental warm run took14.834s; it is not a speed benchmark.
+The earlier protocol-only build/run at the same source recorded109 executed,
+one skipped, zero failures; peak2.82GiB. Raw build warnings remain in its log.
+
+Both actual local Bonsai bundle tokenizers and media processors executed:
+native-default/Off/low/medium/xhigh prompt token counts528/492/516/490/528,
+canonical no-generation-prompt equality, full JSON schemas and native errors.
+Two-image inputs produced638 prompt tokens,128 image slots, two frames and
+pixels[512,1536], preserving tool/reasoning history and media/effort isolation.
+Media `cachePrefixTokenCounts=[]` remains an unclosed performance item, not a
+cache-hit claim. No full weights opened and no VLM forward occurred.
+
+Fragmented tool tests retain exact strings/types, both calls, literal think
+tags and progress before EOS. Incomplete payloads do not invent a call; normal
+reasoning resumes after a closer. Existing Gemma schema, MiniCPM CDATA and
+reasoning-family tests also execute unchanged. Core Hadamard/packed/load and
+tiny hybrid disk-reopen/rotating state-logit parity re-ran at this same source.
+
+Open gates: app-owned bridge tests and dev build/UI, both full27B models,
+natural-stop multi-turn/tool/media output, actual token/s and footprint,
+full-model accepted restore and tool publication ordering, CI and PR merge.
+The app preparation branch is based on current main0901780c in its own worktree;
+no Gemma source is reworked here. See the active private STATUS.md for ownership.
+
+## Retained protocol failure checkpoint — 20:44 PDT
 
 SOURCE EVIDENCE: `382d07ff`, `Tests/MLXLMTests/Bonsai2ProtocolTests.swift`.
 LIVE EVIDENCE: `unit-7e1a13f4/SWIFTTEST_bonsai2_protocol_typed__203821.log`
