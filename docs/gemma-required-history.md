@@ -12,4 +12,24 @@ Plan: preserve the complete message list at both Gemma processor consumers, reta
 
 Baseline app530c2f12e8afd815c8d578fceeb73460b5443bec, binary63699d39b89c09e671928fb177746f47efccdcff2f3950638798ab4fe990fecd, engine8ba593aff16c13cf526211b8477c0a037f0122af; E2B8bit snapshot433003a1e3fbfd10819ad15179d5e3c4d02d7ea7. Full catalogs: AgentLoop40/56passed,10failed,2errored,4skipped; Frontier23/42passed,16failed,3errored. Every nonpass retained/reviewed; no universal pass claim. Private evidence: handoff-parity-2026-09-16/implementation/REQUIRED-MEDIA-HISTORY-FAILURE.md and EVAL-REVIEW-530.md.
 
-Current implementation/test/live status: pending. Required acceptance: red/green production-processor regressions; native first image/tool result/follow-up/new image after history; named/required/auto API pairing; complete tool cards and unlocked input; exact cache/media identity and throughput; rebuilt app and full catalogs with all failures attributed. A separate prefill-error propagation issue currently converts processing failure to cancellation/empty output and then a misleading app retry; it must not be hidden by this history correction.
+## Correction and executable regressions
+
+Implementation `055f0137df946486ef559f97e1a9b3425522f12e` removes only the two destructive compaction consumers/helpers. Tool selection arguments, scalar system content, original tool calls/results, reasoning, media processing, generation defaults and cache paths remain intact. The original closed/unanswered-tool tests now call the production processor and assert exact retained protocol instead of synthetic summaries.
+
+At regression-only `8b8f90201d4937eca23b441a53ab611cbd52488f`, 18 of 33 parameter cases failed: 14 required/named VLM history cases and 4 text-history cases. All 11 auto cases and 4 pending-tool controls retained their contracts. The VLM failures include zero slots for one image and four slots for two images requiring eight. No production correction was present in this baseline.
+
+At corrected `055f0137`, all 33 cases passed. The combined selected suites completed with 82 Swift Testing tests in 8 suites plus 12 XCTest cases, zero failures, on two runs. The second finished its Swift Testing assertions in 0.071 seconds without lock recovery. Suites: Gemma4RequiredHistoryTests, ChatMessageToolCallTests, Gemma4ImageEdgeCaseTests, CacheCoordinatorMediaSaltTests, Gemma4CacheTopologyTests, ToolCallEdgeCasesTests, ThinkingTemplateDefaultTests, Gemma4TemplateFallbackSourceTests and Gemma4ToolFallbackRoutingSourceTests.
+
+Artifacts under private `handoff-parity-2026-09-16/implementation/`:
+
+- `gemma-history-8b8f90201d4937eca23b441a53ab611cbd52488f-red4.log`: clean failing baseline.
+- `gemma-history-055f0137df946486ef559f97e1a9b3425522f12e-green2.log`: clean corrected repeat.
+- `SWIFTTEST_GemmaHistoryRed4__184233.*`, `SWIFTTEST_GemmaHistoryGreen1__184556.*`, `SWIFTTEST_GemmaHistoryGreen2__184831.*`: original resource limits and zero-survivor cleanup receipts.
+
+Retained non-acceptance attempts: red1 stopped on a copied nonrelocatable compiler cache; red2 stopped on fixture Sendable typing; red3 also exposed one-ULP CoreImage color-conversion noise (pixel tolerance is now 1e-6, message/slot counts remain exact). Green1 exercised the existing 90-second abandoned-test-semaphore recovery; its sample and full log are retained. No test-lock implementation or runtime settings were changed.
+
+## Remaining live acceptance — PARTIAL
+
+Native first image/tool result/follow-up/new image after history; named/required/auto API pairing; complete tool cards and unlocked input; exact cache/media identity and throughput; rebuilt app and full catalogs with every nonpass attributed are still required on this engine correction. These processor tests use a capturing tokenizer and tiny real pixel tensors; they are not a real-bundle/Jinja or UI substitute. Current upstream `bfb34ff142817f3a35cf6502ad5d8dd742c4e87f` and the baseline app's `8ba593af` have the same tree `23f38cb58bdf043860b1fef012b8c3b52cdb111f`.
+
+A separate prefill-error propagation issue currently converts processing failure to cancellation/empty output and then a misleading app retry; it is traced but not corrected by this history patch.
