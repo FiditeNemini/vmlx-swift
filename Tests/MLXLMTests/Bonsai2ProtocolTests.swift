@@ -18,34 +18,32 @@ private enum Bonsai2ProtocolFixture {
         }
     }
 
-    static let tools: [ToolSpec] = [
-        [
-            "type": "function",
-            "function": [
-                "name": "write_note",
-                "description": "Write a note without interpreting its content.",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "path": ["type": "string"], "content": ["type": "string"],
-                        "enabled": ["type": "boolean"], "count": ["type": "integer"],
-                        "labels": ["type": "array", "items": ["type": "string"]],
-                        "metadata": ["type": "object", "properties": ["code": ["type": "string"]]],
-                    ], "required": ["path", "content"], "additionalProperties": false,
-                ],
-            ],
-        ],
-        [
-            "type": "function",
-            "function": [
-                "name": "read_note", "description": "Read a saved note.",
-                "parameters": [
-                    "type": "object", "properties": ["path": ["type": "string"]],
-                    "required": ["path"], "additionalProperties": false,
-                ],
-            ],
-        ],
-    ]
+    static let tools: [ToolSpec] = {
+        let string: ToolSpec = ["type": "string"]
+        let labels: ToolSpec = ["type": "array", "items": string]
+        let metadata: ToolSpec = ["type": "object", "properties": ["code": string]]
+        let properties: ToolSpec = [
+            "path": string, "content": string,
+            "enabled": ["type": "boolean"], "count": ["type": "integer"],
+            "labels": labels, "metadata": metadata,
+        ]
+        let writeParameters: ToolSpec = [
+            "type": "object", "properties": properties,
+            "required": ["path", "content"], "additionalProperties": false,
+        ]
+        let readParameters: ToolSpec = [
+            "type": "object", "properties": ["path": string],
+            "required": ["path"], "additionalProperties": false,
+        ]
+        let write: ToolSpec = [
+            "name": "write_note", "description": "Write a note without interpreting its content.",
+            "parameters": writeParameters,
+        ]
+        let read: ToolSpec = [
+            "name": "read_note", "description": "Read a saved note.", "parameters": readParameters,
+        ]
+        return [["type": "function", "function": write], ["type": "function", "function": read]]
+    }()
 
     static func call(_ name: String, _ arguments: [String: JSONValue], order: [String]) -> ToolCall
     {
