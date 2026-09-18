@@ -4,7 +4,29 @@ Status: **PARTIAL — focused runtime tests executed; full-model/app proof missi
 This is a private, local implementation checkpoint, not permission to publish
 the model repositories, merge a runtime PR, or advertise working model support.
 
-## Current execution checkpoint — 20:36 PDT
+## Current protocol checkpoint — 20:44 PDT
+
+SOURCE EVIDENCE: `382d07ff`, `Tests/MLXLMTests/Bonsai2ProtocolTests.swift`.
+LIVE EVIDENCE: `unit-7e1a13f4/SWIFTTEST_bonsai2_protocol_typed__203821.log`
+in the retained evidence directory below: four test functions,19 assertion
+issues, guard exit1 with zero survivors. No full model weights were opened.
+
+Two-call ordering/types and serialization passed across fragmented streams.
+Actual tokenizers rendered the native default and all four modes, but exposed
+schema-field loss and swallowed invalid-effort errors. Real two-image
+preprocessing produced the expected pixels/token slots and isolated cache
+salts, but lost structured assistant tool-call history. Literal think tags
+inside tool argument values were also stripped. Two other assertions were
+fixture errors: the bundle explicitly sets repetition_penalty=1.0.
+
+The source-bound plan preserves previous fixes: retain the Gemma schema adapter
+from27f5806e/3d06edee, route configured Qwen XML templates with raw schemas and
+their own errors, compose Qwen3VL media content over canonical message metadata,
+and protect committed Qwen tool payloads from reasoning-marker parsing. Test
+both generation-prompt modes, invalid input, fragments, incomplete envelopes,
+ordinary reasoning and prior MiniCPM behavior before claiming correction.
+
+## Retained core execution checkpoint — 20:36 PDT
 
 SOURCE EVIDENCE: `fc5fc19c2c6e23b82a24b93d7f646264a5df4bca`, runtime files and
 four new contract/runtime/routing/cache test files described below. Production
@@ -28,10 +50,10 @@ ordinary-affine behavior, and cold versus disk-reopened hybrid continuation
 state/logits with simple and rotating attention. It does **not** establish
 complete27B model output, speed, app controls or image-forward correctness.
 
-`Bonsai2ProtocolTests.swift` is now authored for the actual installed bundle
+At that earlier checkpoint `Bonsai2ProtocolTests.swift` was authored for the actual installed bundle
 tokenizers, native reasoning/schema/history semantics, two-image processor
-payloads, and fragmented tool-stream fidelity. These new tests have **not yet
-executed** at this checkpoint. Their local-bundle rows are opt-in using
+payloads, and fragmented tool-stream fidelity. Its subsequent failures are
+recorded above. The local-bundle rows are opt-in using
 `BONSAI2_PROTOCOL_BUNDLE_ROOT`, open no weights, and must not be counted when
 skipped. Full real-model acceptance remains listed at the end of this document.
 

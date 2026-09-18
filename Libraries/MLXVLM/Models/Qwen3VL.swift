@@ -2030,10 +2030,12 @@ public struct Qwen3VLMessageGenerator: MessageGenerator {
             ["type": "video"]
         }
 
-        return [
-            "role": message.role.rawValue,
-            "content": imageContent + videoContent + textContent,
-        ]
+        // Media changes content representation, not the assistant/tool metadata.
+        // Keep reasoning, ordered calls and tool-result correlation through VL
+        // continuations just as the text-only message generator does.
+        var result = defaultMessageDict(for: message)
+        result["content"] = imageContent + videoContent + textContent
+        return result
     }
 }
 

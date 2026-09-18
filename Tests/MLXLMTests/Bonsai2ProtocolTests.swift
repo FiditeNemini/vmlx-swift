@@ -86,20 +86,22 @@ private enum Bonsai2ProtocolFixture {
         let format = try #require(ToolCallFormat.fromCapabilityName("qwen3_coder"))
         let tools = ToolCallProcessor(format: format, tools: Self.tools)
         var events: [Generation] = []
+        var lastChannel: GenerationTextChannel = .content
         func append(_ segments: [ReasoningSegment]) {
             for segment in segments {
                 switch segment {
                 case .reasoning(let value):
+                    lastChannel = .reasoning
                     events += routeGenerationText(value, channel: .reasoning, through: tools)
                 case .content(let value):
+                    lastChannel = .content
                     events += routeGenerationText(value, channel: .content, through: tools)
                 }
             }
         }
         for chunk in chunks { append(reasoning.feed(chunk)) }
         append(reasoning.flush())
-        tools.processEOS()
-        events += drainToolCallEvents(from: tools)
+        events += flushGenerationText(channel: lastChannel, through: tools)
         #expect(tools.toolCallProtocolFailure == nil)
         return events
     }
@@ -139,6 +141,8 @@ struct ActualBonsai2ProtocolTests {
         #expect(ChatTemplateRepair.repaired(template) == template)
         let tokenizer = try await #huggingFaceTokenizerLoader().load(
             from: JangLoader.resolveChatTemplateSidecarSubstitution(for: directory))
+        let controllable = try #require(tokenizer as? any GenerationPromptControllableTokenizer)
+        #expect(Qwen3XMLToolTemplate.matchesTemplate(template))
         let defaults = try JSONDecoder().decode(
             GenerationConfigFile.self,
             from: Data(contentsOf: directory.appendingPathComponent("generation_config.json")))
@@ -146,7 +150,7 @@ struct ActualBonsai2ProtocolTests {
         #expect(parameters.temperature == 1)
         #expect(parameters.topP == 0.95)
         #expect(parameters.topK == 20)
-        #expect(parameters.repetitionPenalty == nil)
+        #expect(parameters.repetitionPenalty == 1)
         #expect(tokenizer.convertTokenToId("<|im_end|>") == 248046)
         #expect(tokenizer.convertTokenToId("<|endoftext|>") == 248044)
 
@@ -165,6 +169,18 @@ struct ActualBonsai2ProtocolTests {
             renderedByLevel[level] = rendered
             let observedTools = try Bonsai2ProtocolFixture.renderedTools(rendered)
             #expect(observedTools == expectedTools)
+            let canonicalIDs = try controllable.applyChatTemplate(
+                messages: messages, tools: Bonsai2ProtocolFixture.tools,
+                additionalContext: context, addGenerationPrompt: false)
+            let canonical = tokenizer.decode(tokenIds: canonicalIDs, skipSpecialTokens: false)
+            let canonicalTools = try Bonsai2ProtocolFixture.renderedTools(canonical)
+            #expect(canonicalTools == expectedTools)
+            #expect(canonicalIDs.count < ids.count)
+            #expect(ids.starts(with: canonicalIDs))
+            let explicitIDs = try controllable.applyChatTemplate(
+                messages: messages, tools: Bonsai2ProtocolFixture.tools,
+                additionalContext: context, addGenerationPrompt: true)
+            #expect(explicitIDs == ids)
             #expect(rendered.contains("SAVED_NOTE_OK"))
             #expect(rendered.contains("READ_NOTE_CODE=007"))
             #expect(rendered.contains("Verify the round trip."))
@@ -204,6 +220,30 @@ struct ActualBonsai2ProtocolTests {
             _ = try tokenizer.applyChatTemplate(
                 messages: messages, tools: Bonsai2ProtocolFixture.tools,
                 additionalContext: ["enable_thinking": true, "reasoning_effort": "unsupported"])
+        }
+        for addGenerationPrompt in [false, true] {
+            #expect(throws: (any Error).self) {
+                _ = try controllable.applyChatTemplate(
+                    messages: messages, tools: Bonsai2ProtocolFixture.tools,
+                    additionalContext: [
+                        "enable_thinking": true, "reasoning_effort": "unsupported",
+                    ],
+                    addGenerationPrompt: addGenerationPrompt)
+            }
+            #expect(throws: (any Error).self) {
+                _ = try controllable.applyChatTemplate(
+                    messages: [], tools: nil, additionalContext: nil,
+                    addGenerationPrompt: addGenerationPrompt)
+            }
+            let invalidMedia: [String: any Sendable] = [
+                "role": "system", "content": [["type": "image"]],
+            ]
+            #expect(throws: (any Error).self) {
+                _ = try controllable.applyChatTemplate(
+                    messages: [invalidMedia, ["role": "user", "content": "What is this?"]],
+                    tools: nil, additionalContext: nil,
+                    addGenerationPrompt: addGenerationPrompt)
+            }
         }
     }
 
@@ -256,6 +296,7 @@ struct ActualBonsai2ProtocolTests {
         #expect(rendered.contains("SAVED_NOTE_OK") && rendered.contains("READ_NOTE_CODE=007"))
         #expect(
             rendered.contains("<function=write_note>") && rendered.contains("<function=read_note>"))
+        #expect(rendered.contains("Verify the round trip."))
         MLX.eval(image.pixels)
         let finite = image.pixels.asArray(Float.self).allSatisfy { $0.isFinite }
         #expect(finite)
@@ -273,6 +314,37 @@ struct ActualBonsai2ProtocolTests {
 
 @Suite("Bonsai2 native fragmented tool/reasoning protocol")
 struct Bonsai2ToolStreamTests {
+    @Test func nativeTemplateDetectionDoesNotChangeOtherDialects() {
+        let native = "<|im_start|><|im_end|><tool_call><function=f><parameter=x></tool_call>"
+        #expect(Qwen3XMLToolTemplate.matchesTemplate(native))
+        #expect(!Qwen3XMLToolTemplate.matchesTemplate(nil))
+        #expect(
+            !Qwen3XMLToolTemplate.matchesTemplate(
+                "<|im_start|><tool_call>{\"name\":\"f\"}</tool_call>"))
+        #expect(
+            !Qwen3XMLToolTemplate.matchesTemplate(
+                "<function name=\"f\"><param name=\"x\"><![CDATA[x]]></param></function>"))
+        #expect(
+            !Qwen3XMLToolTemplate.matchesTemplate(
+                native.replacingOccurrences(of: "<|im_end|>", with: "")))
+    }
+
+    @Test func mediaGeneratorPreservesAllCanonicalMetadata() throws {
+        let generator = Qwen3VLMessageGenerator()
+        var messages = Bonsai2ProtocolFixture.history()
+        messages.append(.tool("correlated result", toolCallId: "call-007"))
+        for message in messages {
+            var media = generator.generate(message: message)
+            var canonical = defaultMessageDict(for: message)
+            let content = try #require(media.removeValue(forKey: "content") as? [[String: String]])
+            #expect(content.last == ["type": "text", "text": message.content])
+            canonical.removeValue(forKey: "content")
+            let mediaJSON = try Bonsai2ProtocolFixture.canonicalJSON(media)
+            let canonicalJSON = try Bonsai2ProtocolFixture.canonicalJSON(canonical)
+            #expect(mediaJSON == canonicalJSON)
+        }
+    }
+
     @Test("two calls retain ordering, types and exact string values", arguments: [1, 2, 7, 4096])
     func twoCalls(width: Int) throws {
         let payload = """
@@ -319,5 +391,62 @@ struct Bonsai2ToolStreamTests {
         let call = try #require(calls.first)
         #expect(call.function.arguments["content"] == .string(content))
         #expect(events.compactMap(\.reasoning).joined().isEmpty)
+    }
+
+    @Test(
+        "opaque payload ends at native closer; normal reasoning resumes",
+        arguments: [1, 2, 7, 4096])
+    func reasoningAfterTool(width: Int) throws {
+        let payload =
+            "<tool_call><function=write_note><parameter=path>tags.md</parameter><parameter=content><think>literal</think></parameter></function></tool_call><think>Now check.</think>Done."
+        let events = try Bonsai2ProtocolFixture.stream(
+            Bonsai2ProtocolFixture.fragments(payload, width: width), promptTail: "</think>\n")
+        #expect(
+            events.compactMap(\.toolCall).first?.function.arguments["content"]
+                == .string("<think>literal</think>"))
+        #expect(events.compactMap(\.reasoning).joined() == "Now check.")
+        #expect(events.compactMap(\.chunk).joined() == "Done.")
+    }
+
+    @Test func incompletePayloadStreamsWithoutInventingACloser() throws {
+        var parser = try #require(
+            ReasoningParser.forPrompt(stampName: "qwen3", promptTail: "</think>"))
+        let payload =
+            "<tool_call><function=write_note><parameter=content>"
+            + String(repeating: "<think>literal</think>", count: 300) + "<thi"
+        let early = parser.feed(payload)
+        func content(_ segments: [ReasoningSegment]) -> String {
+            segments.compactMap { if case .content(let text) = $0 { text } else { nil } }.joined()
+        }
+        #expect(content(early).count >= payload.count - 11)
+        let final = parser.flush()
+        #expect(content(early + final) == payload)
+        #expect(!parser.isInsideReasoning)
+        let processor = ToolCallProcessor(format: .xmlFunction, tools: Bonsai2ProtocolFixture.tools)
+        _ = processor.processChunk(content(early + final))
+        _ = processor.processEOS()
+        #expect(processor.toolCalls.isEmpty)
+        #expect(
+            parser.feed("<think>New.</think>Done.") + parser.flush() == [
+                .reasoning("New."), .content("Done."),
+            ])
+    }
+
+    @Test func reasoningSideExamplesDoNotActivateOpaqueContentMode() throws {
+        var parser = try #require(
+            ReasoningParser.forPrompt(stampName: "qwen3", promptTail: "<think>"))
+        let segments =
+            parser.feed("Example: <tool_call>illustration</tool_call>.</think>Answer.")
+            + parser.flush()
+        #expect(
+            segments == [
+                .reasoning("Example: <tool_call>illustration</tool_call>."), .content("Answer."),
+            ])
+        #expect(
+            ReasoningParser.fromCapabilityName("minicpm5")?.preservesQwenToolCallPayloads == false)
+        #expect(
+            ReasoningParser.fromCapabilityName("deepseek_r1")?.preservesQwenToolCallPayloads
+                == false)
+        #expect(ReasoningParser.fromCapabilityName("qwen3")?.preservesQwenToolCallPayloads == true)
     }
 }
