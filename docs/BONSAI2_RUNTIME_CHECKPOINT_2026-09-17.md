@@ -203,7 +203,10 @@ The concrete reproducible invariant/test matrix, still **unexecuted**, is:
    types, offsets, state-array counts/contents and continuation logits against
    the cold reference. Repeat attention with an explicit rotating bound.
    Build on `HybridStripBoundaryPrefillTests` and `TQDiskSerializerTests`; do
-   not count just a no-exception round trip as parity.
+   not count just a no-exception round trip as parity. This engine-level row
+   is now authored in `Qwen35HadamardCacheTests` (details below), but has not
+   been compiled or executed. The app adapter/bridge composition in row 1
+   remains a proposed follow-up, not implemented by this port.
 3. On each real bundle, normal tool-choice/auto rows must capture the actual
    rendered prompt/schema/media/cache salt, canonical key and offset,
    complete file plus index after the quota pass, `TOOL-BATCH published`, and
@@ -265,6 +268,28 @@ Authored, **unexecuted**:
 - `Qwen35HadamardRoutingTests`: supported/refused routes, actual text/VLM
   sanitize +1 vs already-shifted norms, F32/F16 passthrough, raw-fusion bypass
   prevention, cache offset/count/content equality.
+- `Qwen35HadamardCacheTests`: both native affine-2 and packed ternary fixtures
+  load through the production loader into the same deterministic four-layer
+  Qwen graph (three GDN + one attention). A 17-token canonical checkpoint is
+  stored, the coordinator is discarded and reopened, and all cache counts,
+  types, offsets, metadata, state-array counts, dtypes and contents are compared
+  with the cold reference. Continuation logits and resulting state are compared
+  exactly, including equality across the two weight representations. The
+  attention row repeats with a rotating window of eight to exercise wraparound.
+  The public `TokenIterator` must report an accepted 17-token disk restore for
+  ordinary continuation, but must prefill fresh for `.freshRequiredToolSelection`
+  without incrementing disk-hit telemetry. Changed first-token, reasoning and
+  media salts must miss. The media tensors are hashing fixtures only, **not** a
+  VLM-forward or image-cache proof, and token IDs represent an already-rendered
+  canonical boundary, **not** tokenizer/template proof. The parsed-tool-style
+  store excludes generated boundaries; no production cache policy is changed.
+
+Registration was inspected in the actual package manifest: `MLXLMTests` at
+`Package.swift:810–835` auto-discovers its directory and has no explicit source
+whitelist, so all four new files are included. The separate
+`MLXLMCommonFocusedTests` target does have a whitelist: existing affine-1,
+Qwen-fusion, norm-convention and delayed-cache-store baselines already appear
+there. No manifest edit is needed or made.
 
 Checks actually executed:
 
@@ -277,11 +302,47 @@ Both returned exit 0 with no diagnostics. These are not compilation or runtime
 tests. Parent's Gemma build/live proof owns the resource slot; no competing
 build, Metal test or Bonsai model was launched.
 
+For the later cache regression, the separate command
+`xcrun swift-format lint --strict Tests/MLXLMTests/Qwen35HadamardCacheTests.swift`
+and `git diff --check` also returned exit 0. Formatting is not executable
+verification of the new assertions.
+
+### Private test-build preparation (planned, not executed)
+
+The full-Xcode path exists, while the machine's global developer selection is
+Command Line Tools. Use a per-command `DEVELOPER_DIR`; do not change the global
+selection. Both `.build-bonsai2` and this worktree's `Package.resolved` were
+absent when planning. The existing root checkout's ignored `Package.resolved`
+has SHA-256 `3af2208ba61fb3a04543a2c5d8d74fdb4af50505a124e3c5f6c8d70eccc6bf8d`.
+A read-only `git cat-file -e <revision>^{commit}` check found all 24 pinned
+revisions already present in local SwiftPM bare caches. The conditional docc
+dependency is not requested by this environment. No resolve/fetch/build was
+run to make those observations.
+
+After the serialized slot is granted, seed only an isolated lockfile and
+private dependency cache from those exact local objects; preserve the ordinary
+package graph and force its resolved versions. Use private cache/config/security
+paths and local manifest caching, disable prefetching and experimental prebuilt
+downloads, and skip remote updates. Do not reuse or edit app SourcePackages or
+DerivedData. SwiftPM's test filter restricts **execution**, not necessarily all
+compilation: a clean first build can still be substantial. Run under a bounded
+owned-process build window with a retained log; if the window expires, report
+the compile checkpoint and resume only after slot coordination. Never represent
+zero matching tests or a compile-only row as a passing regression run.
+
 Planned command, only after an explicit serialized slot with full Xcode and
 an approved isolated scratch/build path (not shared SourcePackages/DerivedData):
 
 ```sh
-swift test --scratch-path /Users/eric/vmlx-bonsai2-runtime/.build-bonsai2 -j 2 --no-parallel --filter 'JangHadamardContractTests|JangHadamardRuntimeTests|Qwen35HadamardRoutingTests|JangAffine1RuntimeContractTests|Qwen35FusedInputProjectionTests|NormConventionResolverTests'
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test \
+  --scratch-path /Users/eric/vmlx-bonsai2-runtime/.build-bonsai2 \
+  --cache-path /Users/eric/vmlx-bonsai2-runtime/.build-bonsai2/cache \
+  --config-path /Users/eric/vmlx-bonsai2-runtime/.build-bonsai2/config \
+  --security-path /Users/eric/vmlx-bonsai2-runtime/.build-bonsai2/security \
+  --manifest-cache local --force-resolved-versions --skip-update \
+  --disable-prefetching --disable-experimental-prebuilts \
+  -j 2 --no-parallel \
+  --filter 'JangHadamardContractTests|JangHadamardRuntimeTests|Qwen35HadamardRoutingTests|Qwen35HadamardCacheTests|JangAffine1RuntimeContractTests|Qwen35FusedInputProjectionTests|NormConventionResolverTests|EarlyCompletionBeforeCachePersistTests'
 ```
 
 Missing acceptance evidence: Swift compilation and the focused tests; exact
