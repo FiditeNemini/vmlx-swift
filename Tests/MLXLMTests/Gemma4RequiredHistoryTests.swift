@@ -88,7 +88,7 @@ struct Gemma4RequiredHistoryTests {
         arguments: ["auto", "required", "named"],
         [
             "text", "earlier-image", "new-image", "repeated-image", "tool-image", "pending-tool",
-            "pending-tool-image",
+            "pending-tool-image", "unanswered-tool", "unanswered-tool-image",
         ])
     func vlmHistory(choice: String, scenario: String) async throws {
         let mlxTestLock = lockSerializedMLXTest()
@@ -115,12 +115,14 @@ struct Gemma4RequiredHistoryTests {
                 toolCalls: [call]),
             .init(
                 role: .tool, content: "Exact tool result.",
-                images: ["tool-image", "pending-tool-image"].contains(scenario) ? [blue] : [],
+                images: ["tool-image", "pending-tool-image", "unanswered-tool-image"].contains(
+                    scenario) ? [blue] : [],
                 toolCallId: "call_visual"),
             .assistant("The first task is complete."),
             .user("Use the earlier result for this next task.", images: newImages),
         ]
         if scenario.hasPrefix("pending-tool") { chat.removeLast(2) }
+        if scenario.hasPrefix("unanswered-tool") { chat.remove(at: 4) }
         let input = UserInput(
             chat: chat, tools: Self.tools, additionalContext: Self.context(choice))
         let config = try JSONDecoder().decode(
@@ -162,12 +164,16 @@ struct Gemma4RequiredHistoryTests {
             #expect(image.pixels.dim(1) == 3)
             let pixels = image.pixels.asArray(Float.self)
             let stride = image.pixels.dim(2) * image.pixels.dim(3)
-            let firstIsRed = !["tool-image", "pending-tool-image"].contains(scenario)
-            #expect(pixels[0] == (firstIsRed ? 1 : 0))
-            #expect(pixels[2 * stride] == (firstIsRed ? 0 : 1))
+            let firstIsRed = !["tool-image", "pending-tool-image", "unanswered-tool-image"]
+                .contains(scenario)
+            // CoreImage's sRGB conversion returns 0.99999994 for a solid 1.0
+            // channel on the proof host. Keep slot/count checks exact; allow
+            // only float conversion noise for the pixel ordering checks.
+            #expect(abs(pixels[0] - (firstIsRed ? 1 : 0)) < 0.000001)
+            #expect(abs(pixels[2 * stride] - (firstIsRed ? 0 : 1)) < 0.000001)
             if imageCount == 2 {
-                #expect(pixels[3 * stride] == (scenario == "repeated-image" ? 1 : 0))
-                #expect(pixels[5 * stride] == (scenario == "repeated-image" ? 0 : 1))
+                #expect(abs(pixels[3 * stride] - (scenario == "repeated-image" ? 1 : 0)) < 0.000001)
+                #expect(abs(pixels[5 * stride] - (scenario == "repeated-image" ? 0 : 1)) < 0.000001)
             }
         }
     }
