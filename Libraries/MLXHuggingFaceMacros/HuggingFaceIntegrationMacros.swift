@@ -138,6 +138,15 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 throw MLXLMCommon.TokenizerError.missingChatTemplate
                             }
                         }
+                        // Configured Qwen XML templates serialize complete JSON schemas
+                        // and reject invalid native inputs. Do not apply Gemma's lossy
+                        // schema adapter or swallow validation errors via a fallback.
+                        if MLXLMCommon.Qwen3XMLToolTemplate.matchesTemplate(
+                            upstream.configuredChatTemplate(forTools: !(tools?.isEmpty ?? true))) {
+                            return try upstream.applyChatTemplate(
+                                messages: messages, tools: tools,
+                                additionalContext: additionalContext)
+                        }
                         // MiniCPM shares <s>/ChatML tokens with Nemotron, but NOT
                         // its tool grammar or thinking tail. Keep the configured
                         // native template, including errors; never substitute a
@@ -580,6 +589,14 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             } catch VMLXTokenizers.TokenizerError.missingChatTemplate {
                                 throw MLXLMCommon.TokenizerError.missingChatTemplate
                             }
+                        }
+                        if MLXLMCommon.Qwen3XMLToolTemplate.matchesTemplate(
+                            upstream.configuredChatTemplate(forTools: !(tools?.isEmpty ?? true))) {
+                            return try upstream.applyChatTemplate(
+                                messages: messages, chatTemplate: nil,
+                                addGenerationPrompt: addGenerationPrompt,
+                                truncation: false, maxLength: nil,
+                                tools: tools, additionalContext: additionalContext)
                         }
                         if MLXLMCommon.MiniCPM5ToolCallParser.matchesTemplate(
                             upstream.configuredChatTemplate(forTools: !(tools?.isEmpty ?? true))) {

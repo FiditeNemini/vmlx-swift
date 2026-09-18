@@ -255,6 +255,9 @@ final class Qwen35GatedDeltaNet: Module {
         else { return nil }
 
         let modules: [Linear] = [inProjQKV, inProjZ, inProjB, inProjA]
+        // Raw weight concatenation bypasses module.callAsFunction. Rotated
+        // matrices require their per-module activation transform first.
+        guard modules.allSatisfy(jangAllowsRawQuantizedProjection) else { return nil }
         // Affine-quantized, bias-free projections only: fusing a float
         // Linear is a plain concat too, but every shipped bundle this class
         // serves is quantized and the float case would need its own kernel
@@ -1681,5 +1684,17 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider, HiddenStat
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
+    }
+}
+
+extension Qwen35Model: JangHadamardRuntimeModel {
+    public func validateJangHadamardRuntime() throws {
+        let config = languageModel.configuration
+        guard !config.tieWordEmbeddings, config.numExperts == 0,
+            config.mtpNumHiddenLayers == 0
+        else {
+            throw JangLoaderError.loadFailed(
+                "Hadamard Qwen3.5 requires an untied dense model without MTP")
+        }
     }
 }

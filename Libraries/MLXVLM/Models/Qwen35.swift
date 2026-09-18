@@ -1592,6 +1592,7 @@ enum Qwen35Language {
             if !attemptedDecodeInputFusion {
                 attemptedDecodeInputFusion = true
                 let modules = [inProjQKV, inProjZ, inProjB, inProjA]
+                guard modules.allSatisfy(jangAllowsRawQuantizedProjection) else { return nil }
                 guard let first = modules[0] as? QuantizedLinear,
                     let firstBiases = first.biases,
                     first.bias == nil,
@@ -1711,6 +1712,7 @@ enum Qwen35Language {
             let modules = [inProjQKV, inProjZ, inProjB, inProjA]
             let quantizedModules = modules.map { $0 as? QuantizedLinear }
             guard
+                modules.allSatisfy(jangAllowsRawQuantizedProjection),
                 quantizedModules.allSatisfy({
                     $0 != nil && $0?.bias == nil && $0?.biases != nil
                 })
@@ -1820,6 +1822,7 @@ enum Qwen35Language {
 
         private func compiledDecodeTail(_ output: MLXArray, gate: MLXArray) -> MLXArray? {
             guard fuseDecodeInputProjections,
+                jangAllowsRawQuantizedProjection(outProj),
                 let quantized = outProj as? QuantizedLinear,
                 let biases = quantized.biases,
                 quantized.bias == nil
@@ -3868,5 +3871,17 @@ extension Qwen35: NativeMTPProposalHeadInstalling {
             ("[ProposalHead] qwen3_5 head is stamp-eligible (q\(bits)) but draft "
                 + "routing is not implemented for this family yet; drafting stays "
                 + "on the full head\n").utf8))
+    }
+}
+
+extension Qwen35: JangHadamardRuntimeModel {
+    public func validateJangHadamardRuntime() throws {
+        let text = config.textConfiguration
+        guard !text.tieWordEmbeddings, text.numExperts == 0,
+            text.mtpNumHiddenLayers == 0
+        else {
+            throw JangLoaderError.loadFailed(
+                "Hadamard Qwen3.5 requires an untied dense model without MTP")
+        }
     }
 }
