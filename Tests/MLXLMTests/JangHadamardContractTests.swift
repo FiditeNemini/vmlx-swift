@@ -111,7 +111,8 @@ struct JangHadamardContractTests {
     @Test("converter contracts select exact module coverage", arguments: [false, true])
     func converterContract(packed: Bool) throws {
         try JangHadamardFixture(packed: packed).withDirectory { directory in
-            let contract = try #require(JangLoader.loadHadamardRuntimeContract(at: directory))
+            let loaded = try JangLoader.loadHadamardRuntimeContract(at: directory)
+            let contract = try #require(loaded)
             #expect(contract.blockSize == 512)
             #expect(contract.computeDType == .float32)
             #expect(contract.forward == [JangHadamardFixture.forward])
@@ -119,7 +120,8 @@ struct JangHadamardContractTests {
             #expect(contract.sidecarSigns[512] == JangHadamardFixture.signs)
             let storage = try JangLoader.loadTernaryPackedRuntimeContract(at: directory)
             #expect(packed ? storage?.modulePaths == contract.modulePaths : storage == nil)
-            #expect(try JangLoader.loadAffine1RuntimeContract(at: directory) == nil)
+            let affine1 = try JangLoader.loadAffine1RuntimeContract(at: directory)
+            #expect(affine1 == nil)
         }
     }
 
@@ -128,14 +130,16 @@ struct JangHadamardContractTests {
         var fixture = JangHadamardFixture()
         fixture.config.removeValue(forKey: "hadamard")
         try fixture.withDirectory { directory in
-            #expect(try JangLoader.loadHadamardRuntimeContract(at: directory) != nil)
+            let sidecarContract = try JangLoader.loadHadamardRuntimeContract(at: directory)
+            #expect(sidecarContract != nil)
             var config = fixture.config
             config["jang_config"] = fixture.jang
             try JSONSerialization.data(withJSONObject: config)
                 .write(to: directory.appendingPathComponent("config.json"))
             try FileManager.default.removeItem(
                 at: directory.appendingPathComponent("jang_config.json"))
-            #expect(try JangLoader.loadHadamardRuntimeContract(at: directory) != nil)
+            let embeddedContract = try JangLoader.loadHadamardRuntimeContract(at: directory)
+            #expect(embeddedContract != nil)
         }
     }
 
@@ -145,8 +149,10 @@ struct JangHadamardContractTests {
         fixture.config.removeValue(forKey: "hadamard")
         fixture.jang = ["format": "jang", "quantization": ["bits": 2, "group_size": 128]]
         try fixture.withDirectory { directory in
-            #expect(try JangLoader.loadHadamardRuntimeContract(at: directory) == nil)
-            #expect(try JangLoader.loadTernaryPackedRuntimeContract(at: directory) == nil)
+            let hadamard = try JangLoader.loadHadamardRuntimeContract(at: directory)
+            let packed = try JangLoader.loadTernaryPackedRuntimeContract(at: directory)
+            #expect(hadamard == nil)
+            #expect(packed == nil)
         }
     }
 

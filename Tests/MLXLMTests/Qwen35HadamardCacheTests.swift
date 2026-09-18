@@ -356,7 +356,8 @@ struct Qwen35HadamardCacheTests {
                     MLX.eval(expected, actual)
                     #expect(MLX.all(actual .== expected).item(Bool.self))
                     let values = actual.asType(.float32).asArray(Float.self)
-                    #expect(values.allSatisfy(\.isFinite))
+                    let allFinite = values.allSatisfy(\.isFinite)
+                    #expect(allFinite)
                     logits.append(contentsOf: values)
                     try Self.assertCacheEqual(restored, coldCache)
                 }

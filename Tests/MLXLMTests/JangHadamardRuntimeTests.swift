@@ -272,7 +272,8 @@ struct JangHadamardRuntimeTests {
                             == tensors["projection.scales"]!.asArray(Float16.self))
                     let output = model(MLXArray([Int32(1), 2], [1, 2]), cache: nil)
                     let values = output.asType(.float32).asArray(Float.self)
-                    #expect(values.allSatisfy(\.isFinite))
+                    let allFinite = values.allSatisfy(\.isFinite)
+                    #expect(allFinite)
                     outputs.append(values)
                 }
             }
