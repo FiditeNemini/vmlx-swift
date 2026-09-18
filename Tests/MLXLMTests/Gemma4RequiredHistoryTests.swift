@@ -74,7 +74,7 @@ struct Gemma4RequiredHistoryTests {
                     "name": "record_visual",
                     "parameters": [
                         "type": "object", "properties": ["description": ["type": "string"]],
-                    ],
+                    ] as [String: any Sendable],
                 ] as [String: any Sendable],
             ]
         ]
@@ -86,7 +86,10 @@ struct Gemma4RequiredHistoryTests {
 
     @Test(
         arguments: ["auto", "required", "named"],
-        ["text", "earlier-image", "new-image", "repeated-image", "tool-image"])
+        [
+            "text", "earlier-image", "new-image", "repeated-image", "tool-image", "pending-tool",
+            "pending-tool-image",
+        ])
     func vlmHistory(choice: String, scenario: String) async throws {
         let mlxTestLock = lockSerializedMLXTest()
         _ = mlxTestLock
@@ -104,7 +107,7 @@ struct Gemma4RequiredHistoryTests {
         let earlierImages =
             ["earlier-image", "new-image", "repeated-image"].contains(scenario) ? [red] : []
         let newImages = scenario == "new-image" ? [blue] : scenario == "repeated-image" ? [red] : []
-        let chat: [Chat.Message] = [
+        var chat: [Chat.Message] = [
             .system("CURRENT SETTINGS. Keep the original observations."),
             .user("Original task and image.", images: earlierImages),
             .init(
@@ -112,11 +115,12 @@ struct Gemma4RequiredHistoryTests {
                 toolCalls: [call]),
             .init(
                 role: .tool, content: "Exact tool result.",
-                images: scenario == "tool-image" ? [blue] : [],
+                images: ["tool-image", "pending-tool-image"].contains(scenario) ? [blue] : [],
                 toolCallId: "call_visual"),
             .assistant("The first task is complete."),
             .user("Use the earlier result for this next task.", images: newImages),
         ]
+        if scenario.hasPrefix("pending-tool") { chat.removeLast(2) }
         let input = UserInput(
             chat: chat, tools: Self.tools, additionalContext: Self.context(choice))
         let config = try JSONDecoder().decode(
@@ -158,7 +162,7 @@ struct Gemma4RequiredHistoryTests {
             #expect(image.pixels.dim(1) == 3)
             let pixels = image.pixels.asArray(Float.self)
             let stride = image.pixels.dim(2) * image.pixels.dim(3)
-            let firstIsRed = scenario != "tool-image"
+            let firstIsRed = !["tool-image", "pending-tool-image"].contains(scenario)
             #expect(pixels[0] == (firstIsRed ? 1 : 0))
             #expect(pixels[2 * stride] == (firstIsRed ? 0 : 1))
             if imageCount == 2 {
@@ -185,8 +189,8 @@ struct Gemma4RequiredHistoryTests {
                         "function": [
                             "name": "record_visual",
                             "arguments": ["description": "original"],
-                        ],
-                    ]
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable]
                 ],
             ],
             [
