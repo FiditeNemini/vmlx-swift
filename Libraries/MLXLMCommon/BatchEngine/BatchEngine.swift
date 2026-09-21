@@ -2036,7 +2036,8 @@ public actor BatchEngine {
                     mediaSalt: slot.mediaSalt,
                     skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: slot.originalInput
-                        .cacheStablePrefixTokenCounts)
+                        .cacheStablePrefixTokenCounts,
+                    chainId: slot.parameters.cacheChainId)
                 if case .hit(
                     let matchedTokens, let remaining, let detail, let blocks,
                     let ssmStates, let diskArrays) = result
@@ -2147,6 +2148,11 @@ public actor BatchEngine {
                             Self.logger.info(
                                 "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(diskRestored) tokens from disk, prefilling \(remaining.count) remaining"
                             )
+                        } else if detail == .disk {
+                            coordinator.reportDiskRestoreRejected(
+                                tokens: tokenIds, boundary: matchedTokens,
+                                mediaSalt: slot.mediaSalt,
+                                reason: "payload does not fit the runtime cache")
                         }
                     }
 
@@ -2158,6 +2164,12 @@ public actor BatchEngine {
                             slot.cache, matchedTokens: matchedTokens,
                             restoredTokens: restoredTokenCount, detail: detail.rawValue)
                     {
+                        if detail == .disk {
+                            coordinator.reportDiskRestoreRejected(
+                                tokens: tokenIds, boundary: matchedTokens,
+                                mediaSalt: slot.mediaSalt,
+                                reason: "restored offsets do not match the boundary")
+                        }
                         restored = false
                         retainedDiskRestore = false
                         slot.cache = context.model.newCache(parameters: slot.parameters)
@@ -2438,7 +2450,8 @@ public actor BatchEngine {
             perLayerData: [],
             ssmStates: nil,
             cache: diskStoreCache,
-            mediaSalt: slot.mediaSalt)
+            mediaSalt: slot.mediaSalt,
+            chainId: slot.parameters.cacheChainId)
         if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
             FileHandle.standardError.write(Data(
                 "[vmlx][cache/store] label=disk-backed-safe-prompt-boundary-prefill count=\(tokens.count)\n".utf8))
@@ -3446,7 +3459,12 @@ public actor BatchEngine {
                     perLayerData: perLayerData,
                     ssmStates: ssmStates,
                     cache: diskStoreCache,
-                    mediaSalt: slot.mediaSalt
+                    mediaSalt: slot.mediaSalt,
+                    chainId: slot.parameters.cacheChainId,
+                    isStableRoot: label.hasPrefix("stable-system-tool"),
+                    // The rows a later prompt of this chat starts with; the
+                    // exact prompt and the post-answer snapshot are not.
+                    isResumeBoundary: label == "history-boundary" || label == "gen-suffix-stripped"
                 )
                 if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                     FileHandle.standardError.write(Data(

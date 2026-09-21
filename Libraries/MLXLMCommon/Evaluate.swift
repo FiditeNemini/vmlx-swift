@@ -295,6 +295,15 @@ public struct GenerateParameters: Sendable {
     /// See `Libraries/MLXLMCommon/BatchEngine/STOP-SEQUENCES-CONTRACT.md`.
     public var extraStopStrings: [String] = []
 
+    /// The conversation this request belongs to, as the host names it (a chat
+    /// session id). Rides with every disk-cache row the request stores, so the
+    /// quota pass can tell the chat in progress from cold ones and evict cold
+    /// conversations' superseded snapshots first. It is not part of any cache
+    /// key: two chats sharing a prefix still share the entry. `nil` (the
+    /// default, and every non-chat caller) leaves rows unowned; the eviction
+    /// order is then exactly what it was before this field existed.
+    public var cacheChainId: String? = nil
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -1899,7 +1908,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                     mediaSalt: mediaSalt,
                     skipExactDiskBoundary: requiresDiskBackedRestore,
                     preferredDiskBoundaries: originalInput
-                        .cacheStablePrefixTokenCounts)
+                        .cacheStablePrefixTokenCounts,
+                    chainId: parameters.cacheChainId)
                 switch result {
                 case .hit(
                     let matchedTokens, let remainingTokens, let detail, let blocks,
@@ -1989,6 +1999,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                         Self.logger.info(
                             "Cache \(detail.rawValue) hit: restored \(diskRestored) tokens from disk, prefilling \(remainingTokens.count) remaining"
                         )
+                    } else if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: cacheLookupTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "payload does not fit the runtime cache")
                     }
                 }
 
@@ -2000,6 +2015,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: detail.rawValue)
                 {
+                    if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: cacheLookupTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "restored offsets do not match the boundary")
+                    }
                     restored = false
                     retainedDiskRestore = false
                     self.cache = self.model.newCache(parameters: effectiveParameters)
@@ -2922,7 +2943,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             tokens: [Int],
             cache cacheToStore: [KVCache],
             kvBits diskKVBits: Int?,
-            kvMode diskKVMode: KVQuantizationMode
+            kvMode diskKVMode: KVQuantizationMode,
+            isStableBoundary: Bool = false,
+            isResumeBoundary: Bool = false
         ) {
             guard !tokens.isEmpty else { return }
             // Saving the cache duplicates it several times over (snapshot, host
@@ -2999,7 +3022,10 @@ public struct TokenIterator: TokenIteratorProtocol {
                 perLayerData: perLayerData,
                 ssmStates: ssmCapture,
                 cache: diskStoreCache,
-                mediaSalt: mediaSalt
+                mediaSalt: mediaSalt,
+                chainId: cacheInitParameters?.cacheChainId,
+                isStableRoot: isStableBoundary,
+                isResumeBoundary: isResumeBoundary
             )
         }
 
@@ -3113,13 +3139,17 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // `stripAt` routinely coincides with a `cachePrefixTokenCounts`
                     // entry.
                     if let strippedSnapshot = hybridStripSnapshot {
+                        // The stripped boundary is where a hybrid model's
+                        // next turn resumes (measured: every warm turn of
+                        // LFM2.5 landed here), so it is the row to keep.
                         store(
                             tokens: Array(promptTokenIds.prefix(stripAt)),
                             cache: strippedSnapshot,
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: strippedSnapshot,
-                                requested: kvMode))
+                                requested: kvMode),
+                            isResumeBoundary: true)
                     } else {
                         Self.logger.debug(
                             "TokenIterator: no stripped-boundary snapshot to store at \(stripAt, privacy: .public); prefill did not cross the boundary"
@@ -3211,7 +3241,12 @@ public struct TokenIterator: TokenIteratorProtocol {
                             kvBits: nil,
                             kvMode: selectivePromptBoundaryDiskKVMode(
                                 cache: boundarySnapshot,
-                                requested: kvMode))
+                                requested: kvMode),
+                            isStableBoundary: isStableBoundary,
+                            // A message boundary that is not the shared root
+                            // is what the next prompt of this chat (or an
+                            // edited one) starts with.
+                            isResumeBoundary: !isStableBoundary)
                     }
                 }
         }

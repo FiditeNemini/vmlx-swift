@@ -677,12 +677,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 result = coordinator.fetch(
                     tokens: cacheLookupTokenIds,
                     mediaSalt: mediaSalt,
-                    preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts
+                    preferredDiskBoundaries: originalInput.cacheStablePrefixTokenCounts,
+                    chainId: parameters.cacheChainId
                 )
             }
             switch result {
             case .hit(
-                let matchedTokens, let remainingTokens, _, let blocks,
+                let matchedTokens, let remainingTokens, let detail, let blocks,
                 let ssmStates, let diskArrays):
                 var restored = false
                 var retainedDiskRestore = false
@@ -702,6 +703,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     }
                 }
 
+                // The base cache is the one TokenIterator builds for this key
+                // (`newCache` over the same salted parameters; the head's
+                // cache is separate), so an entry that does not fit it fits
+                // neither, and is reported the same way.
                 if let diskArrays, !restored {
                     let diskRestored = restoreFromDiskArrays(
                                 diskArrays, into: &self.cache, requirePromptBoundary: true)
@@ -719,6 +724,11 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         }
                         MLX.eval(self.cache)
                         restored = true
+                    } else if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: cacheLookupTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "payload does not fit the runtime cache")
                     }
                 }
 
@@ -730,6 +740,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         self.cache, matchedTokens: matchedTokens,
                         restoredTokens: restoredTokenCount, detail: "native-mtp")
                 {
+                    if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: cacheLookupTokenIds, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "restored offsets do not match the boundary")
+                    }
                     restored = false
                     retainedDiskRestore = false
                     self.cache = model.newCache(parameters: effectiveParameters)
@@ -998,7 +1014,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 cachePrefixTokenCounts + [sharedPromptStripBoundary].compactMap { $0 }
             ))
 
-            func store(tokens: [Int], snapshot: [KVCache], label: String) {
+            func store(
+                tokens: [Int], snapshot: [KVCache], label: String, isStableRoot: Bool = false
+            ) {
                 guard !tokens.isEmpty else { return }
                 // Post-generation tail breakdown (VMLX_CACHE_FETCH_TRACE=1): live
                 // 2026-09-04 the whole 9.5–15 s "hang at the last letters" was
@@ -1080,7 +1098,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     perLayerData: perLayerData,
                     ssmStates: ssmCapture,
                     cache: diskStoreCache,
-                    mediaSalt: mediaSalt)
+                    mediaSalt: mediaSalt,
+                    chainId: cacheInitParameters.cacheChainId,
+                    isStableRoot: isStableRoot,
+                    isResumeBoundary: label == "history-boundary" || label == "gen-suffix-stripped")
             }
 
             if shouldPersistExactWarmupPrompt, !usesCanonicalHybridBoundary {
@@ -1123,7 +1144,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         store(
                             tokens: boundaryTokens,
                             snapshot: boundarySnapshot,
-                            label: "history-boundary")
+                            label: "history-boundary",
+                            isStableRoot: isStableBoundary)
                     }
                 }
 
