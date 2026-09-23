@@ -1530,6 +1530,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     private static let logger = Logger(subsystem: "vmlx", category: "TokenIterator")
 
     private static func compiledDecodeDenied(for model: any LanguageModel) -> Bool {
+        guard model.supportsWholeForwardCompilation else { return true }
         let typeName = String(describing: type(of: model)).lowercased()
         // DSV4 owns a composite SWA + CSA/HSA cache. Its stateless gate and
         // SwiGLU micrographs are already compiled inside the model, while the
@@ -1578,6 +1579,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     var state: LMOutput.State?
 
     var y: LMInput.Text
+    // `y` advances to the next prediction before next() returns. Retain the
+    // token actually forwarded into KV using the existing return-value sync.
+    private var lastForwardedTokenId: Int?
     var cache: [KVCache]
     var processor: LogitProcessor?
     let sampler: LogitSampler
@@ -2398,6 +2402,22 @@ public struct TokenIterator: TokenIteratorProtocol {
         let split = boundary - (promptTokenIds.count - size)
         guard split >= 0, split < size else { return nil }
 
+        // Keep a media payload with the complete placeholder span it belongs
+        // to. Stable system/history boundaries can precede that span; putting
+        // the payload on the text-only head loses it from the actual media
+        // prefill. A split inside the span cannot partition opaque tower inputs.
+        var mediaInHead = false
+        var mediaInTail = false
+        if input.hasMediaContent {
+            guard let mediaTokenIds = input.mediaTokenIds, !mediaTokenIds.isEmpty else { return nil }
+            let ids = input.text.tokenIds ?? input.text.tokens.reshaped(-1).asArray(Int.self)
+            guard ids.count == size else { return nil }
+            let media = Set(mediaTokenIds)
+            mediaInHead = ids[..<split].contains(where: media.contains)
+            mediaInTail = ids[split...].contains(where: media.contains)
+            guard mediaInHead != mediaInTail else { return nil }
+        }
+
         // The mask, when present, is per-token (`Qwen3VLProcessor` hands the
         // hybrids an all-ones `[1, T]`), so it slices exactly like the tokens.
         // Anything not token-aligned — a materialized `[1, 1, T, T]` attention
@@ -2420,9 +2440,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                     tokens: flat[..<split][.newAxis, 0...],
                     mask: flatMask.map { slice($0[..<split]) },
                     tokenIds: headTokenIds),
-                image: input.image,
-                video: input.video,
-                audio: input.audio,
+                image: mediaInHead ? input.image : nil,
+                video: mediaInHead ? input.video : nil,
+                audio: mediaInHead ? input.audio : nil,
                 mediaTokenIds: input.mediaTokenIds,
                 cacheScopeSalt: input.cacheScopeSalt,
                 cachePromptIntent: input.cachePromptIntent,
@@ -2433,6 +2453,10 @@ public struct TokenIterator: TokenIteratorProtocol {
                 tokens: flat[split...][.newAxis, 0...],
                 mask: flatMask.map { slice($0[split...]) },
                 tokenIds: tailTokenIds),
+            image: mediaInTail ? input.image : nil,
+            video: mediaInTail ? input.video : nil,
+            audio: mediaInTail ? input.audio : nil,
+            mediaTokenIds: input.mediaTokenIds,
             cacheScopeSalt: input.cacheScopeSalt,
             cachePromptIntent: input.cachePromptIntent,
             toolSchemas: input.toolSchemas)
@@ -2462,6 +2486,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        // A warm input contains only the suffix after the restored prefix.
+        // Snapshot keys and processor boundaries refer to the whole prompt.
+        let inputStart = promptTokenIds.count - input.text.tokens.size
         // Prefill to a reusable structural boundary first, copy the exact cache
         // state, then consume the tail. Both halves run through the model's real
         // prepare/forward path in order; this avoids a second full prefill after
@@ -2492,11 +2519,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             // The head we just prefilled ends exactly at a boundary the store
             // loop will ask for later. Keep it so that loop can use it instead
             // of replaying the prefix through the model.
-            var capturedHeadCount = 0
+            var capturedBoundary = inputStart
             if let head = capture.head {
-                capturedHeadCount = head.text.tokenIds?.count ?? head.text.tokens.size
-                if capturedHeadCount > 0 {
-                    stableBoundarySnapshots[capturedHeadCount] = snapshot
+                capturedBoundary += head.text.tokenIds?.count ?? head.text.tokens.size
+                if capturedBoundary > inputStart {
+                    stableBoundarySnapshots[capturedBoundary] = snapshot
                 }
             }
             // Keep going through the stable boundaries that sit AFTER this
@@ -2508,7 +2535,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             if try prepareCapturingStableBoundaries(
                 input: capture.tail,
                 windowSize: windowSize,
-                alreadyConsumed: capturedHeadCount,
+                alreadyConsumed: capturedBoundary,
                 promptTokensForProcessor: input.text.tokens)
             {
                 return
@@ -2519,7 +2546,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             return
         }
         if try prepareCapturingStableBoundaries(
-            input: input, windowSize: windowSize, alreadyConsumed: 0,
+            input: input, windowSize: windowSize, alreadyConsumed: inputStart,
             promptTokensForProcessor: input.text.tokens)
         {
             return
@@ -2571,7 +2598,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         var remaining = input
         for boundary in wanted {
             guard boundary > consumed,
-                let split = boundarySplit(of: remaining, at: boundary - consumed),
+                let split = boundarySplit(of: remaining, at: boundary),
                 let head = split.head
             else { continue }
             let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
@@ -2901,9 +2928,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             Memory.clearCache()
         }
 
-        return MLXPressGenerationProfile.time("decode.token_item_sync") {
+        let forwardedToken = MLXPressGenerationProfile.time("decode.token_item_sync") {
             previousY.tokens.item(Int.self)
         }
+        lastForwardedTokenId = forwardedToken
+        return forwardedToken
     }
 
     public mutating func storeCacheAfterGeneration(
@@ -3268,13 +3297,13 @@ public struct TokenIterator: TokenIteratorProtocol {
         // boundary-offset guard (correctly) refuses the store, silently
         // costing the post-answer boundary every turn (observed live:
         // "REFUSED offset/key mismatch tokens=3627 offsets=[3628]").
-        // Extend the key by the pending drained token instead.
+        // Extend the key by the forwarded stop token. `y` already holds the
+        // next prediction, which has never been forwarded and cannot label KV.
         let generatedBoundaryTokens = Self.generatedBoundaryTokensAligned(
             promptTokenIds: promptTokenIds,
             generatedTokenIds: generatedTokenIds,
             cacheOffsets: cache.map(\.offset),
-            pendingDrainedTokenId: y.tokens.size == 1
-                ? y.tokens.item(Int.self) : nil)
+            pendingDrainedTokenId: lastForwardedTokenId)
         guard let generatedBoundaryTokens else { return }
         // Whether the next prompt starts from this row depends on the
         // template; the cache learns that from the first hit on one.
