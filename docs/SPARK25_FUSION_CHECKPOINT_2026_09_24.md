@@ -22,6 +22,8 @@ The repeated same-binary long-prefill ABBA ran reference 2.636/2.456 s and fused
 
 The prefill-only 8a254032 native parsed row completed correctly at 75.1 tok/s even though the 44-token prompt and decode shapes took the helper reference path. Spotlight workers were active after copying app build directories; those owned copies were renamed `.noindex`. This is a potential confound, not an established root cause. The next revision returns the original MLP expression directly for short/decode input before evaluating `up(x)`, preserving graph construction and temporary lifetimes. Eight focused tests pass; full runtime/app proof must use that final revision.
 
+The final size guard uses `Int32.max`, matching `MLXFastKernel`'s signed grid conversion. The ninth focused test constructs a lazy broadcast with 2^31 elements and verifies reference fallback without evaluating or allocating the logical tensor. All nine focused tests pass. Earlier eight-test receipts remain historical.
+
 ## Remaining work, in order
 
 - [ ] Complete same-binary raw-submit token-delivery comparison; report median/p95/max as host delivery, not GPU kernel latency.

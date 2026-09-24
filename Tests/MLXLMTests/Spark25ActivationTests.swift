@@ -104,6 +104,15 @@ struct Spark25ActivationTests {
         #expect((referenceMap(inputs) .== actualMap(inputs)).all().item(Bool.self))
     }
 
+    @Test func signedMetalGridOverflowUsesLazyReferencePath() {
+        // A zero-stride broadcast creates the logical shape without allocating
+        // a multi-gigabyte buffer. Do not evaluate this diagnostic graph.
+        let input = broadcast(MLXArray(Float(1)).asType(.bfloat16), to: [128, 16_777_216])
+        let actual = Spark25Activation.geluMultiply(input, input)
+        #expect(actual.shape == input.shape)
+        #expect(actual.dtype == .bfloat16)
+    }
+
     @Test func emptyInputsPreserveShape() {
         let empty = zeros([0, 10240], dtype: .bfloat16)
         let actual = Spark25Activation.geluMultiply(empty, empty)

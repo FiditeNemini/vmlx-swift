@@ -22,7 +22,7 @@ enum Spark25Activation {
             guard isLargePrefillShape(gate),
                 !referenceOverride, usesMetalStream,
                 gate.dtype == .bfloat16, up.dtype == .bfloat16,
-                gate.shape == up.shape, gate.size > 0, gate.size <= Int(UInt32.max),
+                gate.shape == up.shape, gate.size > 0, gate.size <= Int(Int32.max),
                 vmlx_graph_array_is_tracer(gate.ctx.ctx) == 0,
                 vmlx_graph_array_is_tracer(up.ctx.ctx) == 0
             else { return gelu(gate) * up }
