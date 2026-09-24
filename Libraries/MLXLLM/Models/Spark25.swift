@@ -176,7 +176,9 @@ final class Spark25MLP: Module, UnaryLayer {
         _up.wrappedValue = Linear(c.hiddenSize, c.intermediateSize, bias: c.mlpBias)
         _down.wrappedValue = Linear(c.intermediateSize, c.hiddenSize, bias: c.mlpBias)
     }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { down(gelu(gate(x)) * up(x)) }
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        down(Spark25Activation.geluMultiply(gate(x), up(x)))
+    }
 }
 
 final class Spark25DecoderLayer: Module {
