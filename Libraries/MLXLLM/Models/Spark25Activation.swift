@@ -8,11 +8,15 @@ import MLXNN
 /// reference path. This does not change projection quantization or residuals.
 enum Spark25Activation {
     static func geluMultiply(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
-        guard Device.defaultDevice() == .gpu,
-            gate.dtype == .bfloat16, up.dtype == .bfloat16,
-            gate.shape == up.shape, gate.size > 0, gate.size <= Int(UInt32.max)
-        else { return gelu(gate) * up }
-        return differentiable([gate, up])[0]
+        #if canImport(Metal)
+            guard Device.defaultDevice() == .gpu,
+                gate.dtype == .bfloat16, up.dtype == .bfloat16,
+                gate.shape == up.shape, gate.size > 0, gate.size <= Int(UInt32.max)
+            else { return gelu(gate) * up }
+            return differentiable([gate, up])[0]
+        #else
+            return gelu(gate) * up
+        #endif
     }
 
     // Retain the original autodiff contract for LoRA/training callers. The
