@@ -502,7 +502,7 @@ let package = Package(
         ),
         .target(
             name: "MLXLLM",
-            dependencies: ["MLXLMCommon", "MLX", "MLXNN", "MLXOptimizers"],
+            dependencies: ["MLXLMCommon", "MLX", "MLXNN", "MLXOptimizers", "CmlxGraphShim"],
             path: "Libraries/MLXLLM",
             exclude: ["README.md", "Models/DSV4-PORT-STATUS.md"]
         ),
