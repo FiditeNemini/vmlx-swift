@@ -3479,6 +3479,19 @@ public actor BatchEngine {
                 )
             }
 
+            // Adjacent rotating boundaries share the same completed prefill
+            // chunks. Retain one sealed seed for this finalization only; each
+            // consumer gets its own evaluated copy before advancing the tail.
+            var boundaryReplaySeed: (tokens: [Int], cache: [KVCache])?
+            let canReuseBoundaryReplay =
+                !slot.originalInput.hasMediaContent
+                && !slot.originalInput.requiresPostPrepareCacheKey
+                && slot.originalInput.text.mask == nil
+                && storageTopologySnapshot.contains { $0 is RotatingKVCache }
+                && storageTopologySnapshot.allSatisfy {
+                    $0 is RotatingKVCache || $0 is KVCacheSimple
+                }
+
             func boundarySnapshot(tokens: [Int], forceRederive: Bool = false) -> [KVCache]? {
                 guard !tokens.isEmpty,
                     tokens.count <= storageSnapshotTokenCount,
@@ -3565,8 +3578,21 @@ public actor BatchEngine {
                 }
 
                 do {
-                    let boundaryTokens = MLXArray(tokens.map { Int32($0) })
-                        .reshaped(1, tokens.count)
+                    let traceRebuild = ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1"
+                    let rebuildStart = traceRebuild ? DispatchTime.now().uptimeNanoseconds : 0
+                    let chunkSize = max(1, slot.prefillStepSize)
+                    let expectedSeedCount = ((tokens.count - 1) / chunkSize) * chunkSize
+                    let reusableSeed = boundaryReplaySeed.flatMap { seed in
+                        canReuseBoundaryReplay
+                            && seed.tokens.count == expectedSeedCount
+                            && tokens.starts(with: seed.tokens)
+                            && CacheStoreBudget.canStore(seed.cache) ? seed : nil
+                    }
+                    if reusableSeed == nil { boundaryReplaySeed = nil }
+                    let reusedCount = reusableSeed?.tokens.count ?? 0
+                    let remainingTokens = Array(tokens.dropFirst(reusedCount))
+                    let boundaryTokens = MLXArray(remainingTokens.map { Int32($0) })
+                        .reshaped(1, remainingTokens.count)
                     let boundaryInput = LMInput(
                         text: LMInput.Text(tokens: boundaryTokens),
                         image: slot.originalInput.image,
@@ -3574,13 +3600,39 @@ public actor BatchEngine {
                         audio: slot.originalInput.audio,
                         mediaTokenIds: slot.originalInput.mediaTokenIds,
                         cacheScopeSalt: slot.originalInput.cacheScopeSalt)
-                    let cache = context.model.newCache(parameters: slot.parameters)
+                    let cache = reusableSeed.map {
+                        // Full chunked prefill clears freed allocator blocks
+                        // between chunks. Reuse skips those chunks, so preserve
+                        // that cleanup before allocating the independent tail.
+                        MLX.Memory.clearCache()
+                        return makePromptBoundaryCacheSnapshot(from: $0.cache)
+                    } ?? context.model.newCache(parameters: slot.parameters)
                     switch try context.model.prepare(
                         boundaryInput,
                         cache: cache,
                         windowSize: slot.prefillStepSize)
                     {
                     case .tokens(let remaining):
+                        // Require an unchanged token suffix and exact offsets,
+                        // not merely a cache-shaped object from custom prepare.
+                        let consumed = tokens.count - remaining.tokens.size
+                        if reusableSeed == nil,
+                           canReuseBoundaryReplay,
+                           consumed > 0, consumed == expectedSeedCount,
+                           remaining.mask == nil,
+                           remaining.tokens.reshaped(-1).asArray(Int32.self)
+                            == tokens.suffix(remaining.tokens.size).map(Int32.init),
+                           cache.count == storageTopologySnapshot.count,
+                           cache.allSatisfy({
+                               ($0 is RotatingKVCache || $0 is KVCacheSimple)
+                                   && $0.offset == consumed
+                           }),
+                           CacheStoreBudget.canStore(cache)
+                        {
+                            boundaryReplaySeed = (
+                                Array(tokens.prefix(consumed)),
+                                makePromptBoundaryCacheSnapshot(from: cache))
+                        }
                         // Match the main prefill path's batch-first shape.
                         // ZAYA CCA reads B/T from activation rank and traps
                         // on a 1D token tensor during coordinator-only
@@ -3593,6 +3645,11 @@ public actor BatchEngine {
                         break
                     }
                     MLX.eval(cache)
+                    if traceRebuild {
+                        let milliseconds = Double(DispatchTime.now().uptimeNanoseconds - rebuildStart) / 1_000_000
+                        FileHandle.standardError.write(Data(
+                            "[vmlx][cache/boundary-rederive] tokens=\(tokens.count) reused=\(reusedCount) ms=\(String(format: "%.3f", milliseconds))\n".utf8))
+                    }
                     return cache
                 } catch {
                     if ProcessInfo.processInfo.environment["VMLX_SSM_STORE_TRACE"] != nil {
