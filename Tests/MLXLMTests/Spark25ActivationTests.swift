@@ -77,6 +77,33 @@ struct Spark25ActivationTests {
         #expect((compiled(g, u) .== gelu(g) * u).all().item(Bool.self))
     }
 
+    @Test func scopedStreamsRespectTheirActualDevice() {
+        Device.withDefaultDevice(.gpu) {
+            for device in [Device.cpu, Device.gpu] {
+                Stream.withNewDefaultStream(device: device) {
+                    expectSame(
+                        MLXArray([Float(-2), 0, 3]).asType(.bfloat16),
+                        MLXArray([Float(1), -1, 2]).asType(.bfloat16))
+                }
+            }
+        }
+    }
+
+    @Test func forwardDerivativesAndVectorizationUseReferenceTransforms() {
+        let g = MLXArray([Float(-2), -0.25, 0, 0.25, 3]).asType(.bfloat16)
+        let u = MLXArray([Float(1), -1, 2, 0.5, 3]).asType(.bfloat16)
+        let tangents = [ones(g.shape, dtype: .bfloat16), ones(u.shape, dtype: .bfloat16)]
+        let reference = jvp({ [gelu($0[0]) * $0[1]] }, primals: [g, u], tangents: tangents)
+        let actual = jvp(
+            { [Spark25Activation.geluMultiply($0[0], $0[1])] }, primals: [g, u], tangents: tangents)
+        eval(reference.1, actual.1)
+        #expect((reference.1[0] .== actual.1[0]).all().item(Bool.self))
+        let inputs = stacked([g, g * 2])
+        let referenceMap = vmap { gelu($0) * u }
+        let actualMap = vmap { Spark25Activation.geluMultiply($0, u) }
+        #expect((referenceMap(inputs) .== actualMap(inputs)).all().item(Bool.self))
+    }
+
     @Test func emptyInputsPreserveShape() {
         let empty = zeros([0, 10240], dtype: .bfloat16)
         let actual = Spark25Activation.geluMultiply(empty, empty)

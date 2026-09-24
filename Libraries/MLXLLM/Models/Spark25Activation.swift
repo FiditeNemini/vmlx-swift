@@ -1,5 +1,8 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
+import Cmlx
+import CmlxGraphShim
+import Foundation
 import MLX
 import MLXNN
 
@@ -9,32 +12,40 @@ import MLXNN
 enum Spark25Activation {
     static func geluMultiply(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
         #if canImport(Metal)
-            guard Device.defaultDevice() == .gpu,
+            guard !referenceOverride, usesMetalStream,
                 gate.dtype == .bfloat16, up.dtype == .bfloat16,
-                gate.shape == up.shape, gate.size > 0, gate.size <= Int(UInt32.max)
+                gate.shape == up.shape, gate.size > 0, gate.size <= Int(UInt32.max),
+                vmlx_graph_array_is_tracer(gate.ctx.ctx) == 0,
+                vmlx_graph_array_is_tracer(up.ctx.ctx) == 0
             else { return gelu(gate) * up }
-            return differentiable([gate, up])[0]
+            return kernel(
+                [gate, up], template: [("T", DType.bfloat16)],
+                grid: (gate.size, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [gate.shape], outputDTypes: [.bfloat16]
+            )[0]
         #else
             return gelu(gate) * up
         #endif
     }
 
-    // Retain the original autodiff contract for LoRA/training callers. The
-    // backward graph uses MLX's reference expression, not a hand-written
-    // derivative with different BF16 rounding.
-    private nonisolated(unsafe) static let differentiable = CustomFunction {
-        Forward { inputs in
-            let gate = inputs[0]
-            return kernel(
-                inputs, template: [("T", DType.bfloat16)],
-                grid: (gate.size, 1, 1), threadGroup: (256, 1, 1),
-                outputShapes: [gate.shape], outputDTypes: [.bfloat16]
-            )
-        }
-        VJP { primals, cotangents in
-            vjp({ [gelu($0[0]) * $0[1]] }, primals: primals, cotangents: cotangents).1
-        }
+    // Diagnostic A/B switch: the reference uses the same dtype, sampler and
+    // model parameters. Read once, before the first forward.
+    private static let referenceOverride =
+        ProcessInfo.processInfo.environment["VMLX_SPARK_GELU_REFERENCE"] == "1"
+
+    private static var usesMetalStream: Bool {
+        let stream = StreamOrDevice.default
+        if stream == .gpu { return true }
+        var device = mlx_device_new()
+        defer { mlx_device_free(device) }
+        var type = MLX_CPU
+        return mlx_stream_get_device(&device, stream.ctx) == 0
+            && mlx_device_get_type(&type, device) == 0 && type == MLX_GPU
     }
+
+    // Traced transformations use the original expression. In particular, do
+    // not put CustomTransforms/StopGradient nodes on ordinary inference:
+    // their stream dependencies serialize otherwise asynchronous decode.
 
     private static let kernel = MLXFast.metalKernel(
         name: "spark25_exact_bf16_gelu_multiply",
