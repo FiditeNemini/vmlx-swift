@@ -177,7 +177,12 @@ final class Spark25MLP: Module, UnaryLayer {
         _down.wrappedValue = Linear(c.intermediateSize, c.hiddenSize, bias: c.mlpBias)
     }
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(Spark25Activation.geluMultiply(gate(x), up(x)))
+        // Preserve the original graph construction and temporary lifetimes
+        // outside the measured prefill regime.
+        guard Spark25Activation.isLargePrefillShape(x) else {
+            return down(gelu(gate(x)) * up(x))
+        }
+        return down(Spark25Activation.geluMultiply(gate(x), up(x)))
     }
 }
 
