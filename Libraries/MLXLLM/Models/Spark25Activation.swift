@@ -6,13 +6,17 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Exact erf GELU followed by multiplication, with the same BF16 rounding at
+/// Prefill erf GELU followed by multiplication, with the same BF16 rounding at
 /// every intermediate as MLXNN.gelu(gate) * up. Other dtypes/devices retain the
 /// reference path. This does not change projection quantization or residuals.
 enum Spark25Activation {
     static func geluMultiply(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
         #if canImport(Metal)
-            guard !referenceOverride, usesMetalStream,
+            // Keep single-token and short-chunk execution on the reference
+            // path: full-model parsed decode regressed despite faster isolated
+            // MLP timings. Fusion is qualified separately for large prefill.
+            guard gate.ndim >= 2, gate.dim(-2) >= 128,
+                !referenceOverride, usesMetalStream,
                 gate.dtype == .bfloat16, up.dtype == .bfloat16,
                 gate.shape == up.shape, gate.size > 0, gate.size <= Int(UInt32.max),
                 vmlx_graph_array_is_tracer(gate.ctx.ctx) == 0,

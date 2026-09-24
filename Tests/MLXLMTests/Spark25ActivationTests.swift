@@ -24,7 +24,7 @@ struct Spark25ActivationTests {
     }
 
     @Test func everyBF16EncodingPreservesReferenceRounding() {
-        let gate = MLXArray((0 ..< 65536).map { UInt16($0) }).view(dtype: .bfloat16)
+        let gate = MLXArray((0 ..< 65536).map { UInt16($0) }).view(dtype: .bfloat16).reshaped(128, 512)
         for factor: Float in [1, -3, 0, 0.125] {
             expectSame(gate, full(gate.shape, values: factor).asType(.bfloat16))
         }
@@ -32,22 +32,22 @@ struct Spark25ActivationTests {
 
     @Test func raptorShapesAndNoncontiguousInputs() {
         MLXRandom.seed(7)
-        for rows in [1, 3, 128, 512] {
+        for rows in [1, 3, 127, 128, 129, 512] {
             let gate = MLXRandom.normal([rows, 10240]).asType(.bfloat16)
             let up = MLXRandom.normal([rows, 10240]).asType(.bfloat16)
             expectSame(gate, up)
             expectSame(gate.transposed(), up.transposed())
         }
-        // A non-threadgroup-aligned length must remain in bounds.
+        // Exercise a fused shape whose element count is not threadgroup aligned.
         expectSame(
-            MLXArray([Float(-2), 0, 3]).asType(.bfloat16),
-            MLXArray([Float(1), -1, 2]).asType(.bfloat16))
+            MLXRandom.normal([129, 3]).asType(.bfloat16),
+            MLXRandom.normal([129, 3]).asType(.bfloat16))
     }
 
     @Test func otherDtypesAndBroadcastUseReferencePath() {
         for dtype: DType in [.float16, .float32, .bfloat16] {
-            let gate = MLXArray([Float(-2), 0, 3]).asType(dtype)
-            expectSame(gate, MLXArray([Float(1), -1, 2]).asType(dtype))
+            let gate = tiled(MLXArray([Float(-2), 0, 3]), repetitions: [128, 1]).asType(dtype)
+            expectSame(gate, tiled(MLXArray([Float(1), -1, 2]), repetitions: [128, 1]).asType(dtype))
             expectSame(gate, MLXArray(Float(2)).asType(dtype))
         }
     }
@@ -55,14 +55,14 @@ struct Spark25ActivationTests {
     @Test func cpuUsesReferencePath() {
         Device.withDefaultDevice(.cpu) {
             expectSame(
-                MLXArray([Float(-2), 0, 3]).asType(.bfloat16),
-                MLXArray([Float(1), -1, 2]).asType(.bfloat16))
+                tiled(MLXArray([Float(-2), 0, 3]), repetitions: [128, 1]).asType(.bfloat16),
+                tiled(MLXArray([Float(1), -1, 2]), repetitions: [128, 1]).asType(.bfloat16))
         }
     }
 
     @Test func compiledAndBackwardPathsMatchReference() {
-        let g = MLXArray([Float(-2), -0.25, 0, 0.25, 3]).asType(.bfloat16)
-        let u = MLXArray([Float(1), -1, 2, 0.5, 3]).asType(.bfloat16)
+        let g = tiled(MLXArray([Float(-2), -0.25, 0, 0.25, 3]), repetitions: [128, 1]).asType(.bfloat16)
+        let u = tiled(MLXArray([Float(1), -1, 2, 0.5, 3]), repetitions: [128, 1]).asType(.bfloat16)
         let cotangent = ones(g.shape, dtype: .bfloat16)
         let reference = vjp({ [gelu($0[0]) * $0[1]] }, primals: [g, u], cotangents: [cotangent])
         let actual = vjp(
@@ -82,16 +82,16 @@ struct Spark25ActivationTests {
             for device in [Device.cpu, Device.gpu] {
                 Stream.withNewDefaultStream(device: device) {
                     expectSame(
-                        MLXArray([Float(-2), 0, 3]).asType(.bfloat16),
-                        MLXArray([Float(1), -1, 2]).asType(.bfloat16))
+                        tiled(MLXArray([Float(-2), 0, 3]), repetitions: [128, 1]).asType(.bfloat16),
+                        tiled(MLXArray([Float(1), -1, 2]), repetitions: [128, 1]).asType(.bfloat16))
                 }
             }
         }
     }
 
     @Test func forwardDerivativesAndVectorizationUseReferenceTransforms() {
-        let g = MLXArray([Float(-2), -0.25, 0, 0.25, 3]).asType(.bfloat16)
-        let u = MLXArray([Float(1), -1, 2, 0.5, 3]).asType(.bfloat16)
+        let g = tiled(MLXArray([Float(-2), -0.25, 0, 0.25, 3]), repetitions: [128, 1]).asType(.bfloat16)
+        let u = tiled(MLXArray([Float(1), -1, 2, 0.5, 3]), repetitions: [128, 1]).asType(.bfloat16)
         let tangents = [ones(g.shape, dtype: .bfloat16), ones(u.shape, dtype: .bfloat16)]
         let reference = jvp({ [gelu($0[0]) * $0[1]] }, primals: [g, u], tangents: tangents)
         let actual = jvp(
