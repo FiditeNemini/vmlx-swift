@@ -43,7 +43,7 @@ architecture. Configuration or location validation is not model execution suppor
 planner summaries. The bundle root may be a user symlink; it is resolved and opened
 once, then index/shard files are opened relative to that directory descriptor with
 no-follow semantics. Each must be a regular file. Prefix/header reads have separate
-per-file and aggregate metadata caps; tensor payloads are never read. Descriptor
+per-file JSON and aggregate metadata caps (including shard prefixes); tensor payloads are never read. Descriptor
 identity includes device, inode, file size, modification time and change time and
 must remain unchanged across each read. Exact metadata bytes are retained for
 provenance hashing. Typed descriptor decoding rejects nonintegral dimensions and
@@ -64,3 +64,10 @@ and architecture descriptor construction are still separate missing adapters.
 GLM dimensions use `hidden_size`, `moe_intermediate_size`, `n_routed_experts`, and
 authoritative `mlp_layer_types`. Naive uses the same projection widths with its
 own `moe_layer_freq` schedule; this does not supply its missing attention runtime.
+
+The first adapter deliberately rejects symlinked shard/index files, including
+legitimate Hugging Face snapshot links to cached blobs. Direct-file bundles and
+symlinked bundle roots are the currently supported storage subset; this is not a
+general Hugging Face loader. Before factory integration, legitimate blob links
+need an audited resolution policy tied to retained descriptor identities rather
+than treating symlink layout as invalid model format.
