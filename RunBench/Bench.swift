@@ -3111,14 +3111,12 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             count: prefixRepeat)
         : ""
     let recallPhrase = env["BENCH_GROWING_RECALL_PHRASE"] ?? "vmlx-cache-green"
-    // `BENCH_GROWING_THINK=1` runs the same conversation with reasoning ON and
-    // replays turn 1 the way a host does — visible text only, think block
-    // stripped. That combination is the only one that makes the post-answer
-    // boundary stop being a prefix of the next prompt, so it is the only shape
-    // in which the turn-start boundary can be shown to matter. With reasoning
-    // off (the default) turn 1 emits no think content, history round-trips
-    // exactly, and both boundaries stay valid.
-    let enableThinking = (env["BENCH_GROWING_THINK"] ?? "0") == "1"
+    // Preserve the bundle template's thinking default unless this diagnostic
+    // explicitly requests an ON/OFF comparison.
+    let thinkingContext: [String: any Sendable]? = env["BENCH_GROWING_THINK"].map {
+        ["enable_thinking": $0 == "1"]
+    }
+    print("Thinking: \(env["BENCH_GROWING_THINK"].map { $0 == "1" ? "explicit-on" : "explicit-off" } ?? "template-default")")
     let firstTurnPrompt = longPrefix
         + "Reply with exactly this phrase and nothing else: \(recallPhrase)"
     let messages: [[String: any Sendable]] = [
@@ -3127,13 +3125,13 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let promptTokens = try context.tokenizer.applyChatTemplate(
         messages: messages,
         tools: nil,
-        additionalContext: ["enable_thinking": enableThinking])
+        additionalContext: thinkingContext)
     let historyBoundaryTokens = try? (
         context.tokenizer as? GenerationPromptControllableTokenizer
     )?.applyChatTemplate(
         messages: messages,
         tools: nil,
-        additionalContext: ["enable_thinking": enableThinking],
+        additionalContext: thinkingContext,
         addGenerationPrompt: false)
     // `BENCH_GROWING_NO_HISTORY_BOUNDARY=1` models a caller that does NOT hand
     // the runtime a turn-start boundary. Osaurus always supplies one, so the
@@ -3155,7 +3153,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         .reshaped(1, promptTokens.count)
     let turn1 = LMInput(
         text: LMInput.Text(tokens: promptArray),
-        cacheScopeSalt: cacheScopeSalt(from: ["enable_thinking": enableThinking]),
+        cacheScopeSalt: cacheScopeSalt(from: thinkingContext),
         cachePrefixTokenCounts: cachePrefixTokenCounts,
         cacheStablePrefixTokenCounts: cachePrefixTokenCounts)
     print("  Cache history-boundary counts: \(cachePrefixTokenCounts)")
@@ -3354,7 +3352,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let turn2Tokens = try context.tokenizer.applyChatTemplate(
         messages: turn2Messages,
         tools: nil,
-        additionalContext: ["enable_thinking": enableThinking])
+        additionalContext: thinkingContext)
     let turn2RenderedTail = context.tokenizer.decode(
         tokenIds: Array(turn2Tokens.suffix(160)),
         skipSpecialTokens: false)
