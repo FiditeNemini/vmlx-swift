@@ -20,6 +20,7 @@ enum JANGHHeaderAdapter {
     }
 
     struct Snapshot: Sendable {
+        let indexName: String
         let weightMap: [String: String]
         let shards: [String: JANGHTensorIndexPlan.ShardHeader]
         let identities: [String: FileIdentity]
@@ -112,11 +113,11 @@ enum JANGHHeaderAdapter {
             identities[name] = before
             headers[name] = data
         }
-        return Snapshot(weightMap: map, shards: summaries, identities: identities,
+        return Snapshot(indexName: indexName, weightMap: map, shards: summaries, identities: identities,
                         indexIdentity: indexIdentity, indexData: indexData, headerData: headers)
     }
 
-    private static func openRegular(rootDescriptor: Int32, name: String) throws -> FileHandle {
+    static func openRegular(rootDescriptor: Int32, name: String) throws -> FileHandle {
         guard !name.isEmpty, name != ".", name != "..", !name.contains("/"),
             !name.contains("\\"), !name.contains("\0")
         else { throw Failure.invalid("unsafe JANGH metadata filename") }
@@ -132,7 +133,7 @@ enum JANGHHeaderAdapter {
         }
     }
 
-    private static func identity(_ file: FileHandle) throws -> FileIdentity {
+    static func identity(_ file: FileHandle) throws -> FileIdentity {
         var value = stat()
         guard fstat(file.fileDescriptor, &value) == 0,
             (value.st_mode & S_IFMT) == S_IFREG, value.st_size >= 0,
