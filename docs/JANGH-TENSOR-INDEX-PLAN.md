@@ -36,3 +36,31 @@ canonical names; construct mapped custom modules without dense placeholders or
 repacking; establish prefill and decode precision contracts; validate real model
 memory, cache, multi-turn behavior and performance. Naive requires its own model
 architecture. Configuration or location validation is not model execution support.
+
+## File-backed metadata adapter (source prepared)
+
+`JANGHHeaderAdapter` reads the actual index and length-prefixed shard headers into
+planner summaries. The bundle root may be a user symlink; it is resolved and opened
+once, then index/shard files are opened relative to that directory descriptor with
+no-follow semantics. Each must be a regular file. Prefix/header reads have separate
+per-file and aggregate metadata caps; tensor payloads are never read. Descriptor
+identity includes device, inode, file size, modification time and change time and
+must remain unchanged across each read. Exact metadata bytes are retained for
+provenance hashing. Typed descriptor decoding rejects nonintegral dimensions and
+malformed offsets; a bounded scan rejects duplicate JSON keys, including escaped
+aliases, before dictionary-derived metadata can silently discard declarations.
+
+This adapter and its five file-fixture tests are newly authored and have not been
+compiled or executed. Earlier planner evidence does not cover this adapter.
+Tests prepare ordinary files, duplicate/escaped keys, malformed dimensions,
+metadata size bounds, missing files, path traversal, forbidden file symlinks,
+allowed bundle-root symlinks, and atomic file replacement identities.
+
+A header snapshot is not a mapping lease. The future bank owner must preserve open
+file identity through mapping or revalidate immediately when opening the mapped
+bank; path identity alone is insufficient. Ordinary tensor semantic validation
+remains the generic loader's responsibility. Config/sidecar alias reconciliation
+and architecture descriptor construction are still separate missing adapters.
+GLM dimensions use `hidden_size`, `moe_intermediate_size`, `n_routed_experts`, and
+authoritative `mlp_layer_types`. Naive uses the same projection widths with its
+own `moe_layer_freq` schedule; this does not supply its missing attention runtime.
