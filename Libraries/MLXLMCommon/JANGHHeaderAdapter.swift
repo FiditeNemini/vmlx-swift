@@ -166,7 +166,7 @@ enum JANGHHeaderAdapter {
     /// duplicate keys (including escaped spellings), which dictionary decoding
     /// would silently collapse, and bounds nesting before walking descriptors.
     @discardableResult
-    private static func validateJSON(_ data: Data) throws -> Any {
+    static func validateJSON(_ data: Data) throws -> Any {
         let result = try JSONSerialization.jsonObject(with: data)
         struct Frame { var keys: Set<String>?; var expectsKey: Bool }
         var stack: [Frame] = []
