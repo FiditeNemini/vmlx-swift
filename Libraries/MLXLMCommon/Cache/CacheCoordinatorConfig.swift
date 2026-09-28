@@ -65,7 +65,8 @@ public struct CacheCoordinatorConfig: Sendable {
     public var modelKey: String?
 
     /// Preserve native floating attention storage on paged/disk restore.
-    /// ModelContainer enables this for the Hadamard attention policy. The
+    /// ModelContainer enables this for model-owned native KV dtype identities
+    /// and the Hadamard attention policy. The
     /// default retains the legacy FP16-to-BF16 compatibility conversion.
     public var preserveStandardKVStorageDType: Bool
 

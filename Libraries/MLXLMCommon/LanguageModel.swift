@@ -463,6 +463,11 @@ public protocol LanguageModel: Module {
     /// casts and must not receive the loader's blanket BF16 materialization.
     var preservesCheckpointParameterDTypes: Bool { get }
 
+    /// Versioned cache namespace for models whose floating KV storage must
+    /// survive disk/paged restore without the legacy FP16-to-BF16 conversion.
+    /// This preserves the stored dtype, not a forced activation precision.
+    var cacheStorageDTypeIdentity: String? { get }
+
     /// Whether the entire forward can be traced by the generic MLX compiler.
     /// Host routing or file-backed row selection may require eager scheduling
     /// even when individual device kernels support compilation.
@@ -528,6 +533,7 @@ public protocol LanguageModel: Module {
 
 extension LanguageModel {
     public var preservesCheckpointParameterDTypes: Bool { false }
+    public var cacheStorageDTypeIdentity: String? { nil }
     public var supportsWholeForwardCompilation: Bool { true }
 
     /// Most standard-attention and wrapped recurrent-cache architectures use

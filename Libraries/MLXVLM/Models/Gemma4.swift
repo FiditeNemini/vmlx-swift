@@ -1161,6 +1161,8 @@ func gemma4MaskedScatter(
 public class Gemma4: Module, VLMModel, KVCacheDimensionProvider, ModalityBearing,
     ModelComponentMapping
 {
+    public var cacheStorageDTypeIdentity: String? { "gemma4-native-kv-dtype-v1" }
+
     @ModuleInfo(key: "vision_tower") private var visionTower: VisionTower?
     @ModuleInfo(key: "vision_embedder") private var unifiedVisionEmbedder: UnifiedVisionEmbedder?
     @ModuleInfo(key: "audio_tower") private var audioTower: Gemma4AudioTower?

@@ -511,7 +511,12 @@ public final class ModelContainer: Sendable {
     }
 
     public init(context: consuming ModelContext) {
-        self.attentionCacheKeyComponent = JangHadamardAttention.cacheKeyComponent(model: context.model)
+        let cachePolicies = [
+            context.model.cacheStorageDTypeIdentity,
+            JangHadamardAttention.cacheKeyComponent(model: context.model),
+        ].compactMap { $0 }
+        self.attentionCacheKeyComponent =
+            cachePolicies.isEmpty ? nil : cachePolicies.joined(separator: "|")
         self.context = .init(context)
     }
 

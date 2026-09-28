@@ -829,6 +829,8 @@ public class Gemma4Model: Module {
 
 public class Gemma4TextModel: Module, LLMModel {
 
+    public var cacheStorageDTypeIdentity: String? { "gemma4-native-kv-dtype-v1" }
+
     @ModuleInfo public var model: Gemma4Model
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
