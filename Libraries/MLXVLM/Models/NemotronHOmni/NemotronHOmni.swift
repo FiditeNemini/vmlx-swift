@@ -976,6 +976,17 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         let promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
+        // These messages already contain the final image placeholder
+        // spans. Preserve exact template boundaries for recurrent cache reuse.
+        // Video EVS changes token positions in model.prepare, so its boundaries
+        // must continue to come from the post-prepare cache-key path.
+        // Audio remains outside this image-cache validation lane.
+        let cacheBoundaries = processedVideo == nil && processedAudio == nil
+            ? canonicalChatCacheBoundaries(
+                tokenizer: tokenizer, messages: messages, tools: input.tools,
+                additionalContext: input.additionalContext, promptTokens: promptTokens,
+                staticSystemPrefix: input.cacheStableSystemPrefix)
+            : CanonicalChatCacheBoundaries(all: [], stable: [])
         let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
         let mask = ones(like: promptArray).asType(.int8)
 
@@ -987,7 +998,9 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             mediaTokenIds: media.isEmpty
                 ? nil
                 : [Self.imageContextTokenId, Self.soundContextTokenId],
-            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            cachePrefixTokenCounts: cacheBoundaries.all,
+            cacheStablePrefixTokenCounts: cacheBoundaries.stable)
     }
 
     private static func textOnlyMessages(from input: UserInput) -> [Message] {
