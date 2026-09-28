@@ -36,7 +36,7 @@ final class JANGHQuantizationIntegrationTests: XCTestCase {
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: split.ordinaryConfiguration)
         let plan = try XCTUnwrap(base.perLayerQuantization)
         for role in ["gate_proj", "up_proj", "down_proj"] {
-            for wrapper in ["", "model.", "language_model.model."] {
+            for wrapper in ["", "model.", "language_model.", "language_model.model."] {
                 XCTAssertNil(plan.quantization(layer: wrapper + "layers.0.mlp.switch_mlp." + role))
             }
         }
