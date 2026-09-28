@@ -902,8 +902,11 @@ enum VLBench {
             return (stats.diskStats?.hits ?? 0) + (stats.pagedStats?.cacheHits ?? 0)
         }
         func probe(_ input: LMInput, expectHit: Bool, label: String) throws {
-            let tokens = input.text.tokens.reshaped(-1).asArray(Int.self)
+            let rawTokens = input.text.tokens.reshaped(-1).asArray(Int.self)
             let salt = computeCacheSalt(for: input, parameters: params)
+            let tokens = coordinator.resolvePostPrepareCacheKeyAlias(
+                rawTokens: rawTokens, mediaSalt: salt) ?? rawTokens
+            print("MEDIA_KEY \(label) raw=\(rawTokens.count) effective=\(tokens.count)")
             guard input.hasMediaContent, salt != nil else {
                 throw NSError(domain: "MediaCacheProof", code: 2,
                     userInfo: [NSLocalizedDescriptionKey: "Missing media payload or cache salt"])
@@ -956,7 +959,7 @@ enum VLBench {
                 throw NSError(domain: "MediaCacheProof", code: 5,
                     userInfo: [NSLocalizedDescriptionKey: "Missing completion telemetry"])
             }
-            print("MEDIA_COMPLETION \(label) stop=\(info.stopReason) tokens=\(info.generationTokenCount) tokps=\(info.tokensPerSecond) footprintMiB=\(currentPhysFootprintMiB()) unclosed=\(info.unclosedReasoning)")
+            print("MEDIA_COMPLETION \(label) stop=\(info.stopReason) tokens=\(info.generationTokenCount) tokps=\(info.tokensPerSecond) promptSeconds=\(info.promptTime) footprintMiB=\(currentPhysFootprintMiB()) unclosed=\(info.unclosedReasoning)")
             guard info.stopReason == .stop, !info.unclosedReasoning,
                   info.tokensPerSecond > 0, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !requireHit || hitDelta > 0 else {
