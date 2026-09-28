@@ -2119,8 +2119,10 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
     print("\n=== BatchEngine B=2 concurrent (iter 33) ===")
     print("Loading with real HuggingFace tokenizer...")
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let loaded = try await MLXLMCommon.loadModel(
+        from: modelDir, using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .osaurusProduction)
+    let context = loaded.0
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
 
