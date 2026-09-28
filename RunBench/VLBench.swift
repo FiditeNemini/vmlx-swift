@@ -22,6 +22,19 @@ import MLXVLM
 /// 7. Reports decode tok/s + first decoded text per turn
 enum VLBench {
 
+    private static func bundleParameters(context: ModelContext, maxTokens: Int) -> GenerateParameters {
+        let seed = ProcessInfo.processInfo.environment["BENCH_VL_SEED"].flatMap(UInt64.init)
+        var parameters = GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: GenerateParameters(maxTokens: maxTokens, randomSeed: seed, prefillStepSize: 512))
+        parameters.maxTokens = maxTokens
+        parameters.randomSeed = seed
+        print("Sampling: source=bundle-defaults temperature=\(parameters.temperature) " +
+              "topP=\(parameters.topP) topK=\(parameters.topK) " +
+              "repetitionPenalty=\(String(describing: parameters.repetitionPenalty)) thinking=template-default")
+        return parameters
+    }
+
     /// Load through the same mmap-backed policy Osaurus uses in production.
     /// The plain `loadModel(from:using:)` overload bypasses that policy and
     /// copies safetensors into anonymous storage, which makes VL memory gates
@@ -111,9 +124,7 @@ enum VLBench {
             let label = compileOn ? "compile ON" : "compile OFF"
             print("\n[\(label)] BatchEngine VL 2-turn chat")
 
-            var params = GenerateParameters(
-                maxTokens: maxNewTokens, temperature: 0,
-                prefillStepSize: 512)
+            var params = bundleParameters(context: context, maxTokens: maxNewTokens)
             params.enableCompiledBatchDecode = compileOn
 
             let engine = BatchEngine(context: ctx, maxBatchSize: 1)
@@ -167,8 +178,7 @@ enum VLBench {
         print("  \(label) [\(parameters.enableCompiledBatchDecode ? "compile" : "uncomp")]:")
         let t0 = CFAbsoluteTimeGetCurrent()
 
-        var userInput = UserInput(prompt: prompt, images: [.ciImage(image)])
-        userInput.additionalContext = ["enable_thinking": false]
+        let userInput = UserInput(prompt: prompt, images: [.ciImage(image)])
         let lmInput = try await context.processor.prepare(input: userInput)
         if (ProcessInfo.processInfo.environment["BENCH_VL_DEBUG_PROMPT"] ?? "0") == "1" {
             let ids = lmInput.text.tokenIds ?? []
@@ -199,6 +209,8 @@ enum VLBench {
         let stream = await engine.generate(input: sendable, parameters: parameters)
 
         var text = ""
+        var reasoning = ""
+        var unclosedReasoning = false
         var ttft: Double?
         var chunkCount = 0
         var generationTokens = 0
@@ -222,7 +234,10 @@ enum VLBench {
                 promptTokensPerSecond = info.promptTokensPerSecond
                 decodeTokensPerSecond = info.tokensPerSecond
                 stopReason = String(describing: info.stopReason)
-            case .reasoning, .toolCall, .toolCallProgress:
+                unclosedReasoning = info.unclosedReasoning
+            case .reasoning(let chunk):
+                reasoning += chunk
+            case .toolCall, .toolCallProgress:
                 break
             }
         }
@@ -238,6 +253,14 @@ enum VLBench {
             stopReason, rssAfter, footprintAfter, rssAfter - rssBefore,
             footprintAfter - footprintBefore))
         print("    \"\(preview)\"")
+
+        print("    FULL_REASONING \(reasoning.debugDescription)")
+        print("    FULL_TEXT \(text.debugDescription)")
+        guard stopReason == "stop", !unclosedReasoning else {
+            throw NSError(domain: "VLBench", code: 20,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "Incomplete media generation: stop=\(stopReason) unclosedReasoning=\(unclosedReasoning)"])
+        }
 
         let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard chunkCount > 0, !visible.isEmpty else {
@@ -383,9 +406,7 @@ enum VLBench {
 
         nonisolated(unsafe) let ctx = context
 
-        let params = GenerateParameters(
-            maxTokens: maxNewTokens, temperature: 0,
-            prefillStepSize: 512)
+        let params = bundleParameters(context: context, maxTokens: maxNewTokens)
 
         let engine = BatchEngine(context: ctx, maxBatchSize: 1)
 
@@ -397,13 +418,9 @@ enum VLBench {
             let turnLabel = "Turn \(i + 1)"
             print("  \(turnLabel):")
             let t0 = CFAbsoluteTimeGetCurrent()
-            // enable_thinking=false so the token budget goes to visible
-            // content, not chain-of-thought. Without this, Qwen 3.x
-            // defaults to thinking-on and a 256-token budget gets spent
-            // entirely inside `<think>...</think>` before any answer.
-            var userInput = UserInput(
+            // Omit thinking overrides: preserve the bundle template contract.
+            let userInput = UserInput(
                 prompt: prompt, videos: [.url(videoURL)])
-            userInput.additionalContext = ["enable_thinking": false]
             let lmInput: LMInput
             do {
                 lmInput = try await ctx.processor.prepare(input: userInput)
@@ -420,6 +437,8 @@ enum VLBench {
                 input: sendable, parameters: params)
 
             var text = ""
+            var reasoning = ""
+            var unclosedReasoning = false
             var chunkCount = 0
             var reasoningCount = 0
             var ttft: Double?
@@ -433,13 +452,15 @@ enum VLBench {
                     if ttft == nil { ttft = CFAbsoluteTimeGetCurrent() - t0 }
                     text += c
                     chunkCount += 1
-                case .reasoning:
+                case .reasoning(let chunk):
+                    reasoning += chunk
                     reasoningCount += 1
                 case .info(let info):
                     generationTokens = info.generationTokenCount
                     promptTokensPerSecond = info.promptTokensPerSecond
                     decodeTokensPerSecond = info.tokensPerSecond
                     stopReason = String(describing: info.stopReason)
+                    unclosedReasoning = info.unclosedReasoning
                 case .prefillProgress, .toolCall, .toolCallProgress:
                     break
                 }
@@ -457,6 +478,14 @@ enum VLBench {
                 generationTokens, promptTokensPerSecond, decodeTokensPerSecond,
                 stopReason, footprint))
             print("    \"\(preview)\"")
+
+            print("    FULL_REASONING \(reasoning.debugDescription)")
+            print("    FULL_TEXT \(text.debugDescription)")
+            guard stopReason == "stop", !unclosedReasoning else {
+                throw NSError(domain: "VLBench", code: 20,
+                              userInfo: [NSLocalizedDescriptionKey:
+                                "Incomplete media generation: stop=\(stopReason) unclosedReasoning=\(unclosedReasoning)"])
+            }
 
             let visible = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard chunkCount > 0, !visible.isEmpty else {
@@ -697,8 +726,7 @@ enum VLBench {
             postLoadRSS, postLoadFootprint, postLoadRSS - preLoadRSS,
             postLoadFootprint - preLoadFootprint))
 
-        let params = GenerateParameters(
-            maxTokens: maxNewTokens, temperature: 0, prefillStepSize: 512)
+        let params = bundleParameters(context: context, maxTokens: maxNewTokens)
         let coordinator = makeProofCoordinator(
             modelDir: modelDir, context: context, parameters: params,
             label: "media-salt")
@@ -733,8 +761,14 @@ enum VLBench {
         let genStart = CFAbsoluteTimeGetCurrent()
         let (_, streamA) = await engine.submit(input: sendA, parameters: params)
         var genA = 0
+        var generatedIDs: [Int] = []
+        var completion: GenerateCompletionInfo?
         for await event in streamA {
-            if case .token = event { genA += 1 }
+            if case .token(let id) = event {
+                genA += 1
+                generatedIDs.append(id)
+            }
+            if case .info(let info) = event { completion = info }
             peakRSS = max(peakRSS, currentRSSMiB())
             peakFootprint = max(peakFootprint, currentPhysFootprintMiB())
         }
@@ -742,6 +776,15 @@ enum VLBench {
         print(String(format:
             "  Turn 1 (store): generated %d tokens at %.2f tok/s with image A",
             genA, Double(genA) / genSeconds))
+
+        print("  RAW_PROTOCOL_TEXT \(context.tokenizer.decode(tokenIds: generatedIDs).debugDescription)")
+        guard let completion, completion.stopReason == .stop,
+              completion.generationTokenCount > 0, completion.tokensPerSecond > 0 else {
+            throw NSError(domain: "VLBenchMediaSalt", code: 20,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "Missing telemetry or non-natural media-salt generation stop"])
+        }
+        print("  completion stop=\(completion.stopReason) decodeTok/s=\(completion.tokensPerSecond)")
 
         // Probe 1: same prompt + same image A → must HIT.
         let probeHit = coordinator.fetch(tokens: tokensA, mediaSalt: saltA)
@@ -1792,8 +1835,7 @@ enum VLBench {
     private static func prepareChat(
         _ chat: [Chat.Message], context: ModelContext
     ) async throws -> LMInput {
-        var input = UserInput(chat: chat)
-        input.additionalContext = ["enable_thinking": false]
+        let input = UserInput(chat: chat)
         return try await context.processor.prepare(input: input)
     }
 
@@ -1911,7 +1953,6 @@ enum VLBench {
             prompt: "Describe what happens in this short video in one sentence.",
             videos: [.url(videoURL)]
         )
-        userInput.additionalContext = ["enable_thinking": false]
         userInput.processing = benchVideoProcessing(defaultSquare: 224)
         if let resize = userInput.processing.resize {
             print("  video processing resize = \(Int(resize.width))x\(Int(resize.height))")
