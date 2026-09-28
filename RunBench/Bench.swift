@@ -2124,8 +2124,18 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
 
-    let params = GenerateParameters(
-        maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+    let env = ProcessInfo.processInfo.environment
+    let bundleSampling = env["BENCH_BATCH_USE_GENERATION_CONFIG"] == "1"
+    var params = bundleSampling
+        ? GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: GenerateParameters(maxTokens: maxNew, prefillStepSize: 512))
+        : GenerateParameters(maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+    params.maxTokens = maxNew
+    params.randomSeed = env["BENCH_BATCH_SEED"].flatMap(UInt64.init)
+    print("Sampling: source=\(bundleSampling ? "bundle-defaults" : "explicit-greedy-diagnostic") " +
+          "temperature=\(params.temperature) topP=\(params.topP) topK=\(params.topK) " +
+          "repetitionPenalty=\(String(describing: params.repetitionPenalty))")
 
     nonisolated(unsafe) let ctx = context
     let engine = BatchEngine(context: ctx, maxBatchSize: 2)
@@ -2161,19 +2171,28 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
     // decode is fine for a small benchmark and avoids the O(n²) relay
     // cost that hammers throughput under HF tokenizers.
     let tokenizer = context.tokenizer
-    let results = await collectBatchStreamsWithOverlap(
+    let results = await collectBatchStreamsWithOverlapAndInfo(
         engine,
         streams: [(0, s0), (1, s1)],
-        maxTokens: maxNew,
         label: "ConcurrentBatch B=2")
     let total = CFAbsoluteTimeGetCurrent() - t0
 
     // Print side-by-side. Guard against empty (stuck) slots.
-    for (slot, ids) in results.sorted(by: { $0.0 < $1.0 }) {
+    for (slot, ids, info) in results.sorted(by: { $0.0 < $1.0 }) {
         let text = tokenizer.decode(tokenIds: ids)
         print("  Slot \(slot) prompt: \"\(prompts[slot])\"")
         print("    tokens: \(ids.count), first 12: \(Array(ids.prefix(12)))")
         printDecodedOutput(label: "ConcurrentBatch slot \(slot)", text: text)
+        guard let info else {
+            fputs("[ConcurrentBatch] FAIL: missing completion telemetry\n", stderr)
+            exit(1)
+        }
+        print("    stop=\(info.stopReason) tokps=\(info.tokensPerSecond) " +
+              "tokens=\(info.generationTokenCount) footprint_mib=\(currentPhysFootprintMiB())")
+        if info.stopReason == .length || lagunaLoopHeuristic(text) {
+            fputs("[ConcurrentBatch] FAIL: length stop or looping output\n", stderr)
+            exit(1)
+        }
         if ids.isEmpty {
             fputs("[ConcurrentBatch] FAIL: slot \(slot) produced zero tokens\n", stderr)
             exit(1)

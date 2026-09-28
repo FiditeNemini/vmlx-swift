@@ -935,13 +935,17 @@ class BatchEngineIntegrationTests: XCTestCase {
 
     /// Test: shutdown closes the high-level generate() stream without hanging.
     func testShutdownDuringGenerateStreamFinishesTextPath() async throws {
-        let engine = makeEngine(maxBatchSize: 1)
+        // Random model weights can emit EOS before the shutdown call. Hold
+        // prefill long enough to cancel a known-live producer instead.
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 100_000, maxBatchSize: 1)
         let stream = await engine.generate(
             input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
             parameters: GenerateParameters(maxTokens: 1000, temperature: 0)
         )
 
-        try await Task.sleep(nanoseconds: 50_000_000)
+        let producerActive = await engine.isSoloFastPathActiveForTesting
+        XCTAssertTrue(producerActive, "The test must shut down an active producer")
         await engine.shutdown()
 
         let result = await collectGenerations(from: stream)
