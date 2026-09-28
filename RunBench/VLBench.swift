@@ -868,6 +868,127 @@ enum VLBench {
         return Double(total) / (1024.0 * 1024.0)
     }
 
+    /// Bundle-default, parsed generation through cold, restored, changed-media
+    /// and growing-history requests. Video mode requires two actual file paths.
+    static func runMediaCacheProof(modelPath: String, maxNewTokens: Int) async throws {
+        let env = ProcessInfo.processInfo.environment
+        let dir = URL(fileURLWithPath: modelPath)
+        let context = try await loadProductionContext(from: dir)
+        let params = bundleParameters(context: context, maxTokens: maxNewTokens)
+        let coordinator = makeProofCoordinator(
+            modelDir: dir, context: context, parameters: params, label: "media-replay")
+        nonisolated(unsafe) let ctx = context
+        let engine = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
+        let isVideo = env["BENCH_MEDIA_VIDEO_A"] != nil
+        let prompt = isVideo
+            ? "Describe the video in one sentence."
+            : "Describe the image in one sentence."
+        func mediaMessage(changed: Bool) throws -> Chat.Message {
+            if isVideo {
+                let key = changed ? "BENCH_MEDIA_VIDEO_B" : "BENCH_MEDIA_VIDEO_A"
+                guard let path = env[key], FileManager.default.fileExists(atPath: path) else {
+                    throw NSError(domain: "MediaCacheProof", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Missing video fixture: \(key)"])
+                }
+                return .user(prompt, videos: [.url(URL(fileURLWithPath: path))])
+            }
+            return .user(prompt, images: [.ciImage(try synthesiseGradientImage(side: 224, invert: changed))])
+        }
+        func prepare(_ chat: [Chat.Message]) async throws -> LMInput {
+            try await ctx.processor.prepare(input: UserInput(chat: chat))
+        }
+        func hitCount() -> Int {
+            let stats = coordinator.snapshotStats()
+            return (stats.diskStats?.hits ?? 0) + (stats.pagedStats?.cacheHits ?? 0)
+        }
+        func probe(_ input: LMInput, expectHit: Bool, label: String) throws {
+            let tokens = input.text.tokens.reshaped(-1).asArray(Int.self)
+            let salt = computeCacheSalt(for: input, parameters: params)
+            guard input.hasMediaContent, salt != nil else {
+                throw NSError(domain: "MediaCacheProof", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Missing media payload or cache salt"])
+            }
+            switch coordinator.fetch(tokens: tokens, mediaSalt: salt) {
+            case .hit(let matched, _, let detail, let blocks, _, let arrays):
+                coordinator.release(blocks: blocks)
+                print("MEDIA_PROBE \(label) hit=\(detail.rawValue) matched=\(matched)/\(tokens.count) arrays=\(arrays?.count ?? 0)")
+                guard expectHit, matched > 0 else {
+                    throw NSError(domain: "MediaCacheProof", code: 3,
+                        userInfo: [NSLocalizedDescriptionKey: "Unexpected media cache hit"])
+                }
+            case .miss:
+                print("MEDIA_PROBE \(label) miss")
+                guard !expectHit else {
+                    throw NSError(domain: "MediaCacheProof", code: 4,
+                        userInfo: [NSLocalizedDescriptionKey: "Expected media cache restore missed"])
+                }
+            }
+        }
+        func generate(_ input: sending LMInput, label: String, requireHit: Bool) async throws -> String {
+            let hitsBefore = hitCount()
+            let stream = await engine.generate(input: input, parameters: params)
+            var text = ""
+            var reasoning = ""
+            var info: GenerateCompletionInfo?
+            var firstPrefill: PrefillProgress?
+            for await event in stream {
+                switch event {
+                case .chunk(let delta): text += delta
+                case .reasoning(let delta): reasoning += delta
+                case .info(let value): info = value
+                case .prefillProgress(let progress):
+                    if progress.stage == .prefill, firstPrefill == nil {
+                        firstPrefill = progress
+                    }
+                    if progress.stage == .cacheRestore {
+                        print("MEDIA_RESTORE \(label) completed=\(progress.completedUnitCount)/\(progress.totalUnitCount) detail=\(progress.detail ?? "none")")
+                    }
+                default: break
+                }
+            }
+            let stats = coordinator.snapshotStats()
+            let hitDelta = hitCount() - hitsBefore
+            print("MEDIA_FULL_TEXT \(label) \(text.debugDescription)")
+            print("MEDIA_FULL_REASONING \(label) \(reasoning.debugDescription)")
+            print("MEDIA_CACHE \(label) hitsDuringGeneration=\(hitDelta) paged=\(stats.pagedEnabled) disk=\(stats.diskEnabled) hybrid=\(stats.isHybrid) pagedIncompatible=\(stats.isPagedIncompatible) ssmHits=\(stats.ssmStats.hits)")
+            print("MEDIA_PREFILL \(label) firstCompleted=\(firstPrefill?.completedUnitCount ?? -1) total=\(firstPrefill?.totalUnitCount ?? -1)")
+            guard let info else {
+                throw NSError(domain: "MediaCacheProof", code: 5,
+                    userInfo: [NSLocalizedDescriptionKey: "Missing completion telemetry"])
+            }
+            print("MEDIA_COMPLETION \(label) stop=\(info.stopReason) tokens=\(info.generationTokenCount) tokps=\(info.tokensPerSecond) footprintMiB=\(currentPhysFootprintMiB()) unclosed=\(info.unclosedReasoning)")
+            guard info.stopReason == .stop, !info.unclosedReasoning,
+                  info.tokensPerSecond > 0, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !requireHit || hitDelta > 0 else {
+                throw NSError(domain: "MediaCacheProof", code: 6,
+                    userInfo: [NSLocalizedDescriptionKey: "Incomplete generation or absent live cache restore"])
+            }
+            for marker in ["<think>", "</think>", "<|channel>", "<channel|>", "<|im_start|>"] {
+                guard !text.contains(marker) else {
+                    throw NSError(domain: "MediaCacheProof", code: 7,
+                        userInfo: [NSLocalizedDescriptionKey: "Visible protocol marker: \(marker)"])
+                }
+            }
+            return text
+        }
+        let base: [Chat.Message] = [try mediaMessage(changed: false)]
+        // Each stream drains fully before the shared processor is used again.
+        nonisolated(unsafe) let cold = try await prepare(base)
+        let first = try await generate(cold, label: "cold", requireHit: false)
+        nonisolated(unsafe) let replay = try await prepare(base)
+        try probe(replay, expectHit: true, label: "same-media")
+        _ = try await generate(replay, label: "replay", requireHit: true)
+        let changed = try await prepare([mediaMessage(changed: true)])
+        try probe(changed, expectHit: false, label: "changed-media")
+        _ = try await generate(changed, label: "changed-media", requireHit: false)
+        let follow = try await prepare(base + [
+            .assistant(first), .user("What colors were in the media I first showed you?")])
+        try probe(follow, expectHit: true, label: "follow-up")
+        _ = try await generate(follow, label: "follow-up", requireHit: true)
+        await engine.shutdown()
+        print("=== Media cache proof completed; inspect full answers for grounding ===")
+    }
+
     // MARK: - Cross-engine byte-identity on VL (iter 47)
 
     /// Run the same VL prompt (text + image) through both `TokenIterator`

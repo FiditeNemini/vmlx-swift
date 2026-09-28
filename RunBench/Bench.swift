@@ -163,6 +163,11 @@ struct Bench {
             return
         }
 
+        if env["BENCH_MEDIA_CACHE_PROOF"] == "1" {
+            try await VLBench.runMediaCacheProof(modelPath: modelPath, maxNewTokens: maxNew)
+            return
+        }
+
         // BENCH_VL_BATCH_CHAT=1 runs VL multi-turn DIRECTLY through
         // `BatchEngine.generate(...)`. This is the honest VL-through-
         // BatchEngine verification — iter 29 audit flagged that prior
