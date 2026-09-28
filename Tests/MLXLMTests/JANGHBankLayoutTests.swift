@@ -136,4 +136,106 @@ final class JANGHBankLayoutTests: XCTestCase {
             }
         }
     }
+    private func withMmapPolicy<T>(enabled: Bool, body: () throws -> T) rethrows -> T {
+        let settings = [
+            "MLX_SAFETENSORS_MMAP": enabled ? "1" : "0",
+            "VMLINUX_MMAP_SAFETENSORS": "0",
+            "MLX_SAFETENSORS_MMAP_START_COLD": "0",
+            "VMLINUX_MMAP_SAFETENSORS_START_COLD": "0",
+            "MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS": "0",
+            "VMLINUX_MMAP_SAFETENSORS_TENSOR_BUFFERS": "0",
+            "VMLX_MMAP_SAFETENSORS_TENSOR_BUFFERS": "0",
+        ]
+        let previous = settings.keys.map { ($0, getenv($0).map { String(cString: $0) }) }
+        for (key, value) in settings { setenv(key, value, 1) }
+        defer {
+            for (key, value) in previous {
+                if let value { setenv(key, value, 1) } else { unsetenv(key) }
+            }
+        }
+        return try body()
+    }
+
+    /// Writes format bytes directly; test banks must come from the loader, not
+    /// from copied MLXArray payloads. Data offsets are dtype aligned; the
+    /// header places the packed payload at a 4096-byte boundary.
+    private func alignedFixture(at url: URL) throws -> (String, String) {
+        let packedKey = prefix + ".gate_proj.tq2_packed"
+        let scalesKey = prefix + ".gate_proj.tq2_scales"
+        let header: [String: Any] = [
+            packedKey: ["dtype": "U32", "shape": [2, 9, 3], "data_offsets": [0, 216]],
+            scalesKey: ["dtype": "F16", "shape": [2, 9], "data_offsets": [216, 252]],
+        ]
+        var json = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+        let headerBytes = 4096 - 8
+        guard json.count <= headerBytes else { throw NSError(domain: "JANGHFixture", code: 1) }
+        json.append(Data(repeating: 32, count: headerBytes - json.count))
+        var size = UInt64(headerBytes).littleEndian
+        var file = Data()
+        withUnsafeBytes(of: &size) { file.append(contentsOf: $0) }
+        file.append(json)
+        file.append(Data(repeating: 0, count: 216))
+        for _ in 0 ..< 18 {
+            var one = Float16(1).bitPattern.littleEndian
+            withUnsafeBytes(of: &one) { file.append(contentsOf: $0) }
+        }
+        try file.write(to: url)
+        return (packedKey, scalesKey)
+    }
+
+    func testAlignedMappedSafetensorsBanksAreReadyWithoutEvaluation() throws {
+        try MLXMetalTestLock.withLock {
+            let file = FileManager.default.temporaryDirectory
+                .appendingPathComponent("jangh-mapped-" + UUID().uuidString + ".safetensors")
+            defer { try? FileManager.default.removeItem(at: file) }
+            let (packedKey, scalesKey) = try alignedFixture(at: file)
+            try withMmapPolicy(enabled: true) {
+                let before = mlx_safetensors_mmap_tracked_buffer_bytes()
+                let arrays = try MLX.loadArrays(url: file, stream: .cpu)
+                let packed = try XCTUnwrap(arrays[packedKey])
+                let scales = try XCTUnwrap(arrays[scalesKey])
+                XCTAssertGreaterThan(mlx_safetensors_mmap_tracked_buffer_bytes(), before,
+                                     "Reader fallback must not masquerade as mapped storage")
+                // All checks before the numerical dispatch are metadata-only.
+                // No eval/asData/asArray/contiguous call prepares either bank.
+                XCTAssertTrue(available(packed))
+                XCTAssertTrue(available(scales))
+                XCTAssertTrue(rowContiguous(packed))
+                XCTAssertTrue(rowContiguous(scales))
+                try JANGHBankLayout.requireReadyRowContiguous(packed, role: "mapped packed")
+                try JANGHBankLayout.requireReadyRowContiguous(scales, role: "mapped scales")
+                let op = try JANGHProjectionKernel(contract: contract(), module: prefix + ".gate_proj")
+                let result = try op.project(
+                    MLXArray([Float](repeating: 1, count: 32), [1, 32]), packed: packed,
+                    scales: scales, indices: MLXArray([UInt32(1), 0]))
+                XCTAssertEqual(result.shape, [2, 9])
+                // Code0 -> level -3.5; 32 unit inputs and scale1 -> -112.
+                XCTAssertTrue(result.asArray(Float.self).allSatisfy { $0 == -112 })
+            }
+        }
+    }
+
+    func testOrdinaryReaderBanksRemainLazyAndRefuseImplicitPreparation() throws {
+        try MLXMetalTestLock.withLock {
+            let file = FileManager.default.temporaryDirectory
+                .appendingPathComponent("jangh-reader-" + UUID().uuidString + ".safetensors")
+            defer { try? FileManager.default.removeItem(at: file) }
+            let (packedKey, scalesKey) = try alignedFixture(at: file)
+            try withMmapPolicy(enabled: false) {
+                let arrays = try MLX.loadArrays(url: file, stream: .cpu)
+                let packed = try XCTUnwrap(arrays[packedKey])
+                let scales = try XCTUnwrap(arrays[scalesKey])
+                XCTAssertFalse(available(packed))
+                XCTAssertFalse(available(scales))
+                let op = try JANGHProjectionKernel(contract: contract(), module: prefix + ".gate_proj")
+                expectRejected({
+                    try op.project(MLXArray([Float](repeating: 1, count: 32), [1, 32]),
+                                   packed: packed, scales: scales, indices: MLXArray([UInt32(0)]))
+                }, containing: "unavailable")
+                XCTAssertFalse(available(packed))
+                XCTAssertFalse(available(scales))
+            }
+        }
+    }
+
 }
