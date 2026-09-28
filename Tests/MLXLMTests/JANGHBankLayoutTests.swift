@@ -9,14 +9,22 @@ final class JANGHBankLayoutTests: XCTestCase {
     private let prefix = "model.layers.0.mlp.switch_mlp"
 
     private func contract() throws -> JANGHFormatContract {
-        let book: [String: Any] = ["alpha": 1.0, "beta": 0.0,
-                                   "levels": (0 ..< 8).map { Double($0) - 3.5 }]
+        let book: [String: Any] = [
+            "alpha": 1.0, "beta": 0.0,
+            "levels": (0 ..< 8).map { Double($0) - 3.5 },
+        ]
         let root: [String: Any] = [
-            "jangtq": ["version": 2, "packing": "lsb-bitstream", "scale_dtype": "float16",
-                       "codebook_family": "odd-cubic", "rotation": "none", "codebooks": ["3": book]],
-            "quantization": Dictionary(uniqueKeysWithValues: ["gate_proj", "up_proj", "down_proj"].map {
-                (prefix + "." + $0, ["mode": "jangtq2", "bits": 3, "rotation": "none"] as [String: Any])
-            }),
+            "jangtq": [
+                "version": 2, "packing": "lsb-bitstream", "scale_dtype": "float16",
+                "codebook_family": "odd-cubic", "rotation": "none", "codebooks": ["3": book],
+            ],
+            "quantization": Dictionary(
+                uniqueKeysWithValues: ["gate_proj", "up_proj", "down_proj"].map {
+                    (
+                        prefix + "." + $0,
+                        ["mode": "jangtq2", "bits": 3, "rotation": "none"] as [String: Any]
+                    )
+                }),
         ]
         return try JANGHFormatContract(configuration: JSONSerialization.data(withJSONObject: root))
     }
@@ -37,8 +45,9 @@ final class JANGHBankLayoutTests: XCTestCase {
     private func calls(_ banks: [MLXArray]) throws -> [() throws -> MLXArray] {
         let c = try contract()
         let single = try JANGHProjectionKernel(contract: c, module: prefix + ".gate_proj")
-        let fused = try JANGHFusedGateUpKernel(contract: c, gateModule: prefix + ".gate_proj",
-                                              upModule: prefix + ".up_proj", outputRotation: .none)
+        let fused = try JANGHFusedGateUpKernel(
+            contract: c, gateModule: prefix + ".gate_proj",
+            upModule: prefix + ".up_proj", outputRotation: .none)
         let down = try JANGHWeightedDownKernel(contract: c, module: prefix + ".down_proj")
         let x = MLXArray([Float](repeating: 1, count: 32), [1, 32])
         let hidden = MLXArray([Float](repeating: 1, count: 64), [2, 32])
@@ -46,12 +55,18 @@ final class JANGHBankLayoutTests: XCTestCase {
         let scores = MLXArray([Float(0.5), 0.5], [1, 2])
         return [
             { try single.project(x, packed: banks[0], scales: banks[1], indices: indices) },
-            { try fused.activatePreparedInput(x, gatePacked: banks[0], gateScales: banks[1],
-                                               upPacked: banks[2], upScales: banks[3],
-                                               indices: indices, limit: nil) },
-            { try down.projectPreparedHidden(hidden, preparedBasis: .none, packed: banks[0],
-                                               scales: banks[1], indices: indices, scores: scores,
-                                               outputDType: .float32) },
+            {
+                try fused.activatePreparedInput(
+                    x, gatePacked: banks[0], gateScales: banks[1],
+                    upPacked: banks[2], upScales: banks[3],
+                    indices: indices, limit: nil)
+            },
+            {
+                try down.projectPreparedHidden(
+                    hidden, preparedBasis: .none, packed: banks[0],
+                    scales: banks[1], indices: indices, scores: scores,
+                    outputDType: .float32)
+            },
         ]
     }
 
@@ -123,7 +138,8 @@ final class JANGHBankLayoutTests: XCTestCase {
         try MLXMetalTestLock.withLock {
             for slot in 0 ..< 4 {
                 var banks = readyBanks()
-                let lazy = slot.isMultiple(of: 2)
+                let lazy =
+                    slot.isMultiple(of: 2)
                     ? MLXArray.zeros([2, 9, 3], dtype: .uint32)
                     : MLXArray.ones([2, 9], dtype: .float16)
                 XCTAssertFalse(available(lazy))
@@ -194,8 +210,9 @@ final class JANGHBankLayoutTests: XCTestCase {
                 let arrays = try MLX.loadArrays(url: file, stream: .cpu)
                 let packed = try XCTUnwrap(arrays[packedKey])
                 let scales = try XCTUnwrap(arrays[scalesKey])
-                XCTAssertGreaterThan(mlx_safetensors_mmap_tracked_buffer_bytes(), before,
-                                     "Reader fallback must not masquerade as mapped storage")
+                XCTAssertGreaterThan(
+                    mlx_safetensors_mmap_tracked_buffer_bytes(), before,
+                    "Reader fallback must not masquerade as mapped storage")
                 // All checks before the numerical dispatch are metadata-only.
                 // No eval/asData/asArray/contiguous call prepares either bank.
                 XCTAssertTrue(available(packed))
@@ -204,7 +221,8 @@ final class JANGHBankLayoutTests: XCTestCase {
                 XCTAssertTrue(rowContiguous(scales))
                 try JANGHBankLayout.requireReadyRowContiguous(packed, role: "mapped packed")
                 try JANGHBankLayout.requireReadyRowContiguous(scales, role: "mapped scales")
-                let op = try JANGHProjectionKernel(contract: contract(), module: prefix + ".gate_proj")
+                let op = try JANGHProjectionKernel(
+                    contract: contract(), module: prefix + ".gate_proj")
                 let result = try op.project(
                     MLXArray([Float](repeating: 1, count: 32), [1, 32]), packed: packed,
                     scales: scales, indices: MLXArray([UInt32(1), 0]))
@@ -227,11 +245,14 @@ final class JANGHBankLayoutTests: XCTestCase {
                 let scales = try XCTUnwrap(arrays[scalesKey])
                 XCTAssertFalse(available(packed))
                 XCTAssertFalse(available(scales))
-                let op = try JANGHProjectionKernel(contract: contract(), module: prefix + ".gate_proj")
-                expectRejected({
-                    try op.project(MLXArray([Float](repeating: 1, count: 32), [1, 32]),
-                                   packed: packed, scales: scales, indices: MLXArray([UInt32(0)]))
-                }, containing: "unavailable")
+                let op = try JANGHProjectionKernel(
+                    contract: contract(), module: prefix + ".gate_proj")
+                expectRejected(
+                    {
+                        try op.project(
+                            MLXArray([Float](repeating: 1, count: 32), [1, 32]),
+                            packed: packed, scales: scales, indices: MLXArray([UInt32(0)]))
+                    }, containing: "unavailable")
                 XCTAssertFalse(available(packed))
                 XCTAssertFalse(available(scales))
             }

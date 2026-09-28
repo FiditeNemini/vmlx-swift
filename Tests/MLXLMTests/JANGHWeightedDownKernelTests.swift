@@ -7,21 +7,30 @@ import XCTest
 final class JANGHWeightedDownKernelTests: XCTestCase {
     private let prefix = "model.layers.0.mlp.switch_mlp"
 
-    private func makeKernel(_ bits: Int, rotation: String = "none", alpha: Double = 0.03125,
-                            beta: Double = 0.000001) throws -> JANGHWeightedDownKernel {
+    private func makeKernel(
+        _ bits: Int, rotation: String = "none", alpha: Double = 0.03125,
+        beta: Double = 0.000001
+    ) throws -> JANGHWeightedDownKernel {
         let levels = (0 ..< (1 << bits)).map { code -> Double in
             let u = Double(code) - Double((1 << bits) - 1) / 2
             return Double(Float(u * (alpha + beta * u * u)))
         }
         let config: [String: Any] = [
-            "jangtq": ["version": 2, "packing": "lsb-bitstream", "scale_dtype": "float16",
-                       "codebook_family": "odd-cubic", "rotation": rotation,
-                       "codebooks": [String(bits): ["alpha": alpha, "beta": beta, "levels": levels]]],
-            "quantization": Dictionary(uniqueKeysWithValues: ["gate_proj", "up_proj", "down_proj"].map {
-                (prefix + "." + $0, ["mode": "jangtq2", "bits": bits, "rotation": rotation] as [String: Any])
-            }),
+            "jangtq": [
+                "version": 2, "packing": "lsb-bitstream", "scale_dtype": "float16",
+                "codebook_family": "odd-cubic", "rotation": rotation,
+                "codebooks": [String(bits): ["alpha": alpha, "beta": beta, "levels": levels]],
+            ],
+            "quantization": Dictionary(
+                uniqueKeysWithValues: ["gate_proj", "up_proj", "down_proj"].map {
+                    (
+                        prefix + "." + $0,
+                        ["mode": "jangtq2", "bits": bits, "rotation": rotation] as [String: Any]
+                    )
+                }),
         ]
-        let contract = try JANGHFormatContract(configuration: JSONSerialization.data(withJSONObject: config))
+        let contract = try JANGHFormatContract(
+            configuration: JSONSerialization.data(withJSONObject: config))
         return try JANGHWeightedDownKernel(contract: contract, module: prefix + ".down_proj")
     }
 
@@ -37,15 +46,19 @@ final class JANGHWeightedDownKernelTests: XCTestCase {
         return words
     }
 
-    private func oracle(_ h: [Float], words: [UInt32], bits: Int, width: Int, rows: Int,
-                        scales: [Float16], ids: [UInt32], scores: [Float], tokens: Int,
-                        alpha: Float = 0.03125, beta: Float = 0.000001) -> [Float] {
+    private func oracle(
+        _ h: [Float], words: [UInt32], bits: Int, width: Int, rows: Int,
+        scales: [Float16], ids: [UInt32], scores: [Float], tokens: Int,
+        alpha: Float = 0.03125, beta: Float = 0.000001
+    ) -> [Float] {
         let routes = ids.count / tokens
         return (0 ..< tokens * rows).map { output in
-            let token = output / rows, row = output % rows
+            let token = output / rows
+            let row = output % rows
             var total: Double = 0
             for route in 0 ..< routes {
-                let dispatch = token * routes + route, expert = Int(ids[dispatch])
+                let dispatch = token * routes + route
+                let expert = Int(ids[dispatch])
                 var dot: Double = 0
                 for column in 0 ..< width {
                     let base = ((expert * rows + row) * width + column) * bits
@@ -54,7 +67,9 @@ final class JANGHWeightedDownKernelTests: XCTestCase {
                         code |= ((words[(base + b) / 32] >> ((base + b) % 32)) & 1) << b
                     }
                     let u = Double(code) - Double((1 << bits) - 1) / 2
-                    dot += Double(h[dispatch * width + column]) * u * (Double(alpha) + Double(beta) * u * u)
+                    dot +=
+                        Double(h[dispatch * width + column]) * u
+                        * (Double(alpha) + Double(beta) * u * u)
                 }
                 total += Double(scores[dispatch]) * dot * Double(scales[expert * rows + row])
             }
@@ -67,28 +82,40 @@ final class JANGHWeightedDownKernelTests: XCTestCase {
             for bits in [2, 3, 4, 6, 8] {
                 let op = try makeKernel(bits)
                 for width in [32, 96, 544] {
-                    let rows = 9, experts = 3, tokens = 2, routes = 8
+                    let rows = 9
+                    let experts = 3
+                    let tokens = 2
+                    let routes = 8
                     let ids: [UInt32] = [2, 0, 2, 1, 1, 2, 0, 1, 1, 0, 2, 2, 0, 1, 2, 0]
-                    let scores: [Float] = [0, 2, -0.5, 0.125, -1, 0, 0.25, 3, 0.5, -2, 0, 1, 2, -0.25, 0.125, 0]
+                    let scores: [Float] = [
+                        0, 2, -0.5, 0.125, -1, 0, 0.25, 3, 0.5, -2, 0, 1, 2, -0.25, 0.125, 0,
+                    ]
                     let h = (0 ..< tokens * routes * width).map { Float(($0 * 17) % 41 - 20) / 31 }
-                    let codes = (0 ..< experts * rows * width).map { UInt32(($0 * 13 + $0 / width) % (1 << bits)) }
+                    let codes = (0 ..< experts * rows * width).map {
+                        UInt32(($0 * 13 + $0 / width) % (1 << bits))
+                    }
                     let words = pack(codes, bits: bits)
                     let scales = (0 ..< experts * rows).map { Float16(Float($0 % 5 + 1) / 8) }
-                    let expected = oracle(h, words: words, bits: bits, width: width, rows: rows,
-                                          scales: scales, ids: ids, scores: scores, tokens: tokens)
+                    let expected = oracle(
+                        h, words: words, bits: bits, width: width, rows: rows,
+                        scales: scales, ids: ids, scores: scores, tokens: tokens)
                     for dtype in [DType.float16, .bfloat16, .float32] {
                         let result = try op.projectPreparedHidden(
                             MLXArray(h, [tokens * routes, width]), preparedBasis: .none,
                             packed: MLXArray(words, [experts, rows, width * bits / 32]),
-                            scales: MLXArray(scales, [experts, rows]), indices: MLXArray(ids, [tokens, routes]),
+                            scales: MLXArray(scales, [experts, rows]),
+                            indices: MLXArray(ids, [tokens, routes]),
                             scores: MLXArray(scores, [tokens, routes]), outputDType: dtype)
                         XCTAssertEqual(result.shape, [tokens, rows])
                         XCTAssertEqual(result.dtype, dtype)
                         let actual = result.asType(.float32).asArray(Float.self)
-                        let relative: Float = dtype == .bfloat16 ? 0.006 : (dtype == .float16 ? 0.001 : 0.0001)
+                        let relative: Float =
+                            dtype == .bfloat16 ? 0.006 : (dtype == .float16 ? 0.001 : 0.0001)
                         for i in actual.indices {
-                            XCTAssertEqual(actual[i], expected[i], accuracy: max(0.0002, abs(expected[i]) * relative),
-                                           "bits=\(bits) H=\(width) dtype=\(dtype) row=\(i)")
+                            XCTAssertEqual(
+                                actual[i], expected[i],
+                                accuracy: max(0.0002, abs(expected[i]) * relative),
+                                "bits=\(bits) H=\(width) dtype=\(dtype) row=\(i)")
                         }
                     }
                 }
@@ -107,10 +134,13 @@ final class JANGHWeightedDownKernelTests: XCTestCase {
             for dtype in [DType.float16, .bfloat16, .float32] {
                 let value = try op.projectPreparedHidden(
                     MLXArray(hidden, [2, 32]), preparedBasis: .hadamard32, packed: packed,
-                    scales: MLXArray([Float16(1)], [1, 1]), indices: MLXArray([UInt32(0), 0], [1, 2]),
-                    scores: MLXArray([Float(1), -1], [1, 2]), outputDType: dtype)
-                    .asType(.float32).item(Float.self)
-                XCTAssertEqual(value, 1.5 * (hidden[0] - 1), accuracy: dtype == .bfloat16 ? 0.00001 : 0.000002)
+                    scales: MLXArray([Float16(1)], [1, 1]),
+                    indices: MLXArray([UInt32(0), 0], [1, 2]),
+                    scores: MLXArray([Float(1), -1], [1, 2]), outputDType: dtype
+                )
+                .asType(.float32).item(Float.self)
+                XCTAssertEqual(
+                    value, 1.5 * (hidden[0] - 1), accuracy: dtype == .bfloat16 ? 0.00001 : 0.000002)
                 XCTAssertGreaterThan(value, 0.001)
             }
         }
@@ -127,7 +157,8 @@ final class JANGHWeightedDownKernelTests: XCTestCase {
                 let result = try op.projectPreparedHidden(
                     hidden, preparedBasis: .none, packed: packed, scales: scales,
                     indices: MLXArray([UInt32(0), 0, 0, UInt32.max], [2, 2]), scores: scores,
-                    outputDType: dtype).asType(.float32).asArray(Float.self)
+                    outputDType: dtype
+                ).asType(.float32).asArray(Float.self)
                 XCTAssertTrue(result.prefix(9).allSatisfy { $0 == 0 })
                 XCTAssertTrue(result.suffix(9).allSatisfy { $0.isNaN })
             }
@@ -153,12 +184,15 @@ final class JANGHWeightedDownKernelTests: XCTestCase {
             let scales = MLXArray([Float16(1)], [1, 1])
             let ids = MLXArray([UInt32(0)], [1, 1])
             let scores = MLXArray([Float(1)], [1, 1])
-            func call(_ input: MLXArray? = nil, basis: JANGHFormatContract.Rotation = .none,
-                      p: MLXArray? = nil, s: MLXArray? = nil, i: MLXArray? = nil,
-                      w: MLXArray? = nil, dtype: DType = .float32) throws {
-                _ = try op.projectPreparedHidden(input ?? h, preparedBasis: basis, packed: p ?? packed,
-                                                 scales: s ?? scales, indices: i ?? ids, scores: w ?? scores,
-                                                 outputDType: dtype)
+            func call(
+                _ input: MLXArray? = nil, basis: JANGHFormatContract.Rotation = .none,
+                p: MLXArray? = nil, s: MLXArray? = nil, i: MLXArray? = nil,
+                w: MLXArray? = nil, dtype: DType = .float32
+            ) throws {
+                _ = try op.projectPreparedHidden(
+                    input ?? h, preparedBasis: basis, packed: p ?? packed,
+                    scales: s ?? scales, indices: i ?? ids, scores: w ?? scores,
+                    outputDType: dtype)
             }
             XCTAssertThrowsError(try call(h.asType(.bfloat16)))
             XCTAssertThrowsError(try call(basis: .hadamard32))

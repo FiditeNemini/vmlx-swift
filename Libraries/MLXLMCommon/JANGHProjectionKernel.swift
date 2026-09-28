@@ -1,11 +1,12 @@
+import Foundation
+import MLX
+import MLXFast
+
 #if canImport(CryptoKit)
     import CryptoKit
 #else
     import Crypto
 #endif
-import Foundation
-import MLX
-import MLXFast
 
 /// Executable JANGH building blocks. Not registered as a model loader.
 /// QMV returns F32, matching the reference's projection accumulation boundary.
@@ -74,7 +75,8 @@ final class JANGHProjectionKernel {
             """
         qmv = MLXFast.metalKernel(
             name: "jangh_qmv_" + identity,
-            inputNames: ["x", "packed", "scales", "indices"], outputNames: ["out"], source: source, ensureRowContiguous: false)
+            inputNames: ["x", "packed", "scales", "indices"], outputNames: ["out"], source: source,
+            ensureRowContiguous: false)
         h32 = MLXFast.metalKernel(
             name: "jangh_h32_v1", inputNames: ["x"], outputNames: ["out"],
             source: """

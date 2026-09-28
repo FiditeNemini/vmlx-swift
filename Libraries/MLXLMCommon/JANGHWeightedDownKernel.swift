@@ -1,11 +1,12 @@
-#if canImport(CryptoKit)
-import CryptoKit
-#else
-import Crypto
-#endif
 import Foundation
 import MLX
 import MLXFast
+
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 
 /// Experimental routed decode primitive. No loader or model factory enables it.
 /// Hidden rows must already be in this down projection's input basis, in F32.
@@ -22,9 +23,11 @@ final class JANGHWeightedDownKernel {
         else { throw JANGHFormatContract.ValidationError.invalid("missing JANGH down projection") }
         bits = projection.bits
         inputRotation = projection.rotation
-        let description = "jangh-weighted-down-v1|\(bits)|\(inputRotation.rawValue)|"
+        let description =
+            "jangh-weighted-down-v1|\(bits)|\(inputRotation.rawValue)|"
             + "\(book.alpha.bitPattern)|\(book.beta.bitPattern)"
-        identity = SHA256.hash(data: Data(description.utf8)).map { String(format: "%02x", $0) }.joined()
+        identity = SHA256.hash(data: Data(description.utf8)).map { String(format: "%02x", $0) }
+            .joined()
         let center = Float((1 << bits) - 1) / 2
         kernel = MLXFast.metalKernel(
             name: "jangh_weighted_down_" + identity,
@@ -97,8 +100,12 @@ final class JANGHWeightedDownKernel {
             packed.ndim == 3, packed.dtype == .uint32,
             packed.dim(0) > 0, packed.dim(1) > 0, scales.dtype == .float16,
             [.float16, .bfloat16, .float32].contains(outputDType)
-        else { throw JANGHFormatContract.ValidationError.invalid("invalid JANGH weighted-down tensors") }
-        let h = hidden.dim(1), n = packed.dim(1), experts = packed.dim(0)
+        else {
+            throw JANGHFormatContract.ValidationError.invalid("invalid JANGH weighted-down tensors")
+        }
+        let h = hidden.dim(1)
+        let n = packed.dim(1)
+        let experts = packed.dim(0)
         let width = h.multipliedReportingOverflow(by: bits)
         let dispatches = indices.dim(0).multipliedReportingOverflow(by: indices.dim(1))
         guard !width.overflow, !dispatches.overflow,
@@ -107,13 +114,18 @@ final class JANGHWeightedDownKernel {
             indices.dim(1) < Int(UInt32.max),
             hidden.dim(0) == dispatches.partialValue,
             packed.shape == [experts, n, width.partialValue / 32], scales.shape == [experts, n]
-        else { throw JANGHFormatContract.ValidationError.invalid("invalid JANGH weighted-down geometry") }
+        else {
+            throw JANGHFormatContract.ValidationError.invalid(
+                "invalid JANGH weighted-down geometry")
+        }
         try JANGHBankLayout.requireReadyRowContiguous(packed, role: "down packed")
         try JANGHBankLayout.requireReadyRowContiguous(scales, role: "down scales")
         return kernel(
             [contiguous(hidden), packed, scales, contiguous(indices), contiguous(scores)],
-            template: [("H", h), ("N", n), ("EXPERTS", experts), ("ROUTES", indices.dim(1)),
-                       ("WORDS", width.partialValue / 32)],
+            template: [
+                ("H", h), ("N", n), ("EXPERTS", experts), ("ROUTES", indices.dim(1)),
+                ("WORDS", width.partialValue / 32),
+            ],
             grid: (64, (n + 7) / 8, indices.dim(0)), threadGroup: (64, 1, 1),
             outputShapes: [[indices.dim(0), n]], outputDTypes: [outputDType])[0]
     }

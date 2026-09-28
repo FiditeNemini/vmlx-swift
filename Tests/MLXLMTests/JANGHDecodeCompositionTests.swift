@@ -20,11 +20,14 @@ final class JANGHDecodeCompositionTests: XCTestCase {
     private func alpha(_ bits: Int) -> Float { 1 / Float(1 << bits) }
     private let beta: Float = 0.0000001
 
-    private func contract(_ bits: (Int, Int, Int), input: JANGHFormatContract.Rotation,
-                          down: JANGHFormatContract.Rotation) throws -> JANGHFormatContract {
+    private func contract(
+        _ bits: (Int, Int, Int), input: JANGHFormatContract.Rotation,
+        down: JANGHFormatContract.Rotation
+    ) throws -> JANGHFormatContract {
         var books: [String: Any] = [:]
         for b in Set([bits.0, bits.1, bits.2]) {
-            let a = Double(alpha(b)), beta = Double(self.beta)
+            let a = Double(alpha(b))
+            let beta = Double(self.beta)
             let levels = (0 ..< (1 << b)).map { code -> Double in
                 let u = Double(code) - Double((1 << b) - 1) / 2
                 return Double(Float(u * (a + beta * u * u)))
@@ -32,15 +35,24 @@ final class JANGHDecodeCompositionTests: XCTestCase {
             books[String(b)] = ["alpha": a, "beta": beta, "levels": levels]
         }
         let config: [String: Any] = [
-            "jangtq": ["version": 2, "packing": "lsb-bitstream", "scale_dtype": "float16",
-                       "codebook_family": "odd-cubic", "rotation": input.rawValue, "codebooks": books],
+            "jangtq": [
+                "version": 2, "packing": "lsb-bitstream", "scale_dtype": "float16",
+                "codebook_family": "odd-cubic", "rotation": input.rawValue, "codebooks": books,
+            ],
             "quantization": [
-                prefix + ".gate_proj": ["mode": "jangtq2", "bits": bits.0, "rotation": input.rawValue],
-                prefix + ".up_proj": ["mode": "jangtq2", "bits": bits.1, "rotation": input.rawValue],
-                prefix + ".down_proj": ["mode": "jangtq2", "bits": bits.2, "rotation": down.rawValue],
+                prefix + ".gate_proj": [
+                    "mode": "jangtq2", "bits": bits.0, "rotation": input.rawValue,
+                ],
+                prefix + ".up_proj": [
+                    "mode": "jangtq2", "bits": bits.1, "rotation": input.rawValue,
+                ],
+                prefix + ".down_proj": [
+                    "mode": "jangtq2", "bits": bits.2, "rotation": down.rawValue,
+                ],
             ],
         ]
-        return try JANGHFormatContract(configuration: JSONSerialization.data(withJSONObject: config))
+        return try JANGHFormatContract(
+            configuration: JSONSerialization.data(withJSONObject: config))
     }
 
     private func bank(bits: Int, input: Int, output: Int, seed: Int) -> Bank {
@@ -94,23 +106,27 @@ final class JANGHDecodeCompositionTests: XCTestCase {
         try MLXMetalTestLock.withLock {
             // Six mixed triples, with the two basis choices independent. Three
             // input dtypes and three final dtypes produce 54 bounded cases.
-            let cases: [((Int, Int, Int), JANGHFormatContract.Rotation, JANGHFormatContract.Rotation)] = [
-                ((2, 3, 4), .none, .none),
-                ((3, 4, 6), .none, .hadamard32),
-                ((4, 6, 8), .hadamard32, .none),
-                ((6, 8, 2), .hadamard32, .hadamard32),
-                ((8, 2, 3), .none, .hadamard32),
-                ((3, 8, 6), .hadamard32, .none),
-            ]
+            let cases:
+                [((Int, Int, Int), JANGHFormatContract.Rotation, JANGHFormatContract.Rotation)] = [
+                    ((2, 3, 4), .none, .none),
+                    ((3, 4, 6), .none, .hadamard32),
+                    ((4, 6, 8), .hadamard32, .none),
+                    ((6, 8, 2), .hadamard32, .hadamard32),
+                    ((8, 2, 3), .none, .hadamard32),
+                    ((3, 8, 6), .hadamard32, .none),
+                ]
             let ids: [UInt32] = [2, 0, 2, 1, 0, 1, 2, 0, 1, 2, 0, 0, 2, 1, 1, 2]
-            let weights: [Float] = [0, 2, -0.5, 0.25, 1, -1, 0.125, 0, -1, 0.5, 0, 2, 0.25, -0.5, 1, 0.125]
+            let weights: [Float] = [
+                0, 2, -0.5, 0.25, 1, -1, 0.125, 0, -1, 0.5, 0, 2, 0.25, -0.5, 1, 0.125,
+            ]
             let indices = MLXArray(ids, [tokens, routes])
             let scores = MLXArray(weights, [tokens, routes])
             for (caseIndex, entry) in cases.enumerated() {
                 let (bits, inputBasis, downBasis) = entry
                 let c = try contract(bits, input: inputBasis, down: downBasis)
-                let gu = try JANGHFusedGateUpKernel(contract: c, gateModule: prefix + ".gate_proj",
-                                                    upModule: prefix + ".up_proj", outputRotation: downBasis)
+                let gu = try JANGHFusedGateUpKernel(
+                    contract: c, gateModule: prefix + ".gate_proj",
+                    upModule: prefix + ".up_proj", outputRotation: downBasis)
                 let down = try JANGHWeightedDownKernel(contract: c, module: prefix + ".down_proj")
                 let g = bank(bits: bits.0, input: width, output: hiddenSize, seed: 3)
                 let u = bank(bits: bits.1, input: width, output: hiddenSize, seed: 11)
@@ -125,7 +141,8 @@ final class JANGHDecodeCompositionTests: XCTestCase {
                         return inputBasis == .hadamard32 ? h32(row) : row
                     }
                     let prepared = try gu.prepareInputForFusedDecode(input)
-                    XCTAssertEqual(prepared.dtype, inputBasis == .hadamard32 ? .float32 : inputDType)
+                    XCTAssertEqual(
+                        prepared.dtype, inputBasis == .hadamard32 ? .float32 : inputDType)
                     let actualHidden = try gu.activatePreparedInput(
                         prepared, gatePacked: packed(g), gateScales: scales(g), upPacked: packed(u),
                         upScales: scales(u), indices: indices, limit: limit)
@@ -133,13 +150,18 @@ final class JANGHDecodeCompositionTests: XCTestCase {
                     XCTAssertEqual(actualHidden.shape, [tokens * routes, hiddenSize])
                     var referenceHidden: [[Float]] = []
                     for dispatch in 0 ..< tokens * routes {
-                        let expert = Int(ids[dispatch]), x = rows[dispatch / routes]
+                        let expert = Int(ids[dispatch])
+                        let x = rows[dispatch / routes]
                         let hidden = (0 ..< hiddenSize).map { row -> Float in
                             var gate = dot(x, bank: g, expert: expert, row: row)
                             var up = dot(x, bank: u, expert: expert, row: row)
-                            if let limit { gate = min(gate, Double(limit)); up = max(-Double(limit), min(up, Double(limit))) }
+                            if let limit {
+                                gate = min(gate, Double(limit))
+                                up = max(-Double(limit), min(up, Double(limit)))
+                            }
                             // Stable double-precision sigmoid; cast once at the hidden boundary.
-                            let sigmoid = gate >= 0 ? 1 / (1 + exp(-gate)) : exp(gate) / (1 + exp(gate))
+                            let sigmoid =
+                                gate >= 0 ? 1 / (1 + exp(-gate)) : exp(gate) / (1 + exp(gate))
                             return Float(gate * sigmoid * up)
                         }
                         referenceHidden.append(downBasis == .hadamard32 ? h32(hidden) : hidden)
@@ -148,32 +170,42 @@ final class JANGHDecodeCompositionTests: XCTestCase {
                     for dispatch in referenceHidden.indices {
                         for row in 0 ..< hiddenSize {
                             let expected = referenceHidden[dispatch][row]
-                            XCTAssertEqual(hiddenValues[dispatch * hiddenSize + row], expected,
-                                           accuracy: max(0.00002, abs(expected) * 0.001),
-                                           "hidden case=\(caseIndex) input=\(inputDType)")
+                            XCTAssertEqual(
+                                hiddenValues[dispatch * hiddenSize + row], expected,
+                                accuracy: max(0.00002, abs(expected) * 0.001),
+                                "hidden case=\(caseIndex) input=\(inputDType)")
                         }
                     }
                     let expected = (0 ..< tokens * outputs).map { output -> Float in
-                        let token = output / outputs, row = output % outputs
+                        let token = output / outputs
+                        let row = output % outputs
                         var total: Double = 0
                         for route in 0 ..< routes {
                             let dispatch = token * routes + route
-                            total += Double(weights[dispatch]) * dot(referenceHidden[dispatch], bank: d,
-                                                                    expert: Int(ids[dispatch]), row: row)
+                            total +=
+                                Double(weights[dispatch])
+                                * dot(
+                                    referenceHidden[dispatch], bank: d,
+                                    expert: Int(ids[dispatch]), row: row)
                         }
                         return Float(total)
                     }
                     for outputDType in [DType.float16, .bfloat16, .float32] {
                         let result = try down.projectPreparedHidden(
-                            actualHidden, preparedBasis: downBasis, packed: packed(d), scales: scales(d),
+                            actualHidden, preparedBasis: downBasis, packed: packed(d),
+                            scales: scales(d),
                             indices: indices, scores: scores, outputDType: outputDType)
                         XCTAssertEqual(result.dtype, outputDType)
                         XCTAssertEqual(result.shape, [tokens, outputs])
                         let output = result.asType(.float32).asArray(Float.self)
-                        let tolerance: Float = outputDType == .bfloat16 ? 0.008 : (outputDType == .float16 ? 0.002 : 0.0005)
+                        let tolerance: Float =
+                            outputDType == .bfloat16
+                            ? 0.008 : (outputDType == .float16 ? 0.002 : 0.0005)
                         for i in output.indices {
-                            XCTAssertEqual(output[i], expected[i], accuracy: max(0.00005, abs(expected[i]) * tolerance),
-                                           "case=\(caseIndex) in=\(inputDType) out=\(outputDType) row=\(i)")
+                            XCTAssertEqual(
+                                output[i], expected[i],
+                                accuracy: max(0.00005, abs(expected[i]) * tolerance),
+                                "case=\(caseIndex) in=\(inputDType) out=\(outputDType) row=\(i)")
                         }
                     }
                 }
