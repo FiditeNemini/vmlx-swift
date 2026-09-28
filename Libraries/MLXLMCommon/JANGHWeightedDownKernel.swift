@@ -76,7 +76,7 @@ final class JANGHWeightedDownKernel {
                 }
                 if (lane == 0) for (uint r = 0; r < 4; ++r)
                     if (row0 + r < N) out[size_t(token) * N + row0 + r] = total[r];
-                """)
+                """, ensureRowContiguous: false)
     }
 
     /// `hidden`: [T*R,H] F32, `indices`/`scores`: [T,R] U32/F32.
@@ -108,8 +108,10 @@ final class JANGHWeightedDownKernel {
             hidden.dim(0) == dispatches.partialValue,
             packed.shape == [experts, n, width.partialValue / 32], scales.shape == [experts, n]
         else { throw JANGHFormatContract.ValidationError.invalid("invalid JANGH weighted-down geometry") }
+        try JANGHBankLayout.requireReadyRowContiguous(packed, role: "down packed")
+        try JANGHBankLayout.requireReadyRowContiguous(scales, role: "down scales")
         return kernel(
-            [contiguous(hidden), contiguous(packed), contiguous(scales), contiguous(indices), contiguous(scores)],
+            [contiguous(hidden), packed, scales, contiguous(indices), contiguous(scores)],
             template: [("H", h), ("N", n), ("EXPERTS", experts), ("ROUTES", indices.dim(1)),
                        ("WORDS", width.partialValue / 32)],
             grid: (64, (n + 7) / 8, indices.dim(0)), threadGroup: (64, 1, 1),

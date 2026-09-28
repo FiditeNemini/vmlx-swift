@@ -112,7 +112,7 @@ final class JANGHFusedGateUpKernel {
         fused = MLXFast.metalKernel(
             name: "jangh_fused_gu_" + identity,
             inputNames: ["x", "packed_g", "scales_g", "packed_u", "scales_u", "indices", "limit_value"],
-            outputNames: ["out"], source: source)
+            outputNames: ["out"], source: source, ensureRowContiguous: false)
         h32 = MLXFast.metalKernel(
             name: "jangh_decode_h32_f32_v1", inputNames: ["x"], outputNames: ["out"],
             source: """
@@ -173,12 +173,16 @@ final class JANGHFusedGateUpKernel {
             gateScales.shape == [experts, n], upScales.shape == [experts, n],
             outputRotation != .hadamard32 || n.isMultiple(of: 32)
         else { throw JANGHFormatContract.ValidationError.invalid("invalid fused JANGH geometry") }
+        try JANGHBankLayout.requireReadyRowContiguous(gatePacked, role: "gate packed")
+        try JANGHBankLayout.requireReadyRowContiguous(gateScales, role: "gate scales")
+        try JANGHBankLayout.requireReadyRowContiguous(upPacked, role: "up packed")
+        try JANGHBankLayout.requireReadyRowContiguous(upScales, role: "up scales")
         let rotated = outputRotation == .hadamard32
         let rows = rotated ? 32 : 8
         let threads = rotated ? 256 : 64
         return fused(
-            [contiguous(input), contiguous(gatePacked), contiguous(gateScales),
-             contiguous(upPacked), contiguous(upScales), contiguous(indices.flattened()),
+            [contiguous(input), gatePacked, gateScales,
+             upPacked, upScales, contiguous(indices.flattened()),
              MLXArray([limit ?? 0])],
             template: [("K", k), ("N", n), ("EXPERTS", experts), ("ROWS", rows),
                        ("WORDS_g", gWidth.partialValue / 32), ("WORDS_u", uWidth.partialValue / 32),

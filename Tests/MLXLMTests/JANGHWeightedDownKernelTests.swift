@@ -120,8 +120,8 @@ final class JANGHWeightedDownKernelTests: XCTestCase {
         try MLXMetalTestLock.withLock {
             let op = try makeKernel(3)
             let hidden = MLXArray.ones([4, 32], dtype: .float32)
-            let packed = MLXArray.zeros([1, 9, 3], dtype: .uint32)
-            let scales = MLXArray.ones([1, 9], dtype: .float16)
+            let packed = MLXArray([UInt32](repeating: 0, count: 27), [1, 9, 3])
+            let scales = MLXArray([Float16](repeating: 1, count: 9), [1, 9])
             let scores = MLXArray.zeros([2, 2], dtype: .float32)
             for dtype in [DType.float16, .bfloat16, .float32] {
                 let result = try op.projectPreparedHidden(
@@ -149,8 +149,8 @@ final class JANGHWeightedDownKernelTests: XCTestCase {
         try MLXMetalTestLock.withLock {
             let op = try makeKernel(2)
             let h = MLXArray.ones([1, 32], dtype: .float32)
-            let packed = MLXArray.zeros([1, 1, 2], dtype: .uint32)
-            let scales = MLXArray.ones([1, 1], dtype: .float16)
+            let packed = MLXArray([UInt32(0), 0], [1, 1, 2])
+            let scales = MLXArray([Float16(1)], [1, 1])
             let ids = MLXArray([UInt32(0)], [1, 1])
             let scores = MLXArray([Float(1)], [1, 1])
             func call(_ input: MLXArray? = nil, basis: JANGHFormatContract.Rotation = .none,
