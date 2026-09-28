@@ -16,9 +16,11 @@ final class TiedEmbeddingActivationDTypeTests: XCTestCase {
     func testHeadConversionPreservesSourceActivationPrecision() throws {
         try MLXMetalTestLock.withLock {
             for dtype: DType in [.float16, .bfloat16, .float32] {
-                let weights = MLXArray((0 ..< 8 * 64).map {
-                    Float($0 % 31 - 15) / 32
-                }, [8, 64]).asType(dtype)
+                let weights = MLXArray(
+                    (0 ..< 8 * 64).map {
+                        Float($0 % 31 - 15) / 32
+                    }, [8, 64]
+                ).asType(dtype)
                 let original = Embedding(weight: weights)
                 let converted = quantizeTiedEmbeddingPreservingOutputDType(
                     original, groupSize: 32, bits: 6)

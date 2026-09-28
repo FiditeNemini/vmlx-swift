@@ -1249,8 +1249,11 @@ public func loadWeights(
                 let emb = mod as? Embedding
             else { continue }
             headUpdates.append(
-                (path, quantizeTiedEmbeddingPreservingOutputDType(
-                    emb, groupSize: headGroupSize, bits: headBits)))
+                (
+                    path,
+                    quantizeTiedEmbeddingPreservingOutputDType(
+                        emb, groupSize: headGroupSize, bits: headBits)
+                ))
         }
         if !headUpdates.isEmpty {
             try model.update(modules: ModuleChildren.unflattened(headUpdates), verify: .none)
