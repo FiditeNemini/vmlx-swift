@@ -24,7 +24,7 @@ final class JANGHWeightedDownKernel {
         bits = projection.bits
         inputRotation = projection.rotation
         let description =
-            "jangh-weighted-down-v1|\(bits)|\(inputRotation.rawValue)|"
+            "jangh-weighted-down-v2|\(bits)|\(inputRotation.rawValue)|"
             + "\(book.alpha.bitPattern)|\(book.beta.bitPattern)"
         identity = SHA256.hash(data: Data(description.utf8)).map { String(format: "%02x", $0) }
             .joined()
@@ -46,7 +46,7 @@ final class JANGHWeightedDownKernel {
                     if (expert >= EXPERTS) {
                         if (lane == 0) for (uint r = 0; r < 4; ++r)
                             if (row0 + r < N) out[size_t(token) * N + row0 + r]
-                                = as_type<float>(0x7fc00000u);
+                                = T(as_type<float>(0x7fc00000u));
                         return;
                     }
                     float accum[4] = {0, 0, 0, 0};
@@ -78,7 +78,7 @@ final class JANGHWeightedDownKernel {
                     }
                 }
                 if (lane == 0) for (uint r = 0; r < 4; ++r)
-                    if (row0 + r < N) out[size_t(token) * N + row0 + r] = total[r];
+                    if (row0 + r < N) out[size_t(token) * N + row0 + r] = T(total[r]);
                 """, ensureRowContiguous: false)
     }
 
@@ -123,7 +123,8 @@ final class JANGHWeightedDownKernel {
         return kernel(
             [contiguous(hidden), packed, scales, contiguous(indices), contiguous(scores)],
             template: [
-                ("H", h), ("N", n), ("EXPERTS", experts), ("ROUTES", indices.dim(1)),
+                ("T", outputDType), ("H", h), ("N", n), ("EXPERTS", experts),
+                ("ROUTES", indices.dim(1)),
                 ("WORDS", width.partialValue / 32),
             ],
             grid: (64, (n + 7) / 8, indices.dim(0)), threadGroup: (64, 1, 1),
