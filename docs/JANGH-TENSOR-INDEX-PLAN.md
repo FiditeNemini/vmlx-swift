@@ -5,7 +5,11 @@ payload read or module construction. It does not enable a model factory or selec
 an architecture. Seven exact-source XCTest methods passed with zero failures in a standalone
 Foundation-only module and test bundle. Production and test files were compiled
 unchanged; the harness supplies a minimal module rather than the full package.
-Full-package integration remains pending.
+Full-package integration remains pending. A separate Foundation-only probe also admitted
+real GLM metadata (126 projections, 252 banks) and Naive metadata (141 projections,
+282 banks), with dimensions derived from architecture configuration and audited
+projection definitions rather than packed shapes. Only config, index, and shard
+headers were read; this was not a model load.
 
 The caller supplies a validated `JANGHFormatContract`, an exact architecture-owned
 projection dimension map, the safetensors index, and complete header summaries for
