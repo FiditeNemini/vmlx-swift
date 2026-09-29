@@ -177,4 +177,13 @@ final class JANGHModelPreparationTests: XCTestCase {
         }
     }
 
+    func testSelectedDiagnosticCacheCapRejectsMalformedAndUnboundedValues() throws {
+        XCTAssertEqual(try JANGHModelPreparation.selectedDiagnosticCacheBytes(environment: [:]), 128 * 1024 * 1024)
+        XCTAssertEqual(try JANGHModelPreparation.selectedDiagnosticCacheBytes(environment: ["VMLX_JANGH_SELECTED_CACHE_MIB": "0"]), 0)
+        XCTAssertEqual(try JANGHModelPreparation.selectedDiagnosticCacheBytes(environment: ["VMLX_JANGH_SELECTED_CACHE_MIB": "8192"]), 8 * 1024 * 1024 * 1024)
+        for value in ["-1", "16385", "abc", "99999999999999999999999999999999"] {
+            XCTAssertThrowsError(try JANGHModelPreparation.selectedDiagnosticCacheBytes(environment: ["VMLX_JANGH_SELECTED_CACHE_MIB": value]))
+        }
+    }
+
 }

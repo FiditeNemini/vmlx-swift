@@ -50,6 +50,9 @@ final class JANGHExpertMappedBanks {
     private var entries: [Key: Entry] = [:]
     private var leastRecentFirst: [Key] = []
     private var retainedBytes = 0
+    private var selections = 0
+    private var cacheHits = 0
+    private var cacheMisses = 0
     /// Checkpoint bytes, regardless of how many GPU views have been materialized.
     let logicalCheckpointBytes: Int
 
@@ -100,6 +103,12 @@ final class JANGHExpertMappedBanks {
         }
         lock.lock()
         defer { lock.unlock() }
+        selections += 1
+        defer {
+            if selections.isMultiple(of: 4096) {
+                print("JANGH_SELECTED_CACHE selections=\(selections) hits=\(cacheHits) misses=\(cacheMisses) retained_bytes=\(retainedBytes) cap_bytes=\(cacheByteLimit)")
+            }
+        }
         return try source.withValidatedFile(for: pair.packed) { packedFD, packedHeader in
             try source.withValidatedFile(for: pair.scales) { scaleFD, scaleHeader in
                 guard packedHeader.dtype == "U32", packedHeader.shape.count == 3,
@@ -154,10 +163,12 @@ final class JANGHExpertMappedBanks {
 
     private func cached(_ key: Key, create: () throws -> Entry) throws -> Entry {
         if let found = entries[key] {
+            cacheHits += 1
             leastRecentFirst.removeAll { $0 == key }
             leastRecentFirst.append(key)
             return found
         }
+        cacheMisses += 1
         let value = try create()
         // Oversized views remain valid for this selection but are not cached.
         guard value.mappedBytes <= cacheByteLimit else { return value }
