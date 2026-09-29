@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import XCTest
 @testable import MLXLLM
@@ -8,6 +9,47 @@ final class NaiveN05AsymmetricSDPATests: XCTestCase {
         (MLXArray.zeros([1, group, tokens, 192], dtype: dtype),
          MLXArray.zeros([1, 1, 17, 192], dtype: dtype),
          MLXArray.ones([1, 1, 17, 128], dtype: dtype))
+    }
+
+    /// Independent scalar oracle for F32 inputs. The explicit GPU reference's
+    /// matmuls can use TF32 under the default process policy, so it is not an
+    /// accuracy oracle for the full-precision vector SDPA output.
+    private func cpuAttention(query: [Float], key: [Float], value: [Float],
+                              allowed: [Bool], heads: Int, tokens: Int,
+                              hasSink: Bool, valueScale: Float) -> [Float] {
+        let keys = 17, width = 192, outputs = 128
+        var result = [Float]()
+        for batch in 0 ..< 2 {
+            for head in 0 ..< heads {
+                for token in 0 ..< tokens {
+                    let selected = (0 ..< keys).filter { allowed[(batch * tokens + token) * keys + $0] }
+                    if selected.isEmpty {
+                        result += [Float](repeating: 0, count: outputs)
+                        continue
+                    }
+                    let logits = selected.map { keyIndex -> Double in
+                        var dot = 0.0
+                        for d in 0 ..< width {
+                            dot += Double(query[((batch * heads + head) * tokens + token) * width + d])
+                                * Double(key[(batch * keys + keyIndex) * width + d])
+                        }
+                        return dot / sqrt(Double(width))
+                    }
+                    let maximum = max(logits.max()!, hasSink ? 0 : -Double.infinity)
+                    let exponentials = logits.map { exp($0 - maximum) }
+                    let denominator = exponentials.reduce(0, +) + (hasSink ? exp(-maximum) : 0)
+                    for column in 0 ..< outputs {
+                        var sum = 0.0
+                        for (slot, keyIndex) in selected.enumerated() {
+                            let scaled = value[(batch * keys + keyIndex) * outputs + column] * valueScale
+                            sum += exponentials[slot] / denominator * Double(scaled)
+                        }
+                        result.append(Float(sum))
+                    }
+                }
+            }
+        }
+        return result
     }
 
     func testNativeAsymmetricCutoffsKeepPrefillOnReference() throws {
@@ -78,9 +120,25 @@ final class NaiveN05AsymmetricSDPATests: XCTestCase {
                         let reference = NaiveN05FlashMath.referenceAttention(query: q, key: k, value: v,
                             allowed: mask, sink: sink, valueScale: 0.707)
                         let got = actual.asType(.float32).asArray(Float.self)
-                        let expected = reference.asType(.float32).asArray(Float.self)
+                        let gpuReference = reference.asType(.float32).asArray(Float.self)
+                        let expected = dtype == .float32
+                            ? cpuAttention(query: q.asArray(Float.self), key: k.asArray(Float.self),
+                                           value: v.asArray(Float.self), allowed: mask.asArray(Bool.self),
+                                           heads: group, tokens: tokens, hasSink: withSink, valueScale: 0.707)
+                            : gpuReference
                         let accuracy: Float = dtype == .float32 ? 0.00001 : dtype == .float16 ? 0.001 : 0.008
                         XCTAssertEqual(actual.shape, [2, group, tokens, 128])
+                        if dtype == .float32 {
+                            let drift = zip(gpuReference, expected).map { abs($0.0 - $0.1) }.max() ?? 0
+                            print("F32 reference vs CPU maximum error=\(drift) group=\(group) sink=\(withSink)")
+                            // This second relation is exercised by an explicitly
+                            // strict test process; no production setting changes.
+                            if ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0" {
+                                for index in got.indices {
+                                    XCTAssertEqual(got[index], gpuReference[index], accuracy: accuracy)
+                                }
+                            }
+                        }
                         for index in got.indices {
                             XCTAssertEqual(got[index], expected[index], accuracy: accuracy,
                                            "dtype=\(dtype) group=\(group) sink=\(withSink) index=\(index)")
