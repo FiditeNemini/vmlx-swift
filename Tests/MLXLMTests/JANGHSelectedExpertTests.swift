@@ -192,7 +192,7 @@ final class JANGHSelectedExpertTests: XCTestCase {
     }
     func testDiagnosticLayerMatchesDecodeAndPrefillWithoutRetainingWholeBanks() throws {
         try MLXMetalTestLock.withLock {
-            let f = try fixture(inputRotation: "hadamard32", downRotation: "hadamard32")
+            let f = try fixture(inputRotation: "hadamard32", downRotation: "hadamard32", hidden: 64)
             defer { try? FileManager.default.removeItem(at: f.directory) }
             let owner = try JANGHExpertMappedBanks(source: f.source, cacheByteLimit: 32768)
             let layer = try JANGHSelectedRoutedExpertLayer(source: f.source, owner: owner,
