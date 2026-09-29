@@ -3109,6 +3109,9 @@ public class Glm5Next: Module, ModalityBearing, ModelComponentMapping, Safetenso
     // Admitted custom bundles retain their native mixed checkpoint dtypes.
     // Keep the existing ordinary GLM loading policy unchanged.
     public var preservesCheckpointParameterDTypes: Bool { !customRoutedTensorNames.isEmpty }
+    // Mixed shards also contain custom banks mapped by their dedicated owner.
+    // Retain only ordinary tensor spans, not a second whole-shard Metal buffer.
+    public var requiresExactTensorMmapBuffers: Bool { !customRoutedTensorNames.isEmpty }
 
     public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
         customRoutedTensorNames.contains(key)

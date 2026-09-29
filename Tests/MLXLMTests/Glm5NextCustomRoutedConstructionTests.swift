@@ -107,11 +107,13 @@ final class Glm5NextCustomRoutedConstructionTests: XCTestCase {
             })
             let custom = try Glm5Next(config, requesting: [.text], routedExperts: banks,
                                       customRoutedTensorNames: names)
+            XCTAssertTrue(custom.requiresExactTensorMmapBuffers)
             for name in names { XCTAssertTrue(custom.excludeFromGenericSafetensorsLoad(key: name)) }
             XCTAssertFalse(custom.excludeFromGenericSafetensorsLoad(key: "model.embed_tokens.weight"))
             XCTAssertThrowsError(try Glm5Next(config, requesting: [.text], routedExperts: banks,
                 customRoutedTensorNames: names.union(["model.embed_tokens.weight"])))
             let ordinary = try Glm5Next(config, requesting: [.text])
+            XCTAssertFalse(ordinary.requiresExactTensorMmapBuffers)
             for name in names { XCTAssertFalse(ordinary.excludeFromGenericSafetensorsLoad(key: name)) }
         }
     }
