@@ -6,7 +6,9 @@ import XCTest
 @testable import MLXLMCommon
 
 private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sendable {
-    let outputShape: [Int]
+    var outputShape: [Int]
+    var preparedOffsets: [Int] = []
+    var preparedTokenCounts: [Int] = []
     let failProjection: Bool
     let mutateCache: Bool
     var vocabularySize: Int { 4 }
@@ -18,11 +20,15 @@ private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sen
         super.init()
     }
 
-    func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        mutateCache ? [KVCacheSimple()] : []
+    }
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        preparedOffsets.append(cache.first?.offset ?? 0)
+        preparedTokenCounts.append(input.text.tokens.size)
         if mutateCache {
-            let row = MLXArray.ones([1, 1, 1, 4])
+            let row = MLXArray.ones([1, 1, input.text.tokens.size, 4])
             for layer in cache { _ = layer.update(keys: row, values: row) }
         }
         if failProjection {
@@ -40,6 +46,59 @@ private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sen
 }
 
 final class PreparedLogitsValidationTests: XCTestCase {
+    func testSessionInvalidatesFailedPreparationUntilExplicitReset() async throws {
+        try await MLXMetalTestLock.withLock {
+            let fixture = PreparedLogitsFixture(shape: [1, 1, 4], mutateCache: true)
+            let tokenizer = PreparationHistoryTokenizer()
+            let processor = TestInputProcessor(
+                tokenizer: tokenizer,
+                configuration: ModelConfiguration(id: "fixture/session"),
+                messageGenerator: DefaultMessageGenerator())
+            let context = ModelContext(
+                configuration: processor.configuration, model: fixture,
+                processor: processor, tokenizer: tokenizer)
+            let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+            let session = ChatSession(context, generateParameters: parameters)
+            _ = try await session.respond(to: "first fact")
+            fixture.outputShape = [1, 4]
+            do {
+                _ = try await session.respond(to: "failing continuation")
+                XCTFail("Expected malformed prepared logits")
+            } catch is PreparedLogitsValidationError {}
+            XCTAssertGreaterThan(
+                fixture.preparedOffsets.last ?? 0, 0,
+                "Failure fixture must begin with retained conversation state")
+            let callsAfterFailure = fixture.preparedOffsets.count
+            await session.withCache { XCTAssertNil($0) }
+            fixture.outputShape = [1, 1, 4]
+            do {
+                _ = try await session.respond(to: "must not silently lose history")
+                XCTFail("Invalid session must require explicit reset/history replay")
+            } catch ChatSessionError.cacheInvalidatedAfterPreparation {}
+            XCTAssertEqual(fixture.preparedOffsets.count, callsAfterFailure)
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+                UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: url) }
+            do {
+                try await session.saveCache(to: url)
+                XCTFail("Failed session cache must not be saved")
+            } catch ChatSessionError.cacheInvalidatedAfterPreparation {}
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+            await session.clear()
+            _ = try await session.respond(to: "explicitly new conversation")
+            XCTAssertEqual(fixture.preparedOffsets.last, 0)
+            let restored = ChatSession(
+                context,
+                history: [.user("first fact"), .assistant("remembered fact")],
+                generateParameters: parameters)
+            _ = try await restored.respond(to: "continuation after replay")
+            XCTAssertEqual(fixture.preparedOffsets.last, 0)
+            XCTAssertEqual(
+                fixture.preparedTokenCounts.last, 3,
+                "A replacement session must prepare complete supplied history plus next turn")
+        }
+    }
+
     func testMalformedPreparedShapesThrowBeforeSampling() throws {
         try MLXMetalTestLock.withLock {
             for shape in [[], [4], [1, 4], [1, 1, 1, 4], [0, 1, 4], [1, 0, 4], [1, 1, 0]] {
@@ -135,5 +194,21 @@ final class PreparedLogitsValidationTests: XCTestCase {
                 XCTAssertEqual(iterator.next(), 3)
             }
         }
+    }
+}
+
+private struct PreparationHistoryTokenizer: Tokenizer {
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [1] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "answer" }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { "answer" }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        Array(repeating: 1, count: messages.count)
     }
 }

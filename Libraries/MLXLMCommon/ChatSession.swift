@@ -26,6 +26,7 @@ public final class ChatSession {
         case empty
         case kvcache([KVCache])
         case history([Chat.Message])
+        case invalidatedAfterPreparation
     }
 
     private let model: ModelContainer
@@ -400,6 +401,8 @@ public final class ChatSession {
                     // Whether this session already carries conversation state the caller depends on.
                     var kvCacheIsPopulated = false
                     switch cache {
+                    case .invalidatedAfterPreparation:
+                        throw ChatSessionError.cacheInvalidatedAfterPreparation
                     case .empty:
                         kvCache = model.newCache(parameters: generateParameters)
                         cache = .kvcache(kvCache)
@@ -473,6 +476,7 @@ public final class ChatSession {
                         // prepare() guard.
                         let stream: AsyncStream<Generation>
                         let task: Task<Void, Never>
+                        do {
                         if let diffusionModel = model as? any BlockDiffusionModel {
                             let options = diffusionModel.blockDiffusionDefaults
                                 .resolving(
@@ -529,9 +533,25 @@ public final class ChatSession {
                             )
                         }
 
+                        } catch {
+                            // Preparation may mutate this session's live KV before
+                            // throwing. Drop it while still holding cache.update's
+                            // exclusive ownership; never reset later and race a
+                            // newer request. This session cannot reconstruct prior
+                            // conversation history from a single next-turn prompt.
+                            StreamOrDevice.default.stream.synchronize()
+                            cache = .invalidatedAfterPreparation
+                            throw error
+                        }
+
                         var pendingToolCalls: [ToolCall] = []
 
                         for await item in stream {
+                            if case .info(let info) = item, let failure = info.generationFailure {
+                                await task.value
+                                cache = .invalidatedAfterPreparation
+                                throw failure
+                            }
                             if case .info(let info) = item,
                                 let failure = info.toolCallProtocolFailure
                             {
@@ -659,6 +679,8 @@ public final class ChatSession {
             switch cache {
             case .kvcache(let cache):
                 try savePromptCache(url: url, cache: cache)
+            case .invalidatedAfterPreparation:
+                throw ChatSessionError.cacheInvalidatedAfterPreparation
             default:
                 throw ChatSessionError.noCacheAvailable
             }
@@ -671,12 +693,18 @@ public enum ChatSessionError: LocalizedError {
     /// ``ChatSession/saveCache(to:)`` was called before any generation occurred.
     case noCacheAvailable
 
+    /// A failed preparation invalidated append-only session state. Clear the
+    /// session or create a new session with complete history before continuing.
+    case cacheInvalidatedAfterPreparation
+
     /// The model completed a committed tool-call envelope that could not be
     /// parsed into an executable call.
     case toolCallProtocolFailure(ToolCallProtocolFailure)
 
     public var errorDescription: String? {
         switch self {
+        case .cacheInvalidatedAfterPreparation:
+            "Session preparation failed and its KV cache was discarded. Clear the session or create a new session with the complete conversation history before continuing."
         case .noCacheAvailable:
             "No KV cache is available. Call respond() or streamResponse() before saveCache(to:)."
         case .toolCallProtocolFailure(let failure):

@@ -1068,7 +1068,8 @@ public actor BatchEngine {
                         turboQuantCompressions: info.turboQuantCompressions,
                         turboQuantCacheTransition: info.turboQuantCacheTransition,
                         unclosedReasoning: unclosed,
-                        toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure)
+                        toolCallProtocolFailure: toolCallProcessor?.toolCallProtocolFailure,
+                        generationFailure: info.generationFailure)
                     terminationState.markCompleted()
                     if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
                         // Hosts report the visible answer finishing seconds
