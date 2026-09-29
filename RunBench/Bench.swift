@@ -8460,7 +8460,7 @@ func runPerfBench(
         }
         // Only this owned diagnostic process uses the existing shared ticket
         // manager. Its cancellation-safe scope restores the prior baseline.
-        let ticket = WiredMemoryTicket(size: mib * 1024 * 1024, policy: WiredSumPolicy())
+        let ticket = MLX.WiredMemoryTicket(size: mib * 1024 * 1024, policy: MLX.WiredSumPolicy())
         print("PERF_SELECTED_RESIDENCY_DIAGNOSTIC requested_mib=\(mib) scope=shared_ticket")
         try await ticket.withWiredLimit {
             try await runPerfBenchBody(modelPath: modelPath, maxNew: maxNew, variant: variant,
