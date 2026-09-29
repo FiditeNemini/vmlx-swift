@@ -220,9 +220,8 @@ final class JANGHExpertMappedBanks {
         var value = try create()
         // Oversized views remain valid for this selection but are not cached.
         guard value.mappedBytes <= cacheByteLimit else { return value }
-        while retainedBytes > cacheByteLimit - value.mappedBytes,
-              let oldest = leastRecent {
-            guard let evicted = entries.removeValue(forKey: oldest) else {
+        while retainedBytes > cacheByteLimit - value.mappedBytes {
+            guard let oldest = leastRecent, let evicted = entries.removeValue(forKey: oldest) else {
                 throw JANGHFormatContract.ValidationError.invalid("invalid JANGH expert cache links")
             }
             leastRecent = evicted.next
