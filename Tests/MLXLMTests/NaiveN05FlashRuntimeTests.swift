@@ -147,10 +147,15 @@ final class NaiveN05FlashRuntimeTests: XCTestCase {
         let model = try NaiveN05FlashModel(tiny(), routedFactory: { layer, _ in
             constructed.append(layer)
             return ConstructionProbe()
-        })
+        }, excludedSafetensorsKeys:["model.layers.1.mlp.switch_mlp.gate_proj.weight"])
+        XCTAssertTrue(model.excludeFromGenericSafetensorsLoad(key:"model.layers.1.mlp.switch_mlp.gate_proj.weight"))
+        XCTAssertFalse(model.excludeFromGenericSafetensorsLoad(key:"model.layers.1.mlp.gate.weight"))
+        XCTAssertTrue(model.requiresExactTensorMmapBuffers)
+        XCTAssertThrowsError(try NaiveN05FlashModel(tiny(),
+            excludedSafetensorsKeys:["model.layers.1.mlp.switch_mlp.gate_proj.weight"]))
         XCTAssertEqual(constructed, [1])
         let names = model.parameters().flattened().map { $0.0 }
-        XCTAssertFalse(names.contains { $0.contains("mlp.experts.") })
+        XCTAssertFalse(names.contains { $0.contains("mlp.switch_mlp.") })
         XCTAssertTrue(names.contains("model.layers.1.mlp.gate.weight"))
             }
     }
@@ -173,4 +178,115 @@ final class NaiveN05FlashRuntimeTests: XCTestCase {
         XCTAssertEqual(cache[1].state.map{$0.dim(2)},[2,2])
             }
     }
+    func testActualDiskSerializerReopenRestoresCompanionAndContinues() throws {
+        try MLXMetalTestLock.withLock {
+            MLXRandom.seed(20260928)
+            let model = try NaiveN05FlashModel(tiny())
+            let tokens = MLXArray([1,2,3,4,5,6]).reshaped(1,6)
+            let original = model.newCache()
+            _ = try model(tokens, cache: original)
+            eval(original)
+            let path = FileManager.default.temporaryDirectory
+                .appendingPathComponent("naive-companion-\(UUID().uuidString).safetensors")
+            defer { try? FileManager.default.removeItem(at: path) }
+            try MLX.save(arrays: TQDiskSerializer.serialize(cache: original), url: path)
+            let disk = try MLX.loadArrays(url: path)
+            var restored: [KVCache] = model.newCache()
+            XCTAssertEqual(restoreFromDiskArrays(disk, into: &restored, requirePromptBoundary: true), 6)
+            XCTAssertTrue(validateRestoredCacheBoundary(restored, matchedTokens:6, restoredTokens:6))
+            let typed = try XCTUnwrap(restored as? [NaiveN05FlashCache])
+            XCTAssertEqual(typed[0].state.count, 3)
+            XCTAssertEqual(typed[1].state[0].dim(2), 2)
+            let next = MLXArray([7]).reshaped(1,1)
+            close(try model(next, cache:typed), try model(next, cache:original), tolerance:0)
+        }
+    }
+
+    func testActualDiskRestoreMissingLateCompanionLeavesAllLayersUntouched() throws {
+        try MLXMetalTestLock.withLock {
+            let first = NaiveN05FlashCache(window:3, requiresIndexer:false)
+            let second = NaiveN05FlashCache(window:nil, requiresIndexer:true)
+            let k = MLXArray.ones([1,1,4,4]), v = MLXArray.ones([1,1,4,2])
+            _ = try first.append(keys:k, values:v, indexer:nil)
+            _ = try second.append(keys:k, values:v, indexer:k)
+            var broken = TQDiskSerializer.serialize(cache:[first,second])
+            XCTAssertNotNil(broken.removeValue(forKey:"model_1_state_2"))
+            var target: [KVCache] = [NaiveN05FlashCache(window:3,requiresIndexer:false),
+                NaiveN05FlashCache(window:nil,requiresIndexer:true)]
+            XCTAssertEqual(restoreFromDiskArrays(broken,into:&target,requirePromptBoundary:true),0)
+            XCTAssertEqual(target.map(\.offset),[0,0])
+            XCTAssertTrue(target.allSatisfy { $0.state.isEmpty })
+        }
+    }
+
+    func testRuntimeAdapterAdmitsSingleSequenceAndPreservesChunkContinuation() throws {
+        try MLXMetalTestLock.withLock {
+            MLXRandom.seed(20260928)
+            let model = try NaiveN05FlashModel(tiny())
+            let runtime: any LanguageModel = model
+            XCTAssertEqual(runtime.maximumSupportedDecodeBatchSize, 1)
+            XCTAssertFalse(runtime.supportsWholeForwardCompilation)
+            let cache = runtime.newCache(parameters:nil)
+            let tokens = MLXArray([1,2,3,4,5,6])
+            let reference = try model(tokens.reshaped(1,-1), padding:nil)
+            guard case .tokens(let remainder) = try runtime.prepare(
+                LMInput(tokens:tokens, mask:MLXArray.ones([6],dtype:.bool)),
+                cache:cache, windowSize:2)
+            else { return XCTFail("Expected remaining prompt tokens") }
+            XCTAssertEqual(remainder.tokens.shape,[2])
+            XCTAssertEqual(cache.map(\.offset),[4,4])
+            let actual = runtime(remainder,cache:cache,state:nil).logits
+            close(actual,reference[0...,4...],tolerance:3e-4)
+            XCTAssertEqual(cache.map(\.offset),[6,6])
+            // A cacheless prepare must leave all context to the final forward.
+            guard case .tokens(let whole) = try runtime.prepare(
+                LMInput(tokens:tokens),cache:[],windowSize:2)
+            else { return XCTFail("Expected complete cacheless prompt") }
+            XCTAssertEqual(whole.tokens.size,6)
+        }
+    }
+
+    func testRuntimeAdapterRejectsPaddingBatchAndWrongCacheBeforeMutation() throws {
+        try MLXMetalTestLock.withLock {
+            let model = try NaiveN05FlashModel(tiny())
+            let runtime: any LanguageModel = model
+            let cache = runtime.newCache(parameters:nil)
+            XCTAssertThrowsError(try runtime.prepare(LMInput(tokens:MLXArray([0,1]),
+                mask:MLXArray([false,true])),cache:cache,windowSize:1))
+            XCTAssertThrowsError(try runtime.prepare(LMInput(tokens:MLXArray([1,2]).reshaped(2,1)),
+                cache:cache,windowSize:1))
+            XCTAssertThrowsError(try runtime.prepare(LMInput(tokens:MLXArray([1])),
+                cache:cache,windowSize:0))
+            // The late layer has the wrong topology. Reject before layer 0 appends.
+            let wrong: [KVCache] = [cache[0],NaiveN05FlashCache(window:nil,requiresIndexer:true)]
+            XCTAssertThrowsError(try runtime.replayForward(MLXArray([1]),cache:wrong))
+            XCTAssertEqual(cache.map(\.offset),[0,0])
+            XCTAssertEqual(wrong.map(\.offset),[0,0])
+            XCTAssertTrue(wrong.allSatisfy { $0.state.isEmpty })
+        }
+    }
+
+    func testRuntimeLateLayerWrongDTypeRestoresEveryCacheWithoutReplacingIdentity() throws {
+        try MLXMetalTestLock.withLock {
+            let model = try NaiveN05FlashModel(tiny())
+            let runtime: any LanguageModel = model
+            let cache = model.newCache()
+            _ = try runtime.replayForward(MLXArray([1,2]),cache:cache)
+            let late = cache[1]
+            XCTAssertTrue(late.restoreDiskCacheState(late.state.map { $0.asType(.float16) },
+                metadata:late.metaState,offset:late.offset))
+            let before = cache.map { $0.state }
+            let identities = cache.map(ObjectIdentifier.init)
+            XCTAssertThrowsError(try runtime.replayForward(MLXArray([3]),cache:cache))
+            XCTAssertEqual(cache.map(\.offset),[2,2])
+            XCTAssertEqual(cache.map(ObjectIdentifier.init),identities)
+            for (entry, rows) in zip(cache,before) {
+                for (actual, expected) in zip(entry.state,rows) {
+                    XCTAssertEqual(actual.dtype,expected.dtype)
+                    close(actual,expected,tolerance:0)
+                }
+            }
+        }
+    }
+
 }

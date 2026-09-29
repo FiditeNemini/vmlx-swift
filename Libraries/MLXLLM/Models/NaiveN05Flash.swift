@@ -120,7 +120,7 @@ final class NaiveN05FlashDenseMLP: Module, UnaryLayer {
 final class NaiveN05FlashMoE: Module, UnaryLayer {
     let gate: NaiveN05FlashRouter
     // Separate projections keep original gate/up/down names and affine loading.
-    @ModuleInfo(key: "experts") var experts: Module
+    @ModuleInfo(key: "switch_mlp") var experts: Module
     init(_ c: NaiveN05ArchitectureContract, experts: (Module & WeightedRoutedExpertLayer)? = nil) {
         gate = NaiveN05FlashRouter(c)
         if let experts {
@@ -174,14 +174,20 @@ final class NaiveN05FlashBackbone: Module {
     }
 }
 
-/// Unregistered reference graph. A throwing forward keeps malformed companion
-/// caches out of the nonthrowing LanguageModel API until its adapter is proven.
+/// Unregistered reference graph. The runtime bridge separately admits unpadded
+/// single-sequence input and validates model-owned companion caches.
 final class NaiveN05FlashModel: Module {
     typealias RoutedFactory = (Int, NaiveN05ArchitectureContract) throws -> (Module & WeightedRoutedExpertLayer)
     let config: NaiveN05ArchitectureContract
+    let excludedSafetensorsKeys: Set<String>
     let model: NaiveN05FlashBackbone
     @ModuleInfo(key: "lm_head") var head: Linear
-    init(_ c: NaiveN05ArchitectureContract, routedFactory: RoutedFactory? = nil) throws {
+    init(_ c: NaiveN05ArchitectureContract, routedFactory: RoutedFactory? = nil,
+        excludedSafetensorsKeys: Set<String> = []) throws {
+        guard excludedSafetensorsKeys.isEmpty || routedFactory != nil else {
+            throw NaiveN05FlashCache.Failure.invalidGeometry
+        }
+        self.excludedSafetensorsKeys = excludedSafetensorsKeys
         config = c
         model = try NaiveN05FlashBackbone(c, routedFactory: routedFactory)
         _head.wrappedValue = Linear(c.hiddenDimensions, c.vocabularySize, bias: false)
@@ -202,4 +208,11 @@ final class NaiveN05FlashModel: Module {
         for (i, layer) in model.layers.enumerated() { h = try layer(h, positions: positions, padding: padding, cache: cache?[i]) }
         return head(model.norm(h))
     }
+}
+
+extension NaiveN05FlashModel: SafetensorsLoadKeyExcluding {
+    func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        excludedSafetensorsKeys.contains(key)
+    }
+    var requiresExactTensorMmapBuffers: Bool { !excludedSafetensorsKeys.isEmpty }
 }
