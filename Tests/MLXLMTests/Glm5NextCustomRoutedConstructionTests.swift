@@ -87,4 +87,32 @@ final class Glm5NextCustomRoutedConstructionTests: XCTestCase {
         }
     }
 
+    func testGenericLoaderExcludesOnlyCompleteCustomBankKeys() throws {
+        try MLXMetalTestLock.withLock {
+            let config = try JSONDecoder().decode(Glm5NextConfiguration.self,
+                from: Data(Glm5NextConstructionTests.tinyJSON.replacingOccurrences(
+                    of: "\"num_nextn_predict_layers\":1", with: "\"num_nextn_predict_layers\":0").utf8))
+            var banks: [Int: any WeightedRoutedExpertLayer] = [:]
+            for layer in 0 ..< config.textConfig.numHiddenLayers
+                where config.textConfig.mlpLayerTypes[layer] == .sparse {
+                banks[layer] = FixtureBank()
+            }
+            let names = Set(banks.keys.flatMap { layer in
+                ["gate_proj", "up_proj", "down_proj"].flatMap { role in
+                    ["tq2_packed", "tq2_scales"].map { suffix in
+                        "model.layers.\(layer).mlp.switch_mlp.\(role).\(suffix)"
+                    }
+                }
+            })
+            let custom = try Glm5Next(config, requesting: [.text], routedExperts: banks,
+                                      customRoutedTensorNames: names)
+            for name in names { XCTAssertTrue(custom.excludeFromGenericSafetensorsLoad(key: name)) }
+            XCTAssertFalse(custom.excludeFromGenericSafetensorsLoad(key: "model.embed_tokens.weight"))
+            XCTAssertThrowsError(try Glm5Next(config, requesting: [.text], routedExperts: banks,
+                customRoutedTensorNames: names.union(["model.embed_tokens.weight"])))
+            let ordinary = try Glm5Next(config, requesting: [.text])
+            for name in names { XCTAssertFalse(ordinary.excludeFromGenericSafetensorsLoad(key: name)) }
+        }
+    }
+
 }
