@@ -17,6 +17,13 @@ enum JANGHDecodeQDot {
             // Two words suffice in either case; K%32 keeps the final pair in-row.
             lines.append("uint qstart = ((\(columnBase)) * 3u) & 31u;")
         }
+        if bits == 2 {
+            // The centered codes are -1.5, -0.5, 0.5, 1.5. Evaluate the
+            // same polynomial for the two magnitudes without changing the
+            // coefficient FMA sequence or rounding levels on the host.
+            lines.append("const float qsmall = 0.5f * fma(\(beta)f, 0.25f, \(alpha)f);")
+            lines.append("const float qlarge = 1.5f * fma(\(beta)f, 2.25f, \(alpha)f);")
+        }
         for i in 0 ..< 16 {
             let code: String
             if bits == 3 {
@@ -33,7 +40,11 @@ enum JANGHDecodeQDot {
                 }
                 code = unpacked
             }
-            lines.append("{ float u = float(\(code) & \((1 << bits) - 1)u) - \(Float((1 << bits) - 1) / 2)f; float level = u * fma(\(beta)f, u * u, \(alpha)f); \(accumulator) = fma(\(values)[\(i)], level, \(accumulator)); }")
+            if bits == 2 {
+                lines.append("{ uint qc = \(code) & 3u; float magnitude = (qc == 0u || qc == 3u) ? qlarge : qsmall; float level = (qc & 2u) != 0u ? magnitude : -magnitude; \(accumulator) = fma(\(values)[\(i)], level, \(accumulator)); }")
+            } else {
+                lines.append("{ float u = float(\(code) & \((1 << bits) - 1)u) - \(Float((1 << bits) - 1) / 2)f; float level = u * fma(\(beta)f, u * u, \(alpha)f); \(accumulator) = fma(\(values)[\(i)], level, \(accumulator)); }")
+            }
         }
         lines.append("}")
         return lines.joined(separator: "\n")
