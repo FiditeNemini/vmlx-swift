@@ -8531,6 +8531,21 @@ func runPerfBench(
                 jangPressRuntime = nil
             }
         }
+        // Explicit diagnostic only. This never changes a production load default.
+        if let raw = env["BENCH_PERF_POST_LOAD_MEMORY_LIMIT_BYTES"] {
+            let physical = ProcessInfo.processInfo.physicalMemory
+            guard let requested = Int(raw), requested > 0,
+                let recommended = GPU.maxRecommendedWorkingSetBytes(), recommended > 0,
+                UInt64(requested) <= physical, requested <= recommended
+            else {
+                throw NSError(domain: "BENCH_PERF", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "Post-load memory limit must be positive and no larger than physical memory or the recommended GPU working set"])
+            }
+            let before = MLX.Memory.memoryLimit
+            let active = MLX.Memory.activeMemory, cached = MLX.Memory.cacheMemory
+            MLX.Memory.memoryLimit = requested
+            print("PERF_MEMORY_LIMIT_DIAGNOSTIC requested_bytes=\(requested) before_bytes=\(before) after_bytes=\(MLX.Memory.memoryLimit) active_bytes=\(active) cached_bytes=\(cached) recommended_bytes=\(recommended) physical_bytes=\(physical) scope=explicit_owned_process_experiment")
+        }
         if let persistentAllocatorCap = env["BENCH_PERF_PERSISTENT_ALLOCATOR_CACHE_BYTES"]
             .flatMap(Int.init)
         {
@@ -9009,8 +9024,11 @@ func runPerfBench(
             "PERF model=%@ variant=%@ path=%@ samplingSource=%@ seed=%@ kvMode=%@ jangpress=%@ mmap=%@ commit=%@ loadSec=%.2f promptTokens=%d peak_rss_mib=%.0f peak_footprint_mib=%.0f graphNodes=%@ asType=%@ genTokens=%d genSec=%.3f tokps_median=%.1f tokps_best=%.1f runs=%@ stop=%@ unclosedReasoning=%@ loop=%@ leaks=%@",
             modelName, variant, pathLabel, samplingSource, perfSeedLabel,
             env["BENCH_PERF_KV_MODE"] ?? "none",
-            useJangPressLoad ? "on" : "off",
-            useMmap ? "on" : "off",
+            jangPressRuntime?.appliedOptions?.enabled == true ? "on" : "off",
+            context.model.modelWeightAccounting().supplementalMappedBytes > 0
+                ? "custom-banks-mapped"
+                : (LoadBundleFacts.inspect(bundleURL: modelDir).resolveMmapSafetensors(requested: useMmap)
+                    ? "policy-enabled" : "policy-disabled"),
             head, loadSec, promptTokens.count,
             peakRSSMiB, peakFootprintMiB,
             graphStats.map { String($0.nodes) } ?? "na",
