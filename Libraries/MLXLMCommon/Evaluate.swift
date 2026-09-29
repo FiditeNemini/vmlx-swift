@@ -4732,15 +4732,18 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 // closing the stream (see the CancellationError branch above).
                 StreamOrDevice.default.stream.synchronize()
                 handler.onGenerationEnd(emit: continuation.yield)
-                _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
-                    promptTokenCount: promptTokenCount,
-                    generationTokenCount: 0,
-                    promptTime: 0,
-                    generationTime: 0,
-                    stopReason: .cancelled,
-                    toolCallProtocolFailure: handler.toolCallProtocolFailure,
-                    generationFailure: GenerationFailure(stage: .preparation, cause: error.localizedDescription)
-                )))
+                _ = continuation.yield(
+                    handler.infoEvent(
+                        GenerateCompletionInfo(
+                            promptTokenCount: promptTokenCount,
+                            generationTokenCount: 0,
+                            promptTime: 0,
+                            generationTime: 0,
+                            stopReason: .cancelled,
+                            toolCallProtocolFailure: handler.toolCallProtocolFailure,
+                            generationFailure: GenerationFailure(
+                                stage: .preparation, cause: error.localizedDescription)
+                        )))
                 continuation.finish()
                 return
             }
