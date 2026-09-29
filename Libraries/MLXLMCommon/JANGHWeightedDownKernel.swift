@@ -24,11 +24,13 @@ final class JANGHWeightedDownKernel {
         bits = projection.bits
         inputRotation = projection.rotation
         let description =
-            "jangh-weighted-down-v2|\(bits)|\(inputRotation.rawValue)|"
+            "jangh-weighted-down-v3-word|\(bits)|\(inputRotation.rawValue)|"
             + "\(book.alpha.bitPattern)|\(book.beta.bitPattern)"
         identity = SHA256.hash(data: Data(description.utf8)).map { String(format: "%02x", $0) }
             .joined()
-        let center = Float((1 << bits) - 1) / 2
+        let dot = JANGHDecodeQDot.source(
+            bits: bits, packed: "packed", rowBase: "base", columnBase: "block + lane * 16u",
+            values: "values", accumulator: "accum[r]", alpha: Float(book.alpha), beta: Float(book.beta))
         kernel = MLXFast.metalKernel(
             name: "jangh_weighted_down_" + identity,
             inputNames: ["hidden", "packed", "scales", "indices", "scores"], outputNames: ["out"],
@@ -51,26 +53,19 @@ final class JANGHWeightedDownKernel {
                     }
                     float accum[4] = {0, 0, 0, 0};
                     for (uint block = 0; block < H; block += 512u) {
-                        for (uint i = 0; i < 16; ++i) {
-                            uint column = block + lane * 16u + i;
-                            if (column >= H) continue;
-                            float value = hidden[dispatch * H + column];
-                            uint bit = column * \(bits)u;
-                            uint shift = bit & 31u;
-                            uint word = bit >> 5u;
-                            for (uint r = 0; r < 4; ++r) {
-                                if (row0 + r >= N) continue;
-                                size_t base = (size_t(expert) * N + row0 + r) * WORDS;
-                                uint code = packed[base + word] >> shift;
-                                if (shift + \(bits)u > 32u)
-                                    code |= packed[base + word + 1] << (32u - shift);
-                                code &= (1u << \(bits)u) - 1u;
-                                float u = float(code) - \(center)f;
-                                float level = u * fma(\(Float(book.beta))f, u * u, \(Float(book.alpha))f);
-                                accum[r] = fma(value, level, accum[r]);
-                            }
+                        if (block + lane * 16u >= H) continue;
+                        float values[16];
+                        _Pragma("clang loop unroll(full)")
+                        for (uint i = 0; i < 16; ++i)
+                            values[i] = hidden[dispatch * H + block + lane * 16u + i];
+                        _Pragma("clang loop unroll(full)")
+                        for (uint r = 0; r < 4; ++r) {
+                            if (row0 + r >= N) continue;
+                            size_t base = (size_t(expert) * N + row0 + r) * WORDS;
+                            \(dot)
                         }
                     }
+
                     for (uint r = 0; r < 4; ++r) {
                         float dot = simd_sum(accum[r]);
                         if (row0 + r < N)

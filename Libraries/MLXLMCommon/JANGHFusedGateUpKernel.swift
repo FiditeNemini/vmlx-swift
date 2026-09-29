@@ -35,33 +35,26 @@ final class JANGHFusedGateUpKernel {
         inputRotation = gate.rotation
         self.outputRotation = outputRotation
         let description =
-            "jangh-fused-gu-v1|\(gate.bits)|\(up.bits)|\(gate.rotation.rawValue)|"
+            "jangh-fused-gu-v2-word|\(gate.bits)|\(up.bits)|\(gate.rotation.rawValue)|"
             + "\(outputRotation.rawValue)|\(gateBook.alpha.bitPattern)|\(gateBook.beta.bitPattern)|"
             + "\(upBook.alpha.bitPattern)|\(upBook.beta.bitPattern)"
         identity = SHA256.hash(data: Data(description.utf8)).map { String(format: "%02x", $0) }
             .joined()
         func projection(_ name: String, bits: Int, book: JANGHFormatContract.Codebook) -> String {
-            let center = Float((1 << bits) - 1) / 2
+            let dot = JANGHDecodeQDot.source(
+                bits: bits, packed: "packed_\(name)", rowBase: "base_\(name)",
+                columnBase: "block + lane * 16u", values: "values",
+                accumulator: "partial_\(name)", alpha: Float(book.alpha), beta: Float(book.beta))
             return """
                 size_t base_\(name) = (size_t(expert) * N + row0 + r) * WORDS_\(name);
                 float partial_\(name) = 0.0f;
-                for (uint i = 0; i < 16; ++i) {
-                    uint column = block + lane * 16u + i;
-                    if (column >= K) continue;
-                    uint bit = column * \(bits)u;
-                    uint shift = bit & 31u;
-                    uint word = bit >> 5u;
-                    uint code = packed_\(name)[base_\(name) + word] >> shift;
-                    if (shift + \(bits)u > 32u)
-                        code |= packed_\(name)[base_\(name) + word + 1] << (32u - shift);
-                    code &= (1u << \(bits)u) - 1u;
-                    float u = float(code) - \(center)f;
-                    float level = u * fma(\(Float(book.beta))f, u * u, \(Float(book.alpha))f);
-                    partial_\(name) = fma(values[i], level, partial_\(name));
+                if (block + lane * 16u < K) {
+                    \(dot)
                 }
                 accum_\(name)[r] += partial_\(name);
                 """
         }
+
         let source = """
             uint lane = thread_index_in_simdgroup;
             uint sg = simdgroup_index_in_threadgroup;
@@ -78,10 +71,12 @@ final class JANGHFusedGateUpKernel {
             float accum_u[4] = {0, 0, 0, 0};
             for (uint block = 0; block < K; block += 512u) {
                 float values[16];
+                _Pragma("clang loop unroll(full)")
                 for (uint i = 0; i < 16; ++i) {
                     uint column = block + lane * 16u + i;
                     values[i] = column < K ? float(x[size_t(dispatch / XDIV) * K + column]) : 0.0f;
                 }
+                _Pragma("clang loop unroll(full)")
                 for (uint r = 0; r < 4; ++r) {
                     if (row0 + r >= N) continue;
                     \(projection("g", bits: gate.bits, book: gateBook))
