@@ -104,7 +104,11 @@ public final class JANGHModelPreparation {
         if ProcessInfo.processInfo.environment["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] == "1" {
             let cacheBytes = try Self.selectedDiagnosticCacheBytes(
                 environment: ProcessInfo.processInfo.environment)
-            return try makeSelectedRoutedExperts(activationLimit: activationLimit, cacheByteLimit: cacheBytes)
+            let storage: JANGHExpertMappedBanks.Storage =
+                ProcessInfo.processInfo.environment["VMLX_JANGH_SELECTED_WHOLE_BANK_VIEWS"] == "1"
+                ? .wholeBankViews : .independentMappings
+            return try makeSelectedRoutedExperts(activationLimit: activationLimit, cacheByteLimit: cacheBytes,
+                                                storage: storage)
         }
         let banks = try mapBanks()
         return try moduleByLayer.mapValues { parent -> any WeightedRoutedExpertLayer in
@@ -121,10 +125,11 @@ public final class JANGHModelPreparation {
         return mib * 1024 * 1024
     }
 
-    func makeSelectedRoutedExperts(activationLimit: Float?, cacheByteLimit: Int = 128 * 1024 * 1024) throws
+    func makeSelectedRoutedExperts(activationLimit: Float?, cacheByteLimit: Int = 128 * 1024 * 1024,
+                                  storage: JANGHExpertMappedBanks.Storage = .independentMappings) throws
         -> [Int: any WeightedRoutedExpertLayer]
     {
-        let owner = try JANGHExpertMappedBanks(source: source, cacheByteLimit: cacheByteLimit)
+        let owner = try JANGHExpertMappedBanks(source: source, cacheByteLimit: cacheByteLimit, storage: storage)
         return try moduleByLayer.mapValues { parent -> any WeightedRoutedExpertLayer in
             try JANGHSelectedRoutedExpertLayer(source: source, owner: owner, parentModule: parent,
                                                inputDimensions: hiddenSize, activationLimit: activationLimit)

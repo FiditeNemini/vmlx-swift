@@ -11,6 +11,7 @@ import Glibc
 /// The cache cap bounds this owner's retained views, not in-flight references or
 /// process/host memory. It does not change any user allocator or residency limit.
 final class JANGHExpertMappedBanks {
+    enum Storage: Equatable { case independentMappings, wholeBankViews }
     let identity = UUID()
     var contract: JANGHFormatContract { source.contract }
 
@@ -46,6 +47,10 @@ final class JANGHExpertMappedBanks {
     }
     private let source: JANGHMappedBanks.SourceLease
     private let cacheByteLimit: Int
+    // Explicit causal diagnostic only: this owner retains full bank resources.
+    // The view-cache cap does not bound this additional whole-bank allocation.
+    private let diagnosticWholeBanks: JANGHMappedBanks?
+    private var diagnosticExpertViews: [String: [MLXArray]] = [:]
     private let lock = NSLock()
     private var entries: [Key: Entry] = [:]
     private var leastRecentFirst: [Key] = []
@@ -56,7 +61,8 @@ final class JANGHExpertMappedBanks {
     /// Checkpoint bytes, regardless of how many GPU views have been materialized.
     let logicalCheckpointBytes: Int
 
-    init(source: JANGHMappedBanks.SourceLease, cacheByteLimit: Int) throws {
+    init(source: JANGHMappedBanks.SourceLease, cacheByteLimit: Int,
+         storage: Storage = .independentMappings) throws {
         guard cacheByteLimit >= 0 else {
             throw JANGHFormatContract.ValidationError.invalid("negative JANGH expert view cache cap")
         }
@@ -75,6 +81,21 @@ final class JANGHExpertMappedBanks {
         self.source = source
         self.cacheByteLimit = cacheByteLimit
         self.logicalCheckpointBytes = total
+        diagnosticWholeBanks = storage == .wholeBankViews ? try JANGHMappedBanks(source: source) : nil
+        if let whole = diagnosticWholeBanks {
+            for module in source.plan.projections.keys.sorted() {
+                let bank = try whole.projection(module).packed
+                let views = (0..<bank.dim(0)).map { bank[$0..<($0 + 1)] }
+                // Materialize metadata at load, not a new eval boundary per route.
+                // Core Slice aliases the ready bank without a payload allocation.
+                eval(views)
+                for view in views {
+                    try JANGHBankLayout.requireReadyRowContiguous(view, role: "whole-bank expert view")
+                }
+                diagnosticExpertViews[module] = views
+            }
+            print("JANGH_SELECTED_STORAGE whole_bank_views logical_bytes=\(total); full bank resources retained, cache cap bounds view entries only")
+        }
     }
 
     func isBacked(by candidate: JANGHMappedBanks.SourceLease) -> Bool { source === candidate }
@@ -124,7 +145,11 @@ final class JANGHExpertMappedBanks {
                 }
                 let perExpert = pair.packed.byteCount / experts
                 let scales = try cached(Key(module: module, expert: nil)) {
-                    try map(fd: scaleFD, offset: pair.scales.fileOffset,
+                    if let whole = diagnosticWholeBanks {
+                        return Entry(array: try whole.projection(module).scales,
+                                     mappedBytes: pair.scales.byteCount)
+                    }
+                    return try map(fd: scaleFD, offset: pair.scales.fileOffset,
                             bytes: pair.scales.byteCount, shape: scaleHeader.shape, dtype: .float16)
                 }
                 var unique: [UInt32: Entry] = [:]
@@ -143,7 +168,10 @@ final class JANGHExpertMappedBanks {
                             throw JANGHFormatContract.ValidationError.invalid("JANGH expert offset overflow")
                         }
                         entry = try cached(Key(module: module, expert: expert)) {
-                            try map(fd: packedFD, offset: offset.partialValue, bytes: perExpert,
+                            if let views = diagnosticExpertViews[module] {
+                                return Entry(array: views[Int(expert)], mappedBytes: perExpert)
+                            }
+                            return try map(fd: packedFD, offset: offset.partialValue, bytes: perExpert,
                                     shape: [1, packedHeader.shape[1], packedHeader.shape[2]], dtype: .uint32)
                         }
                         unique[expert] = entry

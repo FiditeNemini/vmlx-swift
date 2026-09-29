@@ -105,6 +105,30 @@ final class JANGHSelectedExpertTests: XCTestCase {
         }
     }
 
+    func testWholeBankViewDiagnosticPreservesOffsetsWithoutAllocatingPackedCopies() throws {
+        try MLXMetalTestLock.withLock {
+            let f = try fixture(experts: 16, width: 512, hidden: 256)
+            defer { try? FileManager.default.removeItem(at: f.directory) }
+            let whole = try JANGHExpertMappedBanks(source: f.source, cacheByteLimit: 0,
+                                                 storage: .wholeBankViews)
+            let mapped = MLX.Memory.activeMemory
+            for role in ["gate_proj", "up_proj", "down_proj"] {
+                let module = parent + "." + role
+                let views = try whole.selection(module: module, expertIDs: ids)
+                XCTAssertEqual(MLX.Memory.activeMemory, mapped)
+                XCTAssertTrue(views.packed[1] === views.packed[6])
+                let independent = try JANGHExpertMappedBanks(source: f.source, cacheByteLimit: 0)
+                let reference = try independent.selection(module: module, expertIDs: ids)
+                for (a, b) in zip(views.packed, reference.packed) {
+                    XCTAssertEqual(a.shape, b.shape)
+                    XCTAssertEqual(a.asArray(UInt32.self), b.asArray(UInt32.self))
+                }
+                XCTAssertEqual(views.scales.asArray(Float16.self), reference.scales.asArray(Float16.self))
+            }
+            XCTAssertEqual(whole.cachedOwnedMappedBytes, 0)
+        }
+    }
+
     func testSelectedDecodeMatchesProvenWholeBankCompositionAcrossRotationsAndDTypes() throws {
         try MLXMetalTestLock.withLock {
             for bits in [[2, 2, 2], [2, 3, 4], [6, 8, 4]] {
