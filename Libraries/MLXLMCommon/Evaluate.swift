@@ -2638,8 +2638,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         windowSize: Int?,
         promptTokensForProcessor: MLXArray
     ) throws {
-        let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-            try model.prepare(input, cache: cache, windowSize: windowSize)
+        // Keep the scope around the originating prepare operation, not merely
+        // the later shape read. Failed C operations can leave an invalid array;
+        // preserve their first synchronous error before inspecting that array.
+        let prepared = try withError { error in
+            let result = try MLXPressGenerationProfile.time("prompt.model_prepare") {
+                try model.prepare(input, cache: cache, windowSize: windowSize)
+            }
+            try error.check()
+            if case .logits(let output) = result {
+                try validatePreparedLogitsForSampling(output.logits)
+            }
+            return result
         }
         switch prepared {
         case .tokens(let tokens):
