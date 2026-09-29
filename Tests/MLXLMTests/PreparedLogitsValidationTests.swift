@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXNN
 import XCTest
@@ -7,17 +8,23 @@ import XCTest
 private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sendable {
     let outputShape: [Int]
     let failProjection: Bool
+    let mutateCache: Bool
     var vocabularySize: Int { 4 }
 
-    init(shape: [Int], failProjection: Bool = false) {
+    init(shape: [Int], failProjection: Bool = false, mutateCache: Bool = false) {
         self.outputShape = shape
         self.failProjection = failProjection
+        self.mutateCache = mutateCache
         super.init()
     }
 
     func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        if mutateCache {
+            let row = MLXArray.ones([1, 1, 1, 4])
+            for layer in cache { _ = layer.update(keys: row, values: row) }
+        }
         if failProjection {
             let invalid = matmul(MLXArray.zeros([2, 3]), MLXArray.zeros([4, 2]))
             return .logits(LMOutput(logits: invalid))
@@ -68,6 +75,40 @@ final class PreparedLogitsValidationTests: XCTestCase {
                 model: PreparedLogitsFixture(shape: [1, 1, 4]),
                 parameters: GenerateParameters(maxTokens: 1, temperature: 0))
             XCTAssertEqual(iterator.next(), 3)
+        }
+    }
+
+    func testFailedPrepareDoesNotPublishMutatedCache() throws {
+        try MLXMetalTestLock.withLock {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("prepared-logits-failure-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let coordinator = CacheCoordinator(
+                config: CacheCoordinatorConfig(
+                    usePagedCache: false, enableDiskCache: true, diskCacheDir: directory,
+                    modelKey: "prepared-logits-failure"))
+            let input = LMInput(tokens: MLXArray([Int32(1)]))
+            let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+            let callerCache = KVCacheSimple()
+            XCTAssertThrowsError(
+                try TokenIterator(
+                    input: input, model: PreparedLogitsFixture(shape: [1, 4], mutateCache: true),
+                    cache: [callerCache], parameters: parameters, cacheCoordinator: coordinator))
+            // A throwing prepare is not transactional for caller-owned objects.
+            // Establish that this fixture really mutated one before the failure.
+            XCTAssertEqual(callerCache.offset, 1)
+            XCTAssertEqual(coordinator.diskCache?.stores, 0)
+            let salt = computeCacheSalt(for: input, parameters: parameters)
+            guard case .miss = coordinator.fetch(tokens: [1], mediaSalt: salt) else {
+                return XCTFail("Failed prepared output must not publish a prefix checkpoint")
+            }
+            // Discard the caller cache after failure; test the supported fresh
+            // request path without implicitly claiming rollback or B=2 support.
+            var next = try TokenIterator(
+                input: input, model: PreparedLogitsFixture(shape: [1, 1, 4]),
+                parameters: parameters, cacheCoordinator: coordinator)
+            XCTAssertEqual(next.next(), 3)
+            XCTAssertEqual(coordinator.diskCache?.stores, 0)
         }
     }
 
