@@ -81,7 +81,7 @@ final class Glm5NextCustomRoutedConstructionTests: XCTestCase {
             for layer in 0 ..< config.numHiddenLayers where config.mlpLayerTypes[layer] == .sparse {
                 banks[layer] = FixtureBank()
             }
-            NativeMTPActivation.$explicitRequestOverride.withValue(true) {
+            try NativeMTPActivation.$explicitRequestOverride.withValue(true) {
                 XCTAssertThrowsError(try Glm5NextLanguageModel(config, routedExperts: banks))
             }
         }

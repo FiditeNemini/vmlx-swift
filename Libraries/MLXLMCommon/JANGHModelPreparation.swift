@@ -1,0 +1,88 @@
+import Foundation
+
+/// Architecture-supplied dimensions, independent of the packed tensor shapes.
+/// This is an admission contract; it does not register an architecture.
+public struct JANGHRoutedModelLayout: Sendable {
+    public let modelType: String
+    public let hiddenSize: Int
+    public let intermediateSize: Int
+    public let expertCount: Int
+    public let sparseLayers: Set<Int>
+
+    public init(modelType: String, hiddenSize: Int, intermediateSize: Int,
+                expertCount: Int, sparseLayers: Set<Int>) {
+        self.modelType = modelType
+        self.hiddenSize = hiddenSize
+        self.intermediateSize = intermediateSize
+        self.expertCount = expertCount
+        self.sparseLayers = sparseLayers
+    }
+}
+
+/// Retains the admitted shard descriptors until explicit bank construction.
+/// The ordinary configuration must only be consumed together with all admitted
+/// custom banks; its false quantization overrides are not affine substitutes.
+public final class JANGHModelPreparation {
+    public let ordinaryConfiguration: Data
+    public let excludedTensorNames: Set<String>
+    public let moduleByLayer: [Int: String]
+    let source: JANGHMappedBanks.SourceLease
+    private let hiddenSize: Int
+
+    public init(directory: URL, configuration: Data, sidecar: Data?,
+                layout: JANGHRoutedModelLayout) throws {
+        let partition = try JANGHConfigurationPartition(
+            configuration: configuration, sidecar: sidecar)
+        guard partition.modelType == layout.modelType,
+              layout.hiddenSize > 0, layout.intermediateSize > 0,
+              layout.expertCount > 0, !layout.sparseLayers.isEmpty,
+              layout.sparseLayers.allSatisfy({ $0 >= 0 }) else {
+            throw JANGHFormatContract.ValidationError.invalid(
+                "JANGH architecture layout does not match configuration")
+        }
+        var dimensions: [String: JANGHTensorIndexPlan.Dimensions] = [:]
+        var modules: [Int: String] = [:]
+        for layer in layout.sparseLayers.sorted() {
+            let parent = "model.layers.\(layer).mlp.switch_mlp"
+            modules[layer] = parent
+            for role in ["gate_proj", "up_proj", "down_proj"] {
+                dimensions[parent + "." + role] = .init(
+                    experts: layout.expertCount,
+                    input: role == "down_proj" ? layout.intermediateSize : layout.hiddenSize,
+                    output: role == "down_proj" ? layout.hiddenSize : layout.intermediateSize)
+            }
+        }
+        guard Set(dimensions.keys) == partition.customModules else {
+            throw JANGHFormatContract.ValidationError.invalid(
+                "JANGH custom banks do not cover the architecture sparse layers")
+        }
+        let metadata = try JANGHHeaderAdapter.read(directory: directory, indexName: "model.safetensors.index.json")
+        source = try JANGHMappedBanks.SourceLease(
+            directory: directory, metadata: metadata, contract: partition.contract,
+            dimensions: dimensions)
+        hiddenSize = layout.hiddenSize
+        ordinaryConfiguration = partition.ordinaryConfiguration
+        excludedTensorNames = Set(partition.customModules.flatMap {
+            [$0 + ".tq2_packed", $0 + ".tq2_scales"]
+        })
+        moduleByLayer = modules
+    }
+
+    /// Call only after strict ordinary quantization decoding succeeds. All banks
+    /// share the mapped owner; no dense expert placeholders are constructed.
+    public func makeRoutedExperts(activationLimit: Float?) throws
+        -> [Int: any WeightedRoutedExpertLayer]
+    {
+        let banks = try mapBanks()
+        return try moduleByLayer.mapValues { parent -> any WeightedRoutedExpertLayer in
+            try JANGHRoutedExpertLayer(banks: banks, parentModule: parent,
+                                       inputDimensions: hiddenSize, activationLimit: activationLimit)
+        }
+    }
+
+    /// Mapping is deferred until the strict ordinary configuration has decoded.
+    /// The retained descriptors prevent pathname replacement from redirecting it.
+    func mapBanks() throws -> JANGHMappedBanks {
+        try JANGHMappedBanks(source: source)
+    }
+}
