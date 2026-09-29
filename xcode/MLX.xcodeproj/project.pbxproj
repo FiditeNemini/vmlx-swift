@@ -1523,6 +1523,11 @@
 			path = xcconfig;
 			sourceTree = "<group>";
 		};
+		A829ED2F51B74947A4DD7161 /* distributed */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = distributed;
+			sourceTree = "<group>";
+		};
 		C3AE90232EAAA47E000BD280 /* json */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = json;
@@ -1705,6 +1710,7 @@
 		C3AE8EFC2EAAA40E000BD280 /* Cmlx */ = {
 			isa = PBXGroup;
 			children = (
+				A829ED2F51B74947A4DD7161 /* distributed */,
 				C3CB25472EB11EFE0029A645 /* framework */,
 				C3CBF2682EAC23BA0029A645 /* fmt */,
 				C3CBE24A2EABF7870029A645 /* include-framework */,
@@ -1831,6 +1837,7 @@
 				C3AE97872EAAAAAD000BD280 /* mlx-conditional */,
 				C3AE98112EAAAAAD000BD280 /* mlx-generated */,
 				C3AE9D992EAAAB29000BD280 /* mlx-c */,
+				A829ED2F51B74947A4DD7161 /* distributed */,
 				C3CB25472EB11EFE0029A645 /* framework */,
 				C3CBE24A2EABF7870029A645 /* include-framework */,
 				C3CBF2682EAC23BA0029A645 /* fmt */,
