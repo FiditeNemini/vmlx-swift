@@ -46,6 +46,8 @@ final class JANGHExpertMappedBanks {
     private struct Entry {
         let array: MLXArray
         let mappedBytes: Int
+        var previous: Key? = nil
+        var next: Key? = nil
     }
     private let source: JANGHMappedBanks.SourceLease
     private let cacheByteLimit: Int
@@ -70,7 +72,8 @@ final class JANGHExpertMappedBanks {
     private var stableFiles: [Int32: StableFile] = [:]
     private let lock = NSLock()
     private var entries: [Key: Entry] = [:]
-    private var leastRecentFirst: [Key] = []
+    private var leastRecent: Key?
+    private var mostRecent: Key?
     private var retainedBytes = 0
     private var selections = 0
     private var cacheHits = 0
@@ -129,7 +132,8 @@ final class JANGHExpertMappedBanks {
     func removeAllCachedViews() {
         lock.lock()
         entries.removeAll()
-        leastRecentFirst.removeAll()
+        leastRecent = nil
+        mostRecent = nil
         retainedBytes = 0
         lock.unlock()
     }
@@ -210,24 +214,45 @@ final class JANGHExpertMappedBanks {
     private func cached(_ key: Key, create: () throws -> Entry) throws -> Entry {
         if let found = entries[key] {
             cacheHits += 1
-            leastRecentFirst.removeAll { $0 == key }
-            leastRecentFirst.append(key)
-            return found
+            return touch(key, found)
         }
         cacheMisses += 1
-        let value = try create()
+        var value = try create()
         // Oversized views remain valid for this selection but are not cached.
         guard value.mappedBytes <= cacheByteLimit else { return value }
         while retainedBytes > cacheByteLimit - value.mappedBytes,
-              let oldest = leastRecentFirst.first {
-            leastRecentFirst.removeFirst()
-            if let evicted = entries.removeValue(forKey: oldest) {
-                retainedBytes -= evicted.mappedBytes
+              let oldest = leastRecent {
+            guard let evicted = entries.removeValue(forKey: oldest) else {
+                throw JANGHFormatContract.ValidationError.invalid("invalid JANGH expert cache links")
             }
+            leastRecent = evicted.next
+            if let next = evicted.next { entries[next]?.previous = nil }
+            else { mostRecent = nil }
+            retainedBytes -= evicted.mappedBytes
         }
+        value.previous = mostRecent
+        if let last = mostRecent { entries[last]?.next = key }
+        else { leastRecent = key }
         entries[key] = value
-        leastRecentFirst.append(key)
+        mostRecent = key
         retainedBytes += value.mappedBytes
+        return value
+    }
+
+    /// Keys form the links, so holding a selection cannot retain other entries.
+    /// Hits and eviction update a constant number of dictionary entries.
+    private func touch(_ key: Key, _ found: Entry) -> Entry {
+        guard mostRecent != key else { return found }
+        if let previous = found.previous { entries[previous]?.next = found.next }
+        else { leastRecent = found.next }
+        if let next = found.next { entries[next]?.previous = found.previous }
+        var value = found
+        value.previous = mostRecent
+        value.next = nil
+        if let last = mostRecent { entries[last]?.next = key }
+        else { leastRecent = key }
+        mostRecent = key
+        entries[key] = value
         return value
     }
 

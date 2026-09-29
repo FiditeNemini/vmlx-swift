@@ -130,6 +130,30 @@ final class JANGHSelectedExpertTests: XCTestCase {
         }
     }
 
+    func testExpertCacheHitRefreshesRecencyAndEvictsOnlyOldestView() throws {
+        try MLXMetalTestLock.withLock {
+            let f = try fixture(experts: 16, width: 512, hidden: 256)
+            defer { try? FileManager.default.removeItem(at: f.directory) }
+            // The gate bank and scale table are page aligned in this fixture.
+            let cap = 8192 + 2 * 32768
+            let owner = try JANGHExpertMappedBanks(source: f.source, cacheByteLimit: cap,
+                                                 storage: .stableFileMappings)
+            func select(_ expert: UInt32) throws -> JANGHExpertMappedBanks.Selection {
+                try owner.selection(module: parent + ".gate_proj", expertIDs: Array(repeating: expert, count: 8))
+            }
+            let first = try select(0)
+            let second = try select(1)
+            XCTAssertTrue(try select(0).packed[0] === first.packed[0])
+            _ = try select(2)
+            XCTAssertLessThanOrEqual(owner.cachedOwnedMappedBytes, cap)
+            XCTAssertTrue(try select(0).packed[0] === first.packed[0])
+            XCTAssertFalse(try select(1).packed[0] === second.packed[0])
+            owner.removeAllCachedViews()
+            XCTAssertEqual(owner.cachedOwnedMappedBytes, 0)
+            XCTAssertFalse(try select(0).packed[0] === first.packed[0])
+        }
+    }
+
     func testSelectedDecodeMatchesProvenWholeBankCompositionAcrossRotationsAndDTypes() throws {
         try checkSelectedDecode(storage: .independentMappings)
     }
