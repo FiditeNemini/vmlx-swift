@@ -37,12 +37,12 @@ final class JANGHSelectedExpertDecode {
         self.gateModule = gateModule; self.upModule = upModule; self.downModule = downModule
         gateBits = g.bits; upBits = u.bits; downBits = d.bits
         inputRotation = g.rotation; downRotation = d.rotation
-        let descriptor = "selected-b1-top8-v1|\(gateModule)|\(upModule)|\(downModule)|\(g.bits)|\(u.bits)|\(d.bits)|\(g.rotation)|\(d.rotation)|\(gb.alpha.bitPattern)|\(gb.beta.bitPattern)|\(ub.alpha.bitPattern)|\(ub.beta.bitPattern)|\(db.alpha.bitPattern)|\(db.beta.bitPattern)"
+        let descriptor = "selected-b1-top8-v2|\(gateModule)|\(upModule)|\(downModule)|\(g.bits)|\(u.bits)|\(d.bits)|\(g.rotation)|\(d.rotation)|\(gb.alpha.bitPattern)|\(gb.beta.bitPattern)|\(ub.alpha.bitPattern)|\(ub.beta.bitPattern)|\(db.alpha.bitPattern)|\(db.beta.bitPattern)"
         identity = SHA256.hash(data: Data(descriptor.utf8)).map { String(format: "%02x", $0) }.joined()
-        func guCase(_ route: Int) -> String {
-            let gd = JANGHDecodeQDot.source(bits:g.bits,packed:"gate\(route)",rowBase:"size_t(row0 + r) * WG",columnBase:"block + lane * 16u",values:"values",accumulator:"pg",alpha:Float(gb.alpha),beta:Float(gb.beta))
-            let ud = JANGHDecodeQDot.source(bits:u.bits,packed:"up\(route)",rowBase:"size_t(row0 + r) * WU",columnBase:"block + lane * 16u",values:"values",accumulator:"pu",alpha:Float(ub.alpha),beta:Float(ub.beta))
-            return "case \(route): { \(gd)\n\(ud)\n break; }"
+        let gateDot = JANGHDecodeQDot.source(bits:g.bits,packed:"gateBank",rowBase:"size_t(row0 + r) * WG",columnBase:"block + lane * 16u",values:"values",accumulator:"pg",alpha:Float(gb.alpha),beta:Float(gb.beta))
+        let upDot = JANGHDecodeQDot.source(bits:u.bits,packed:"upBank",rowBase:"size_t(row0 + r) * WU",columnBase:"block + lane * 16u",values:"values",accumulator:"pu",alpha:Float(ub.alpha),beta:Float(ub.beta))
+        func bankChoice(_ name: String) -> String {
+            (0..<7).map { "route == \($0) ? \(name)\($0) : " }.joined() + "\(name)7"
         }
         let gateNames = (0..<8).map { "gate\($0)" }, upNames = (0..<8).map { "up\($0)" }
         // 21 input buffers plus one output; no full bank or per-route copy.
@@ -57,6 +57,8 @@ final class JANGHSelectedExpertDecode {
                     if (row0+r<N) out[size_t(route)*N+row0+r]=as_type<float>(0x7fc00000u);
                 return;
             }
+            const device uint* gateBank = \(bankChoice("gate"));
+            const device uint* upBank = \(bankChoice("up"));
             float ag[4]={0,0,0,0}, au[4]={0,0,0,0};
             for (uint block=0;block<K;block+=512u) {
                 float values[16];
@@ -70,7 +72,8 @@ final class JANGHSelectedExpertDecode {
                     if (row0+r>=N) continue;
                     float pg=0.0f, pu=0.0f;
                     if (block+lane*16u<K) {
-                        switch (route) { \((0..<8).map(guCase).joined(separator:"\n")) }
+                        \(gateDot)
+                        \(upDot)
                     }
                     ag[r]+=pg; au[r]+=pu;
                 }
@@ -100,10 +103,7 @@ final class JANGHSelectedExpertDecode {
                 }
             }
             """,ensureRowContiguous:false)
-        let downCases = (0..<8).map { route -> String in
-            let dot = JANGHDecodeQDot.source(bits:d.bits,packed:"down\(route)",rowBase:"size_t(row0+r)*WORDS",columnBase:"block+lane*16u",values:"values",accumulator:"accum[r]",alpha:Float(db.alpha),beta:Float(db.beta))
-            return "case \(route): { \(dot)\n break; }"
-        }.joined(separator:"\n")
+        let downDot = JANGHDecodeQDot.source(bits:d.bits,packed:"downBank",rowBase:"size_t(row0+r)*WORDS",columnBase:"block+lane*16u",values:"values",accumulator:"accum[r]",alpha:Float(db.alpha),beta:Float(db.beta))
         // 12 inputs plus output; routes are accumulated sequentially in F32.
         down = MLXFast.metalKernel(name:"jangh_selected_down_"+identity,
             inputNames:["hidden"]+(0..<8).map { "down\($0)" }+["scales","ids","scores"],outputNames:["out"],source:"""
@@ -117,6 +117,7 @@ final class JANGHSelectedExpertDecode {
                         if (row0+r<N) out[row0+r]=T(as_type<float>(0x7fc00000u));
                     return;
                 }
+                const device uint* downBank = \(bankChoice("down"));
                 float accum[4]={0,0,0,0};
                 for (uint block=0;block<H;block+=512u) {
                     if (block+lane*16u>=H) continue;
@@ -126,7 +127,7 @@ final class JANGHSelectedExpertDecode {
                     _Pragma("clang loop unroll(full)")
                     for (uint r=0;r<4;++r) {
                         if (row0+r>=N) continue;
-                        switch (route) { \(downCases) }
+                        \(downDot)
                     }
                 }
                 for (uint r=0;r<4;++r) {
