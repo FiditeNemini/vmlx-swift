@@ -76,6 +76,32 @@ final class NaiveN05FlashRuntimeTests: XCTestCase {
         }
     }
 
+    func testForwardScopedRotaryTablesPreserveBitsAndSeparateGeometryAndPositions() {
+        MLXMetalTestLock.withLock {
+            for offset in [0, 127, 2048, 65536] {
+                let positions = MLXArray([offset, offset + 1, offset + 7, offset + 8]).reshaped(2, 2)
+                let tables = NaiveN05FlashMath.RotaryTables(positions: positions)
+                for dtype in [DType.bfloat16, .float16, .float32] {
+                    let x = (MLXArray(0 ..< 512).asType(.float32) / 64 - 4)
+                        .reshaped(2, 2, 2, 64).asType(dtype)
+                    for dimensions in [32, 64] {
+                        for theta in [10_000.0, 10_000_000.0] {
+                            let expected = NaiveN05FlashMath.rotary(
+                                x, positions: positions, dimensions: dimensions, theta: theta)
+                            for _ in 0 ..< 2 {
+                                let actual = NaiveN05FlashMath.rotary(x, positions: positions,
+                                    dimensions: dimensions, theta: theta, tables: tables)
+                                XCTAssertEqual(actual.asType(.float32).asArray(Float.self).map(\.bitPattern),
+                                    expected.asType(.float32).asArray(Float.self).map(\.bitPattern))
+                            }
+                        }
+                    }
+                }
+                XCTAssertEqual(tables.count, 12)
+            }
+        }
+    }
+
     func testStableSparseTiesAcrossLargeSortAndPadding() {
         MLXMetalTestLock.withLock {
         let scores = MLXArray.zeros([1,1,2053])

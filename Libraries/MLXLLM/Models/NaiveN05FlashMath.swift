@@ -5,6 +5,29 @@ import MLX
 /// Vendor reference operations retained beside narrowly admitted optimized paths.
 /// Asymmetric prefill remains explicit until a supported fused kernel is proven.
 enum NaiveN05FlashMath {
+    /// One forward's positions only. Reusing these lazy arrays across layers
+    /// avoids rebuilding identical trigonometric graphs; nothing survives into
+    /// the next decode step or into a restored KV cache.
+    final class RotaryTables {
+        private struct Key: Hashable {
+            let dimensions: Int
+            let theta: Double
+            let dtype: DType
+        }
+        private let positions: MLXArray
+        private var values: [Key: (MLXArray, MLXArray)] = [:]
+        var count: Int { values.count }
+        init(positions: MLXArray) { self.positions = positions }
+        func phases(dimensions: Int, theta: Double, dtype: DType) -> (MLXArray, MLXArray) {
+            let key = Key(dimensions: dimensions, theta: theta, dtype: dtype)
+            if let found = values[key] { return found }
+            let result = NaiveN05FlashMath.rotaryPhases(
+                positions: positions, dimensions: dimensions, theta: theta, dtype: dtype)
+            values[key] = result
+            return result
+        }
+    }
+
     static func roundIndexerFP8(_ input: MLXArray) -> MLXArray {
         let x = input.asType(.float32)
         let scale = maximum(abs(x).max(axis: -1, keepDims: true), 1e-4) / 448
@@ -16,13 +39,19 @@ enum NaiveN05FlashMath {
     }
 
     /// GPTNeoX half-rotation on only the prefix; positions may differ per batch.
-    static func rotary(_ x: MLXArray, positions: MLXArray, dimensions: Int, theta: Double) -> MLXArray {
-        precondition(dimensions > 0 && dimensions.isMultiple(of: 2) && dimensions <= x.dim(-1))
+    private static func rotaryPhases(positions: MLXArray, dimensions: Int, theta: Double, dtype: DType) -> (MLXArray, MLXArray) {
         let inverse = exp(-MLXArray(0 ..< dimensions / 2).asType(.float32)
             * (Float(2 * log(theta)) / Float(dimensions)))
         let angle = positions.asType(.float32).expandedDimensions(axis: -1) * inverse
-        let c = cos(angle).expandedDimensions(axis: 1).asType(x.dtype)
-        let s = sin(angle).expandedDimensions(axis: 1).asType(x.dtype)
+        return (cos(angle).expandedDimensions(axis: 1).asType(dtype),
+                sin(angle).expandedDimensions(axis: 1).asType(dtype))
+    }
+
+    static func rotary(_ x: MLXArray, positions: MLXArray, dimensions: Int, theta: Double,
+                       tables: RotaryTables? = nil) -> MLXArray {
+        precondition(dimensions > 0 && dimensions.isMultiple(of: 2) && dimensions <= x.dim(-1))
+        let (c, s) = tables?.phases(dimensions: dimensions, theta: theta, dtype: x.dtype)
+            ?? rotaryPhases(positions: positions, dimensions: dimensions, theta: theta, dtype: x.dtype)
         let a = x[.ellipsis, ..<(dimensions / 2)]
         let b = x[.ellipsis, (dimensions / 2)..<dimensions]
         let rotated = concatenated([a * c - b * s, b * c + a * s], axis: -1)

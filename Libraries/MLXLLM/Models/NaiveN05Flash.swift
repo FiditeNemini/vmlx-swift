@@ -18,12 +18,12 @@ final class NaiveN05FlashIndexer: Module {
         _keyNorm.wrappedValue = LayerNorm(dimensions: c.indexerDimensions, eps: 1e-5, affine: true, bias: true)
         _weightsProjection.wrappedValue = Linear(c.hiddenDimensions, c.indexerHeads, bias: false)
     }
-    func project(_ states: MLXArray, positions: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    func project(_ states: MLXArray, positions: MLXArray, rotaryTables: NaiveN05FlashMath.RotaryTables? = nil) -> (MLXArray, MLXArray, MLXArray) {
         let c = config
         var q = wq(states).reshaped(states.dim(0), states.dim(1), c.indexerHeads, c.indexerDimensions).transposed(0, 2, 1, 3)
         var k = keyNorm(wk(states)).expandedDimensions(axis: 1)
-        q = NaiveN05FlashMath.rotary(q, positions: positions, dimensions: c.fullAttention.rotaryDimensions, theta: c.fullAttention.ropeTheta)
-        k = NaiveN05FlashMath.rotary(k, positions: positions, dimensions: c.fullAttention.rotaryDimensions, theta: c.fullAttention.ropeTheta)
+        q = NaiveN05FlashMath.rotary(q, positions: positions, dimensions: c.fullAttention.rotaryDimensions, theta: c.fullAttention.ropeTheta, tables: rotaryTables)
+        k = NaiveN05FlashMath.rotary(k, positions: positions, dimensions: c.fullAttention.rotaryDimensions, theta: c.fullAttention.ropeTheta, tables: rotaryTables)
         if c.indexerPrecision == .fp8E4M3 {
             q = NaiveN05FlashMath.roundIndexerFP8(q)
             k = NaiveN05FlashMath.roundIndexerFP8(k)
@@ -60,16 +60,16 @@ final class NaiveN05FlashAttention: Module {
         _sink.wrappedValue = g.hasSink ? MLXArray.zeros([g.heads]) : nil
         indexer = sliding ? nil : NaiveN05FlashIndexer(c)
     }
-    func callAsFunction(_ states: MLXArray, positions: MLXArray, padding: MLXArray, cache: NaiveN05FlashCache?) throws -> MLXArray {
+    func callAsFunction(_ states: MLXArray, positions: MLXArray, padding: MLXArray, cache: NaiveN05FlashCache?, rotaryTables: NaiveN05FlashMath.RotaryTables? = nil) throws -> MLXArray {
         let g = geometry, batch = states.dim(0), length = states.dim(1)
         let past = cache?.offset ?? 0
         let keyOffset = cache?.keyOffset ?? 0
         var q = query(states).reshaped(batch, length, g.heads, g.keyDimensions).transposed(0, 2, 1, 3)
         var k = key(states).reshaped(batch, length, g.kvHeads, g.keyDimensions).transposed(0, 2, 1, 3)
         var v = value(states).reshaped(batch, length, g.kvHeads, g.valueDimensions).transposed(0, 2, 1, 3)
-        q = NaiveN05FlashMath.rotary(q, positions: positions, dimensions: g.rotaryDimensions, theta: g.ropeTheta)
-        k = NaiveN05FlashMath.rotary(k, positions: positions, dimensions: g.rotaryDimensions, theta: g.ropeTheta)
-        let projectedIndex = indexer?.project(states, positions: positions)
+        q = NaiveN05FlashMath.rotary(q, positions: positions, dimensions: g.rotaryDimensions, theta: g.ropeTheta, tables: rotaryTables)
+        k = NaiveN05FlashMath.rotary(k, positions: positions, dimensions: g.rotaryDimensions, theta: g.ropeTheta, tables: rotaryTables)
+        let projectedIndex = indexer?.project(states, positions: positions, rotaryTables: rotaryTables)
         var indexKeys = projectedIndex?.1
         if let cache {
             let full = try cache.append(keys: k, values: v, indexer: indexKeys)
@@ -161,8 +161,8 @@ final class NaiveN05FlashDecoderLayer: Module {
         _postNorm.wrappedValue = RMSNorm(dimensions: c.hiddenDimensions, eps: Float(c.normEpsilon))
         mlp = c.routedLayers[layer] ? NaiveN05FlashMoE(c, experts: routed, layerIndex: layer) : NaiveN05FlashDenseMLP(c)
     }
-    func callAsFunction(_ x: MLXArray, positions: MLXArray, padding: MLXArray, cache: NaiveN05FlashCache?) throws -> MLXArray {
-        let h = try x + attention(inputNorm(x), positions: positions, padding: padding, cache: cache)
+    func callAsFunction(_ x: MLXArray, positions: MLXArray, padding: MLXArray, cache: NaiveN05FlashCache?, rotaryTables: NaiveN05FlashMath.RotaryTables? = nil) throws -> MLXArray {
+        let h = try x + attention(inputNorm(x), positions: positions, padding: padding, cache: cache, rotaryTables: rotaryTables)
         return h + mlp(postNorm(h))
     }
 }
@@ -218,8 +218,9 @@ final class NaiveN05FlashModel: Module {
         guard padding.shape == [tokens.dim(0), past + tokens.dim(1)] else { throw NaiveN05FlashCache.Failure.invalidGeometry }
         let positions = suppliedPositions ?? maximum(cumsum(padding.asType(.int32), axis: -1) - 1, 0)[0..., past...]
         guard positions.shape == tokens.shape else { throw NaiveN05FlashCache.Failure.invalidGeometry }
+        let rotaryTables = NaiveN05FlashMath.RotaryTables(positions: positions)
         var h = model.embedding(tokens)
-        for (i, layer) in model.layers.enumerated() { h = try layer(h, positions: positions, padding: padding, cache: cache?[i]) }
+        for (i, layer) in model.layers.enumerated() { h = try layer(h, positions: positions, padding: padding, cache: cache?[i], rotaryTables: rotaryTables) }
         return head(model.norm(h))
     }
 }
