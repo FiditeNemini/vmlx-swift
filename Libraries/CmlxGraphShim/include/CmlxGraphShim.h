@@ -4,6 +4,7 @@
 #define VMLX_CMLX_GRAPH_SHIM_H
 
 #include <stdint.h>
+#include "VMLXMappedFile.h"
 
 #ifdef __cplusplus
 extern "C" {

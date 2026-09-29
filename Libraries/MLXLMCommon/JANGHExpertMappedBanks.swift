@@ -1,4 +1,5 @@
 import Cmlx
+import CmlxGraphShim
 import Foundation
 import MLX
 #if canImport(Darwin)
@@ -12,7 +13,7 @@ import Glibc
 /// The cache cap bounds this owner's retained views, not in-flight references or
 /// process/host memory. It does not change any user allocator or residency limit.
 final class JANGHExpertMappedBanks {
-    enum Storage: Equatable { case independentMappings, wholeBankViews }
+    enum Storage: Equatable { case independentMappings, wholeBankViews, stableFileMappings }
     let identity = UUID()
     var contract: JANGHFormatContract { source.contract }
 
@@ -52,6 +53,21 @@ final class JANGHExpertMappedBanks {
     // The view-cache cap does not bound this additional whole-bank allocation.
     private let diagnosticWholeBanks: JANGHMappedBanks?
     private var diagnosticExpertViews: [String: [MLXArray]] = [:]
+    private let usesStableFileMappings: Bool
+    private final class StableFile {
+        var handle: UnsafeMutableRawPointer?
+        init(fd: Int32) throws {
+            handle = nil
+            let status = try withError { vmlx_mapped_file_create(fd, &handle) }
+            guard status == 0, handle != nil else {
+                throw JANGHFormatContract.ValidationError.invalid("cannot create stable JANGH file mapping")
+            }
+        }
+        deinit { vmlx_mapped_file_release(&handle) }
+    }
+    // SourceLease retains the verified FDs, so keys cannot be recycled while
+    // this owner exists. GPU arrays retain their mapping after owner release.
+    private var stableFiles: [Int32: StableFile] = [:]
     private let lock = NSLock()
     private var entries: [Key: Entry] = [:]
     private var leastRecentFirst: [Key] = []
@@ -82,6 +98,7 @@ final class JANGHExpertMappedBanks {
         self.source = source
         self.cacheByteLimit = cacheByteLimit
         self.logicalCheckpointBytes = total
+        usesStableFileMappings = storage == .stableFileMappings
         diagnosticWholeBanks = storage == .wholeBankViews ? try JANGHMappedBanks(source: source) : nil
         if let whole = diagnosticWholeBanks {
             for module in source.plan.projections.keys.sorted() {
@@ -225,8 +242,21 @@ final class JANGHExpertMappedBanks {
         var dimensions = shape.map(Int32.init)
         var raw = mlx_array_new()
         do {
+            var stableFile: StableFile?
+            if usesStableFileMappings {
+                if let cached = stableFiles[fd] { stableFile = cached }
+                else {
+                    let file = try StableFile(fd: fd)
+                    stableFiles[fd] = file
+                    stableFile = file
+                }
+            }
             let status = try withError {
-                "/dev/fd/\(fd)".withCString { path in
+                if let file = stableFile {
+                    return vmlx_mapped_file_array(&raw.ctx, file.handle, UInt64(offset), bytes,
+                                                  &dimensions, Int32(dimensions.count), Int32(dtype.cmlxDtype.rawValue))
+                }
+                return "/dev/fd/\(fd)".withCString { path in
                     mlx_array_new_mmap_file_region(&raw, path, UInt64(offset), bytes,
                                                   &dimensions, Int32(dimensions.count), dtype.cmlxDtype)
                 }

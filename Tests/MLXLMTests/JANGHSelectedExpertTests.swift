@@ -1,4 +1,5 @@
 import Cmlx
+import CmlxGraphShim
 import Foundation
 import MLX
 import XCTest
@@ -130,13 +131,22 @@ final class JANGHSelectedExpertTests: XCTestCase {
     }
 
     func testSelectedDecodeMatchesProvenWholeBankCompositionAcrossRotationsAndDTypes() throws {
+        try checkSelectedDecode(storage: .independentMappings)
+    }
+
+    func testStableMappingDecodeMatchesWholeBanksAcrossRotationsAndDTypes() throws {
+        try checkSelectedDecode(storage: .stableFileMappings)
+    }
+
+    private func checkSelectedDecode(storage: JANGHExpertMappedBanks.Storage) throws {
         try MLXMetalTestLock.withLock {
             for bits in [[2, 2, 2], [2, 3, 4], [6, 8, 4]] {
                 for inputRotation in ["none", "hadamard32"] {
                     for downRotation in ["none", "hadamard32"] {
                         let f = try fixture(bits: bits, inputRotation: inputRotation, downRotation: downRotation)
                         defer { try? FileManager.default.removeItem(at: f.directory) }
-                        let owner = try JANGHExpertMappedBanks(source: f.source, cacheByteLimit: 32768)
+                        let owner = try JANGHExpertMappedBanks(source: f.source, cacheByteLimit: 32768,
+                                                             storage: storage)
                         let selected = try kernel(owner)
                         let whole = try JANGHMappedBanks(source: f.source)
                         let reference = try JANGHRoutedDecodeBlock(banks: whole, parentModule: parent, activationLimit: 0.75)
@@ -214,6 +224,54 @@ final class JANGHSelectedExpertTests: XCTestCase {
             XCTAssertEqual(selection.packed[0].asArray(UInt32.self), expected)
         }
     }
+
+    func testStableMappedSelectionsSurviveOwnerReleaseAndUnlink() throws {
+        try MLXMetalTestLock.withLock {
+            let f = try fixture()
+            defer { try? FileManager.default.removeItem(at: f.directory) }
+            var owner: JANGHExpertMappedBanks? = try JANGHExpertMappedBanks(
+                source: f.source, cacheByteLimit: 0, storage: .stableFileMappings)
+            let selection = try owner!.selection(module: parent + ".gate_proj", expertIDs: ids)
+            let expected = selection.packed[1].asArray(UInt32.self)
+            owner = nil
+            try FileManager.default.removeItem(at: f.directory.appendingPathComponent("model.safetensors"))
+            XCTAssertEqual(selection.packed[1].asArray(UInt32.self), expected)
+        }
+    }
+
+    func testStableMappingRejectsInvalidViewsAndChangedSourceWithoutWholeFileGPUAllocation() throws {
+        try MLXMetalTestLock.withLock {
+            let f = try fixture()
+            defer { try? FileManager.default.removeItem(at: f.directory) }
+            let path = f.directory.appendingPathComponent("model.safetensors")
+            let file = try FileHandle(forReadingFrom: path)
+            defer { try? file.close() }
+            var handle: UnsafeMutableRawPointer?
+            defer { vmlx_mapped_file_release(&handle) }
+            let before = MLX.Memory.activeMemory
+            XCTAssertEqual(try withError { vmlx_mapped_file_create(file.fileDescriptor, &handle) }, 0)
+            XCTAssertEqual(MLX.Memory.activeMemory, before)
+            func reject(offset: UInt64, length: Int, shape: [Int32]) {
+                var dimensions = shape
+                var raw = mlx_array_new()
+                defer { mlx_array_free(raw) }
+                XCTAssertThrowsError(try withError {
+                    vmlx_mapped_file_array(&raw.ctx, handle, offset, length, &dimensions,
+                                           Int32(dimensions.count), Int32(DType.uint32.cmlxDtype.rawValue))
+                })
+            }
+            reject(offset: UInt64.max, length: 64, shape: [16])
+            reject(offset: 4097, length: 64, shape: [16])
+            reject(offset: 4096, length: 60, shape: [16])
+            reject(offset: 4096, length: 64, shape: [-1])
+            reject(offset: 4096, length: 64, shape: [Int32.max, Int32.max, Int32.max])
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 10)],
+                                                  ofItemAtPath: path.path)
+            reject(offset: 4096, length: 64, shape: [16])
+            XCTAssertEqual(MLX.Memory.activeMemory, before)
+        }
+    }
+
     func testDiagnosticLayerMatchesDecodeAndPrefillWithoutRetainingWholeBanks() throws {
         try MLXMetalTestLock.withLock {
             let f = try fixture(inputRotation: "hadamard32", downRotation: "hadamard32", hidden: 64)

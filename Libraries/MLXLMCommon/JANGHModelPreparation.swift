@@ -104,9 +104,13 @@ public final class JANGHModelPreparation {
         if ProcessInfo.processInfo.environment["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] == "1" {
             let cacheBytes = try Self.selectedDiagnosticCacheBytes(
                 environment: ProcessInfo.processInfo.environment)
-            let storage: JANGHExpertMappedBanks.Storage =
-                ProcessInfo.processInfo.environment["VMLX_JANGH_SELECTED_WHOLE_BANK_VIEWS"] == "1"
-                ? .wholeBankViews : .independentMappings
+            let env = ProcessInfo.processInfo.environment
+            guard !(env["VMLX_JANGH_SELECTED_WHOLE_BANK_VIEWS"] == "1" &&
+                    env["VMLX_JANGH_STABLE_FILE_MAPPINGS"] == "1") else {
+                throw JANGHFormatContract.ValidationError.invalid("conflicting JANGH mapping diagnostics")
+            }
+            let storage: JANGHExpertMappedBanks.Storage = env["VMLX_JANGH_SELECTED_WHOLE_BANK_VIEWS"] == "1"
+                ? .wholeBankViews : (env["VMLX_JANGH_STABLE_FILE_MAPPINGS"] == "1" ? .stableFileMappings : .independentMappings)
             return try makeSelectedRoutedExperts(activationLimit: activationLimit, cacheByteLimit: cacheBytes,
                                                 storage: storage)
         }
