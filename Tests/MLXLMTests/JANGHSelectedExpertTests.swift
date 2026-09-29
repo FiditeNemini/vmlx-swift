@@ -1,3 +1,4 @@
+import Cmlx
 import Foundation
 import MLX
 import XCTest
@@ -189,4 +190,49 @@ final class JANGHSelectedExpertTests: XCTestCase {
             XCTAssertEqual(selection.packed[0].asArray(UInt32.self), expected)
         }
     }
+    func testDiagnosticLayerMatchesDecodeAndPrefillWithoutRetainingWholeBanks() throws {
+        try MLXMetalTestLock.withLock {
+            let f = try fixture(inputRotation: "hadamard32", downRotation: "hadamard32")
+            defer { try? FileManager.default.removeItem(at: f.directory) }
+            let owner = try JANGHExpertMappedBanks(source: f.source, cacheByteLimit: 32768)
+            let layer = try JANGHSelectedRoutedExpertLayer(source: f.source, owner: owner,
+                parentModule: parent, inputDimensions: 64, activationLimit: 0.75)
+            let banks = try JANGHMappedBanks(source: f.source)
+            let reference = try JANGHRoutedDecodeBlock(banks: banks, parentModule: parent, activationLimit: 0.75)
+            let tracked = mlx_safetensors_mmap_tracked_buffer_bytes()
+            for tokens in [1, 2, 9] {
+                let input = MLXArray((0..<(tokens * 64)).map { Float(($0 * 19) % 59 - 29) / 31 }, [tokens, 64]).asType(.bfloat16)
+                let routes = MLXArray(Array(repeating: ids, count: tokens).flatMap { $0 }, [tokens, 8])
+                let scores = MLXArray.ones([tokens, 8]) * Float(0.125)
+                let actual = try layer.routed(input, indices: routes, scores: scores)
+                let expected = try reference.routed(input, indices: routes, scores: scores, outputDType: input.dtype)
+                let a = actual.asType(.float32).asArray(Float.self)
+                let e = expected.asType(.float32).asArray(Float.self)
+                for i in a.indices {
+                    XCTAssertEqual(a[i], e[i], accuracy: max(0.00005, abs(e[i]) * 0.008), "tokens=\(tokens) row=\(i)")
+                }
+                XCTAssertEqual(mlx_safetensors_mmap_tracked_buffer_bytes(), tracked,
+                               "Prefill must release temporary whole-bank resources after evaluation")
+            }
+            let x = MLXArray.ones([1,64])
+            XCTAssertThrowsError(try layer.routed(x, indices: MLXArray([UInt32(0)], [1,1]), scores: MLXArray.ones([1,1])))
+            let other = try fixture()
+            defer { try? FileManager.default.removeItem(at: other.directory) }
+            XCTAssertThrowsError(try JANGHSelectedRoutedExpertLayer(source: other.source, owner: owner,
+                parentModule: parent, inputDimensions: 64, activationLimit: nil))
+        }
+    }
+
+    func testPartialBankMappingRefusesUnknownOrEmptySubsets() throws {
+        try MLXMetalTestLock.withLock {
+            let f = try fixture()
+            defer { try? FileManager.default.removeItem(at: f.directory) }
+            XCTAssertThrowsError(try JANGHMappedBanks(source: f.source, modules: []))
+            XCTAssertThrowsError(try JANGHMappedBanks(source: f.source, modules: ["unknown"]))
+            let only = try JANGHMappedBanks(source: f.source, modules: [parent + ".gate_proj"])
+            XCTAssertNoThrow(try only.projection(parent + ".gate_proj"))
+            XCTAssertThrowsError(try only.projection(parent + ".up_proj"))
+        }
+    }
+
 }

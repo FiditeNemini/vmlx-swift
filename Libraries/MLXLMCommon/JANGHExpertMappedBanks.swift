@@ -74,6 +74,8 @@ final class JANGHExpertMappedBanks {
         self.logicalCheckpointBytes = total
     }
 
+    func isBacked(by candidate: JANGHMappedBanks.SourceLease) -> Bool { source === candidate }
+
     /// Owner-retained GPU allocation spans, not global active bytes. Caller-held
     /// selections and queued Metal work can keep evicted views alive separately.
     var cachedOwnedMappedBytes: Int {

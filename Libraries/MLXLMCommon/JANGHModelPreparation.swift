@@ -100,10 +100,24 @@ public final class JANGHModelPreparation {
     public func makeRoutedExperts(activationLimit: Float?) throws
         -> [Int: any WeightedRoutedExpertLayer]
     {
+        // Explicit diagnostic only. Defaults retain the proven whole-bank route.
+        if ProcessInfo.processInfo.environment["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] == "1" {
+            return try makeSelectedRoutedExperts(activationLimit: activationLimit)
+        }
         let banks = try mapBanks()
         return try moduleByLayer.mapValues { parent -> any WeightedRoutedExpertLayer in
             try JANGHRoutedExpertLayer(banks: banks, parentModule: parent,
                                        inputDimensions: hiddenSize, activationLimit: activationLimit)
+        }
+    }
+
+    func makeSelectedRoutedExperts(activationLimit: Float?) throws
+        -> [Int: any WeightedRoutedExpertLayer]
+    {
+        let owner = try JANGHExpertMappedBanks(source: source, cacheByteLimit: 128 * 1024 * 1024)
+        return try moduleByLayer.mapValues { parent -> any WeightedRoutedExpertLayer in
+            try JANGHSelectedRoutedExpertLayer(source: source, owner: owner, parentModule: parent,
+                                               inputDimensions: hiddenSize, activationLimit: activationLimit)
         }
     }
 

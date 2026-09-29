@@ -102,12 +102,17 @@ final class JANGHMappedBanks {
                                         contract: contract, dimensions: dimensions))
     }
 
-    init(source: SourceLease) throws {
+    init(source: SourceLease, modules: Set<String>? = nil) throws {
         defer { withExtendedLifetime(source) {} }
         let metadata = source.metadata
         let files = source.files
         let index = source.index
         let plan = source.plan
+        if let modules {
+            guard !modules.isEmpty, modules.isSubset(of: Set(plan.projections.keys)) else {
+                throw JANGHFormatContract.ValidationError.invalid("invalid JANGH mapped module subset")
+            }
+        }
         for (name, file) in files {
             guard try JANGHHeaderAdapter.identity(file) == metadata.identities[name] else {
                 throw JANGHFormatContract.ValidationError.invalid("JANGH source lease became stale before mapping")
@@ -160,7 +165,7 @@ final class JANGHMappedBanks {
             return result
         }
         var mapped: [String: Projection] = [:]
-        for (module, locations) in plan.projections {
+        for (module, locations) in plan.projections where modules == nil || modules!.contains(module) {
             mapped[module] = try Projection(packed: map(locations.packed), scales: map(locations.scales))
         }
         // The C++ mapper opens /dev/fd/N while these descriptors stay alive, so

@@ -159,4 +159,22 @@ final class JANGHModelPreparationTests: XCTestCase {
         }
     }
 
+    func testSelectedDiagnosticAdmissionCountsWeightsWithoutWholeBankMapping() throws {
+        try MLXMetalTestLock.withLock {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let config = try fixture(directory)
+            let before = mlx_safetensors_mmap_tracked_buffer_bytes()
+            let prepared = try JANGHModelPreparation(directory: directory, configuration: config,
+                                                     sidecar: nil, layout: layout())
+            let layers = try prepared.makeSelectedRoutedExperts(activationLimit: nil)
+            let layer = try XCTUnwrap(layers[0])
+            XCTAssertTrue(layer is JANGHSelectedRoutedExpertLayer)
+            XCTAssertTrue(layer.parameters().flattenedValues().isEmpty)
+            XCTAssertEqual(layer.modelWeightAccounting().supplementalMappedBytes, 2688)
+            XCTAssertEqual(layer.numParameters(), 6144)
+            XCTAssertEqual(mlx_safetensors_mmap_tracked_buffer_bytes(), before)
+        }
+    }
+
 }
