@@ -1249,7 +1249,11 @@ public func loadWeights(
                 let emb = mod as? Embedding
             else { continue }
             headUpdates.append(
-                (path, QuantizedEmbedding(emb, groupSize: headGroupSize, bits: headBits)))
+                (
+                    path,
+                    quantizeTiedEmbeddingPreservingOutputDType(
+                        emb, groupSize: headGroupSize, bits: headBits)
+                ))
         }
         if !headUpdates.isEmpty {
             try model.update(modules: ModuleChildren.unflattened(headUpdates), verify: .none)
@@ -1346,15 +1350,7 @@ public func loadWeights(
     if hadamardContract == nil, preserveJANGAffineMmapDtypes,
         !shouldUseQwen4ExpNativeBF16Affine(modelDirectory: modelDirectory)
     {
-        var pinned = 0
-        for (_, module) in model.leafModules().flattened() {
-            if let embedding = module as? QuantizedEmbedding,
-                embedding.scales.dtype == .float16
-            {
-                embedding.outputDType = .bfloat16
-                pinned += 1
-            }
-        }
+        let pinned = pinPreservedAffineEmbeddingOutputDTypes(model)
         if pinned > 0 {
             FileHandle.standardError.write(Data(
                 "[Load] jang_affine_preserve embedding_output_dtype=bfloat16 modules=\(pinned)\n"
@@ -1421,6 +1417,34 @@ public func loadWeights(
         // ship it, and only calibrated bundles have earned an eligibility
         // derivation (speed-audit mlx_lm packs stay unstamped on purpose).
         isCalibratedBundle: jangConfig != nil)
+}
+
+/// A host-requested storage conversion must preserve the original embedding's
+/// activation precision. In particular, changing a Gemma QAT fp16 embedding to
+/// bf16 makes its fp16 router and layer scales promote activations to fp32.
+/// This also preserves the tied output projection's original result precision.
+func quantizeTiedEmbeddingPreservingOutputDType(
+    _ embedding: Embedding, groupSize: Int, bits: Int
+) -> QuantizedEmbedding {
+    let quantized = QuantizedEmbedding(embedding, groupSize: groupSize, bits: bits)
+    quantized.outputDType = embedding.weight.dtype
+    return quantized
+}
+
+/// Checkpoint-quantized embeddings retain the existing bf16 alignment policy.
+/// An explicit activation contract, including a newly quantized floating-point
+/// tied embedding's source dtype, takes precedence over that inferred policy.
+func pinPreservedAffineEmbeddingOutputDTypes(_ model: Module) -> Int {
+    var pinned = 0
+    for (_, module) in model.leafModules().flattened() {
+        if let embedding = module as? QuantizedEmbedding,
+            embedding.scales.dtype == .float16, embedding.outputDType == nil
+        {
+            embedding.outputDType = .bfloat16
+            pinned += 1
+        }
+    }
+    return pinned
 }
 
 /// Safetensors files emitted or copied by converters for calibration and
