@@ -7,7 +7,8 @@ import Darwin
 import Glibc
 #endif
 
-/// Experimental decode owner: full packed banks never become Metal resources here.
+/// Experimental decode owner. Independent mappings avoid whole-bank resources;
+/// the explicit wholeBankViews causal diagnostic deliberately retains them.
 /// The cache cap bounds this owner's retained views, not in-flight references or
 /// process/host memory. It does not change any user allocator or residency limit.
 final class JANGHExpertMappedBanks {

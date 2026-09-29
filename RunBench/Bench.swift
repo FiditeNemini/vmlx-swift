@@ -8447,6 +8447,40 @@ func runPerfBench(
     runs: Int,
     useTokenIterator: Bool = false
 ) async throws {
+    let env = ProcessInfo.processInfo.environment
+    if let raw = env["BENCH_PERF_SELECTED_WIRED_MIB"] {
+        guard env["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] == "1",
+            env["VMLX_JANGH_SELECTED_WHOLE_BANK_VIEWS"] != "1",
+            let mib = Int(raw), (1...8192).contains(mib),
+            let recommended = GPU.maxRecommendedWorkingSetBytes(),
+            mib * 1024 * 1024 <= recommended
+        else {
+            throw NSError(domain: "BENCH_PERF", code: 7, userInfo: [NSLocalizedDescriptionKey:
+                "Selected residency diagnostic requires independent selected mappings and 1...8192 MiB within the GPU working set"])
+        }
+        // Only this owned diagnostic process uses the existing shared ticket
+        // manager. Its cancellation-safe scope restores the prior baseline.
+        let ticket = WiredMemoryTicket(size: mib * 1024 * 1024, policy: WiredSumPolicy())
+        print("PERF_SELECTED_RESIDENCY_DIAGNOSTIC requested_mib=\(mib) scope=shared_ticket")
+        try await ticket.withWiredLimit {
+            try await runPerfBenchBody(modelPath: modelPath, maxNew: maxNew, variant: variant,
+                                       warmup: warmup, runs: runs, useTokenIterator: useTokenIterator)
+        }
+        print("PERF_SELECTED_RESIDENCY_DIAGNOSTIC ticket_ended=true")
+    } else {
+        try await runPerfBenchBody(modelPath: modelPath, maxNew: maxNew, variant: variant,
+                                   warmup: warmup, runs: runs, useTokenIterator: useTokenIterator)
+    }
+}
+
+private func runPerfBenchBody(
+    modelPath: String,
+    maxNew: Int,
+    variant: String,
+    warmup: Int,
+    runs: Int,
+    useTokenIterator: Bool
+) async throws {
     let modelDir = URL(fileURLWithPath: modelPath)
     let env = ProcessInfo.processInfo.environment
     let thinkingContext: [String: any Sendable]?
