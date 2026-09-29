@@ -3097,6 +3097,10 @@ public class Glm5Next: Module, ModalityBearing, ModelComponentMapping, Safetenso
 
     private let customRoutedTensorNames: Set<String>
 
+    // Admitted custom bundles retain their native mixed checkpoint dtypes.
+    // Keep the existing ordinary GLM loading policy unchanged.
+    public var preservesCheckpointParameterDTypes: Bool { !customRoutedTensorNames.isEmpty }
+
     public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
         customRoutedTensorNames.contains(key)
     }

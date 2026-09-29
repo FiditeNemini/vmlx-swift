@@ -19,6 +19,8 @@ extension NaiveN05FlashModel: LLMModel {
         }
     }
 
+    // Router weights/correction retain native F32 while ordinary BF16 weights stay BF16.
+    var preservesCheckpointParameterDTypes: Bool { true }
     var maximumSupportedDecodeBatchSize: Int? { 1 }
     var supportsWholeForwardCompilation: Bool { false }
     var cacheStorageDTypeIdentity: String? { "naive-n05-paired-v1" }

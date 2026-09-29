@@ -121,7 +121,7 @@ final class NaiveN05JANGHPreparationTests: XCTestCase {
                 configurationData:config))
             XCTAssertThrowsError(try prepared.construct(requesting:[.vision]))
             XCTAssertThrowsError(try prepared.construct(requesting:[]))
-            NativeMTPActivation.$explicitRequestOverride.withValue(true) {
+            try NativeMTPActivation.$explicitRequestOverride.withValue(true) {
                 XCTAssertThrowsError(try NaiveN05JANGHPreparation.loadIfDeclared(directory:directory,
                     configurationData:config))
             }
@@ -129,7 +129,7 @@ final class NaiveN05JANGHPreparationTests: XCTestCase {
         }
     }
 
-    func testActualGenericLoadPreservesCustomBanksAndLoadsOrdinaryAffineHead() throws {
+    func testActualGenericLoadPreservesCustomBanksF32RouterAndOrdinaryAffineHead() throws {
         try Self.withLock {
             let directory = try Self.temporaryDirectory()
             defer { try? FileManager.default.removeItem(at:directory) }
@@ -141,10 +141,16 @@ final class NaiveN05JANGHPreparationTests: XCTestCase {
             let prepared = try XCTUnwrap(NaiveN05JANGHPreparation.loadIfDeclared(directory:directory,
                 configurationData:data))
             let original = try prepared.construct(requesting:[.text])
-            // This fixture is an explicitly BF16 ordinary checkpoint. It tests
-            // exact ordinary loading, not preservation of F16 source parameters.
+            // Native mixed checkpoint: ordinary BF16, router/correction F32.
+            // Values below are deliberately not representable in BF16.
             try original.update(parameters:ModuleParameters.unflattened(
                 original.parameters().flattened().map { ($0.0,$0.1.asType(.bfloat16)) }),verify:[.all])
+            let routerName = "model.layers.1.mlp.gate.weight"
+            let correctionName = "model.layers.1.mlp.gate.e_score_correction_bias"
+            let nativeRouter = MLXArray.full([2,32],values:Float(0.1234567),dtype:.float32)
+            let nativeCorrection = MLXArray([Float(0.2345678),-0.1234567])
+            try original.update(parameters:ModuleParameters.unflattened([
+                routerName:nativeRouter,correctionName:nativeCorrection]),verify:[])
             quantize(model:original,groupSize:32,bits:4,mode:.affine,filter:{ path,_ in path == "lm_head" })
             let weights = Dictionary(uniqueKeysWithValues:original.parameters().flattened())
             XCTAssertNotNil(weights["lm_head.scales"])
@@ -156,17 +162,23 @@ final class NaiveN05JANGHPreparationTests: XCTestCase {
             for key in weights.keys { map[key] = ordinaryShard }
             index["weight_map"] = map
             try JSONSerialization.data(withJSONObject:index).write(to:indexURL)
-            let loaded = try prepared.construct(requesting:[.text])
+            // Index mutation invalidates the previous lease intentionally.
+            // Admit the complete final index before the second construction.
+            let reloadedPreparation = try XCTUnwrap(NaiveN05JANGHPreparation.loadIfDeclared(
+                directory:directory,configurationData:data))
+            let loaded = try reloadedPreparation.construct(requesting:[.text])
             try loadWeights(modelDirectory:directory,model:loaded,
                 quantization:prepared.baseConfiguration.quantizationContainer?.quantization,
                 perLayerQuantization:prepared.baseConfiguration.perLayerQuantization)
             XCTAssertTrue(loaded.head is QuantizedLinear)
+            XCTAssertTrue(loaded.preservesCheckpointParameterDTypes)
             let actual = Dictionary(uniqueKeysWithValues:loaded.parameters().flattened())
             XCTAssertEqual(Set(actual.keys),Set(weights.keys))
             for (name,expected) in weights {
                 let value = try XCTUnwrap(actual[name])
                 XCTAssertEqual(value.shape,expected.shape)
-                XCTAssertTrue((value == expected).all().item(Bool.self),name)
+                XCTAssertEqual(value.dtype,expected.dtype,name)
+                XCTAssertTrue((value .== expected).all().item(Bool.self),name)
             }
             let moe = try XCTUnwrap(loaded.model.layers[1].mlp as? NaiveN05FlashMoE)
             XCTAssertTrue(moe.experts is JANGHRoutedExpertLayer)
