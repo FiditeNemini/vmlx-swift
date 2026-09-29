@@ -477,61 +477,62 @@ public final class ChatSession {
                         let stream: AsyncStream<Generation>
                         let task: Task<Void, Never>
                         do {
-                        if let diffusionModel = model as? any BlockDiffusionModel {
-                            let options = diffusionModel.blockDiffusionDefaults
-                                .resolving(
-                                    generationConfig: modelConfiguration.generationDefaults)
-                                .overriding(parameters: generateParameters)
-                            let iterator = try BlockDiffusionTokenIterator(
-                                input: input, model: diffusionModel, cache: kvCache,
-                                parameters: generateParameters,
-                                options: options,
-                                cacheCoordinator: cacheCoordinator)
-                            (stream, task) = MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                toolSchemas: input.toolSchemas
-                            )
-                        } else if let strategy = generateParameters.draftStrategy,
-                            case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
-                            generateParameters.canUseNativeMTP(for: input)
-                        {
-                            // Native model-owned MTP speculative decode. `generate(...)` and
-                            // `generateTokensTask(...)` already dispatch on `draftStrategy`, but
-                            // `ChatSession` did not — so a caller using the high-level chat API got
-                            // plain autoregressive decode no matter what it set, with no error and
-                            // no log line to say so. Eligibility is `canUseNativeMTP` (penalty-free,
-                            // no media, unbounded KV; greedy verifies token-identical, sampled runs
-                            // the exact-pq accept path), so this cannot change the output law.
-                            guard let nativeModel = model as? any NativeMTPModel else {
-                                throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
+                            if let diffusionModel = model as? any BlockDiffusionModel {
+                                let options = diffusionModel.blockDiffusionDefaults
+                                    .resolving(
+                                        generationConfig: modelConfiguration.generationDefaults
+                                    )
+                                    .overriding(parameters: generateParameters)
+                                let iterator = try BlockDiffusionTokenIterator(
+                                    input: input, model: diffusionModel, cache: kvCache,
+                                    parameters: generateParameters,
+                                    options: options,
+                                    cacheCoordinator: cacheCoordinator)
+                                (stream, task) = MLXLMCommon.generateTask(
+                                    promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration,
+                                    tokenizer: tokenizer,
+                                    iterator: iterator,
+                                    toolSchemas: input.toolSchemas
+                                )
+                            } else if let strategy = generateParameters.draftStrategy,
+                                case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
+                                generateParameters.canUseNativeMTP(for: input)
+                            {
+                                // Native model-owned MTP speculative decode. `generate(...)` and
+                                // `generateTokensTask(...)` already dispatch on `draftStrategy`, but
+                                // `ChatSession` did not — so a caller using the high-level chat API got
+                                // plain autoregressive decode no matter what it set, with no error and
+                                // no log line to say so. Eligibility is `canUseNativeMTP` (penalty-free,
+                                // no media, unbounded KV; greedy verifies token-identical, sampled runs
+                                // the exact-pq accept path), so this cannot change the output law.
+                                guard let nativeModel = model as? any NativeMTPModel else {
+                                    throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
+                                }
+                                let iterator = try NativeMTPTokenIterator(
+                                    input: input, model: nativeModel, cache: kvCache,
+                                    parameters: generateParameters, depth: depth,
+                                    cacheCoordinator: cacheCoordinator)
+                                (stream, task) = MLXLMCommon.generateTask(
+                                    promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration,
+                                    tokenizer: tokenizer,
+                                    iterator: iterator,
+                                    toolSchemas: input.toolSchemas
+                                )
+                            } else {
+                                let iterator = try TokenIterator(
+                                    input: input, model: model, cache: kvCache,
+                                    parameters: generateParameters,
+                                    cacheCoordinator: cacheCoordinator)
+                                (stream, task) = MLXLMCommon.generateTask(
+                                    promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration,
+                                    tokenizer: tokenizer,
+                                    iterator: iterator,
+                                    toolSchemas: input.toolSchemas
+                                )
                             }
-                            let iterator = try NativeMTPTokenIterator(
-                                input: input, model: nativeModel, cache: kvCache,
-                                parameters: generateParameters, depth: depth,
-                                cacheCoordinator: cacheCoordinator)
-                            (stream, task) = MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                toolSchemas: input.toolSchemas
-                            )
-                        } else {
-                            let iterator = try TokenIterator(
-                                input: input, model: model, cache: kvCache,
-                                parameters: generateParameters,
-                                cacheCoordinator: cacheCoordinator)
-                            (stream, task) = MLXLMCommon.generateTask(
-                                promptTokenCount: input.text.tokens.size,
-                                modelConfiguration: modelConfiguration,
-                                tokenizer: tokenizer,
-                                iterator: iterator,
-                                toolSchemas: input.toolSchemas
-                            )
-                        }
 
                         } catch {
                             // Preparation may mutate this session's live KV before
@@ -547,6 +548,8 @@ public final class ChatSession {
                         var pendingToolCalls: [ToolCall] = []
 
                         for await item in stream {
+                            // GenerationFailure currently represents preparation only;
+                            // this is not a claim of recoverable decode-step errors.
                             if case .info(let info) = item, let failure = info.generationFailure {
                                 await task.value
                                 cache = .invalidatedAfterPreparation
