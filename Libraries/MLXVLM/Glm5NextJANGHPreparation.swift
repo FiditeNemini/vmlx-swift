@@ -8,6 +8,19 @@ struct Glm5NextJANGHPreparation {
     let banks: JANGHModelPreparation
     let baseConfiguration: BaseConfiguration
 
+    /// Detect the explicit custom contract, never a folder-name substring.
+    /// Once declared, malformed metadata is an error rather than an affine fallback.
+    static func loadIfDeclared(directory: URL, configurationData: Data) throws -> Self? {
+        guard let root = try? JSONSerialization.jsonObject(with: configurationData) as? [String: Any],
+              root["model_type"] as? String == "glm5_next" else { return nil }
+        let sidecarURL = directory.appendingPathComponent("jang_config.json")
+        let sidecar = FileManager.default.fileExists(atPath: sidecarURL.path)
+            ? try Data(contentsOf: sidecarURL) : nil
+        guard JANGHModelPreparation.declaresCustomFormat(configuration: configurationData, sidecar: sidecar)
+        else { return nil }
+        return try Self(directory: directory, configurationData: configurationData, sidecar: sidecar)
+    }
+
     init(directory: URL, configurationData: Data, sidecar: Data?) throws {
         let config = try JSONDecoder.json5().decode(Glm5NextConfiguration.self, from: configurationData)
         _ = try config.textConfig.validatedSchedule()

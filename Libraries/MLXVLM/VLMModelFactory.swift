@@ -469,13 +469,18 @@ public final class VLMModelFactory: ModelFactory {
 
         // Load config.json once and decode for both base config and model-specific config
         let configurationURL = modelDirectory.appending(component: "config.json")
-        let configData: Data
+        var configData: Data
         do {
             configData = try Data(contentsOf: configurationURL)
         } catch {
             throw ModelFactoryError.configurationFileError(
                 configurationURL.lastPathComponent, configuration.name, error)
         }
+        // Custom packed banks are admitted before the strict generic quantization
+        // decoder. Only their validated entries are removed from its ordinary view.
+        let jangHPreparation = try Glm5NextJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let jangHPreparation { configData = jangHPreparation.banks.ordinaryConfiguration }
         let baseConfig: BaseConfiguration
         do {
             baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
@@ -503,7 +508,7 @@ public final class VLMModelFactory: ModelFactory {
         // without `jang_config.json` skip this entirely.
         var mergedConfigData = configData
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if FileManager.default.fileExists(atPath: jangConfigURL.path),
+        if jangHPreparation == nil, FileManager.default.fileExists(atPath: jangConfigURL.path),
             let jangData = try? Data(contentsOf: jangConfigURL),
             let jangJSON = try? JSONSerialization.jsonObject(with: jangData)
                 as? [String: Any],
@@ -641,9 +646,13 @@ public final class VLMModelFactory: ModelFactory {
 
         let model: LanguageModel
         do {
-            model = try await typeRegistry.createModel(
-                configuration: mergedConfigData, modelType: dispatchModelType,
-                requesting: configuration.requestedModalities)
+            if let jangHPreparation {
+                model = try jangHPreparation.construct(requesting: configuration.requestedModalities)
+            } else {
+                model = try await typeRegistry.createModel(
+                    configuration: mergedConfigData, modelType: dispatchModelType,
+                    requesting: configuration.requestedModalities)
+            }
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
@@ -773,9 +782,12 @@ public final class VLMModelFactory: ModelFactory {
             // gs. Without it, MXFP4 omni fell back to `jangConfig.blockSize`'s
             // default 64 instead of the actual gs=32, mis-inferring layers
             // and causing mid-prefill rmsNorm shape traps.
-            quantization: jangConfig != nil ? baseConfig.quantizationContainer?.quantization : nil,
+            quantization: (jangHPreparation != nil || jangConfig != nil)
+                ? baseConfig.quantizationContainer?.quantization : nil,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: jangConfig,
+            // Custom v2 banks already have an authoritative typed contract. Keep
+            // their ordinary modes explicit, bypassing legacy JANG shape inference.
+            jangConfig: jangHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask

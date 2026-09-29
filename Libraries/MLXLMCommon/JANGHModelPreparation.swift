@@ -29,6 +29,25 @@ public final class JANGHModelPreparation {
     let source: JANGHMappedBanks.SourceLease
     private let hiddenSize: Int
 
+    /// Shared declaration gate for architecture factories. This only selects
+    /// strict admission; it never establishes support from a label alone.
+    public static func declaresCustomFormat(configuration: Data, sidecar: Data?) -> Bool {
+        guard let root = try? JSONSerialization.jsonObject(with: configuration) as? [String: Any]
+        else { return false }
+        let sidecarObject = sidecar.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        func customMode(_ value: Any?) -> Bool {
+            guard let object = value as? [String: Any] else { return false }
+            if object["mode"] as? String == "jangtq2" { return true }
+            return object.values.contains { customMode($0) }
+        }
+        let text = root["text_config"] as? [String: Any]
+        let header = root["jangtq"] as? [String: Any]
+        return customMode(root["quantization"]) || customMode(root["quantization_config"])
+            || customMode(text?["quantization"]) || customMode(text?["quantization_config"])
+            || header?["codebook_family"] as? String == "odd-cubic"
+            || sidecarObject?["format"] as? String == "jangtq2"
+    }
+
     public init(directory: URL, configuration: Data, sidecar: Data?,
                 layout: JANGHRoutedModelLayout) throws {
         let partition = try JANGHConfigurationPartition(
