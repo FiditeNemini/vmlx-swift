@@ -11,6 +11,7 @@ private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sen
     var preparedTokenCounts: [Int] = []
     let failProjection: Bool
     let mutateCache: Bool
+    var returnsTokens = false
     var cancelPreparation = false
     var vocabularySize: Int { 4 }
 
@@ -33,6 +34,7 @@ private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sen
             let row = MLXArray.ones([1, 1, input.text.tokens.size, 4])
             for layer in cache { _ = layer.update(keys: row, values: row) }
         }
+        if returnsTokens { return .tokens(input.text) }
         if failProjection {
             let invalid = matmul(MLXArray.zeros([2, 3]), MLXArray.zeros([4, 2]))
             return .logits(LMOutput(logits: invalid))
@@ -43,7 +45,13 @@ private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sen
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        MLXArray([Float(0), 1, 2, 3]).reshaped(1, 1, 4)
+        if returnsTokens {
+            if failProjection {
+                return matmul(MLXArray.zeros([2, 3]), MLXArray.zeros([4, 2]))
+            }
+            return MLXArray(0 ..< outputShape.reduce(1, *)).asType(.float32).reshaped(outputShape)
+        }
+        return MLXArray([Float(0), 1, 2, 3]).reshaped(1, 1, 4)
     }
 }
 
@@ -104,6 +112,53 @@ final class PreparedLogitsValidationTests: XCTestCase {
                     }
                 }
                 XCTAssertEqual(fixture.preparedOffsets, [0, 0])
+                let highWatermark = await engine.activeCountHighWatermarkForDiagnostics
+                XCTAssertEqual(
+                    highWatermark, 2, "Both requests must be admitted to scheduler slots")
+            }
+        }
+    }
+
+    func testBatchTokenTailFailureDoesNotPublishCache() async throws {
+        try await MLXMetalTestLock.withLock {
+            for projectionFailure in [false, true] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+                    UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let coordinator = CacheCoordinator(
+                    config: CacheCoordinatorConfig(
+                        usePagedCache: false, enableDiskCache: true, diskCacheDir: directory,
+                        modelKey: "batch-token-tail-failure"))
+                let fixture = PreparedLogitsFixture(
+                    shape: [1, 4], failProjection: projectionFailure, mutateCache: true)
+                fixture.returnsTokens = true
+                let processor = TestInputProcessor()
+                let context = ModelContext(
+                    configuration: processor.configuration, model: fixture,
+                    processor: processor, tokenizer: processor.tokenizer)
+                let engine = BatchEngine(
+                    context: context, maxBatchSize: 2, cacheCoordinator: coordinator)
+                let (_, stream) = await engine.submit(
+                    input: LMInput(tokens: MLXArray([Int32(1), 2])),
+                    parameters: GenerateParameters(maxTokens: 1, temperature: 0))
+                var infos: [GenerateCompletionInfo] = []
+                for await event in stream {
+                    if case .token = event { XCTFail("Failed token-tail projection must not emit") }
+                    if case .info(let info) = event { infos.append(info) }
+                }
+                XCTAssertEqual(infos.count, 1)
+                XCTAssertEqual(infos.first?.generationFailure?.stage, .preparation)
+                if projectionFailure {
+                    XCTAssertTrue(infos.first?.generationFailure?.cause.contains("matmul") == true)
+                } else {
+                    XCTAssertEqual(
+                        infos.first?.generationFailure?.cause,
+                        PreparedLogitsValidationError.invalidShape([1, 4]).localizedDescription)
+                }
+                XCTAssertEqual(coordinator.diskCache?.stores, 0)
+                if case .hit = coordinator.fetch(tokens: [1, 2]) {
+                    XCTFail("Failed token-tail cache must not be reusable")
+                }
             }
         }
     }

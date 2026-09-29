@@ -2522,14 +2522,17 @@ public actor BatchEngine {
                                 head,
                                 cache: slot.cache,
                                 windowSize: slot.prefillStepSize)
+                            try error.check()
                             if case .tokens(let remainingHead) = headResult {
                                 _ = context.model(
                                     remainingHead[text: .newAxis],
                                     cache: slot.cache,
                                     state: nil)
+                                try error.check()
                             }
                         }
                         MLX.eval(slot.cache)
+                        try error.check()
                         let diskSeedSnapshot = makePromptBoundaryCacheSnapshot(
                             from: slot.cache)
                         storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)
@@ -2595,13 +2598,16 @@ public actor BatchEngine {
                                 input,
                                 cache: slot.cache,
                                 windowSize: slot.prefillStepSize)
+                            try error.check()
                             if case .tokens(let remainingTail) = result {
                                 _ = context.model(
                                     remainingTail[text: .newAxis],
                                     cache: slot.cache,
                                     state: nil)
+                                try error.check()
                             }
                             MLX.eval(slot.cache)
+                            try error.check()
                         }
 
                         try completePrefill(head)
