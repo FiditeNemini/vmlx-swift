@@ -116,4 +116,26 @@ final class JANGHModelPreparationTests: XCTestCase {
         }
     }
 
+    func testMappedBanksReportLogicalSizeWithoutReflectedWeightArrays() throws {
+        try MLXMetalTestLock.withLock {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let config = try fixture(directory)
+            let before = mlx_safetensors_mmap_tracked_buffer_bytes()
+            try autoreleasepool {
+                let prepared = try JANGHModelPreparation(directory: directory, configuration: config,
+                                                         sidecar: nil, layout: layout())
+                let banks = try prepared.makeRoutedExperts(activationLimit: nil)
+                let bank = try XCTUnwrap(banks[0])
+                XCTAssertTrue(bank.parameters().flattenedValues().isEmpty)
+                let counts = bank.modelWeightAccounting()
+                XCTAssertEqual(counts.parameterArrayBytes, 0)
+                XCTAssertEqual(counts.supplementalMappedBytes, 2688)
+                XCTAssertEqual(bank.numParameters(), 6144)
+                XCTAssertGreaterThan(mlx_safetensors_mmap_tracked_buffer_bytes(), before)
+            }
+            XCTAssertEqual(mlx_safetensors_mmap_tracked_buffer_bytes(), before)
+        }
+    }
+
 }

@@ -4,9 +4,11 @@ import MLXNN
 /// A pre-admitted mapped routed bank. Storage stays in an opaque owner rather
 /// than generic Module parameters, so weight loading cannot evaluate or replace
 /// the entire packed bank. Construction errors are thrown before model creation.
-public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer {
+public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, SupplementalModelWeights {
     private let block: JANGHRoutedDecodeBlock
     private let inputDimensions: Int
+    public let supplementalWeightBytes: Int
+    public let supplementalParameterCount: Int
 
     init(banks: JANGHMappedBanks, parentModule: String, inputDimensions: Int,
          activationLimit: Float?) throws {
@@ -19,6 +21,13 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer {
               down.scales.dim(1) == inputDimensions else {
             throw JANGHFormatContract.ValidationError.invalid("JANGH routed architecture geometry mismatch")
         }
+        let projections = [gate, up, down]
+        supplementalWeightBytes = projections.reduce(0) { $0 + $1.packed.nbytes + $1.scales.nbytes }
+        // The sidecar scales have one entry per expert/output row. Count the
+        // represented scalar weights, not packed words or codebook levels.
+        let hidden = gate.scales.dim(1)
+        supplementalParameterCount = gate.scales.size * inputDimensions
+            + up.scales.size * inputDimensions + down.scales.size * hidden
         self.block = try JANGHRoutedDecodeBlock(
             banks: banks, parentModule: parentModule, activationLimit: activationLimit)
         self.inputDimensions = inputDimensions

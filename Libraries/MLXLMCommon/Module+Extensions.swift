@@ -19,6 +19,6 @@ extension Module {
                         $0 + $1.size
                     })
             }
-        }.reduce(0, +)
+        }.reduce(0, +) + supplementalWeightTotals().parameters
     }
 }
