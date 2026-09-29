@@ -106,7 +106,7 @@ final class JANGHSelectedExpertTests: XCTestCase {
 
     func testSelectedDecodeMatchesProvenWholeBankCompositionAcrossRotationsAndDTypes() throws {
         try MLXMetalTestLock.withLock {
-            for bits in [[2, 2, 2], [2, 3, 4]] {
+            for bits in [[2, 2, 2], [2, 3, 4], [6, 8, 4]] {
                 for inputRotation in ["none", "hadamard32"] {
                     for downRotation in ["none", "hadamard32"] {
                         let f = try fixture(bits: bits, inputRotation: inputRotation, downRotation: downRotation)
