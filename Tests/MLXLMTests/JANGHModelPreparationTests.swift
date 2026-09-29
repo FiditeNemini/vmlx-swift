@@ -138,4 +138,25 @@ final class JANGHModelPreparationTests: XCTestCase {
         }
     }
 
+    func testLegacyRuntimeAndOverlayRefusedBeforeMapping() throws {
+        try MLXMetalTestLock.withLock {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let config = try fixture(directory)
+            let before = mlx_safetensors_mmap_tracked_buffer_bytes()
+            for name in ["jangtq_runtime.safetensors", "jangtq_stacked.safetensors"] {
+                let legacy = directory.appendingPathComponent(name)
+                try Data().write(to: legacy)
+                XCTAssertThrowsError(try JANGHModelPreparation(directory: directory,
+                    configuration: config, sidecar: nil, layout: layout())) { error in
+                    XCTAssertTrue(String(describing: error).contains("legacy JANGTQ"))
+                }
+                XCTAssertEqual(mlx_safetensors_mmap_tracked_buffer_bytes(), before)
+                try FileManager.default.removeItem(at: legacy)
+            }
+            XCTAssertNoThrow(try JANGHModelPreparation(directory: directory,
+                configuration: config, sidecar: nil, layout: layout()))
+        }
+    }
+
 }

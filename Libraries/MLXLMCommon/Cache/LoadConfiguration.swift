@@ -267,6 +267,14 @@ public enum DeepseekV4ActivationQAT {
 /// pulled once at load entry so the resolver doesn't re-walk the
 /// directory or re-parse `config.json`.
 public struct LoadBundleFacts: Sendable, Equatable {
+    /// Metadata classification only, not tensor geometry or model-runtime proof.
+    public enum CustomRoutedFormat: Sendable, Equatable {
+        case none
+        case janghV2
+        case invalidJANGHDeclaration
+    }
+    public private(set) var customRoutedFormat: CustomRoutedFormat = .none
+
     /// Converted MiMo V2.6 packed banks are owned GPU inputs by default.
     public private(set) var isMiMoV26MixedQuantized: Bool = false
     /// Top-level or nested `model_type` from config metadata, when available.
@@ -384,8 +392,16 @@ public struct LoadBundleFacts: Sendable, Equatable {
         var declaredComputeDType: String?
         var routedExpertLayout: String?
         var isMiMoV26MixedQuantized = false
-        let configURL = url.appendingPathComponent("config.json")
-        if let data = try? Data(contentsOf: configURL),
+        let rawConfiguration = try? Data(contentsOf: url.appendingPathComponent("config.json"))
+        let rawSidecar = try? Data(contentsOf: url.appendingPathComponent("jang_config.json"))
+        var customRoutedFormat: CustomRoutedFormat = .none
+        if let rawConfiguration,
+           JANGHModelPreparation.declaresCustomFormat(configuration: rawConfiguration, sidecar: rawSidecar) {
+            customRoutedFormat = (try? JANGHConfigurationPartition(
+                configuration: rawConfiguration, sidecar: rawSidecar)) == nil
+                ? .invalidJANGHDeclaration : .janghV2
+        }
+        if let data = rawConfiguration,
             let json = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any]
         {
@@ -488,7 +504,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
         let jangConfigURL = url.appendingPathComponent("jang_config.json")
         let hasJangConfig = fm.fileExists(atPath: jangConfigURL.path)
         if hasJangConfig,
-            let data = try? Data(contentsOf: jangConfigURL),
+            let data = rawSidecar,
             let json = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any]
         {
@@ -529,6 +545,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
             topK: topK)
         facts.hasPrestackedAffineRoutedExperts = hasPrestackedAffineRoutedExperts
         facts.isMiMoV26MixedQuantized = isMiMoV26MixedQuantized
+        facts.customRoutedFormat = customRoutedFormat
         return facts
     }
 
@@ -643,6 +660,10 @@ public struct LoadBundleFacts: Sendable, Equatable {
         let format = weightFormat?.lowercased() ?? ""
         let declaresAffine = format.isEmpty || format == "affine" || format == "jang"
         return (type == "glm5_next" || type == "glm5_next_text")
+            && customRoutedFormat == .none
+            // A format label alone cannot validate custom banks, but it must
+            // never opt a declared custom bundle into an affine resident policy.
+            && jangFormat?.lowercased() != "jangtq2"
             && !hasJangTQRuntime
             && declaresAffine
             && isRouted

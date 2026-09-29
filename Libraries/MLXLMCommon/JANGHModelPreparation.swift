@@ -50,6 +50,14 @@ public final class JANGHModelPreparation {
 
     public init(directory: URL, configuration: Data, sidecar: Data?,
                 layout: JANGHRoutedModelLayout) throws {
+        // The generic loader treats these historical files as executable
+        // codebook/overlay inputs. Never mix them with a custom-v2 bank owner.
+        for legacyName in ["jangtq_runtime.safetensors", "jangtq_stacked.safetensors"] {
+            guard !FileManager.default.fileExists(atPath: directory.appendingPathComponent(legacyName).path) else {
+                throw JANGHFormatContract.ValidationError.invalid(
+                    "JANGH cannot coexist with legacy JANGTQ runtime or overlay files")
+            }
+        }
         let partition = try JANGHConfigurationPartition(
             configuration: configuration, sidecar: sidecar)
         guard partition.modelType == layout.modelType,
