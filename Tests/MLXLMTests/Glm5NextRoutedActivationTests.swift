@@ -31,7 +31,7 @@ final class Glm5NextRoutedActivationTests: XCTestCase {
 
     private func routedFixture(limit: Float?, dtype: DType) throws -> SwitchGLU {
         let config = try config(limit: limit)
-        let routed = Glm5NextMoE(config).switchMLP
+        let routed = try XCTUnwrap(Glm5NextMoE(config).switchMLP)
         let inputs = config.hiddenSize
         let hidden = config.moeIntermediateSize
         let experts = config.nRoutedExperts
@@ -131,7 +131,7 @@ final class Glm5NextRoutedActivationTests: XCTestCase {
             let group = 128
             let moe = Glm5NextMoE(
                 try config(limit: 10, inputs: inputs, hidden: hidden, routes: experts))
-            let glue = try XCTUnwrap(moe.switchMLP.glue)
+            let glue = try XCTUnwrap(moe.switchMLP?.glue)
             func projection(input: Int, output: Int, bias: Float) -> QuantizedSwitchLinear {
                 QuantizedSwitchLinear(
                     inputDims: input, outputDims: output, numExperts: experts,
@@ -144,7 +144,7 @@ final class Glm5NextRoutedActivationTests: XCTestCase {
             let gate = projection(input: inputs, output: hidden, bias: 25)
             let up = projection(input: inputs, output: hidden, bias: 400)
             let down = projection(input: hidden, output: inputs, bias: 1 / Float(hidden))
-            try moe.switchMLP.update(modules: ModuleChildren.unflattened([
+            try XCTUnwrap(moe.switchMLP).update(modules: ModuleChildren.unflattened([
                 ("gate_proj", gate as Module), ("up_proj", up as Module), ("down_proj", down as Module),
             ]), verify: .all)
             var values = [Float](repeating: 0, count: inputs)
@@ -157,12 +157,12 @@ final class Glm5NextRoutedActivationTests: XCTestCase {
             // This is the same eligibility entry point Glm5NextMoE calls, not a
             // direct forced kernel dispatch. Nil must fail the regression.
             let fused = try XCTUnwrap(
-                moe.switchMLP.qwen4ExpReduced(input, indices: indices, scores: scores))
+                try XCTUnwrap(moe.switchMLP).qwen4ExpReduced(input, indices: indices, scores: scores))
             let expanded = expandedDimensions(input, axes: [-2, -3])
             let activated = glue(gate(expanded, indices), up(expanded, indices))
             let routed = down(activated, indices).squeezed(axis: -2)
             let reference = (routed * expandedDimensions(scores, axis: -1)).sum(axis: -2)
-            let eager = (moe.switchMLP(input, indices) * expandedDimensions(scores, axis: -1)).sum(
+            let eager = (try XCTUnwrap(moe.switchMLP)(input, indices) * expandedDimensions(scores, axis: -1)).sum(
                 axis: -2)
             XCTAssertEqual(fused.dtype, .bfloat16)
             XCTAssertEqual(eager.dtype, .bfloat16)

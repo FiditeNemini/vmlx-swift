@@ -1865,13 +1865,20 @@ public final class Glm5NextMoE: Module {
     @ParameterInfo(key: "e_score_correction_bias") public var eScoreCorrectionBias: MLXArray
 
     @ModuleInfo(key: "gate") public var gate: Glm5NextMoEGate
-    @ModuleInfo(key: "switch_mlp") public var switchMLP: SwitchGLU
+    @ModuleInfo(key: "switch_mlp") public var routedExperts: any WeightedRoutedExpertLayer
+
+    /// Ordinary affine/MX branch, absent when a custom bank owns the routed path.
+    public var switchMLP: SwitchGLU? { routedExperts as? SwitchGLU }
     @ModuleInfo(key: "shared_experts") public var sharedExperts: Glm5NextSharedExpert
 
-    public init(_ config: Glm5NextTextConfiguration) {
+    public init(
+        _ config: Glm5NextTextConfiguration,
+        routedExperts: (any WeightedRoutedExpertLayer)? = nil
+    ) {
         _eScoreCorrectionBias.wrappedValue = MLXArray.zeros([config.nRoutedExperts])
         _gate.wrappedValue = Glm5NextMoEGate(config)
-        _switchMLP.wrappedValue = SwitchGLU(
+        // Select the custom bank before constructing any dense expert placeholders.
+        _routedExperts.wrappedValue = routedExperts ?? SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.nRoutedExperts,
@@ -1884,23 +1891,7 @@ public final class Glm5NextMoE: Module {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = gate(x, correctionBias: eScoreCorrectionBias)
 
-        // DECODE FAST PATH. `qwen4ExpReduced` walks gate and up in one pass and applies the router
-        // scores while reducing the down projections straight into the hidden vector, so it never
-        // materialises the [routes, hidden] routed tensor the generic path builds. It returns nil
-        // for anything it does not handle exactly — prefill batches, unqualified geometry, a
-        // quantization it has not been given — and the generic path below then runs unchanged.
-        //
-        // Asking for it is the half that was missing: the kernel and its shape gate can both be
-        // correct while nothing ever calls them, which is what made this a fast path GLM-5.3 could
-        // not reach no matter what the gate said.
-        let combined: MLXArray
-        if let fused = switchMLP.qwen4ExpReduced(x, indices: indices, scores: weights) {
-            combined = fused
-        } else {
-            let routed = switchMLP(x, indices)
-            // `switchMLP` returns [..., topK, hidden]; weight each expert's contribution and sum.
-            combined = (routed * expandedDimensions(weights, axis: -1)).sum(axis: -2)
-        }
+        let combined = routedExperts.callRouted(x, indices: indices, scores: weights)
         // The shared expert is ALWAYS on — it is not one of the routed `topK`.
         return combined + sharedExperts(x)
     }
@@ -1983,7 +1974,8 @@ public final class Glm5NextDecoderLayer: Module {
 
     public init(
         _ config: Glm5NextTextConfiguration, kind: Glm5NextLayerKind, mlpKind: Glm5NextMLPKind,
-        isMultiTokenPrediction: Bool = false
+        isMultiTokenPrediction: Bool = false,
+        routedExperts: (any WeightedRoutedExpertLayer)? = nil
     ) {
         self.kind = kind
         self.mlpKind = mlpKind
@@ -2007,7 +1999,8 @@ public final class Glm5NextDecoderLayer: Module {
 
         switch mlpKind {
         case .dense: _feedForward.wrappedValue = Glm5NextDenseMLP(config)
-        case .sparse: _feedForward.wrappedValue = Glm5NextMoE(config)
+        case .sparse:
+            _feedForward.wrappedValue = Glm5NextMoE(config, routedExperts: routedExperts)
         }
 
         // NOT on the MTP layer. The shipped layer 45 carries no `attn_hc` / `ffn_hc` at all — it
@@ -2783,6 +2776,11 @@ extension Glm5Next {
 /// separate head would mean rewriting keys for no gain. `num_nextn_predict_layers` decides whether
 /// it exists at all: the same model is published with and without MTP, and the version without must
 /// declare no parameter its checkpoint lacks.
+public enum Glm5NextRoutedBankError: Error {
+    case incompleteCoverageOrUnsupportedMTP
+    case invalidCustomTensorExclusions
+}
+
 public final class Glm5NextLanguageModel: Module {
 
     public let numDecoderLayers: Int
@@ -2794,8 +2792,21 @@ public final class Glm5NextLanguageModel: Module {
     @ModuleInfo(key: "layers") public var layers: [Glm5NextDecoderLayer]
     @ModuleInfo(key: "norm") public var norm: RMSNorm
 
-    public init(_ config: Glm5NextTextConfiguration) throws {
+    public init(
+        _ config: Glm5NextTextConfiguration,
+        routedExperts: [Int: any WeightedRoutedExpertLayer] = [:]
+    ) throws {
         let schedule = try config.validatedSchedule()
+        if !routedExperts.isEmpty {
+            let expected = Set((0 ..< config.numHiddenLayers).filter {
+                config.mlpLayerTypes[$0] == .sparse
+            })
+            guard Set(routedExperts.keys) == expected,
+                !glm5NextNativeMTPEnabled() || config.numNextnPredictLayers == 0
+            else {
+                throw Glm5NextRoutedBankError.incompleteCoverageOrUnsupportedMTP
+            }
+        }
         self.numDecoderLayers = config.numHiddenLayers
         // Gated, not config-driven: see `glm5NextNativeMTPEnabled()`. A bundle that declares an
         // MTP layer but ships no weights for it must not allocate one.
@@ -2809,7 +2820,8 @@ public final class Glm5NextLanguageModel: Module {
 
         var built = (0 ..< config.numHiddenLayers).map { index in
             Glm5NextDecoderLayer(
-                config, kind: schedule[index], mlpKind: config.mlpLayerTypes[index])
+                config, kind: schedule[index], mlpKind: config.mlpLayerTypes[index],
+                routedExperts: routedExperts[index])
         }
         // The MTP layer is NOT in `layer_types` — that list is exactly `num_hidden_layers` long, as
         // `validatedSchedule` enforces. Its kinds come from the weights instead: the shipped layer
@@ -3081,7 +3093,13 @@ public struct Glm5NextDecoderUnavailable: Error, CustomStringConvertible {
 /// caller actually reaches, which is the failure mode this repo has been removing (see the
 /// force-unwrap in `PromptTailDecodeTests` that took the whole test process down). An
 /// `unsupportedModelType` is a worse message but an honest one.
-public class Glm5Next: Module, ModalityBearing, ModelComponentMapping {
+public class Glm5Next: Module, ModalityBearing, ModelComponentMapping, SafetensorsLoadKeyExcluding {
+
+    private let customRoutedTensorNames: Set<String>
+
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        customRoutedTensorNames.contains(key)
+    }
 
     public let config: Glm5NextConfiguration
     public let plan: ResolvedConstructionPlan
@@ -3136,16 +3154,39 @@ public class Glm5Next: Module, ModalityBearing, ModelComponentMapping {
         try self.init(config, requesting: nil)
     }
 
-    /// - Parameter requesting: the caller's subset, or nil for everything the configuration offers.
-    public init(
+    /// Retains the factory's exact two-argument constructor identity.
+    public convenience init(
         _ config: Glm5NextConfiguration, requesting: Set<ModelRuntimeRequestModality>?
     ) throws {
+        try self.init(config, requesting: requesting, routedExperts: [:])
+    }
+
+    /// - Parameter requesting: the caller's subset, or nil for everything the configuration offers.
+    public init(
+        _ config: Glm5NextConfiguration, requesting: Set<ModelRuntimeRequestModality>?,
+        routedExperts: [Int: any WeightedRoutedExpertLayer],
+        customRoutedTensorNames: Set<String> = []
+    ) throws {
+        if !customRoutedTensorNames.isEmpty {
+            let expected = Set(routedExperts.keys.flatMap { layer in
+                ["gate_proj", "up_proj", "down_proj"].flatMap { role in
+                    ["tq2_packed", "tq2_scales"].map { suffix in
+                        "model.layers.\(layer).mlp.switch_mlp.\(role).\(suffix)"
+                    }
+                }
+            })
+            guard customRoutedTensorNames == expected else {
+                throw Glm5NextRoutedBankError.invalidCustomTensorExclusions
+            }
+        }
+        self.customRoutedTensorNames = customRoutedTensorNames
         let plan = try Self.resolveConstruction(config, requesting: requesting)
         self.config = config
         self.plan = plan
         self.schedule = try config.textConfig.validatedSchedule()
         self.modalities = plan.served
-        _languageModel.wrappedValue = try Glm5NextLanguageModel(config.textConfig)
+        _languageModel.wrappedValue = try Glm5NextLanguageModel(
+            config.textConfig, routedExperts: routedExperts)
         if !config.textConfig.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(
                 config.textConfig.hiddenSize, config.textConfig.vocabSize, bias: false)
