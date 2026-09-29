@@ -67,15 +67,26 @@ final class NaiveN05FlashRuntimeTests: XCTestCase {
 
     func testSinkAndAllMaskedAsymmetricAttention() {
         MLXMetalTestLock.withLock {
-        let q = MLXArray.zeros([1,2,1,4]), k = MLXArray.zeros([1,1,2,4])
-        let v = MLXArray([Float(2),4,6,8]).reshaped(1,1,2,2)
+        // Exercise the actual native asymmetric geometry, not the tiny generic
+        // F32-matmul fallback whose default precision may be TF32.
+        let q = MLXArray.zeros([1,2,1,192]), k = MLXArray.zeros([1,1,2,192])
+        let v = MLXArray((0..<256).map { Float($0 < 128 ? ($0 % 2 == 0 ? 2 : 4) : ($0 % 2 == 0 ? 6 : 8)) }).reshaped(1,1,2,128)
         let allowed = MLXArray.ones([1,1,2], dtype: .bool)
-        // Two equal real logits plus one equal sink: sum(values)/3, scaledonce.
+        XCTAssertTrue(NaiveN05FlashMath.usesAsymmetricDecodeSDPA(query:q,key:k,value:v))
         let y = NaiveN05FlashMath.attention(query:q,key:k,value:v,allowed:allowed,sink:MLXArray.zeros([2]),valueScale:0.5)
-        close(y, MLXArray([Float(4.0/3),2,4.0/3,2]).reshaped(1,2,1,2))
+        let expected = MLXArray((0..<256).map { $0 % 2 == 0 ? Float(4.0/3) : Float(2) }).reshaped(1,2,1,128)
+        close(y, expected)
         for sink in [nil, MLXArray([Float(100), -100])] as [MLXArray?] {
-            close(NaiveN05FlashMath.attention(query:q,key:k,value:v,allowed:MLXArray.zeros([1,1,2],dtype:.bool),sink:sink,valueScale:nil), MLXArray.zeros([1,2,1,2]), tolerance:0)
+            close(NaiveN05FlashMath.attention(query:q,key:k,value:v,allowed:MLXArray.zeros([1,1,2],dtype:.bool),sink:sink,valueScale:nil), MLXArray.zeros([1,2,1,128]), tolerance:0)
         }
+        // Preserve the original generic fallback analytic relation in an
+        // explicitly strict diagnostic process; production defaults are untouched.
+        if ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0" {
+            let smallQ = MLXArray.zeros([1,2,1,4]), smallK = MLXArray.zeros([1,1,2,4])
+            let smallV = MLXArray([Float(2),4,6,8]).reshaped(1,1,2,2)
+            close(NaiveN05FlashMath.attention(query:smallQ,key:smallK,value:smallV,allowed:allowed,sink:MLXArray.zeros([2]),valueScale:0.5), MLXArray([Float(4.0/3),2,4.0/3,2]).reshaped(1,2,1,2))
+        }
+
             }
     }
 
@@ -168,22 +179,54 @@ final class NaiveN05FlashRuntimeTests: XCTestCase {
     }
 
     func testTinyRealModelFullChunkAndDecodeParityWithLeftPadding() throws {
-        try MLXMetalTestLock.withLock {
+        try MLXMetalTestLock.withLock { try verifyTinyChunkParity(dtype: .bfloat16) }
+    }
+
+    func testStrictF32TinyRealModelFullChunkAndDecodeParityWithLeftPadding() throws {
+        guard ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0" else {
+            throw XCTSkip("Full-precision F32 cross-shape relation requires the explicit strict diagnostic process; native BF16 relation remains active")
+        }
+        try MLXMetalTestLock.withLock { try verifyTinyChunkParity(dtype: .float32) }
+    }
+
+    private func verifyTinyChunkParity(dtype: DType) throws {
         MLXRandom.seed(20260928)
         let model=try NaiveN05FlashModel(tiny())
+        func parameterDType(_ name: String) -> DType {
+            // Preserve the router's F32 weights/correction contract while ordinary
+            // projection and embedding parameters exercise BF16 storage.
+            name.contains(".mlp.gate.") ? .float32 : dtype
+        }
+        if dtype != .float32 {
+            try model.update(parameters: ModuleParameters.unflattened(
+                model.parameters().flattened().map { ($0.0, $0.1.asType(parameterDType($0.0))) }), verify: [.all])
+        }
+        XCTAssertTrue(model.parameters().flattened().allSatisfy { $0.1.dtype == parameterDType($0.0) })
         let tokens=MLXArray([0,0,3,4,5,6,7,8]).reshaped(1,8)
         let padding=MLXArray([false,false,true,true,true,true,true,true]).reshaped(1,8)
         let reference=try model(tokens,padding:padding)
+        let fullCache=model.newCache()
+        close(try model(tokens,padding:padding,cache:fullCache), reference, tolerance:3e-4)
         let cache=model.newCache()
         var chunks=[MLXArray]()
         for range in [0..<3,3..<5,5..<6,6..<8] {
             chunks.append(try model(tokens[0...,range],padding:padding[0...,..<range.upperBound],cache:cache))
         }
         close(concatenated(chunks,axis:1),reference,tolerance:3e-4)
+        // Whole-prefix execution is an independent cache chronology oracle:
+        // compare every KV and sparse indexer companion against chunked history.
+        for layer in cache.indices {
+            XCTAssertEqual(cache[layer].keyOffset, fullCache[layer].keyOffset)
+            XCTAssertEqual(cache[layer].metaState, fullCache[layer].metaState)
+            XCTAssertEqual(cache[layer].state.count, fullCache[layer].state.count)
+            for row in cache[layer].state.indices {
+                XCTAssertEqual(cache[layer].state[row].dtype, fullCache[layer].state[row].dtype)
+                close(cache[layer].state[row], fullCache[layer].state[row], tolerance:3e-4)
+            }
+        }
         XCTAssertEqual(cache.map(\.offset),[8,8])
         XCTAssertEqual(cache[0].state.map{$0.dim(2)},[8,8,8])
         XCTAssertEqual(cache[1].state.map{$0.dim(2)},[2,2])
-            }
     }
     func testActualDiskSerializerReopenRestoresCompanionAndContinues() throws {
         try MLXMetalTestLock.withLock {
