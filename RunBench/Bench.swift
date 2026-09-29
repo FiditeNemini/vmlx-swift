@@ -8448,6 +8448,24 @@ func runPerfBench(
     useTokenIterator: Bool = false
 ) async throws {
     let env = ProcessInfo.processInfo.environment
+    if let raw = env["BENCH_PERF_RESIDENT_WIRED_BYTES"] {
+        guard env["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] != "1",
+            env["BENCH_PERF_SELECTED_WIRED_MIB"] == nil,
+            let bytes = Int(raw), bytes > 0,
+            let recommended = GPU.maxRecommendedWorkingSetBytes(), bytes <= recommended
+        else {
+            throw NSError(domain: "BENCH_PERF", code: 7, userInfo: [NSLocalizedDescriptionKey:
+                "Resident wired diagnostic requires a positive budget within the GPU working set and no selected-expert override"])
+        }
+        let ticket = MLX.WiredMemoryTicket(size: bytes, policy: MLX.WiredSumPolicy())
+        print("PERF_RESIDENT_WIRED_DIAGNOSTIC requested_bytes=\(bytes) scope=shared_ticket")
+        try await ticket.withWiredLimit {
+            try await runPerfBenchBody(modelPath: modelPath, maxNew: maxNew, variant: variant,
+                                       warmup: warmup, runs: runs, useTokenIterator: useTokenIterator)
+        }
+        print("PERF_RESIDENT_WIRED_DIAGNOSTIC ticket_ended=true")
+        return
+    }
     if let raw = env["BENCH_PERF_SELECTED_WIRED_MIB"] {
         guard env["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] == "1",
             env["VMLX_JANGH_SELECTED_WHOLE_BANK_VIEWS"] != "1",
