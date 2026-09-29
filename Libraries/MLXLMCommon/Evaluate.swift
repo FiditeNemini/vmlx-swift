@@ -2638,8 +2638,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         windowSize: Int?,
         promptTokensForProcessor: MLXArray
     ) throws {
-        let prepared = try MLXPressGenerationProfile.time("prompt.model_prepare") {
-            try model.prepare(input, cache: cache, windowSize: windowSize)
+        // Keep the scope around the originating prepare operation, not merely
+        // the later shape read. Failed C operations can leave an invalid array;
+        // preserve their first synchronous error before inspecting that array.
+        let prepared = try withError { error in
+            let result = try MLXPressGenerationProfile.time("prompt.model_prepare") {
+                try model.prepare(input, cache: cache, windowSize: windowSize)
+            }
+            try error.check()
+            if case .logits(let output) = result {
+                try validatePreparedLogitsForSampling(output.logits)
+            }
+            return result
         }
         switch prepared {
         case .tokens(let tokens):
@@ -4722,14 +4732,18 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 // closing the stream (see the CancellationError branch above).
                 StreamOrDevice.default.stream.synchronize()
                 handler.onGenerationEnd(emit: continuation.yield)
-                _ = continuation.yield(handler.infoEvent(GenerateCompletionInfo(
-                    promptTokenCount: promptTokenCount,
-                    generationTokenCount: 0,
-                    promptTime: 0,
-                    generationTime: 0,
-                    stopReason: .cancelled,
-                    toolCallProtocolFailure: handler.toolCallProtocolFailure
-                )))
+                _ = continuation.yield(
+                    handler.infoEvent(
+                        GenerateCompletionInfo(
+                            promptTokenCount: promptTokenCount,
+                            generationTokenCount: 0,
+                            promptTime: 0,
+                            generationTime: 0,
+                            stopReason: .cancelled,
+                            toolCallProtocolFailure: handler.toolCallProtocolFailure,
+                            generationFailure: GenerationFailure(
+                                stage: .preparation, cause: error.localizedDescription)
+                        )))
                 continuation.finish()
                 return
             }
@@ -5005,6 +5019,12 @@ public struct GenerateCompletionInfo: Sendable {
     /// native-MTP iterator.
     public let nativeMTPStats: NativeMTPGenerationStats?
 
+    /// An originating runtime failure, distinct from explicit cancellation.
+    /// Consumers must surface this error rather than treating the terminal
+    /// metadata as a successful or user-cancelled completion. The legacy stop
+    /// reason remains cancelled for source compatibility with older consumers.
+    public let generationFailure: GenerationFailure?
+
     /// The number of tokens processed per second during the prompt phase.
     ///
     /// Zero when the phase did not measurably run. `promptTime` is legitimately
@@ -5036,7 +5056,8 @@ public struct GenerateCompletionInfo: Sendable {
         turboQuantCacheTransition: TurboQuantCacheTransitionSnapshot? = nil,
         unclosedReasoning: Bool = false,
         nativeMTPStats: NativeMTPGenerationStats? = nil,
-        toolCallProtocolFailure: ToolCallProtocolFailure? = nil
+        toolCallProtocolFailure: ToolCallProtocolFailure? = nil,
+        generationFailure: GenerationFailure? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
@@ -5048,6 +5069,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.unclosedReasoning = unclosedReasoning
         self.toolCallProtocolFailure = toolCallProtocolFailure
         self.nativeMTPStats = nativeMTPStats
+        self.generationFailure = generationFailure
     }
 
     public func summary() -> String {
