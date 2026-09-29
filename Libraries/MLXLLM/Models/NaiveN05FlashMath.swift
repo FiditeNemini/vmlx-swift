@@ -40,6 +40,10 @@ enum NaiveN05FlashMath {
     /// MLX merge-sort preserves left input on equality. Descending order is
     /// obtained by negating scores rather than reversing sorted equal keys.
     static func sparseMask(scores: MLXArray, allowed: MLXArray, topK: Int) -> MLXArray {
+        // Selecting every key cannot change the causal/padding mask. Avoid
+        // evaluating indexer scores and sorting the full history in this case.
+        // Indexer key insertion is owned by the caller and still advances.
+        if scores.dim(-1) <= topK { return allowed }
         let masked = which(allowed, scores, MLXArray(-Float.infinity))
         let selected = argSort(-masked, axis: -1)[.ellipsis, ..<min(topK, scores.dim(-1))]
         let picked = putAlong(MLXArray.zeros(scores.shape, dtype: .bool), selected,

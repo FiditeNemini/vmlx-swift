@@ -52,6 +52,30 @@ final class NaiveN05FlashRuntimeTests: XCTestCase {
             }
     }
 
+    func testSparseSelectionRetainingAllKeysPreservesCausalAndPaddingMask() {
+        MLXMetalTestLock.withLock {
+            for count in [1, 127, 2047, 2048] {
+                let keys = MLXArray(0 ..< count)
+                let allowed = stacked([
+                    keys .< max(0, count - 1),
+                    MLXArray.zeros([count], dtype: .bool),
+                    keys .>= 0,
+                ]).reshaped(1, 3, count)
+                let scores = broadcast(-keys.asType(.float32), to: allowed.shape)
+                // Independent original selection graph, including masked ties.
+                let masked = which(allowed, scores, MLXArray(-Float.infinity))
+                let selected = argSort(-masked, axis: -1)
+                let picked = putAlong(MLXArray.zeros(scores.shape, dtype: .bool),
+                    selected, values: MLXArray(true), axis: -1)
+                let expected = allowed .&& picked
+                let actual = NaiveN05FlashMath.sparseMask(
+                    scores: scores, allowed: allowed, topK: 2048)
+                XCTAssertEqual(actual.asArray(Bool.self), expected.asArray(Bool.self))
+                XCTAssertEqual(actual.asArray(Bool.self), allowed.asArray(Bool.self))
+            }
+        }
+    }
+
     func testStableSparseTiesAcrossLargeSortAndPadding() {
         MLXMetalTestLock.withLock {
         let scores = MLXArray.zeros([1,1,2053])
