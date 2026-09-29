@@ -603,8 +603,8 @@ public func loadModel(
     let facts = LoadBundleFacts.inspect(bundleURL: directory)
     let useMmapSafetensors = facts.resolveMmapSafetensors(
         requested: loadConfiguration.useMmapSafetensors)
-    let memoryLimit = facts.resolveMLXMemoryLimit(
-        requested: loadConfiguration.memoryLimit)
+    let memoryLimit = loadConfiguration.resolvedSchedulingMemoryLimit(
+        facts: facts, recommendedWorkingSetBytes: MLX.GPU.maxRecommendedWorkingSetBytes())
     let nativeResidentPoolCeiling =
         applyResidentPoolProcessMemoryLimitsIfNeeded(
             facts: facts,
@@ -619,7 +619,9 @@ public func loadModel(
     if loadConfiguration.memoryLimit != memoryLimit {
         FileHandle.standardError.write(
             Data(
-                "[Load] Resident affine bundle uses RAM admission instead of the decode-throttling MLX memory limit\n"
+                (facts.customRoutedFormat == .janghV2
+                    ? "[Load] Automatic JANGH scheduling budget includes mapped weights plus scratch headroom; explicit limits and physical-memory admission remain separate\n"
+                    : "[Load] Resident affine bundle uses RAM admission instead of the decode-throttling MLX memory limit\n")
                     .utf8))
     }
 

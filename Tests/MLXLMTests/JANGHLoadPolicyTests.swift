@@ -70,4 +70,53 @@ final class JANGHLoadPolicyTests: XCTestCase {
         XCTAssertEqual(legacy.customRoutedFormat, .none)
         XCTAssertFalse(legacy.isGlm5NextAffineJANG)
     }
+    func testAutomaticSchedulingBudgetDoesNotDrainAdmittedMappedWeights() throws {
+        for type in ["glm5_next", "naive_n05_flash"] {
+            var facts = try inspect(config(modelType: type))
+            facts.totalSafetensorsBytes = 96 << 30
+            facts.physicalMemory = 128 << 30
+            let automatic = LoadConfiguration()
+            XCTAssertFalse(automatic.memoryLimitWasExplicit)
+            XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: facts,
+                recommendedWorkingSetBytes: 107 << 30), .absolute(100 << 30))
+            XCTAssertTrue(facts.resolveMmapSafetensors(requested: true))
+            XCTAssertFalse(facts.requiresUncappedResidentPools)
+            for limit in [ResidentCap.fraction(0.7), .absolute(4 << 30), .unlimited] {
+                var explicit = LoadConfiguration(memoryLimit: limit)
+                XCTAssertTrue(explicit.memoryLimitWasExplicit)
+                XCTAssertEqual(explicit.resolvedSchedulingMemoryLimit(facts: facts,
+                    recommendedWorkingSetBytes: 107 << 30), limit)
+                explicit = LoadConfiguration()
+                explicit.memoryLimit = limit
+                XCTAssertTrue(explicit.memoryLimitWasExplicit)
+                XCTAssertEqual(explicit.resolvedSchedulingMemoryLimit(facts: facts,
+                    recommendedWorkingSetBytes: 107 << 30), limit)
+            }
+        }
+    }
+
+    func testAutomaticSchedulingBudgetRefusesOversizedUnknownAndOverflowRows() throws {
+        var facts = try inspect(config())
+        facts.totalSafetensorsBytes = 96 << 30
+        facts.physicalMemory = 128 << 30
+        let automatic = LoadConfiguration()
+        for workingSet: Int? in [nil, 0, 99 << 30] {
+            XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: facts,
+                recommendedWorkingSetBytes: workingSet), .default)
+        }
+        facts.physicalMemory = 112 << 30
+        XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: facts,
+            recommendedWorkingSetBytes: 107 << 30), .default)
+        facts.physicalMemory = 128 << 30
+        for bytes: UInt64 in [0, 8 << 30, UInt64.max] {
+            facts.totalSafetensorsBytes = bytes
+            XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: facts,
+                recommendedWorkingSetBytes: 107 << 30), .default)
+        }
+        let ordinary = LoadBundleFacts(totalSafetensorsBytes: 96 << 30, isRouted: true,
+            physicalMemory: 128 << 30, modelType: "naive_n05_flash")
+        XCTAssertEqual(automatic.resolvedSchedulingMemoryLimit(facts: ordinary,
+            recommendedWorkingSetBytes: 107 << 30), .default)
+    }
+
 }

@@ -134,7 +134,11 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// Default `.fraction(0.70)` — Python's tested-good production
     /// value, capped to whichever is smaller of physical RAM and the
     /// GPU's recommended max working set.
-    public var memoryLimit: ResidentCap
+    public var memoryLimit: ResidentCap {
+        didSet { memoryLimitWasExplicit = true }
+    }
+    /// Explicit initializer values and subsequent assignments are never auto-raised.
+    public private(set) var memoryLimitWasExplicit: Bool
 
     /// Use MLX's mmap-backed safetensors loader when the pinned
     /// `mlx-swift` build supports it. For MLXPress `.mmap` loads, the
@@ -221,17 +225,43 @@ public struct LoadConfiguration: Sendable, Equatable {
     public init(
         jangPress: JangPressPolicy = .disabled,
         maxResidentBytes: ResidentCap = .default,
-        memoryLimit: ResidentCap = .default,
+        memoryLimit: ResidentCap? = nil,
         useMmapSafetensors: Bool = true,
         nativeMTP: Bool = false,
         deepseekV4ActivationQAT: Bool? = nil
     ) {
         self.jangPress = jangPress
         self.maxResidentBytes = maxResidentBytes
-        self.memoryLimit = memoryLimit
+        self.memoryLimit = memoryLimit ?? .default
+        self.memoryLimitWasExplicit = memoryLimit != nil
         self.useMmapSafetensors = useMmapSafetensors
         self.nativeMTP = nativeMTP
         self.deepseekV4ActivationQAT = deepseekV4ActivationQAT
+    }
+
+    /// A scheduling budget, not a physical-footprint limit. Mapped weights remain
+    /// charged by MLX even when their pages are cold. Do not endlessly drain GPU
+    /// work for an automatically admitted JANGH bundle larger than the generic cap.
+    /// Explicit limits, unsupported formats and oversized bundles remain unchanged.
+    func resolvedSchedulingMemoryLimit(
+        facts: LoadBundleFacts, recommendedWorkingSetBytes: Int?
+    ) -> ResidentCap {
+        let ordinary = facts.resolveMLXMemoryLimit(requested: memoryLimit)
+        guard !memoryLimitWasExplicit, facts.customRoutedFormat == .janghV2,
+            facts.isRouted, facts.totalSafetensorsBytes > 0,
+            let recommendedWorkingSetBytes, recommendedWorkingSetBytes > 0,
+            let base = ordinary.resolve(physicalMemory: facts.physicalMemory)
+        else { return ordinary }
+        let headroom: UInt64 = 4 << 30
+        let desired = facts.totalSafetensorsBytes.addingReportingOverflow(headroom)
+        // Keep at least 15% of physical RAM outside this scheduling allowance.
+        let physical85 = (facts.physicalMemory / 20) * 17
+            + ((facts.physicalMemory % 20) * 17) / 20
+        let ceiling = min(physical85, UInt64(recommendedWorkingSetBytes))
+        guard !desired.overflow, desired.partialValue <= ceiling,
+            desired.partialValue > base
+        else { return ordinary }
+        return .absolute(desired.partialValue)
     }
 }
 
