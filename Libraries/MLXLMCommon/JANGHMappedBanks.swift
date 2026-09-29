@@ -65,6 +65,31 @@ final class JANGHMappedBanks {
             self.files = files
         }
 
+        /// Keeps the verified descriptor alive while an exact mapped region is created.
+        /// Cached GPU views must also revalidate their source before each selection.
+        func withValidatedFile<T>(
+            for location: JANGHTensorIndexPlan.Location,
+            _ body: (Int32, JANGHTensorIndexPlan.TensorHeader) throws -> T
+        ) throws -> T {
+            guard let file = files[location.shard],
+                let expected = metadata.identities[location.shard],
+                let header = metadata.shards[location.shard]?.tensors[location.tensor]
+            else {
+                throw JANGHFormatContract.ValidationError.invalid("unknown JANGH leased tensor")
+            }
+            func validate() throws {
+                guard try JANGHHeaderAdapter.identity(index) == metadata.indexIdentity,
+                    try JANGHHeaderAdapter.identity(file) == expected
+                else {
+                    throw JANGHFormatContract.ValidationError.invalid("JANGH source lease became stale")
+                }
+            }
+            try validate()
+            let result = try body(file.fileDescriptor, header)
+            try validate()
+            return result
+        }
+
         deinit {
             try? index.close()
             files.values.forEach { try? $0.close() }
