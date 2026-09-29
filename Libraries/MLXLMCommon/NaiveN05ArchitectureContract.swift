@@ -2,51 +2,51 @@ import Foundation
 
 /// Source-derived architecture metadata, not registration or executable model support.
 /// Generation settings belong to the model bundle and are intentionally not decoded here.
-struct NaiveN05ArchitectureContract: Decodable, Sendable {
-    enum ContractError: Error, Equatable { case unsupported(String) }
-    enum AttentionKind: Int, Sendable {
+public struct NaiveN05ArchitectureContract: Decodable, Sendable {
+    public enum ContractError: Error, Equatable { case unsupported(String) }
+    public enum AttentionKind: Int, Sendable {
         case sparse = 0
         case sliding = 1
     }
-    enum IndexerPrecision: String, Decodable, Sendable {
+    public enum IndexerPrecision: String, Decodable, Sendable {
         case bf16
         case fp8E4M3 = "fp8_e4m3"
     }
 
-    struct Attention: Sendable {
-        let heads: Int
-        let kvHeads: Int
-        let keyDimensions: Int
-        let valueDimensions: Int
-        let rotaryDimensions: Int
-        let ropeTheta: Double
-        let hasSink: Bool
+    public struct Attention: Sendable {
+        public let heads: Int
+        public let kvHeads: Int
+        public let keyDimensions: Int
+        public let valueDimensions: Int
+        public let rotaryDimensions: Int
+        public let ropeTheta: Double
+        public let hasSink: Bool
     }
 
-    let layerCount: Int
-    let hiddenDimensions: Int
-    let denseDimensions: Int
-    let expertDimensions: Int
-    let expertCount: Int
-    let routes: Int
-    let vocabularySize: Int
-    let contextLimit: Int
-    let normEpsilon: Double
-    let attentionKinds: [AttentionKind]
-    let routedLayers: [Bool]
-    let fullAttention: Attention
-    let slidingAttention: Attention
-    let window: Int
-    let valueScale: Double?
-    let requestedRoutingScale: Double?
-    let routingScaleWasProvided: Bool
-    let routingScale: Double
-    let normalizeRoutes: Bool
-    let attentionBias: Bool
-    let indexerHeads: Int
-    let indexerDimensions: Int
-    let indexerTopK: Int
-    let indexerPrecision: IndexerPrecision
+    public let layerCount: Int
+    public let hiddenDimensions: Int
+    public let denseDimensions: Int
+    public let expertDimensions: Int
+    public let expertCount: Int
+    public let routes: Int
+    public let vocabularySize: Int
+    public let contextLimit: Int
+    public let normEpsilon: Double
+    public let attentionKinds: [AttentionKind]
+    public let routedLayers: [Bool]
+    public let fullAttention: Attention
+    public let slidingAttention: Attention
+    public let window: Int
+    public let valueScale: Double?
+    public let requestedRoutingScale: Double?
+    public let routingScaleWasProvided: Bool
+    public let routingScale: Double
+    public let normalizeRoutes: Bool
+    public let attentionBias: Bool
+    public let indexerHeads: Int
+    public let indexerDimensions: Int
+    public let indexerTopK: Int
+    public let indexerPrecision: IndexerPrecision
 
     private struct Key: CodingKey {
         let stringValue: String
@@ -56,7 +56,7 @@ struct NaiveN05ArchitectureContract: Decodable, Sendable {
         init?(intValue: Int) { return nil }
     }
 
-    init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Key.self)
         // Absent values use the vendor defaults. Explicit null is rejected for
         // non-nullable geometry instead of silently replacing malformed metadata.
