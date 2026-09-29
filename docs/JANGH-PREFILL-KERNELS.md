@@ -19,11 +19,12 @@ claimed.
 
 ## Bounded proof
 
-Four XCTest methods passed on an M5 Max using these exact candidate primitive
+Six XCTest methods passed on an M5 Max using these exact candidate primitive
 sources and actual production MLX objects. Coverage includes 2/3/4-bit mixed
 projections, FP16/BF16/FP32, input/output rotations, token counts1/3/7/8/16/33/65,
 ragged columns, tiny device buffers and invalid routes. Independent scalar
 bit-unpacking and backend-specific rounding form the numerical reference.
+Additional coverage executes36 standalone H32 input/output dtype/shape combinations and96 mapped routed calls spanning56/64/72 route assignments, duplicates, unequal weights and B2→B1 shapes. H32 input and steel output rotation now fuse the F32 butterfly and output cast into one launch.
 Both native NAX and forced steel execute; FP32 requests explicitly resolve to
 steel. Full-package integration and full-model cache/tool/performance proof remain.
 
@@ -34,6 +35,5 @@ broke the fragment-layout contract. None of those candidates is promoted, and no
 numerical threshold was relaxed. Default FP16/BF16 fusion remains enabled in this
 primitive; actual model activation dtype must be verified at integration.
 
-Next gates: sorted route restoration and weighted reduction through owned mapped
-banks, strict loader admission, coherent multi-turn real-model execution, physical
+Next gates: strict loader admission, coherent multi-turn real-model execution, physical
 footprint, and matched prefill/decode measurements against same-size affine.

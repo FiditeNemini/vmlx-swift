@@ -154,6 +154,37 @@ final class JANGHPrefillKernelTests: XCTestCase {
             else { XCTAssertEqual(got[i], expected[i], accuracy: tolerance * max(1, abs(expected[i])), "\(backend) T\(tokens) bits\(bits) row\(i)") }
         }
     }
+    func testStandaloneRowRotationAllInputOutputDTypes() throws {
+        try MLXMetalTestLock.withLock {
+            let rotate = JANGHRowRotation()
+            for rows in [1, 3] {
+                for width in [32, 96] {
+                    for inputDType in [DType.float16, .bfloat16, .float32] {
+                        let values = rounded((0 ..< rows * width).map {
+                            Float(($0 * 17 + $0 / width * 7) % 67 - 33) / 19
+                        }, inputDType)
+                        let transformed = (0 ..< rows).flatMap {
+                            hadamard(Array(values[$0 * width ..< ($0 + 1) * width]))
+                        }
+                        for outputDType in [DType.float16, .bfloat16, .float32] {
+                            let actual = try rotate(MLXArray(values, [rows, width]).asType(inputDType),
+                                                    outputDType: outputDType)
+                            let expected = rounded(transformed, outputDType)
+                            XCTAssertEqual(actual.shape, [rows, width])
+                            XCTAssertEqual(actual.dtype, outputDType)
+                            let got = actual.asType(.float32).asArray(Float.self)
+                            let tolerance: Float = outputDType == .bfloat16 ? 0.008 : outputDType == .float16 ? 0.001 : 0.000002
+                            for i in got.indices {
+                                XCTAssertEqual(got[i], expected[i], accuracy: tolerance * max(1, abs(expected[i])),
+                                    "H32 \(inputDType) -> \(outputDType), \(rows)x\(width) element\(i)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func testResolvedBackendKeepsFullFloatPrecision() {
         XCTAssertEqual(JANGHPrefillKernel.resolvedBackend(dtype: .float32, requested: .nax), .steel)
         XCTAssertEqual(JANGHPrefillKernel.resolvedBackend(dtype: .float32, requested: .steel), .steel)

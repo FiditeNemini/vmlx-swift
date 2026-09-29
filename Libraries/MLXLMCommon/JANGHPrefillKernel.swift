@@ -13,6 +13,7 @@ final class JANGHPrefillKernel {
     private let codebookHeader: String
     private var kernels: [String: MLXFast.MLXFastKernel] = [:]
     private let lock = NSLock()
+    private let rotation = JANGHRowRotation()
 
     init(contract: JANGHFormatContract, module: String, upModule: String? = nil) throws {
         guard let projection = contract.projections[module],
@@ -155,7 +156,7 @@ final class JANGHPrefillKernel {
             gate = (gate * sigmoid(gate) * up).asType(input.dtype)
         }
         if rotateOutput {
-            gate = MLX.hadamardTransform(gate.asType(.float32).reshaped(m, n / 32, 32)).reshaped(m, n).asType(input.dtype)
+            gate = try rotation(gate, outputDType: input.dtype)
         }
         return gate
     }
