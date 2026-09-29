@@ -405,7 +405,6 @@ public final class ChatSession {
                         throw ChatSessionError.cacheInvalidatedAfterPreparation
                     case .empty:
                         kvCache = model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache)
 
                     case .kvcache(let array):
                         kvCacheIsPopulated = array.contains { $0.offset > 0 }
@@ -420,7 +419,6 @@ public final class ChatSession {
                     case .history(let history):
                         // the KVCache is represented by a chat history
                         kvCache = model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache)
                         messages.append(contentsOf: history)
                     }
 
@@ -468,6 +466,10 @@ public final class ChatSession {
                             tools: tools, additionalContext: additionalContext)
                         let input = try await processor.prepare(input: userInput)
                             .withToolSchemas(tools)
+                        // Tokenization/template failure has not mutated model KV. Keep
+                        // pending history until preparation succeeds so retry cannot
+                        // silently drop the conversation's earlier messages.
+                        cache = .kvcache(kvCache)
                         messages.removeAll()
 
                         // generate output — block-diffusion models (e.g.

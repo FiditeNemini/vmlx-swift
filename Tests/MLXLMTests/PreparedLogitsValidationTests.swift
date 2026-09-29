@@ -47,6 +47,26 @@ private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sen
     }
 }
 
+private final class FailingHistoryProcessor: UserInputProcessor, @unchecked Sendable {
+    let underlying: TestInputProcessor
+    var failNext = true
+
+    init() {
+        underlying = TestInputProcessor(
+            tokenizer: PreparationHistoryTokenizer(),
+            configuration: ModelConfiguration(id: "fixture/history-retry"),
+            messageGenerator: DefaultMessageGenerator())
+    }
+
+    func prepare(input: UserInput) throws -> LMInput {
+        if failNext {
+            failNext = false
+            throw NSError(domain: "history-template", code: 1)
+        }
+        return try underlying.prepare(input: input)
+    }
+}
+
 final class PreparedLogitsValidationTests: XCTestCase {
     func testBatchSubmitValidatesPreparedOutputAndPreservesFailure() async throws {
         try await MLXMetalTestLock.withLock {
@@ -114,6 +134,29 @@ final class PreparedLogitsValidationTests: XCTestCase {
                     XCTAssertTrue(infos.first?.generationFailure?.cause.contains("matmul") == true)
                 }
             }
+        }
+    }
+
+    func testProcessorFailurePreservesPendingSessionHistoryOnRetry() async throws {
+        try await MLXMetalTestLock.withLock {
+            let fixture = PreparedLogitsFixture(shape: [1, 1, 4], mutateCache: true)
+            let processor = FailingHistoryProcessor()
+            let context = ModelContext(
+                configuration: processor.underlying.configuration, model: fixture,
+                processor: processor, tokenizer: processor.underlying.tokenizer)
+            let session = ChatSession(
+                context, history: [.user("retained fact"), .assistant("remembered")],
+                generateParameters: GenerateParameters(maxTokens: 1, temperature: 0))
+            do {
+                _ = try await session.respond(to: "template fails")
+                XCTFail("Expected processor failure")
+            } catch {
+                XCTAssertEqual((error as NSError).domain, "history-template")
+            }
+            XCTAssertTrue(fixture.preparedOffsets.isEmpty)
+            _ = try await session.respond(to: "retry with history")
+            XCTAssertEqual(fixture.preparedTokenCounts, [3])
+            XCTAssertEqual(fixture.preparedOffsets, [0])
         }
     }
 
