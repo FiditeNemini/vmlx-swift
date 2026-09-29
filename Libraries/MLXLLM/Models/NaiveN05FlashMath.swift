@@ -2,8 +2,8 @@
 import Foundation
 import MLX
 
-/// Deliberately explicit reference operations. Optimized paths must match these
-/// before adopting fused SDPA (asymmetric values, sinks and all-masked rows).
+/// Vendor reference operations retained beside narrowly admitted optimized paths.
+/// Asymmetric prefill remains explicit until a supported fused kernel is proven.
 enum NaiveN05FlashMath {
     static func roundIndexerFP8(_ input: MLXArray) -> MLXArray {
         let x = input.asType(.float32)
@@ -47,7 +47,40 @@ enum NaiveN05FlashMath {
         return allowed .&& picked
     }
 
+    /// The pinned Metal vector kernel supports asymmetric 192/128 heads only
+    /// for short queries. Larger prefill retains the independent reference.
+    static func usesAsymmetricDecodeSDPA(query: MLXArray, key: MLXArray, value: MLXArray) -> Bool {
+        guard query.ndim == 4, key.ndim == 4, value.ndim == 4,
+              query.dtype == key.dtype, query.dtype == value.dtype,
+              [.float32, .float16, .bfloat16].contains(query.dtype),
+              query.dim(-1) == 192, key.dim(-1) == 192, value.dim(-1) == 128,
+              query.dim(0) == key.dim(0), key.dim(0) == value.dim(0),
+              query.dim(1) > 0, key.dim(1) > 0, query.dim(1).isMultiple(of: key.dim(1)),
+              key.dim(1) == value.dim(1), key.dim(2) == value.dim(2),
+              query.dim(2) > 0, query.dim(2) <= 8, query.dim(2) <= key.dim(2)
+        else { return false }
+        return query.dim(2) <= 32 / (query.dim(1) / key.dim(1))
+    }
+
     static func attention(query: MLXArray, key: MLXArray, value: MLXArray, allowed: MLXArray, sink: MLXArray?, valueScale: Float?) -> MLXArray {
+        guard usesAsymmetricDecodeSDPA(query: query, key: key, value: value) else {
+            return referenceAttention(query: query, key: key, value: value,
+                                      allowed: allowed, sink: sink, valueScale: valueScale)
+        }
+        var v = value
+        if let valueScale { v = v * MLXArray(valueScale, dtype: v.dtype) }
+        let result = MLXFast.scaledDotProductAttention(
+            queries: query, keys: key, values: v,
+            scale: Float(1 / sqrt(Double(query.dim(-1)))),
+            mask: allowed.expandedDimensions(axis: 1), sinks: sink?.asType(query.dtype))
+        // The generic SDPA fallback substitutes a finite minimum for a false
+        // bool mask, which would make an all-masked row average V without a
+        // sink. Explicitly preserve the vendor's zero-output padding contract.
+        let hasKey = allowed.any(axis: -1).expandedDimensions(axis: 1).expandedDimensions(axis: -1)
+        return which(hasKey, result, MLXArray.zeros(result.shape, dtype: result.dtype))
+    }
+
+    static func referenceAttention(query: MLXArray, key: MLXArray, value: MLXArray, allowed: MLXArray, sink: MLXArray?, valueScale: Float?) -> MLXArray {
         let repeats = query.dim(1) / key.dim(1)
         let k = repeated(key, count: repeats, axis: 1)
         var v = repeated(value, count: repeats, axis: 1)
