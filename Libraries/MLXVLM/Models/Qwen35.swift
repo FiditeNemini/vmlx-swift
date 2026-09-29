@@ -521,7 +521,11 @@ enum Qwen4ExpCompiledMoE {
 
     private static let postRegion = vmlxTrustedCompile(shapeless: true) {
         (routed: MLXArray, scores: MLXArray, shared: MLXArray) -> MLXArray in
-        let combined = (routed * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        // Swift new-axis indexing records a concrete reshape target. That
+        // freezes the first batch width in this shapeless trace and crashes
+        // when a completed request shrinks the active batch. ExpandDims keeps
+        // the leading dimensions dynamic while retaining the compiled region.
+        let combined = (routed * expandedDimensions(scores, axis: -1)).sum(axis: -2)
         return combined + shared
     }
 

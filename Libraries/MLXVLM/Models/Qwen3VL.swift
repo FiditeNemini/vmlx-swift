@@ -137,17 +137,14 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             tools: input.tools,
             additionalContext: input.additionalContext
         )
+        var cacheBoundaries = canonicalChatCacheBoundaries(
+            tokenizer: tokenizer, messages: messages, tools: input.tools,
+            additionalContext: input.additionalContext, promptTokens: promptTokens,
+            staticSystemPrefix: input.cacheStableSystemPrefix)
 
         if input.images.isEmpty, input.videos.isEmpty {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray).asType(.int8)
-            let cacheBoundaries = canonicalChatCacheBoundaries(
-                tokenizer: tokenizer,
-                messages: messages,
-                tools: input.tools,
-                additionalContext: input.additionalContext,
-                promptTokens: promptTokens,
-                staticSystemPrefix: input.cacheStableSystemPrefix)
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask, tokenIds: promptTokens),
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
@@ -165,12 +162,14 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             processedImage = .init(pixels: concatenated, frames: imageFrames.map { $0.1 })
 
             if let frames = processedImage?.frames {
-                promptTokens = try QwenVL.replacePaddingTokens(
+                let expanded = try QwenVL.expandPaddingTokens(
                     in: promptTokens,
                     frames: frames,
                     paddingToken: "<|image_pad|>",
                     mergeSize: config.mergeSize,
-                    tokenizer: tokenizer)
+                    tokenizer: tokenizer, boundaries: cacheBoundaries)
+                promptTokens = expanded.tokens
+                cacheBoundaries = expanded.boundaries
             }
         }
 
@@ -219,12 +218,14 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             processedVideo = .init(pixels: concatenated, frames: videoFrames.map { $0.1 })
 
             if let frames = processedVideo?.frames {
-                promptTokens = try QwenVL.replacePaddingTokens(
+                let expanded = try QwenVL.expandPaddingTokens(
                     in: promptTokens,
                     frames: frames,
                     paddingToken: "<|video_pad|>",
                     mergeSize: config.mergeSize,
-                    tokenizer: tokenizer)
+                    tokenizer: tokenizer, boundaries: cacheBoundaries)
+                promptTokens = expanded.tokens
+                cacheBoundaries = expanded.boundaries
             }
         }
 
@@ -238,6 +239,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             mediaTokenIds: QwenVL.mediaTokenIds(
                 tokenizer: tokenizer, tokens: ["<|image_pad|>", "<|video_pad|>"]),
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
+            cachePrefixTokenCounts: cacheBoundaries.all,
+            cacheStablePrefixTokenCounts: cacheBoundaries.stable,
             toolSchemas: input.tools)
     }
 }

@@ -448,6 +448,7 @@
 				benchmarks/python/segmented_mm_bench.py,
 				benchmarks/python/single_ops.py,
 				benchmarks/python/slice_update_bench.py,
+				benchmarks/python/swiglu_bench.py,
 				benchmarks/python/synchronize_bench.py,
 				benchmarks/python/time_utils.py,
 				cmake/FindCUDNN.cmake,
@@ -863,6 +864,7 @@
 				mlx/backend/metal/kernels/fp_quantized.metal,
 				mlx/backend/metal/kernels/fp_quantized_nax.h,
 				mlx/backend/metal/kernels/fp_quantized_nax.metal,
+				mlx/backend/metal/kernels/gather_mm_offsets.metal,
 				mlx/backend/metal/kernels/gemv.h,
 				mlx/backend/metal/kernels/gemv.metal,
 				mlx/backend/metal/kernels/gemv_masked.h,
@@ -1019,6 +1021,7 @@
 				mlx/distributed/jaccl/lib/jaccl/tcp.h,
 				mlx/distributed/jaccl/lib/jaccl/threadpool.h,
 				mlx/distributed/jaccl/lib/jaccl/types.h,
+				mlx/distributed/jaccl/no_jaccl.cpp,
 				mlx/distributed/mpi/CMakeLists.txt,
 				mlx/distributed/mpi/mpi.cpp,
 				mlx/distributed/mpi/mpi.h,
@@ -1520,6 +1523,11 @@
 			path = xcconfig;
 			sourceTree = "<group>";
 		};
+		A829ED2F51B74947A4DD7161 /* distributed */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = distributed;
+			sourceTree = "<group>";
+		};
 		C3AE90232EAAA47E000BD280 /* json */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = json;
@@ -1702,6 +1710,7 @@
 		C3AE8EFC2EAAA40E000BD280 /* Cmlx */ = {
 			isa = PBXGroup;
 			children = (
+				A829ED2F51B74947A4DD7161 /* distributed */,
 				C3CB25472EB11EFE0029A645 /* framework */,
 				C3CBF2682EAC23BA0029A645 /* fmt */,
 				C3CBE24A2EABF7870029A645 /* include-framework */,
@@ -1828,6 +1837,7 @@
 				C3AE97872EAAAAAD000BD280 /* mlx-conditional */,
 				C3AE98112EAAAAAD000BD280 /* mlx-generated */,
 				C3AE9D992EAAAB29000BD280 /* mlx-c */,
+				A829ED2F51B74947A4DD7161 /* distributed */,
 				C3CB25472EB11EFE0029A645 /* framework */,
 				C3CBE24A2EABF7870029A645 /* include-framework */,
 				C3CBF2682EAC23BA0029A645 /* fmt */,

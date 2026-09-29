@@ -163,6 +163,11 @@ struct Bench {
             return
         }
 
+        if env["BENCH_MEDIA_CACHE_PROOF"] == "1" {
+            try await VLBench.runMediaCacheProof(modelPath: modelPath, maxNewTokens: maxNew)
+            return
+        }
+
         // BENCH_VL_BATCH_CHAT=1 runs VL multi-turn DIRECTLY through
         // `BatchEngine.generate(...)`. This is the honest VL-through-
         // BatchEngine verification — iter 29 audit flagged that prior
@@ -2119,13 +2124,25 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
     print("\n=== BatchEngine B=2 concurrent (iter 33) ===")
     print("Loading with real HuggingFace tokenizer...")
     let loadStart = CFAbsoluteTimeGetCurrent()
-    let context = try await MLXLMCommon.loadModel(
-        from: modelDir, using: #huggingFaceTokenizerLoader())
+    let loaded = try await MLXLMCommon.loadModel(
+        from: modelDir, using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: .osaurusProduction)
+    let context = loaded.0
     print(String(format: "Load: %.2fs", CFAbsoluteTimeGetCurrent() - loadStart))
     print("Model: \(type(of: context.model))")
 
-    let params = GenerateParameters(
-        maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+    let env = ProcessInfo.processInfo.environment
+    let bundleSampling = env["BENCH_BATCH_USE_GENERATION_CONFIG"] == "1"
+    var params = bundleSampling
+        ? GenerateParameters(
+            generationConfig: context.configuration.generationDefaults,
+            fallback: GenerateParameters(maxTokens: maxNew, prefillStepSize: 512))
+        : GenerateParameters(maxTokens: maxNew, temperature: 0, prefillStepSize: 512)
+    params.maxTokens = maxNew
+    params.randomSeed = env["BENCH_BATCH_SEED"].flatMap(UInt64.init)
+    print("Sampling: source=\(bundleSampling ? "bundle-defaults" : "explicit-greedy-diagnostic") " +
+          "temperature=\(params.temperature) topP=\(params.topP) topK=\(params.topK) " +
+          "repetitionPenalty=\(String(describing: params.repetitionPenalty))")
 
     nonisolated(unsafe) let ctx = context
     let engine = BatchEngine(context: ctx, maxBatchSize: 2)
@@ -2161,19 +2178,28 @@ func runBatchEngineConcurrent(modelPath: String, maxNew: Int) async throws {
     // decode is fine for a small benchmark and avoids the O(n²) relay
     // cost that hammers throughput under HF tokenizers.
     let tokenizer = context.tokenizer
-    let results = await collectBatchStreamsWithOverlap(
+    let results = await collectBatchStreamsWithOverlapAndInfo(
         engine,
         streams: [(0, s0), (1, s1)],
-        maxTokens: maxNew,
         label: "ConcurrentBatch B=2")
     let total = CFAbsoluteTimeGetCurrent() - t0
 
     // Print side-by-side. Guard against empty (stuck) slots.
-    for (slot, ids) in results.sorted(by: { $0.0 < $1.0 }) {
+    for (slot, ids, info) in results.sorted(by: { $0.0 < $1.0 }) {
         let text = tokenizer.decode(tokenIds: ids)
         print("  Slot \(slot) prompt: \"\(prompts[slot])\"")
         print("    tokens: \(ids.count), first 12: \(Array(ids.prefix(12)))")
         printDecodedOutput(label: "ConcurrentBatch slot \(slot)", text: text)
+        guard let info else {
+            fputs("[ConcurrentBatch] FAIL: missing completion telemetry\n", stderr)
+            exit(1)
+        }
+        print("    stop=\(info.stopReason) tokps=\(info.tokensPerSecond) " +
+              "tokens=\(info.generationTokenCount) footprint_mib=\(currentPhysFootprintMiB())")
+        if info.stopReason == .length || lagunaLoopHeuristic(text) {
+            fputs("[ConcurrentBatch] FAIL: length stop or looping output\n", stderr)
+            exit(1)
+        }
         if ids.isEmpty {
             fputs("[ConcurrentBatch] FAIL: slot \(slot) produced zero tokens\n", stderr)
             exit(1)
@@ -3090,14 +3116,12 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
             count: prefixRepeat)
         : ""
     let recallPhrase = env["BENCH_GROWING_RECALL_PHRASE"] ?? "vmlx-cache-green"
-    // `BENCH_GROWING_THINK=1` runs the same conversation with reasoning ON and
-    // replays turn 1 the way a host does — visible text only, think block
-    // stripped. That combination is the only one that makes the post-answer
-    // boundary stop being a prefix of the next prompt, so it is the only shape
-    // in which the turn-start boundary can be shown to matter. With reasoning
-    // off (the default) turn 1 emits no think content, history round-trips
-    // exactly, and both boundaries stay valid.
-    let enableThinking = (env["BENCH_GROWING_THINK"] ?? "0") == "1"
+    // Preserve the bundle template's thinking default unless this diagnostic
+    // explicitly requests an ON/OFF comparison.
+    let thinkingContext: [String: any Sendable]? = env["BENCH_GROWING_THINK"].map {
+        ["enable_thinking": $0 == "1"]
+    }
+    print("Thinking: \(env["BENCH_GROWING_THINK"].map { $0 == "1" ? "explicit-on" : "explicit-off" } ?? "template-default")")
     let firstTurnPrompt = longPrefix
         + "Reply with exactly this phrase and nothing else: \(recallPhrase)"
     let messages: [[String: any Sendable]] = [
@@ -3106,13 +3130,13 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let promptTokens = try context.tokenizer.applyChatTemplate(
         messages: messages,
         tools: nil,
-        additionalContext: ["enable_thinking": enableThinking])
+        additionalContext: thinkingContext)
     let historyBoundaryTokens = try? (
         context.tokenizer as? GenerationPromptControllableTokenizer
     )?.applyChatTemplate(
         messages: messages,
         tools: nil,
-        additionalContext: ["enable_thinking": enableThinking],
+        additionalContext: thinkingContext,
         addGenerationPrompt: false)
     // `BENCH_GROWING_NO_HISTORY_BOUNDARY=1` models a caller that does NOT hand
     // the runtime a turn-start boundary. Osaurus always supplies one, so the
@@ -3134,7 +3158,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
         .reshaped(1, promptTokens.count)
     let turn1 = LMInput(
         text: LMInput.Text(tokens: promptArray),
-        cacheScopeSalt: cacheScopeSalt(from: ["enable_thinking": enableThinking]),
+        cacheScopeSalt: cacheScopeSalt(from: thinkingContext),
         cachePrefixTokenCounts: cachePrefixTokenCounts,
         cacheStablePrefixTokenCounts: cachePrefixTokenCounts)
     print("  Cache history-boundary counts: \(cachePrefixTokenCounts)")
@@ -3333,7 +3357,7 @@ func runGrowingChatCacheReuse(modelPath: String, maxNew: Int) async throws {
     let turn2Tokens = try context.tokenizer.applyChatTemplate(
         messages: turn2Messages,
         tools: nil,
-        additionalContext: ["enable_thinking": enableThinking])
+        additionalContext: thinkingContext)
     let turn2RenderedTail = context.tokenizer.decode(
         tokenIds: Array(turn2Tokens.suffix(160)),
         skipSpecialTokens: false)
