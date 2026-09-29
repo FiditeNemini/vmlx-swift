@@ -8469,6 +8469,24 @@ func runPerfBench(
                     "BENCH_PERF_ENABLE_THINKING must be 0, 1, or unset"
             ])
     }
+    let conversationPrompts: [String]?
+    if let path = env["BENCH_PERF_CONVERSATION_JSON"] {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let prompts = try JSONDecoder().decode([String].self, from: data)
+        let forbidden = ["BENCH_PERF_TEMP", "BENCH_PERF_TOP_P", "BENCH_PERF_TOP_K", "BENCH_PERF_MIN_P",
+            "BENCH_PERF_REPETITION_PENALTY", "BENCH_PERF_REPETITION_CONTEXT", "BENCH_PERF_ENABLE_THINKING",
+            "BENCH_PERF_NATIVE_MTP_DEPTH", "BENCH_PERF_LOAD_NATIVE_MTP", "BENCH_PERF_COMPILED",
+            "BENCH_COMPILE_DECODE", "BENCH_PERF_MAX_KV_SIZE", "BENCH_PERF_KV_MODE"]
+        guard (2...3).contains(prompts.count), prompts.allSatisfy({ !$0.isEmpty }),
+            !useTokenIterator, (env["BENCH_PERF_PATH"] ?? "batch") == "batch",
+            forbidden.allSatisfy({ env[$0] == nil })
+        else {
+            throw NSError(domain: "BENCH_PERF", code: 3, userInfo: [NSLocalizedDescriptionKey:
+                "Conversation proof requires two or three nonempty prompts, parsed batch path and no sampler/thinking/speculation overrides"])
+        }
+        conversationPrompts = prompts
+    } else { conversationPrompts = nil }
+    var conversationHistory: [Chat.Message] = []
     let modelName = modelDir.lastPathComponent
     let useJangPressLoad = env["BENCH_PERF_JANGPRESS"] == "1"
     let useMmap = env["BENCH_PERF_MMAP"] != "0"
@@ -8531,6 +8549,7 @@ func runPerfBench(
                 jangPressRuntime = nil
             }
         }
+        print("PERF_POST_LOAD_POLICY memory_limit_bytes=\(MLX.Memory.memoryLimit) active_bytes=\(MLX.Memory.activeMemory) cached_bytes=\(MLX.Memory.cacheMemory) recommended_bytes=\(GPU.maxRecommendedWorkingSetBytes().map(String.init) ?? "unknown") supplemental_mapped_bytes=\(context.model.modelWeightAccounting().supplementalMappedBytes) jangpress_applied=\(jangPressRuntime?.appliedOptions?.enabled == true) mmap_requested=\(useMmap)")
         // Explicit diagnostic only. This never changes a production load default.
         if let raw = env["BENCH_PERF_POST_LOAD_MEMORY_LIMIT_BYTES"] {
             let physical = ProcessInfo.processInfo.physicalMemory
@@ -8565,7 +8584,7 @@ func runPerfBench(
             "PERF_MEMORY label=after_load rss_mib=%.0f footprint_mib=%.0f loadSec=%.2f",
             rssAfterLoad, footprintAfterLoad, loadSec))
 
-        let promptText = env[
+        let promptText = conversationPrompts?.first ?? env[
             "BENCH_PERF_PROMPT"]
             ?? "Write one long paragraph describing ocean waves. Be verbose and detailed."
         let messages: [[String: any Sendable]] = [
@@ -8592,13 +8611,13 @@ func runPerfBench(
         }
 
         let perfCacheCoordinator: CacheCoordinator?
-        if env["BENCH_PERF_CACHE_COORDINATOR"] == "1" {
+        if env["BENCH_PERF_CACHE_COORDINATOR"] == "1" || conversationPrompts != nil {
             let modelKey = "\(modelName)|perf-cache-coordinator"
             let diskDir = env["BENCH_PERF_CACHE_DIR"].map {
                 URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath)
             }
             let config = CacheCoordinatorConfig(
-                usePagedCache: env["BENCH_PERF_CACHE_PAGED"] != "0",
+                usePagedCache: conversationPrompts != nil ? env["BENCH_PERF_CACHE_PAGED"] == "1" : env["BENCH_PERF_CACHE_PAGED"] != "0",
                 enableDiskCache: env["BENCH_PERF_CACHE_DISK"] == "1",
                 diskCacheMaxGB: Float(env["BENCH_PERF_CACHE_DISK_MAX_GB"] ?? "1") ?? 1,
                 diskCacheDir: diskDir,
@@ -8701,15 +8720,25 @@ func runPerfBench(
             ].filter { text.contains($0) }
         }
 
-        let useGenerationConfigSampling = env["BENCH_PERF_USE_GENERATION_CONFIG"] == "1"
+        let useGenerationConfigSampling = conversationPrompts != nil || env["BENCH_PERF_USE_GENERATION_CONFIG"] == "1"
         let samplingSource = useGenerationConfigSampling
             ? "bundle-defaults"
             : "explicit-env"
         let perfSeed = env["BENCH_PERF_SEED"].flatMap(UInt64.init)
         let perfSeedLabel = perfSeed.map(String.init) ?? "nil"
 
+        var lastRequestPromptTokenCount = promptTokens.count
         func oneTurn(_ label: String) async throws -> PerfTurnResult {
-            let input = LMInput(text: LMInput.Text(tokens: promptIds))
+            let input: LMInput
+            if conversationPrompts != nil {
+                guard context.configuration.generationDefaults != nil else {
+                    throw NSError(domain: "BENCH_PERF", code: 4, userInfo: [NSLocalizedDescriptionKey:
+                        "Native conversation proof requires bundle generation defaults"])
+                }
+                input = try await context.processor.prepare(input: UserInput(chat: conversationHistory))
+            } else { input = LMInput(text: LMInput.Text(tokens: promptIds)) }
+            let requestPromptTokenCount = input.text.tokens.size
+            lastRequestPromptTokenCount = requestPromptTokenCount
             nonisolated(unsafe) let sendable = input
             let perfRepetitionContext = Int(env["BENCH_PERF_REPETITION_CONTEXT"] ?? "20") ?? 20
             let printPhaseSnapshot = env["BENCH_PERF_PHASE_SNAPSHOT"] == "1"
@@ -8815,6 +8844,13 @@ func runPerfBench(
                 break
             }
             params.cacheChainId = env["BENCH_PERF_CACHE_CHAIN_ID"]
+            if conversationPrompts != nil {
+                params = GenerateParameters(generationConfig: context.configuration.generationDefaults,
+                    fallback: GenerateParameters(maxTokens: maxNew))
+                params.maxTokens = maxNew
+                params.randomSeed = perfSeed
+                params.cacheChainId = env["BENCH_PERF_CACHE_CHAIN_ID"] ?? "native-conversation-proof"
+            }
             var result = PerfTurnResult()
             let start = CFAbsoluteTimeGetCurrent()
             let whichPath = env["BENCH_PERF_PATH"] ?? "batch"
@@ -8935,7 +8971,7 @@ func runPerfBench(
                     label, samplingSource, perfSeedLabel,
                     result.ttftSec * 1000,
                     result.promptSec * 1000,
-                    result.promptTokensPerSecond(promptTokenCount: promptTokens.count),
+                    result.promptTokensPerSecond(promptTokenCount: requestPromptTokenCount),
                     result.firstDecodeSecEstimate * 1000,
                     result.genTokens, result.genSec, result.tokps,
                     result.tailTokpsEstimate,
@@ -8952,7 +8988,7 @@ func runPerfBench(
                     let restored = min(progress.completedUnitCount, progress.totalUnitCount)
                     let remaining = progress.totalUnitCount - restored
                     print(
-                        "  PERF_PREFILL label=\(label) logical_tokens=\(promptTokens.count) reported_restored_units=\(restored) reported_remaining_units=\(remaining) source=first_running_progress"
+                        "  PERF_PREFILL label=\(label) logical_tokens=\(requestPromptTokenCount) reported_restored_units=\(restored) reported_remaining_units=\(remaining) source=first_running_progress"
                     )
                 } else {
                     print("  PERF_PREFILL label=\(label) reported_restored_units=unknown reported_remaining_units=unknown")
@@ -8979,6 +9015,16 @@ func runPerfBench(
                         text: result.text.isEmpty ? result.reasoning : result.text)
                 }
             }
+            if conversationPrompts != nil {
+                let record: [String: Any] = ["label": label, "messages": conversationHistory.count,
+                    "prompt_tokens": requestPromptTokenCount, "user": conversationHistory.last?.content ?? "", "visible": result.text, "reasoning": result.reasoning,
+                    "stop": result.stopReason, "generation_tokens": result.genTokens,
+                    "generation_seconds": result.genSec, "tokens_per_second": result.tokps,
+                    "ttft_seconds": result.ttftSec, "unclosed_reasoning": result.unclosedReasoning,
+                    "tool_calls": result.toolCalls, "sampling_source": "bundle-defaults"]
+                let data = try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
+                print("PERF_CONVERSATION_TURN " + String(decoding: data, as: UTF8.self))
+            }
             if let snapshot = perfCacheCoordinator?.snapshotStats() {
                 let paged = snapshot.pagedStats.map {
                     "hits=\($0.cacheHits),misses=\($0.cacheMisses),allocated=\($0.allocatedBlocks),free=\($0.freeBlocks),evictions=\($0.evictions)"
@@ -8994,22 +9040,38 @@ func runPerfBench(
             return result
         }
 
-        for i in 0..<warmup {
-            _ = try await oneTurn("warmup\(i)")
+        if conversationPrompts == nil {
+            for i in 0..<warmup { _ = try await oneTurn("warmup\(i)") }
         }
 
         var tokps: [Double] = []
         var lastGenTokens = 0
         var lastGenSec = 0.0
         var lastResult = PerfTurnResult()
-        for i in 0..<runs {
+        var conversationFailures: [String] = []
+        for i in 0..<(conversationPrompts?.count ?? runs) {
+            if let prompts = conversationPrompts { conversationHistory.append(.user(prompts[i])) }
             let result = try await oneTurn("run\(i)")
+            if conversationPrompts != nil {
+                conversationHistory.append(Chat.Message(role: .assistant, content: result.text,
+                    reasoningContent: result.reasoning.isEmpty ? nil : result.reasoning))
+                if result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || result.stopReason != "stop" || result.genTokens <= 0 || result.tokps <= 0
+                    || result.unclosedReasoning || result.toolCalls != 0
+                    || lagunaLoopHeuristic(result.text) || !markerLeaks(in: result.text).isEmpty {
+                    conversationFailures.append("turn\(i + 1)")
+                }
+            }
             tokps.append(result.tokps)
             lastGenTokens = result.genTokens
             lastGenSec = result.genSec
             lastResult = result
         }
         await engine.shutdown()
+        if !conversationFailures.isEmpty {
+            throw NSError(domain: "BENCH_PERF", code: 5, userInfo: [NSLocalizedDescriptionKey:
+                "Conversation proof failed visible/stop/rate/protocol gates: " + conversationFailures.joined(separator: ",")])
+        }
 
         let median = tokps.sorted()[tokps.count / 2]
         let best = tokps.max() ?? 0
@@ -9029,7 +9091,7 @@ func runPerfBench(
                 ? "custom-banks-mapped"
                 : (LoadBundleFacts.inspect(bundleURL: modelDir).resolveMmapSafetensors(requested: useMmap)
                     ? "policy-enabled" : "policy-disabled"),
-            head, loadSec, promptTokens.count,
+            head, loadSec, lastRequestPromptTokenCount,
             peakRSSMiB, peakFootprintMiB,
             graphStats.map { String($0.nodes) } ?? "na",
             graphStats.map { String($0.asType) } ?? "na",
