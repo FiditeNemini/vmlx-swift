@@ -8451,12 +8451,12 @@ func runPerfBench(
     if let raw = env["BENCH_PERF_SELECTED_WIRED_MIB"] {
         guard env["VMLX_JANGH_SELECTED_EXPERT_DIAGNOSTIC"] == "1",
             env["VMLX_JANGH_SELECTED_WHOLE_BANK_VIEWS"] != "1",
-            let mib = Int(raw), (1...8192).contains(mib),
+            let mib = Int(raw), (1...16384).contains(mib),
             let recommended = GPU.maxRecommendedWorkingSetBytes(),
             mib * 1024 * 1024 <= recommended
         else {
             throw NSError(domain: "BENCH_PERF", code: 7, userInfo: [NSLocalizedDescriptionKey:
-                "Selected residency diagnostic requires independent selected mappings and 1...8192 MiB within the GPU working set"])
+                "Selected residency diagnostic requires independent selected mappings and 1...16384 MiB within the GPU working set"])
         }
         // Only this owned diagnostic process uses the existing shared ticket
         // manager. Its cancellation-safe scope restores the prior baseline.
