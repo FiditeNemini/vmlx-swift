@@ -147,7 +147,7 @@ final class NaiveN05JANGHPreparationTests: XCTestCase {
                 original.parameters().flattened().map { ($0.0,$0.1.asType(.bfloat16)) }),verify:[.all])
             let routerName = "model.layers.1.mlp.gate.weight"
             let correctionName = "model.layers.1.mlp.gate.e_score_correction_bias"
-            let nativeRouter = MLXArray.full([2,32],values:Float(0.1234567),dtype:.float32)
+            let nativeRouter = MLXArray.full([2,32],values:MLXArray(Float(0.1234567)),dtype:.float32)
             let nativeCorrection = MLXArray([Float(0.2345678),-0.1234567])
             try original.update(parameters:ModuleParameters.unflattened([
                 routerName:nativeRouter,correctionName:nativeCorrection]),verify:[])
