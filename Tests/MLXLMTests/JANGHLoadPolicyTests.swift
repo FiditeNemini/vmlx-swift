@@ -119,4 +119,49 @@ final class JANGHLoadPolicyTests: XCTestCase {
             recommendedWorkingSetBytes: 107 << 30), .default)
     }
 
+    func testSafeAutoHostPlanKeepsJANGHMappedAndResolvesSchedulingHeadroom() throws {
+        for type in ["glm5_next", "naive_n05_flash"] {
+            var facts = try inspect(config(modelType: type))
+            facts.totalSafetensorsBytes = 96 << 30
+            facts.physicalMemory = 128 << 30
+            let host = MemoryStatus(memoryLimit: 0, cacheLimit: 0,
+                recommendedWorkingSetBytes: 107 << 30, physicalMemory: 128 << 30,
+                currentRSS: 0)
+            var settings = VMLXServerRuntimeSettings()
+            let plan = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
+            XCTAssertEqual(plan.loadConfiguration.memoryLimit, .absolute(100 << 30))
+            XCTAssertTrue(plan.loadConfiguration.useMmapSafetensors)
+            XCTAssertEqual(plan.loadConfiguration.maxResidentBytes, .absolute(128 << 20))
+            XCTAssertFalse(plan.warnings.contains { $0.contains("loading materialized") })
+            settings.memorySafety.customPhysicalMemoryFraction = 0.65
+            let explicit = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
+            XCTAssertEqual(explicit.loadConfiguration.memoryLimit, .fraction(0.65))
+            XCTAssertTrue(explicit.loadConfiguration.useMmapSafetensors)
+            settings.memorySafety.customPhysicalMemoryFraction = nil
+            settings.memorySafety.mode = .strict
+            let strict = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
+            XCTAssertEqual(strict.loadConfiguration.memoryLimit, .fraction(0.60))
+            XCTAssertTrue(strict.loadConfiguration.useMmapSafetensors)
+        }
+    }
+
+    func testSafeAutoHostPlanDoesNotInventUnknownWorkingSetOrMaterializeCustomBanks() throws {
+        var facts = try inspect(config())
+        facts.totalSafetensorsBytes = 96 << 30
+        facts.physicalMemory = 128 << 30
+        let host = MemoryStatus(memoryLimit: 0, cacheLimit: 0,
+            recommendedWorkingSetBytes: nil, physicalMemory: 128 << 30, currentRSS: 0)
+        let settings = VMLXServerRuntimeSettings()
+        let plan = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
+        XCTAssertEqual(plan.loadConfiguration.memoryLimit, .default)
+        XCTAssertTrue(plan.loadConfiguration.useMmapSafetensors)
+        for mode in [VMLXMemorySafetyMode.balanced, .performance] {
+            var settings = settings
+            settings.memorySafety.mode = mode
+            let plan = settings.resolvedMemorySafetyPlan(bundleFacts: facts, host: host)
+            XCTAssertTrue(plan.loadConfiguration.useMmapSafetensors)
+            XCTAssertFalse(plan.warnings.contains { $0.contains("loading materialized") })
+        }
+    }
+
 }
