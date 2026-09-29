@@ -134,7 +134,11 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// Default `.fraction(0.70)` — Python's tested-good production
     /// value, capped to whichever is smaller of physical RAM and the
     /// GPU's recommended max working set.
-    public var memoryLimit: ResidentCap
+    public var memoryLimit: ResidentCap {
+        didSet { memoryLimitWasExplicit = true }
+    }
+    /// Explicit initializer values and subsequent assignments are never auto-raised.
+    public private(set) var memoryLimitWasExplicit: Bool
 
     /// Use MLX's mmap-backed safetensors loader when the pinned
     /// `mlx-swift` build supports it. For MLXPress `.mmap` loads, the
@@ -221,17 +225,43 @@ public struct LoadConfiguration: Sendable, Equatable {
     public init(
         jangPress: JangPressPolicy = .disabled,
         maxResidentBytes: ResidentCap = .default,
-        memoryLimit: ResidentCap = .default,
+        memoryLimit: ResidentCap? = nil,
         useMmapSafetensors: Bool = true,
         nativeMTP: Bool = false,
         deepseekV4ActivationQAT: Bool? = nil
     ) {
         self.jangPress = jangPress
         self.maxResidentBytes = maxResidentBytes
-        self.memoryLimit = memoryLimit
+        self.memoryLimit = memoryLimit ?? .default
+        self.memoryLimitWasExplicit = memoryLimit != nil
         self.useMmapSafetensors = useMmapSafetensors
         self.nativeMTP = nativeMTP
         self.deepseekV4ActivationQAT = deepseekV4ActivationQAT
+    }
+
+    /// A scheduling budget, not a physical-footprint limit. Mapped weights remain
+    /// charged by MLX even when their pages are cold. Do not endlessly drain GPU
+    /// work for an automatically admitted JANGH bundle larger than the generic cap.
+    /// Explicit limits, unsupported formats and oversized bundles remain unchanged.
+    func resolvedSchedulingMemoryLimit(
+        facts: LoadBundleFacts, recommendedWorkingSetBytes: Int?
+    ) -> ResidentCap {
+        let ordinary = facts.resolveMLXMemoryLimit(requested: memoryLimit)
+        guard !memoryLimitWasExplicit, facts.customRoutedFormat == .janghV2,
+            facts.isRouted, facts.totalSafetensorsBytes > 0,
+            let recommendedWorkingSetBytes, recommendedWorkingSetBytes > 0,
+            let base = ordinary.resolve(physicalMemory: facts.physicalMemory)
+        else { return ordinary }
+        let headroom: UInt64 = 4 << 30
+        let desired = facts.totalSafetensorsBytes.addingReportingOverflow(headroom)
+        // Keep at least 15% of physical RAM outside this scheduling allowance.
+        let physical85 = (facts.physicalMemory / 20) * 17
+            + ((facts.physicalMemory % 20) * 17) / 20
+        let ceiling = min(physical85, UInt64(recommendedWorkingSetBytes))
+        guard !desired.overflow, desired.partialValue <= ceiling,
+            desired.partialValue > base
+        else { return ordinary }
+        return .absolute(desired.partialValue)
     }
 }
 
@@ -267,6 +297,14 @@ public enum DeepseekV4ActivationQAT {
 /// pulled once at load entry so the resolver doesn't re-walk the
 /// directory or re-parse `config.json`.
 public struct LoadBundleFacts: Sendable, Equatable {
+    /// Metadata classification only, not tensor geometry or model-runtime proof.
+    public enum CustomRoutedFormat: Sendable, Equatable {
+        case none
+        case janghV2
+        case invalidJANGHDeclaration
+    }
+    public private(set) var customRoutedFormat: CustomRoutedFormat = .none
+
     /// Converted MiMo V2.6 packed banks are owned GPU inputs by default.
     public private(set) var isMiMoV26MixedQuantized: Bool = false
     /// Top-level or nested `model_type` from config metadata, when available.
@@ -384,8 +422,16 @@ public struct LoadBundleFacts: Sendable, Equatable {
         var declaredComputeDType: String?
         var routedExpertLayout: String?
         var isMiMoV26MixedQuantized = false
-        let configURL = url.appendingPathComponent("config.json")
-        if let data = try? Data(contentsOf: configURL),
+        let rawConfiguration = try? Data(contentsOf: url.appendingPathComponent("config.json"))
+        let rawSidecar = try? Data(contentsOf: url.appendingPathComponent("jang_config.json"))
+        var customRoutedFormat: CustomRoutedFormat = .none
+        if let rawConfiguration,
+           JANGHModelPreparation.declaresCustomFormat(configuration: rawConfiguration, sidecar: rawSidecar) {
+            customRoutedFormat = (try? JANGHConfigurationPartition(
+                configuration: rawConfiguration, sidecar: rawSidecar)) == nil
+                ? .invalidJANGHDeclaration : .janghV2
+        }
+        if let data = rawConfiguration,
             let json = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any]
         {
@@ -488,7 +534,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
         let jangConfigURL = url.appendingPathComponent("jang_config.json")
         let hasJangConfig = fm.fileExists(atPath: jangConfigURL.path)
         if hasJangConfig,
-            let data = try? Data(contentsOf: jangConfigURL),
+            let data = rawSidecar,
             let json = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any]
         {
@@ -529,6 +575,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
             topK: topK)
         facts.hasPrestackedAffineRoutedExperts = hasPrestackedAffineRoutedExperts
         facts.isMiMoV26MixedQuantized = isMiMoV26MixedQuantized
+        facts.customRoutedFormat = customRoutedFormat
         return facts
     }
 
@@ -643,6 +690,10 @@ public struct LoadBundleFacts: Sendable, Equatable {
         let format = weightFormat?.lowercased() ?? ""
         let declaresAffine = format.isEmpty || format == "affine" || format == "jang"
         return (type == "glm5_next" || type == "glm5_next_text")
+            && customRoutedFormat == .none
+            // A format label alone cannot validate custom banks, but it must
+            // never opt a declared custom bundle into an affine resident policy.
+            && jangFormat?.lowercased() != "jangtq2"
             && !hasJangTQRuntime
             && declaresAffine
             && isRouted

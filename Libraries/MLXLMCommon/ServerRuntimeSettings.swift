@@ -682,6 +682,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         if profile.allowsNearRAMScaleMaterialization,
             memorySafety.customPhysicalMemoryFraction == nil,
             let facts = bundleFacts,
+            facts.customRoutedFormat == .none,
             facts.totalSafetensorsBytes > 0,
             physicalMemory > 0,
             Double(facts.totalSafetensorsBytes) > 0.55 * Double(physicalMemory),
@@ -713,6 +714,18 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 requested: loadConfiguration.memoryLimit)
             loadConfiguration.useMmapSafetensors = facts.resolveMmapSafetensors(
                 requested: loadConfiguration.useMmapSafetensors)
+        }
+        // Safe Auto owns its default scheduling allowance. Keep JANGH mapped
+        // and use the same bounded mapped-weight headroom as the loader. A user
+        // fraction, an explicit base cap, and stricter profiles remain explicit.
+        if memorySafety.mode == .safeAuto,
+            memorySafety.customPhysicalMemoryFraction == nil,
+            !baseLoadConfiguration.memoryLimitWasExplicit,
+            var facts = bundleFacts, facts.customRoutedFormat == .janghV2
+        {
+            facts.physicalMemory = physicalMemory
+            loadConfiguration.memoryLimit = baseLoadConfiguration.resolvedSchedulingMemoryLimit(
+                facts: facts, recommendedWorkingSetBytes: host?.recommendedWorkingSetBytes)
         }
         var blockingIssues: [VMLXServerSettingsIssue] = []
 
@@ -751,7 +764,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             }
         }
 
-        let displaySummary = "mode=\(memorySafety.mode.rawValue) slider=\(memorySafety.slider) load_cap=\(requestedFraction) allocator_cap=\(allocatorCap.displayValue) max_concurrent=\(resolvedConcurrency.maxConcurrentSequences ?? 0) kv_cap=\(resolvedCache.defaultMaxKVSize ?? 0)"
+        let displaySummary = "mode=\(memorySafety.mode.rawValue) slider=\(memorySafety.slider) load_cap=\(requestedFraction) scheduling_cap=\(loadConfiguration.memoryLimit.displayValue) allocator_cap=\(allocatorCap.displayValue) max_concurrent=\(resolvedConcurrency.maxConcurrentSequences ?? 0) kv_cap=\(resolvedCache.defaultMaxKVSize ?? 0)"
 
         return VMLXResolvedMemorySafetyPlan(
             loadConfiguration: loadConfiguration,
