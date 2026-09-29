@@ -165,6 +165,8 @@ final class NaiveN05FlashRuntimeTests: XCTestCase {
         XCTAssertTrue(model.excludeFromGenericSafetensorsLoad(key:"model.layers.1.mlp.switch_mlp.gate_proj.tq2_packed"))
         XCTAssertFalse(model.excludeFromGenericSafetensorsLoad(key:"model.layers.1.mlp.gate.weight"))
         XCTAssertTrue(model.requiresExactTensorMmapBuffers)
+        XCTAssertEqual((model.model.layers[1].mlp as? NaiveN05FlashMoE)?.routedAdviceLayerIndex, 1)
+        XCTAssertNil(NaiveN05FlashMoE(try tiny()).routedAdviceLayerIndex)
         for invalid in [Set(exclusions.dropFirst()), exclusions.union(["model.layers.1.mlp.gate.weight"])] {
             XCTAssertThrowsError(try NaiveN05FlashModel(tiny(),routedFactory:{ _,_ in ConstructionProbe() },
                 excludedSafetensorsKeys:invalid))

@@ -118,10 +118,13 @@ final class NaiveN05FlashDenseMLP: Module, UnaryLayer {
 }
 
 final class NaiveN05FlashMoE: Module, UnaryLayer {
+    let routedAdviceLayerIndex: Int?
     let gate: NaiveN05FlashRouter
     // Separate projections keep original gate/up/down names and affine loading.
     @ModuleInfo(key: "switch_mlp") var experts: Module
-    init(_ c: NaiveN05ArchitectureContract, experts: (Module & WeightedRoutedExpertLayer)? = nil) {
+    init(_ c: NaiveN05ArchitectureContract, experts: (Module & WeightedRoutedExpertLayer)? = nil,
+         layerIndex: Int? = nil) {
+        routedAdviceLayerIndex = layerIndex
         gate = NaiveN05FlashRouter(c)
         if let experts {
             _experts.wrappedValue = experts
@@ -132,6 +135,10 @@ final class NaiveN05FlashMoE: Module, UnaryLayer {
     }
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
+        if let layer = routedAdviceLayerIndex {
+            // Preserve explicit advisor enablement and its bounded readback policy.
+            JangPressCanonicalExpertAdvisor.shared.observe(layer: layer, indices: indices)
+        }
         // Custom format construction supplies its complete weighted operation.
         // The ordinary affine branch retains Naive-specific contribution rounding.
         guard let affine = experts as? SwitchGLU else {
@@ -152,7 +159,7 @@ final class NaiveN05FlashDecoderLayer: Module {
         _attention.wrappedValue = NaiveN05FlashAttention(c, layer: layer)
         _inputNorm.wrappedValue = RMSNorm(dimensions: c.hiddenDimensions, eps: Float(c.normEpsilon))
         _postNorm.wrappedValue = RMSNorm(dimensions: c.hiddenDimensions, eps: Float(c.normEpsilon))
-        mlp = c.routedLayers[layer] ? NaiveN05FlashMoE(c, experts: routed) : NaiveN05FlashDenseMLP(c)
+        mlp = c.routedLayers[layer] ? NaiveN05FlashMoE(c, experts: routed, layerIndex: layer) : NaiveN05FlashDenseMLP(c)
     }
     func callAsFunction(_ x: MLXArray, positions: MLXArray, padding: MLXArray, cache: NaiveN05FlashCache?) throws -> MLXArray {
         let h = try x + attention(inputNorm(x), positions: positions, padding: padding, cache: cache)

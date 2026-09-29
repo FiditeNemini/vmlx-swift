@@ -1858,6 +1858,8 @@ public final class Glm5NextMoEGate: Module {
 
 /// The sparse MLP: 288 routed experts fused into a `SwitchGLU`, plus one always-on shared expert.
 public final class Glm5NextMoE: Module {
+    /// Canonical checkpoint layer; standalone modules do not invent an owner.
+    public let routedAdviceLayerIndex: Int?
 
     /// Sibling of `gate`, NOT a child of it — `mlp.e_score_correction_bias`, where DeepSeek V3 puts
     /// the same tensor at `mlp.gate.e_score_correction_bias`. Copying V3's nesting produced a
@@ -1873,8 +1875,10 @@ public final class Glm5NextMoE: Module {
 
     public init(
         _ config: Glm5NextTextConfiguration,
-        routedExperts: (any WeightedRoutedExpertLayer)? = nil
+        routedExperts: (any WeightedRoutedExpertLayer)? = nil,
+        layerIndex: Int? = nil
     ) {
+        routedAdviceLayerIndex = layerIndex
         _eScoreCorrectionBias.wrappedValue = MLXArray.zeros([config.nRoutedExperts])
         _gate.wrappedValue = Glm5NextMoEGate(config)
         // Select the custom bank before constructing any dense expert placeholders.
@@ -1890,6 +1894,10 @@ public final class Glm5NextMoE: Module {
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = gate(x, correctionBias: eScoreCorrectionBias)
+        if let layer = routedAdviceLayerIndex {
+            // Existing advisor policy is opt-in; disabled calls perform no readback.
+            JangPressCanonicalExpertAdvisor.shared.observe(layer: layer, indices: indices)
+        }
 
         let combined = routedExperts.callRouted(x, indices: indices, scores: weights)
         // The shared expert is ALWAYS on — it is not one of the routed `topK`.
@@ -1975,6 +1983,7 @@ public final class Glm5NextDecoderLayer: Module {
     public init(
         _ config: Glm5NextTextConfiguration, kind: Glm5NextLayerKind, mlpKind: Glm5NextMLPKind,
         isMultiTokenPrediction: Bool = false,
+        layerIndex: Int? = nil,
         routedExperts: (any WeightedRoutedExpertLayer)? = nil
     ) {
         self.kind = kind
@@ -2000,7 +2009,7 @@ public final class Glm5NextDecoderLayer: Module {
         switch mlpKind {
         case .dense: _feedForward.wrappedValue = Glm5NextDenseMLP(config)
         case .sparse:
-            _feedForward.wrappedValue = Glm5NextMoE(config, routedExperts: routedExperts)
+            _feedForward.wrappedValue = Glm5NextMoE(config, routedExperts: routedExperts, layerIndex: layerIndex)
         }
 
         // NOT on the MTP layer. The shipped layer 45 carries no `attn_hc` / `ffn_hc` at all — it
@@ -2821,7 +2830,7 @@ public final class Glm5NextLanguageModel: Module {
         var built = (0 ..< config.numHiddenLayers).map { index in
             Glm5NextDecoderLayer(
                 config, kind: schedule[index], mlpKind: config.mlpLayerTypes[index],
-                routedExperts: routedExperts[index])
+                layerIndex: index, routedExperts: routedExperts[index])
         }
         // The MTP layer is NOT in `layer_types` — that list is exactly `num_hidden_layers` long, as
         // `validatedSchedule` enforces. Its kinds come from the weights instead: the shipped layer
@@ -2830,7 +2839,7 @@ public final class Glm5NextLanguageModel: Module {
             built.append(
                 Glm5NextDecoderLayer(
                     config, kind: .deepseekSparseAttention, mlpKind: .sparse,
-                    isMultiTokenPrediction: true))
+                    isMultiTokenPrediction: true, layerIndex: built.count))
         }
         _layers.wrappedValue = built
         _norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)

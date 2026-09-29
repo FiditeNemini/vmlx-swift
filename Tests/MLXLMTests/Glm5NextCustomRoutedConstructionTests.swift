@@ -37,6 +37,7 @@ final class Glm5NextCustomRoutedConstructionTests: XCTestCase {
             let names = Set(model.parameters().flattened().map { $0.0 })
             for index in sparse {
                 let moe = try XCTUnwrap(model.layers[index].moe)
+                XCTAssertEqual(moe.routedAdviceLayerIndex, index)
                 XCTAssertNil(moe.switchMLP)
                 XCTAssertTrue(moe.routedExperts === (try XCTUnwrap(banks[index])))
                 XCTAssertTrue(names.contains("layers.\(index).mlp.switch_mlp.tq2_fixture"))
