@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXNN
 
@@ -7,6 +8,7 @@ import MLXNN
 public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, SupplementalModelWeights {
     private let block: JANGHRoutedDecodeBlock
     private let inputDimensions: Int
+    private let synchronizeRoutesForDiagnostic: Bool
     public let supplementalWeightBytes: Int
     public let supplementalParameterCount: Int
 
@@ -31,6 +33,10 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         self.block = try JANGHRoutedDecodeBlock(
             banks: banks, parentModule: parentModule, activationLimit: activationLimit)
         self.inputDimensions = inputDimensions
+        // Explicit ablation: retain all original kernels/banks while introducing
+        // only the host route synchronization required by selected-buffer decode.
+        synchronizeRoutesForDiagnostic = ProcessInfo.processInfo.environment[
+            "VMLX_JANGH_ROUTE_SYNC_DIAGNOSTIC"] == "1"
         super.init()
     }
 
@@ -45,6 +51,7 @@ public final class JANGHRoutedExpertLayer: Module, WeightedRoutedExpertLayer, Su
         // Both vendor routers select on F32 probabilities. GLM may already have
         // rounded its output weights to input dtype; this cast does not undo it.
         do {
+            if synchronizeRoutesForDiagnostic { _ = indices.asArray(UInt32.self) }
             let result = try block.routed(
                 input.reshaped(tokens, inputDimensions),
                 indices: indices.reshaped(tokens, routes),
