@@ -11,6 +11,7 @@ private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sen
     var preparedTokenCounts: [Int] = []
     let failProjection: Bool
     let mutateCache: Bool
+    var cancelPreparation = false
     var vocabularySize: Int { 4 }
 
     init(shape: [Int], failProjection: Bool = false, mutateCache: Bool = false) {
@@ -25,6 +26,7 @@ private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sen
     }
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        if cancelPreparation { throw CancellationError() }
         preparedOffsets.append(cache.first?.offset ?? 0)
         preparedTokenCounts.append(input.text.tokens.size)
         if mutateCache {
@@ -46,6 +48,75 @@ private final class PreparedLogitsFixture: Module, LanguageModel, @unchecked Sen
 }
 
 final class PreparedLogitsValidationTests: XCTestCase {
+    func testBatchSubmitValidatesPreparedOutputAndPreservesFailure() async throws {
+        try await MLXMetalTestLock.withLock {
+            // submit always uses real scheduler slots, bypassing generate's solo iterator.
+            for shape in [[1, 4], [1, 0, 4], [1, 1, 4]] {
+                let fixture = PreparedLogitsFixture(shape: shape, mutateCache: true)
+                let processor = TestInputProcessor()
+                let context = ModelContext(
+                    configuration: processor.configuration, model: fixture,
+                    processor: processor, tokenizer: processor.tokenizer)
+                let engine = BatchEngine(context: context, maxBatchSize: 2)
+                let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+                let (_, first) = await engine.submit(
+                    input: LMInput(tokens: MLXArray([Int32(1), 2])), parameters: parameters)
+                let (_, second) = await engine.submit(
+                    input: LMInput(tokens: MLXArray([Int32(2), 1])), parameters: parameters)
+                for stream in [first, second] {
+                    var infos: [GenerateCompletionInfo] = []
+                    var tokens: [Int] = []
+                    for await event in stream {
+                        if case .info(let info) = event { infos.append(info) }
+                        if case .token(let token) = event { tokens.append(token) }
+                    }
+                    XCTAssertEqual(infos.count, 1)
+                    if shape == [1, 1, 4] {
+                        XCTAssertNil(infos.first?.generationFailure)
+                        XCTAssertEqual(tokens, [3])
+                    } else {
+                        XCTAssertTrue(tokens.isEmpty)
+                        XCTAssertEqual(infos.first?.stopReason, .cancelled)
+                        XCTAssertEqual(infos.first?.generationFailure?.stage, .preparation)
+                        XCTAssertEqual(
+                            infos.first?.generationFailure?.cause,
+                            PreparedLogitsValidationError.invalidShape(shape).localizedDescription)
+                    }
+                }
+                XCTAssertEqual(fixture.preparedOffsets, [0, 0])
+            }
+        }
+    }
+
+    func testBatchSubmitPreservesMLXErrorAndExplicitCancellation() async throws {
+        try await MLXMetalTestLock.withLock {
+            for cancel in [false, true] {
+                let fixture = PreparedLogitsFixture(shape: [1, 1, 4], failProjection: !cancel)
+                fixture.cancelPreparation = cancel
+                let processor = TestInputProcessor()
+                let context = ModelContext(
+                    configuration: processor.configuration, model: fixture,
+                    processor: processor, tokenizer: processor.tokenizer)
+                let engine = BatchEngine(context: context, maxBatchSize: 2)
+                let (_, stream) = await engine.submit(
+                    input: LMInput(tokens: MLXArray([Int32(1)])),
+                    parameters: GenerateParameters(maxTokens: 1, temperature: 0))
+                var infos: [GenerateCompletionInfo] = []
+                for await event in stream {
+                    if case .token = event { XCTFail("Failed prepare must not emit tokens") }
+                    if case .info(let info) = event { infos.append(info) }
+                }
+                XCTAssertEqual(infos.count, 1)
+                XCTAssertEqual(infos.first?.stopReason, .cancelled)
+                if cancel {
+                    XCTAssertNil(infos.first?.generationFailure)
+                } else {
+                    XCTAssertTrue(infos.first?.generationFailure?.cause.contains("matmul") == true)
+                }
+            }
+        }
+    }
+
     func testSessionInvalidatesFailedPreparationUntilExplicitReset() async throws {
         try await MLXMetalTestLock.withLock {
             let fixture = PreparedLogitsFixture(shape: [1, 1, 4], mutateCache: true)

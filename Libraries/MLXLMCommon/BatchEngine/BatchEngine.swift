@@ -2485,239 +2485,265 @@ public actor BatchEngine {
             detail: "running")))
 
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
-        let prepareResult: PrepareResult
+        let firstToken: MLXArray
         do {
-            let completedBeforePrefill = max(0, totalPromptUnits - remainingPromptUnits)
-            let progressAccumulator = PrefillProgressAccumulator(
-                continuation: slot.continuation,
-                completedBeforePrefill: completedBeforePrefill,
-                totalPromptUnits: totalPromptUnits)
-            prepareResult = try PrefillProgressReporter.withHandler({
-                progressAccumulator.report(completedInPrepare: $0)
-            }) {
-                // DSV4's typed disk cache contains every SWA/CSA/HSA state,
-                // but after its 128-token local ring wraps it cannot produce a
-                // lossless N-1 checkpoint by trimming the completed prompt.
-                // Consume all remaining prompt tokens except the final one,
-                // snapshot that exact state, then run the final token through
-                // the ordinary prepare path. A later exact replay restores the
-                // N-1 disk entry and performs only this one-token prefill.
-                let shouldCaptureDiskSeed =
-                    slot.originalInput.cachePromptIntent != .auxiliary
-                    && cacheCoordinator?.canPersistBoundaries == true
-                    && slot.diskSeedSnapshot == nil
-                    && cacheRequiresPrefillCapturedDiskSeed(slot.cache)
-                    && !slot.originalInput.hasMediaContent
-                    && !slot.originalInput.requiresPostPrepareCacheKey
-                    && !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)
-                    && totalPromptUnits > 1
-                    && remainingPromptUnits > 1
+            let prepareResult = try withError { error in
+                let completedBeforePrefill = max(0, totalPromptUnits - remainingPromptUnits)
+                let progressAccumulator = PrefillProgressAccumulator(
+                    continuation: slot.continuation,
+                    completedBeforePrefill: completedBeforePrefill,
+                    totalPromptUnits: totalPromptUnits)
+                let prepared = try PrefillProgressReporter.withHandler({
+                    progressAccumulator.report(completedInPrepare: $0)
+                }) {
+                    // DSV4's typed disk cache contains every SWA/CSA/HSA state,
+                    // but after its 128-token local ring wraps it cannot produce a
+                    // lossless N-1 checkpoint by trimming the completed prompt.
+                    // Consume all remaining prompt tokens except the final one,
+                    // snapshot that exact state, then run the final token through
+                    // the ordinary prepare path. A later exact replay restores the
+                    // N-1 disk entry and performs only this one-token prefill.
+                    let shouldCaptureDiskSeed =
+                        slot.originalInput.cachePromptIntent != .auxiliary
+                        && cacheCoordinator?.canPersistBoundaries == true
+                        && slot.diskSeedSnapshot == nil
+                        && cacheRequiresPrefillCapturedDiskSeed(slot.cache)
+                        && !slot.originalInput.hasMediaContent
+                        && !slot.originalInput.requiresPostPrepareCacheKey
+                        && !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot)
+                        && totalPromptUnits > 1
+                        && remainingPromptUnits > 1
 
-                if shouldCaptureDiskSeed,
-                   let split = splitPrefillInputBeforeFinalToken(inputForPrepare)
-                {
-                    if let head = split.head {
-                        let headResult = try context.model.prepare(
-                            head,
-                            cache: slot.cache,
-                            windowSize: slot.prefillStepSize)
-                        if case .tokens(let remainingHead) = headResult {
-                            _ = context.model(
-                                remainingHead[text: .newAxis],
+                    if shouldCaptureDiskSeed,
+                        let split = splitPrefillInputBeforeFinalToken(inputForPrepare)
+                    {
+                        if let head = split.head {
+                            let headResult = try context.model.prepare(
+                                head,
                                 cache: slot.cache,
-                                state: nil)
-                        }
-                    }
-                    MLX.eval(slot.cache)
-                    let diskSeedSnapshot = makePromptBoundaryCacheSnapshot(
-                        from: slot.cache)
-                    storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)
-                    // The synchronous store above owns the N-1 boundary now.
-                    // Do not keep the duplicate SWA/pool state through decode.
-                    slot.diskSeedSnapshot = nil
-                    progressAccumulator.report(
-                        completedInPrepare: remainingPromptUnits - 1)
-                    return try context.model.prepare(
-                        split.tail,
-                        cache: slot.cache,
-                        windowSize: slot.prefillStepSize)
-                }
-
-                // Hybrid-SSM strip-boundary capture during prefill (§440 /
-                // Python #109). The post-answer store needs GDN companion
-                // state at the turn-start strip boundary, and recurrent state
-                // cannot rewind — so without a checkpoint captured HERE, the
-                // store path replays the whole prompt after the answer
-                // finishes. Measured on a 13,823-token growing turn: ~18-22s
-                // of post-answer re-derive with the stream still open, which
-                // presented as "decode collapsed to 1-6 tok/s" until the wall
-                // was decomposed. Splitting the prefill at the boundary and
-                // capturing the live state makes the turn's own forward pass
-                // the only forward pass.
-                let hybridBoundarySplit: Int? = {
-                    guard cacheCoordinator?.isHybrid == true,
-                          !slot.originalInput.hasMediaContent,
-                          slot.diskSeedSnapshot == nil
-                    else { return nil }
-                    let fullLen = slot.cachePromptTokenIds.count
-                    let remainingLen = inputForPrepare.text.tokens.size
-                    let processed = fullLen - remainingLen
-                    guard processed >= 0 else { return nil }
-                    guard let boundary = slot.originalInput.cachePrefixTokenCounts
-                        .filter({ $0 > processed && $0 < fullLen })
-                        .max()
-                    else { return nil }
-                    let split = boundary - processed
-                    return (split > 0 && split < remainingLen) ? split : nil
-                }()
-                // The store path derives companion state at BOTH the strip
-                // boundary and its N-1 sibling (the boundary set mirrors the
-                // KV N-1 restore pattern), so capture both: pause one token
-                // before the boundary, capture, advance the single boundary
-                // token, capture again, then continue the tail. Missing the
-                // N-1 sibling costs a full post-answer prompt replay for a
-                // boundary one token away from state we already computed.
-                if let splitAt = hybridBoundarySplit,
-                   splitAt > 1,
-                   let coordinator = cacheCoordinator,
-                   let split = splitPrefillInput(inputForPrepare, at: splitAt - 1),
-                   let head = split.head,
-                   let boundaryTokenSplit = splitPrefillInput(split.tail, at: 1)
-                {
-                    let fullLen = slot.cachePromptTokenIds.count
-                    let remainingLen = inputForPrepare.text.tokens.size
-                    let boundary = (fullLen - remainingLen) + splitAt
-
-                    func completePrefill(_ input: LMInput) throws {
-                        let result = try context.model.prepare(
-                            input,
-                            cache: slot.cache,
-                            windowSize: slot.prefillStepSize)
-                        if case .tokens(let remainingTail) = result {
-                            _ = context.model(
-                                remainingTail[text: .newAxis],
-                                cache: slot.cache,
-                                state: nil)
+                                windowSize: slot.prefillStepSize)
+                            if case .tokens(let remainingHead) = headResult {
+                                _ = context.model(
+                                    remainingHead[text: .newAxis],
+                                    cache: slot.cache,
+                                    state: nil)
+                            }
                         }
                         MLX.eval(slot.cache)
+                        let diskSeedSnapshot = makePromptBoundaryCacheSnapshot(
+                            from: slot.cache)
+                        storePrefillCapturedDiskSeed(diskSeedSnapshot, for: slot)
+                        // The synchronous store above owns the N-1 boundary now.
+                        // Do not keep the duplicate SWA/pool state through decode.
+                        slot.diskSeedSnapshot = nil
+                        progressAccumulator.report(
+                            completedInPrepare: remainingPromptUnits - 1)
+                        return try context.model.prepare(
+                            split.tail,
+                            cache: slot.cache,
+                            windowSize: slot.prefillStepSize)
                     }
 
-                    try completePrefill(head)
-                    captureCleanSSMStateInline(
-                        coordinator: coordinator,
-                        liveCache: slot.cache,
-                        promptTokenIds: slot.cachePromptTokenIds,
-                        genPromptLen: fullLen - (boundary - 1),
-                        enableSSMReDerive: true,
-                        mediaSalt: slot.mediaSalt)
-                    if let boundaryHead = boundaryTokenSplit.head {
-                        try completePrefill(boundaryHead)
+                    // Hybrid-SSM strip-boundary capture during prefill (§440 /
+                    // Python #109). The post-answer store needs GDN companion
+                    // state at the turn-start strip boundary, and recurrent state
+                    // cannot rewind — so without a checkpoint captured HERE, the
+                    // store path replays the whole prompt after the answer
+                    // finishes. Measured on a 13,823-token growing turn: ~18-22s
+                    // of post-answer re-derive with the stream still open, which
+                    // presented as "decode collapsed to 1-6 tok/s" until the wall
+                    // was decomposed. Splitting the prefill at the boundary and
+                    // capturing the live state makes the turn's own forward pass
+                    // the only forward pass.
+                    let hybridBoundarySplit: Int? = {
+                        guard cacheCoordinator?.isHybrid == true,
+                            !slot.originalInput.hasMediaContent,
+                            slot.diskSeedSnapshot == nil
+                        else { return nil }
+                        let fullLen = slot.cachePromptTokenIds.count
+                        let remainingLen = inputForPrepare.text.tokens.size
+                        let processed = fullLen - remainingLen
+                        guard processed >= 0 else { return nil }
+                        guard
+                            let boundary = slot.originalInput.cachePrefixTokenCounts
+                                .filter({ $0 > processed && $0 < fullLen })
+                                .max()
+                        else { return nil }
+                        let split = boundary - processed
+                        return (split > 0 && split < remainingLen) ? split : nil
+                    }()
+                    // The store path derives companion state at BOTH the strip
+                    // boundary and its N-1 sibling (the boundary set mirrors the
+                    // KV N-1 restore pattern), so capture both: pause one token
+                    // before the boundary, capture, advance the single boundary
+                    // token, capture again, then continue the tail. Missing the
+                    // N-1 sibling costs a full post-answer prompt replay for a
+                    // boundary one token away from state we already computed.
+                    if let splitAt = hybridBoundarySplit,
+                        splitAt > 1,
+                        let coordinator = cacheCoordinator,
+                        let split = splitPrefillInput(inputForPrepare, at: splitAt - 1),
+                        let head = split.head,
+                        let boundaryTokenSplit = splitPrefillInput(split.tail, at: 1)
+                    {
+                        let fullLen = slot.cachePromptTokenIds.count
+                        let remainingLen = inputForPrepare.text.tokens.size
+                        let boundary = (fullLen - remainingLen) + splitAt
+
+                        func completePrefill(_ input: LMInput) throws {
+                            let result = try context.model.prepare(
+                                input,
+                                cache: slot.cache,
+                                windowSize: slot.prefillStepSize)
+                            if case .tokens(let remainingTail) = result {
+                                _ = context.model(
+                                    remainingTail[text: .newAxis],
+                                    cache: slot.cache,
+                                    state: nil)
+                            }
+                            MLX.eval(slot.cache)
+                        }
+
+                        try completePrefill(head)
+                        captureCleanSSMStateInline(
+                            coordinator: coordinator,
+                            liveCache: slot.cache,
+                            promptTokenIds: slot.cachePromptTokenIds,
+                            genPromptLen: fullLen - (boundary - 1),
+                            enableSSMReDerive: true,
+                            mediaSalt: slot.mediaSalt)
+                        if let boundaryHead = boundaryTokenSplit.head {
+                            try completePrefill(boundaryHead)
+                        }
+                        captureCleanSSMStateInline(
+                            coordinator: coordinator,
+                            liveCache: slot.cache,
+                            promptTokenIds: slot.cachePromptTokenIds,
+                            genPromptLen: fullLen - boundary,
+                            enableSSMReDerive: true,
+                            mediaSalt: slot.mediaSalt)
+                        progressAccumulator.report(completedInPrepare: splitAt)
+                        return try context.model.prepare(
+                            boundaryTokenSplit.tail,
+                            cache: slot.cache,
+                            windowSize: slot.prefillStepSize)
                     }
-                    captureCleanSSMStateInline(
-                        coordinator: coordinator,
-                        liveCache: slot.cache,
-                        promptTokenIds: slot.cachePromptTokenIds,
-                        genPromptLen: fullLen - boundary,
-                        enableSSMReDerive: true,
-                        mediaSalt: slot.mediaSalt)
-                    progressAccumulator.report(completedInPrepare: splitAt)
+
                     return try context.model.prepare(
-                        boundaryTokenSplit.tail,
+                        inputForPrepare,
                         cache: slot.cache,
                         windowSize: slot.prefillStepSize)
                 }
-
-                return try context.model.prepare(
-                    inputForPrepare,
-                    cache: slot.cache,
-                    windowSize: slot.prefillStepSize)
+                try error.check()
+                if case .logits(let output) = prepared {
+                    try validatePreparedLogitsForSampling(output.logits)
+                }
+                return prepared
             }
+
+            slot.continuation.yield(
+                .prefillProgress(
+                    PrefillProgress(
+                        stage: .complete,
+                        completedUnitCount: totalPromptUnits,
+                        totalUnitCount: totalPromptUnits,
+                        detail: "decode_ready")))
+
+            // Extract the first generated token from the prepare result
+            switch prepareResult {
+            case .tokens(let remainingText):
+                // prepare() has already forwarded complete chunks. Preserve that
+                // exact boundary rather than repeating those chunks after decode.
+                // Do not split/reorder prefill, and reject custom token/mask/media
+                // paths or an unaligned restored prefix.
+                let consumed = slot.cachePromptTokenIds.count - remainingText.tokens.size
+                let chunkSize = max(1, slot.prefillStepSize)
+                let seedBoundary = max(0, slot.cachePromptTokenIds.count - 1)
+                let expectedChunk = max(0, (seedBoundary - 1) / chunkSize) * chunkSize
+                if slot.originalInput.cachePromptIntent != .auxiliary,
+                    slot.originalInput.cachePromptIntent != .reusablePrefixWarmup,
+                    cacheCoordinator?.canPersistBoundaries == true,
+                    !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
+                    !slot.originalInput.hasMediaContent,
+                    !slot.originalInput.requiresPostPrepareCacheKey,
+                    slot.originalInput.text.mask == nil, remainingText.mask == nil,
+                    consumed > 0, consumed == expectedChunk || consumed == seedBoundary,
+                    slot.cache.contains(where: { $0 is RotatingKVCache }),
+                    slot.cache.allSatisfy({
+                        ($0 is RotatingKVCache || $0 is KVCacheSimple) && $0.offset == consumed
+                    }),
+                    remainingText.tokens.reshaped(-1).asArray(Int32.self)
+                        == slot.cachePromptTokenIds.suffix(remainingText.tokens.size).map(
+                            Int32.init),
+                    CacheStoreBudget.canStore(slot.cache)
+                {
+                    slot.prefillReplaySeed = BatchPrefillReplaySeed(
+                        tokens: Array(slot.cachePromptTokenIds.prefix(consumed)),
+                        cache: makePromptBoundaryCacheSnapshot(from: slot.cache),
+                        canonicalChunkSize: canonicalPrefillStart && consumed % chunkSize == 0
+                            ? chunkSize : nil)
+                    if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                        FileHandle.standardError.write(
+                            Data(
+                                "[vmlx][cache/prefill-replay-seed] captured=\(consumed) prompt=\(slot.cachePromptTokenIds.count)\n"
+                                    .utf8))
+                    }
+                }
+                // Seed the processor with the full prompt tokens.
+                let promptTokens = slot.originalInput.text.tokens
+                slot.processor?.prompt(promptTokens)
+
+                // LLM path: prepare() consumed all but the last chunk, returned remaining tokens.
+                // Run the last chunk through the model to get logits for the first decode token.
+                let result = try withError { error in
+                    let output = context.model(
+                        remainingText[text: .newAxis], cache: slot.cache, state: nil)
+                    try error.check()
+                    try validatePreparedLogitsForSampling(output.logits)
+                    MLX.eval(slot.cache)
+                    try error.check()
+                    return output
+                }
+                let logits = result.logits[0 ..< 1, -1, 0...]
+                firstToken = slot.sampleToken(from: logits)
+
+            case .logits(let result):
+                if let effectivePromptTokens = result.effectivePromptTokens,
+                    !effectivePromptTokens.isEmpty
+                {
+                    slot.cachePromptTokenIds = effectivePromptTokens
+                    slot.cachePromptUsesPostPrepareKey = true
+                    if slot.originalInput.requiresPostPrepareCacheKey {
+                        cacheCoordinator?.recordPostPrepareCacheKeyAlias(
+                            rawTokens: slot.originalInput.text.tokens.reshaped(-1).asArray(
+                                Int.self),
+                            effectiveTokens: effectivePromptTokens,
+                            mediaSalt: slot.mediaSalt)
+                    }
+                    let promptTokens = MLXArray(effectivePromptTokens.map { Int32($0) })
+                        .expandedDimensions(axis: 0)
+                    slot.processor?.prompt(promptTokens)
+                } else {
+                    let promptTokens = slot.originalInput.text.tokens
+                    slot.processor?.prompt(promptTokens)
+                }
+                // VLM path: prepare() already ran the full prompt and returned logits directly.
+                let logits = result.logits[0 ..< 1, -1, 0...]
+                firstToken = slot.sampleToken(from: logits)
+            }
+
         } catch {
-            // Prefill failed (e.g., invalid input) — finish with cancellation
-            finishSlot(&slot, reason: .cancelled)
+            // Failed slot caches are never published by finishSlot's cancelled path.
+            // Preserve explicit cancellation while reporting preparation errors to clients.
+            finishSlot(
+                &slot, reason: .cancelled,
+                generationFailure: error is CancellationError
+                    ? nil
+                    : GenerationFailure(
+                        stage: .preparation, cause: error.localizedDescription))
             slot.isFinished = true
             activeSlots[slotIndex] = slot
             return
-        }
-
-        slot.continuation.yield(.prefillProgress(PrefillProgress(
-            stage: .complete,
-            completedUnitCount: totalPromptUnits,
-            totalUnitCount: totalPromptUnits,
-            detail: "decode_ready")))
-
-        // Extract the first generated token from the prepare result
-        let firstToken: MLXArray
-        switch prepareResult {
-        case .tokens(let remainingText):
-            // prepare() has already forwarded complete chunks. Preserve that
-            // exact boundary rather than repeating those chunks after decode.
-            // Do not split/reorder prefill, and reject custom token/mask/media
-            // paths or an unaligned restored prefix.
-            let consumed = slot.cachePromptTokenIds.count - remainingText.tokens.size
-            let chunkSize = max(1, slot.prefillStepSize)
-            let seedBoundary = max(0, slot.cachePromptTokenIds.count - 1)
-            let expectedChunk = max(0, (seedBoundary - 1) / chunkSize) * chunkSize
-            if slot.originalInput.cachePromptIntent != .auxiliary,
-               slot.originalInput.cachePromptIntent != .reusablePrefixWarmup,
-               cacheCoordinator?.canPersistBoundaries == true,
-               !shouldSkipDiskBackedToolPromptSeedBoundary(for: slot),
-               !slot.originalInput.hasMediaContent,
-               !slot.originalInput.requiresPostPrepareCacheKey,
-               slot.originalInput.text.mask == nil, remainingText.mask == nil,
-               consumed > 0, consumed == expectedChunk || consumed == seedBoundary,
-               slot.cache.contains(where: { $0 is RotatingKVCache }),
-               slot.cache.allSatisfy({
-                   ($0 is RotatingKVCache || $0 is KVCacheSimple) && $0.offset == consumed
-               }),
-               remainingText.tokens.reshaped(-1).asArray(Int32.self)
-                   == slot.cachePromptTokenIds.suffix(remainingText.tokens.size).map(Int32.init),
-               CacheStoreBudget.canStore(slot.cache)
-            {
-                slot.prefillReplaySeed = BatchPrefillReplaySeed(
-                    tokens: Array(slot.cachePromptTokenIds.prefix(consumed)),
-                    cache: makePromptBoundaryCacheSnapshot(from: slot.cache),
-                    canonicalChunkSize: canonicalPrefillStart && consumed % chunkSize == 0
-                        ? chunkSize : nil)
-                if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
-                    FileHandle.standardError.write(Data(
-                        "[vmlx][cache/prefill-replay-seed] captured=\(consumed) prompt=\(slot.cachePromptTokenIds.count)\n".utf8))
-                }
-            }
-            // Seed the processor with the full prompt tokens.
-            let promptTokens = slot.originalInput.text.tokens
-            slot.processor?.prompt(promptTokens)
-
-            // LLM path: prepare() consumed all but the last chunk, returned remaining tokens.
-            // Run the last chunk through the model to get logits for the first decode token.
-            let result = context.model(
-                remainingText[text: .newAxis], cache: slot.cache, state: nil)
-            MLX.eval(slot.cache)
-            let logits = result.logits[0 ..< 1, -1, 0...]
-            firstToken = slot.sampleToken(from: logits)
-
-        case .logits(let result):
-            if let effectivePromptTokens = result.effectivePromptTokens,
-               !effectivePromptTokens.isEmpty
-            {
-                slot.cachePromptTokenIds = effectivePromptTokens
-                slot.cachePromptUsesPostPrepareKey = true
-                if slot.originalInput.requiresPostPrepareCacheKey {
-                    cacheCoordinator?.recordPostPrepareCacheKeyAlias(
-                        rawTokens: slot.originalInput.text.tokens.reshaped(-1).asArray(Int.self),
-                        effectiveTokens: effectivePromptTokens,
-                        mediaSalt: slot.mediaSalt)
-                }
-                let promptTokens = MLXArray(effectivePromptTokens.map { Int32($0) })
-                    .expandedDimensions(axis: 0)
-                slot.processor?.prompt(promptTokens)
-            } else {
-                let promptTokens = slot.originalInput.text.tokens
-                slot.processor?.prompt(promptTokens)
-            }
-            // VLM path: prepare() already ran the full prompt and returned logits directly.
-            let logits = result.logits[0 ..< 1, -1, 0...]
-            firstToken = slot.sampleToken(from: logits)
         }
 
         // Capture the cache exactly at the prompt boundary. The first sampled
@@ -3331,7 +3357,10 @@ public actor BatchEngine {
     /// When a cache coordinator is present and the slot completed normally
     /// (not cancelled), stores prompt and safe post-answer boundaries for
     /// future cache reuse.
-    private func finishSlot(_ liveSlot: inout BatchSlot, reason: GenerateStopReason) {
+    private func finishSlot(
+        _ liveSlot: inout BatchSlot, reason: GenerateStopReason,
+        generationFailure: GenerationFailure? = nil
+    ) {
         var slot = liveSlot
         slot.nanTrace?.finish(totalSteps: slot.generatedTokenCount)
         defer {
@@ -3351,7 +3380,8 @@ public actor BatchEngine {
             generationTokenCount: slot.generatedTokenCount,
             promptTime: prefillTime,
             generationTime: decodeTime,
-            stopReason: reason
+            stopReason: reason,
+            generationFailure: generationFailure
         )
 
         // Surface completion before the cache store. The store may include a
