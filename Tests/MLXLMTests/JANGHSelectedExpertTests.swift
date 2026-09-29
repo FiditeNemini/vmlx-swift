@@ -132,10 +132,14 @@ final class JANGHSelectedExpertTests: XCTestCase {
 
     func testExpertCacheHitRefreshesRecencyAndEvictsOnlyOldestView() throws {
         try MLXMetalTestLock.withLock {
-            let f = try fixture(experts: 16, width: 512, hidden: 256)
+            let page = Int(getpagesize())
+            let f = try fixture(experts: 16, width: page / 32, hidden: 256)
             defer { try? FileManager.default.removeItem(at: f.directory) }
-            // The gate bank and scale table are page aligned in this fixture.
-            let cap = 8192 + 2 * 32768
+            // Include the real page-prefix bytes, including on 16 KiB hosts.
+            let pair = try XCTUnwrap(f.source.plan.projections[parent + ".gate_proj"])
+            let expertSpan = pair.packed.byteCount / 16 + pair.packed.fileOffset % page
+            let scaleSpan = pair.scales.byteCount + pair.scales.fileOffset % page
+            let cap = scaleSpan + 2 * expertSpan
             let owner = try JANGHExpertMappedBanks(source: f.source, cacheByteLimit: cap,
                                                  storage: .stableFileMappings)
             func select(_ expert: UInt32) throws -> JANGHExpertMappedBanks.Selection {
