@@ -6,7 +6,11 @@ extension Module {
 
     /// Compute the number of parameters in a possibly quantized model
     public func numParameters() -> Int {
-        return leafModules().flattenedValues().map {
+        let leaves = leafModules().flattenedValues()
+        // leafModules returns descendants, so a standalone Linear/Embedding
+        // has no entries. Count the root itself using the same quantized rule.
+        let counted = leaves.isEmpty ? [self] : leaves
+        return counted.map {
             mod -> Int in
             if let qlin = mod as? QuantizedLinear {
                 return qlin.scales.size * qlin.groupSize

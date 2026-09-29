@@ -47,4 +47,15 @@ final class SupplementalModelWeightsTests: XCTestCase {
         XCTAssertEqual(sample.totalBytes, 1792)
         XCTAssertEqual(sample.logicalWeightBytes, 1024 + 96 * 1024 * 1024 * 1024)
     }
+    func testStandaloneQuantizedRootUsesRepresentedParameterCount() throws {
+        try MLXMetalTestLock.withLock {
+            let linear = QuantizedLinear(64, 4, bias: false, groupSize: 32, bits: 4)
+            XCTAssertEqual(linear.numParameters(), 256)
+            XCTAssertEqual(linear.numParameters(), linear.scales.size * linear.groupSize)
+            let embedding = QuantizedEmbedding(embeddingCount: 8, dimensions: 64, groupSize: 32, bits: 4)
+            XCTAssertEqual(embedding.numParameters(), 512)
+            XCTAssertEqual(embedding.numParameters(), embedding.scales.size * embedding.groupSize)
+        }
+    }
+
 }
