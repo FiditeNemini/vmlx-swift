@@ -8537,10 +8537,24 @@ func runPerfBench(
             jangPressRuntime = loaded.1
         } else {
             if useMmap {
+                var requestedLoad = LoadConfiguration(useMmapSafetensors: true)
+                if env["BENCH_PERF_MEMORY_SAFETY_PLAN"] == "1" {
+                    let settings = VMLXServerRuntimeSettings()
+                    let plan = settings.resolvedMemorySafetyPlan(
+                        baseLoadConfiguration: requestedLoad,
+                        bundleFacts: LoadBundleFacts.inspect(bundleURL: modelDir),
+                        host: MemoryStatus.snapshot())
+                    guard plan.blockingIssues.isEmpty else {
+                        throw NSError(domain: "BENCH_PERF", code: 6,
+                            userInfo: [NSLocalizedDescriptionKey: "Memory safety plan blocked load"])
+                    }
+                    requestedLoad = plan.loadConfiguration
+                    print("PERF_HOST_MEMORY_PLAN \(plan.displaySummary) mmap=\(requestedLoad.useMmapSafetensors)")
+                }
                 let loaded = try await MLXLMCommon.loadModel(
                     from: modelDir,
                     using: #huggingFaceTokenizerLoader(),
-                    loadConfiguration: LoadConfiguration(useMmapSafetensors: true))
+                    loadConfiguration: requestedLoad)
                 context = loaded.0
                 jangPressRuntime = loaded.1
             } else {
