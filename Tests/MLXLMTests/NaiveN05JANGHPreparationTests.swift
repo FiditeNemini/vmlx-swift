@@ -33,7 +33,7 @@ final class NaiveN05JANGHPreparationTests: XCTestCase {
     private static func fixture(_ directory: URL) throws -> Data {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var books: [String: Any] = [:]
-        var quant: [String: Any] = [:]
+        var quant: [String: Any] = ["mode": "affine", "bits": 4, "group_size": 32]
         var headers: [String: Any] = [:]
         var map: [String: String] = [:]
         var payload = Data()

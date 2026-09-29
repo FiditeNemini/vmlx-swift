@@ -116,9 +116,11 @@ final class JANGHMappedBanks {
             do {
                 let status = try withError {
                     path.withCString { name in
-                        mlx_array_new_mmap_file_region(
-                            &array, name, UInt64(location.fileOffset), location.byteCount,
-                            &shape, Int32(shape.count), dtype.cmlxDtype)
+                        location.tensor.withCString { tensorName in
+                            mlx_array_new_mmap_file_region_named(
+                                &array, name, UInt64(location.fileOffset), location.byteCount,
+                                &shape, Int32(shape.count), dtype.cmlxDtype, tensorName)
+                        }
                     }
                 }
                 guard status == 0 else {
