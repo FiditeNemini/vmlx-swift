@@ -23,6 +23,21 @@ public enum LLMTypeRegistry {
     // Split into functions to help the compiler type-check the large model registry
     private static func coreModels() -> [String: ModelCreator] {
         [
+            "naive_n05_flash": { data, requesting in
+                guard !JANGHModelPreparation.declaresCustomFormat(configuration: data, sidecar: nil)
+                else {
+                    throw NaiveN05ArchitectureContract.ContractError.unsupported(
+                        "JANGH banks require validated directory-backed model loading")
+                }
+                guard requesting == nil || requesting == [.text],
+                    !NativeMTPActivation.isExplicitlyRequested
+                else {
+                    throw NaiveN05ArchitectureContract.ContractError.unsupported(
+                        "Naive-N0.5 requires text-only autoregressive loading")
+                }
+                let config = try JSONDecoder.json5().decode(NaiveN05ArchitectureContract.self, from: data)
+                return try NaiveN05FlashModel(config)
+            },
             "mistral": create(LlamaConfiguration.self, LlamaModel.init),
             "llama": create(LlamaConfiguration.self, LlamaModel.init),
             "phi": create(PhiConfiguration.self, PhiModel.init),
@@ -1539,6 +1554,23 @@ public final class LLMModelFactory: ModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        // Admit custom v2 banks before generic quantization or legacy sidecar
+        // merging. The partition excludes only verified custom tensor names.
+        struct FactoryRoutingConfiguration: Decodable {
+            let model_type: String?
+        }
+        if let route = try? JSONDecoder.json5().decode(FactoryRoutingConfiguration.self, from: configData),
+            route.model_type == "glm5_next"
+        {
+            // This family is constructed by the VLM factory, including text-only
+            // requests. Preserve its detailed admission error instead of an
+            // unrelated LLM quantization error winning factory fallback.
+            throw ModelFactoryError.unsupportedModelType("glm5_next")
+        }
+        let jangHPreparation = try NaiveN05JANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let jangHPreparation { configData = jangHPreparation.banks.ordinaryConfiguration }
+
         // JANGTQ: merge `weight_format`, `mxtq_bits`, `mxtq_seed` from
         // jang_config.json into config.json so per-type creator closures can
         // dispatch on them (e.g. minimax_m2 → MiniMaxJANGTQModel). The real
@@ -1546,7 +1578,7 @@ public final class LLMModelFactory: ModelFactory {
         // config.json — without this merge the factory never sees "mxtq" and
         // falls through to the standard non-TQ model path.
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if let jangData = try? Data(contentsOf: jangConfigURL),
+        if jangHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
             var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
             let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
@@ -1746,9 +1778,11 @@ public final class LLMModelFactory: ModelFactory {
                 configData = merged
             }
         }
-        configData = Self.mergeJANGTQSidecarStartupMetadata(
-            configData,
-            modelDirectory: modelDirectory)
+        if jangHPreparation == nil {
+            configData = Self.mergeJANGTQSidecarStartupMetadata(
+                configData,
+                modelDirectory: modelDirectory)
+        }
 
         let baseConfig: BaseConfiguration
         do {
@@ -1808,10 +1842,16 @@ public final class LLMModelFactory: ModelFactory {
         }
         let model: LanguageModel
         do {
-            model = try await typeRegistry.createModel(
-                configuration: configData, modelType: baseConfig.modelType,
-                requesting: configuration.requestedModalities)
+            if let jangHPreparation {
+                model = try jangHPreparation.construct(requesting: configuration.requestedModalities)
+            } else {
+                model = try await typeRegistry.createModel(
+                    configuration: configData, modelType: baseConfig.modelType,
+                    requesting: configuration.requestedModalities)
+            }
         } catch {
+            // A rejected custom bank must never fall back to an ordinary model.
+            if jangHPreparation != nil { throw error }
             // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
             // or the config couldn't be decoded for that type).
             // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
@@ -1991,13 +2031,14 @@ public final class LLMModelFactory: ModelFactory {
         // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            quantization: jangConfig != nil ? baseConfig.quantizationContainer?.quantization : nil,
+            quantization: jangConfig != nil || jangHPreparation != nil
+                ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
             // loadWeights treats config.json's explicit per-layer dict as
             // declared evidence, then validates it against exact manifests,
             // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: jangConfig,
+            jangConfig: jangHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask

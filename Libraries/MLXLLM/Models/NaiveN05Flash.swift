@@ -184,9 +184,16 @@ final class NaiveN05FlashModel: Module {
     @ModuleInfo(key: "lm_head") var head: Linear
     init(_ c: NaiveN05ArchitectureContract, routedFactory: RoutedFactory? = nil,
         excludedSafetensorsKeys: Set<String> = []) throws {
-        guard excludedSafetensorsKeys.isEmpty || routedFactory != nil else {
-            throw NaiveN05FlashCache.Failure.invalidGeometry
-        }
+        let canonicalExclusions = Set(c.routedLayers.indices.filter { c.routedLayers[$0] }.flatMap { layer in
+            ["gate_proj", "up_proj", "down_proj"].flatMap { role in
+                ["tq2_packed", "tq2_scales"].map {
+                    "model.layers.\(layer).mlp.switch_mlp.\(role).\($0)"
+                }
+            }
+        })
+        guard excludedSafetensorsKeys.isEmpty
+            || (routedFactory != nil && excludedSafetensorsKeys == canonicalExclusions)
+        else { throw NaiveN05FlashCache.Failure.invalidGeometry }
         self.excludedSafetensorsKeys = excludedSafetensorsKeys
         config = c
         model = try NaiveN05FlashBackbone(c, routedFactory: routedFactory)

@@ -144,15 +144,22 @@ final class NaiveN05FlashRuntimeTests: XCTestCase {
             }
         }
         var constructed = [Int]()
+        let exclusions = Set(["gate_proj", "up_proj", "down_proj"].flatMap { role in
+            ["tq2_packed", "tq2_scales"].map { "model.layers.1.mlp.switch_mlp.\(role).\($0)" }
+        })
         let model = try NaiveN05FlashModel(tiny(), routedFactory: { layer, _ in
             constructed.append(layer)
             return ConstructionProbe()
-        }, excludedSafetensorsKeys:["model.layers.1.mlp.switch_mlp.gate_proj.weight"])
-        XCTAssertTrue(model.excludeFromGenericSafetensorsLoad(key:"model.layers.1.mlp.switch_mlp.gate_proj.weight"))
+        }, excludedSafetensorsKeys:exclusions)
+        XCTAssertTrue(model.excludeFromGenericSafetensorsLoad(key:"model.layers.1.mlp.switch_mlp.gate_proj.tq2_packed"))
         XCTAssertFalse(model.excludeFromGenericSafetensorsLoad(key:"model.layers.1.mlp.gate.weight"))
         XCTAssertTrue(model.requiresExactTensorMmapBuffers)
+        for invalid in [Set(exclusions.dropFirst()), exclusions.union(["model.layers.1.mlp.gate.weight"])] {
+            XCTAssertThrowsError(try NaiveN05FlashModel(tiny(),routedFactory:{ _,_ in ConstructionProbe() },
+                excludedSafetensorsKeys:invalid))
+        }
         XCTAssertThrowsError(try NaiveN05FlashModel(tiny(),
-            excludedSafetensorsKeys:["model.layers.1.mlp.switch_mlp.gate_proj.weight"]))
+            excludedSafetensorsKeys:exclusions))
         XCTAssertEqual(constructed, [1])
         let names = model.parameters().flattened().map { $0.0 }
         XCTAssertFalse(names.contains { $0.contains("mlp.switch_mlp.") })
