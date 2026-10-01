@@ -5,6 +5,13 @@ import MLX
 /// Vendor reference operations retained beside narrowly admitted optimized paths.
 /// Asymmetric prefill remains explicit until a supported fused kernel is proven.
 enum NaiveN05FlashMath {
+    static func allowedMaskGPUArangeRequested(environment: [String: String]) -> Bool {
+        // Unset uses the model default. Exact 1 enables; 0 and unrecognized
+        // values keep the reference path rather than accepting truthy spellings.
+        guard let value = environment["VMLX_NAIVE_ALLOWED_MASK_GPU_ARANGE"] else { return true }
+        return value == "1"
+    }
+
     /// One forward's positions only. Reusing these lazy arrays across layers
     /// avoids rebuilding identical trigonometric graphs; nothing survives into
     /// the next decode step or into a restored KV cache.
@@ -58,9 +65,26 @@ enum NaiveN05FlashMath {
         return dimensions == x.dim(-1) ? rotated : concatenated([rotated, x[.ellipsis, dimensions...]], axis: -1)
     }
 
-    static func allowedMask(padding: MLXArray, queryOffset: Int, length: Int, keyOffset: Int, keyLength: Int, window: Int?) -> MLXArray {
-        let q = MLXArray(queryOffset ..< queryOffset + length).expandedDimensions(axis: -1)
-        let k = MLXArray(keyOffset ..< keyOffset + keyLength)
+    /// Preserve the Sequence<Int> constructor's Int32 values without its two
+    /// host arrays. Callers retain an explicit reference-path comparison policy.
+    static func maskPositionRange(start: Int, count: Int, gpuArange: Bool) -> MLXArray {
+        precondition(count >= 0)
+        let stop = start + count
+        // The Metal encoder casts start and start + step before subtraction.
+        // Int32.max singletons and unsupported bounds retain the exact baseline
+        // constructor, including its existing out-of-Int32 precondition.
+        if gpuArange,
+           count == 0 || (start >= Int(Int32.min) && start < Int(Int32.max)
+                          && stop - 1 <= Int(Int32.max)) {
+            return arange(start, stop, dtype: .int32)
+        }
+        return MLXArray(start ..< stop)
+    }
+
+    static func allowedMask(padding: MLXArray, queryOffset: Int, length: Int, keyOffset: Int, keyLength: Int, window: Int?, gpuArange: Bool = false) -> MLXArray {
+        let q = maskPositionRange(start: queryOffset, count: length, gpuArange: gpuArange)
+            .expandedDimensions(axis: -1)
+        let k = maskPositionRange(start: keyOffset, count: keyLength, gpuArange: gpuArange)
         var mask = q .>= k
         if let window { mask = mask .&& (q - k .< window) }
         return mask.expandedDimensions(axis: 0) .&& padding[0..., keyOffset ..< keyOffset + keyLength].expandedDimensions(axis: 1)
