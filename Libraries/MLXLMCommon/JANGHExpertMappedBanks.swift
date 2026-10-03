@@ -138,11 +138,12 @@ final class JANGHExpertMappedBanks {
         lock.unlock()
     }
 
-    /// B1/top8 diagnostic admission. No hidden full-bank fallback or GPU-index
+    /// B1/top-k diagnostic admission. No hidden full-bank fallback or GPU-index
     /// readback: the caller explicitly supplies the measured router's host IDs.
     func selection(module: String, expertIDs: [UInt32]) throws -> Selection {
-        guard expertIDs.count == 8, let pair = source.plan.projections[module] else {
-            throw JANGHFormatContract.ValidationError.invalid("JANGH expert selection requires a known module and eight routes")
+        guard (1 ... JANGHSelectedExpertDecode.maxRoutes).contains(expertIDs.count),
+              let pair = source.plan.projections[module] else {
+            throw JANGHFormatContract.ValidationError.invalid("JANGH expert selection requires a known module and 1...12 routes")
         }
         lock.lock()
         defer { lock.unlock() }

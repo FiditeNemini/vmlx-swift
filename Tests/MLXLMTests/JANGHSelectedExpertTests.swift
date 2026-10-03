@@ -97,7 +97,8 @@ final class JANGHSelectedExpertTests: XCTestCase {
             XCTAssertLessThan(s.mappedPackedBytes, f.packedBytes / 2)
             XCTAssertLessThanOrEqual(owner.cachedOwnedMappedBytes, 256 * 1024)
             XCTAssertGreaterThan(MLX.Memory.activeMemory, before)
-            XCTAssertThrowsError(try owner.selection(module: parent + ".gate_proj", expertIDs: [0]))
+            XCTAssertThrowsError(try owner.selection(module: parent + ".gate_proj", expertIDs: []))
+            XCTAssertThrowsError(try owner.selection(module: parent + ".gate_proj", expertIDs: Array(repeating: 0, count: 14)))
             XCTAssertThrowsError(try owner.selection(module: parent + ".gate_proj", expertIDs: Array(repeating: 64, count: 8)))
             XCTAssertThrowsError(try owner.selection(module: "unknown", expertIDs: ids))
             owner.removeAllCachedViews()
@@ -160,6 +161,51 @@ final class JANGHSelectedExpertTests: XCTestCase {
 
     func testSelectedDecodeMatchesProvenWholeBankCompositionAcrossRotationsAndDTypes() throws {
         try checkSelectedDecode(storage: .independentMappings)
+    }
+
+    func testTopTenAndMetalBufferBoundaryMatchWholeBanksWithoutClamp() throws {
+        try MLXMetalTestLock.withLock {
+            let f = try fixture(bits: [2, 3, 4], inputRotation: "hadamard32", downRotation: "hadamard32")
+            defer { try? FileManager.default.removeItem(at: f.directory) }
+            let owner = try JANGHExpertMappedBanks(source: f.source, cacheByteLimit: 32768)
+            let whole = try JANGHMappedBanks(source: f.source)
+            let reference = try JANGHRoutedDecodeBlock(banks: whole, parentModule: parent, activationLimit: nil)
+            XCTAssertEqual(JANGHSelectedExpertDecode.maxRoutes, 12)
+            for count in [1, 2, 8, 10, 12] {
+                let selected = try JANGHSelectedExpertDecode(owner: owner,
+                    gateModule: parent + ".gate_proj", upModule: parent + ".up_proj",
+                    downModule: parent + ".down_proj", routes: count)
+                let ids = (0 ..< count).map { UInt32(($0 * 7) % 16) }
+                let gate = try owner.selection(module: parent + ".gate_proj", expertIDs: ids)
+                let up = try owner.selection(module: parent + ".up_proj", expertIDs: ids)
+                let down = try owner.selection(module: parent + ".down_proj", expertIDs: ids)
+                let routes = MLXArray(ids, [1, count])
+                let scores = MLXArray((0 ..< count).map { Float($0 + 1) / Float(count * (count + 1) / 2) }, [1, count])
+                for dtype in [DType.float16, .bfloat16, .float32] {
+                    let x = MLXArray((0 ..< 64).map { Float(($0 * 19) % 59 - 29) / 31 }, [1, 64]).asType(dtype)
+                    let hidden = try selected.activatePreparedInput(selected.prepareInput(x), gate: gate, up: up, limit: nil)
+                    let actual = try selected.projectPreparedHidden(hidden, down: down, scores: scores, outputDType: dtype)
+                    let expected = try reference(x, indices: routes, scores: scores, outputDType: dtype)
+                    let a = actual.asType(.float32).asArray(Float.self)
+                    let e = expected.asType(.float32).asArray(Float.self)
+                    let tolerance: Float = dtype == .bfloat16 ? 0.008 : (dtype == .float16 ? 0.002 : 0.0005)
+                    for i in a.indices {
+                        XCTAssertTrue(a[i].isFinite)
+                        XCTAssertEqual(a[i], e[i], accuracy: max(0.00005, abs(e[i]) * tolerance),
+                            "routes=\(count), dtype=\(dtype), column=\(i)")
+                    }
+                    XCTAssertThrowsError(try selected.projectPreparedHidden(hidden, down: down,
+                        scores: MLXArray.ones([1, count + 1]), outputDType: dtype))
+                }
+            }
+            for count in [0, 13, 14] {
+                XCTAssertThrowsError(try JANGHSelectedExpertDecode(owner: owner,
+                    gateModule: parent + ".gate_proj", upModule: parent + ".up_proj",
+                    downModule: parent + ".down_proj", routes: count))
+                XCTAssertThrowsError(try owner.selection(module: parent + ".gate_proj",
+                    expertIDs: Array(repeating: 0, count: count)))
+            }
+        }
     }
 
     func testStableMappingDecodeMatchesWholeBanksAcrossRotationsAndDTypes() throws {

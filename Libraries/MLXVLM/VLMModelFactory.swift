@@ -481,6 +481,10 @@ public final class VLMModelFactory: ModelFactory {
         let jangHPreparation = try Glm5NextJANGHPreparation.loadIfDeclared(
             directory: modelDirectory, configurationData: configData)
         if let jangHPreparation { configData = jangHPreparation.banks.ordinaryConfiguration }
+        let qwen4JANGHPreparation = jangHPreparation == nil
+            ? try Qwen4ExpJANGHPreparation.loadIfDeclared(directory: modelDirectory, configurationData: configData)
+            : nil
+        if let qwen4JANGHPreparation { configData = qwen4JANGHPreparation.banks.ordinaryConfiguration }
         let baseConfig: BaseConfiguration
         do {
             baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
@@ -648,6 +652,9 @@ public final class VLMModelFactory: ModelFactory {
         do {
             if let jangHPreparation {
                 model = try jangHPreparation.construct(requesting: configuration.requestedModalities)
+            } else if let qwen4JANGHPreparation {
+                model = try qwen4JANGHPreparation.construct(
+                    configurationData: mergedConfigData, requesting: configuration.requestedModalities)
             } else {
                 model = try await typeRegistry.createModel(
                     configuration: mergedConfigData, modelType: dispatchModelType,
