@@ -78,7 +78,11 @@ public enum ModelRegistry {
         // Collapse `flux.1-schnell` → `flux1-schnell`.
         let collapsed = key.replacingOccurrences(of: ".", with: "")
                            .replacingOccurrences(of: "_", with: "-")
-        return lookup(name: collapsed)
+        if let entry = lookup(name: collapsed) { return entry }
+        // Bundle directory names (`Qwen-Image-2.1-mflux-8bit`, `ideogram-4-mflux-q4`)
+        // route through the same family rules the local store uses, so callers that
+        // resolve defaults by directory name get the family's steps/guidance.
+        return MLXStudioModelStore.canonicalName(for: name).flatMap { lookup(name: $0) }
     }
 
     /// Enumerate all registered models (for UI listing).

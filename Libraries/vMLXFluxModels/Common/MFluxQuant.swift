@@ -38,6 +38,10 @@ final class MFluxStore {
         var candidates = [key]
         if component.hasPrefix("text_encoder") {
             candidates.append("model.\(key)")
+            // mflux-saved bundles drop the HF `language_model.` prefix.
+            if key.hasPrefix("language_model.") {
+                candidates.append(String(key.dropFirst("language_model.".count)))
+            }
         }
         for candidate in candidates {
             if let value = loaded.componentWeights[component]?[candidate] { return value }

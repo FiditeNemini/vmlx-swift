@@ -147,19 +147,24 @@ enum Ideogram4BundleValidator {
             }
         }
 
+        // Resolve keys through MFluxStore so diffusers (`language_model.*`) and
+        // mflux-saved (prefix-free) text-encoder layouts both validate.
+        let store = MFluxStore(loaded)
         for component in requiredWeightsByComponent.keys.sorted() {
             guard let weights = loaded.componentWeights[component], !weights.isEmpty else {
                 reasons.append("missing \(component) component")
                 continue
             }
-            for key in requiredWeightsByComponent[component, default: []] where weights[key] == nil {
+            for key in requiredWeightsByComponent[component, default: []] where !store.hasKey(component, key) {
                 reasons.append("missing \(component) weight \(key)")
             }
             for prefix in requiredQuantizedLinearsByComponent[component, default: []] {
-                if hasFp8Linear(prefix, in: weights) || hasNF4Linear(prefix, in: weights) {
+                if hasFp8Linear(prefix, in: weights) || hasNF4Linear(prefix, in: weights)
+                    || hasGroupQuantLinear(prefix, in: weights)
+                {
                     continue
                 }
-                reasons.append("missing \(component) quant metadata for \(prefix) (fp8 weight_scale or bitsandbytes NF4 absmax/quant_map/state)")
+                reasons.append("missing \(component) quant metadata for \(prefix) (fp8 weight_scale, bitsandbytes NF4 absmax/quant_map/state, or MLX group scales)")
             }
         }
 
@@ -176,5 +181,10 @@ enum Ideogram4BundleValidator {
         weights["\(prefix).weight.absmax"] != nil &&
             weights["\(prefix).weight.quant_map"] != nil &&
             weights["\(prefix).weight.quant_state.bitsandbytes__nf4"] != nil
+    }
+
+    /// mflux `-q 4/8` saves: packed uint32 `weight` + `scales` (+ `biases`).
+    private static func hasGroupQuantLinear(_ prefix: String, in weights: [String: MLXArray]) -> Bool {
+        weights["\(prefix).weight"] != nil && weights["\(prefix).scales"] != nil
     }
 }
