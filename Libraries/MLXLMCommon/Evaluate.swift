@@ -2219,8 +2219,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         // seed. Warm/media requests retain their original fallback behavior.
         let canonicalTargets: [Int]
         if let coordinator = self.cacheCoordinator, coordinator.canPersistBoundaries,
-           !self.disableDiskBackedRequiredToolRestore,
-           !self.skipDiskBackedToolPromptSeedBoundary,
+           // These are fresh in-request checkpoints, not restored disk state.
+           // Required-tool restore and whole-prompt N-1 exclusions stay below.
            inputForPrepare.text.tokens.size == self.promptTokenIds.count,
            cacheRequiresDiskBackedCoordinatorRestore(self.cache),
            let strip = self.hybridStripBoundary {

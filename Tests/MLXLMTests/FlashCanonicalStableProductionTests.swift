@@ -226,14 +226,18 @@ final class FlashCanonicalStableProductionTests: XCTestCase {
     func testSmallStableBoundaryDoesNotPreventLaterCanonicalCapture() throws {
         try exercise(multiple: true, smallAndLarge: true)
     }
-    private func exercise(multiple: Bool, smallAndLarge: Bool = false) throws {
+    func testRequiredFreshSelectionSkipsExistingDiskButCapturesOwnStableSeed() throws {
+        try exercise(multiple: false, freshRequired: true)
+    }
+    private func exercise(multiple: Bool, smallAndLarge: Bool = false, freshRequired: Bool = false) throws {
         try MLXMetalTestLock.withLock {
             try Self.withFixture(routedBits: [2, 3, 4], inputProjectionBits: 2) { real in
                 let prompt = (0..<60).map { 2 + ($0 * 17) % 113 }
                 let stable = smallAndLarge ? [9, 37] : (multiple ? [33, 37] : [37])
                 let parameters = GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 16)
                 let input = LMInput(tokens: MLXArray(prompt.map(Int32.init)).reshaped(1, prompt.count),
-                    mask: MLXArray.ones([1, prompt.count], dtype: .int8), tokenIds: prompt, cachePrefixTokenCounts: stable + [52], cacheStablePrefixTokenCounts: stable)
+                    mask: MLXArray.ones([1, prompt.count], dtype: .int8), tokenIds: prompt, cachePrefixTokenCounts: stable + [52], cacheStablePrefixTokenCounts: stable,
+                    cacheRestorePolicy: freshRequired ? .freshRequiredToolSelection : .standard)
                 let directory = FileManager.default.temporaryDirectory.appendingPathComponent("canonical-production-\(UUID().uuidString)")
                 defer { try? FileManager.default.removeItem(at: directory) }
                 let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
@@ -241,11 +245,32 @@ final class FlashCanonicalStableProductionTests: XCTestCase {
                     diskCacheDir: directory, modelKey: "tiny-canonical-production"))
                 coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true, requiresSeparateRecurrentPayload: false)
                 coordinator.setGenPromptSuffixTokens(Array(prompt.suffix(8)))
+                if freshRequired {
+                    let prior = real.newCache(parameters: parameters)
+                    _ = try feed(Array(prompt.prefix(52)), model: real, cache: prior)
+                    coordinator.storeAfterGeneration(promptTokens: Array(prompt.prefix(52)), perLayerData: [],
+                        ssmStates: extractSSMStates(from: prior), cache: prior,
+                        mediaSalt: computeCacheSalt(for: input, parameters: parameters))
+                    // Demonstrate that a usable disk restore exists, rather than
+                    // mistaking an empty cache for successful restore exclusion.
+                    guard case .hit(let matched, _, let detail, _, _, _) = coordinator.fetch(
+                        tokens: prompt, mediaSalt: computeCacheSalt(for: input, parameters: parameters)) else {
+                        XCTFail("Required-tool control needs an actual usable prior disk prefix"); return
+                    }
+                    XCTAssertEqual(matched, 52); XCTAssertEqual(detail, .disk)
+                    XCTAssertFalse(coordinator.hasDurableDiskEntry(tokens: Array(prompt.prefix(36)),
+                        mediaSalt: computeCacheSalt(for: input, parameters: parameters)))
+                }
+                let hitsBefore = coordinator.snapshotStats().diskStats?.hits
                 let model = CaptureModel(real)
                 let progress = ProgressRows()
                 var iterator = try TokenIterator(input: input, model: model, parameters: parameters,
                     cacheCoordinator: coordinator, prefillProgressHandler: { progress.add($0) })
                 XCTAssertEqual(model.preparedLengths, [52, 8])
+                if freshRequired {
+                    XCTAssertEqual(coordinator.snapshotStats().diskStats?.hits, hitsBefore,
+                        "Required generation must not fetch the proven available disk prefix")
+                }
                 let baselineProgress = ProgressRows()
                 let baselineCoordinator = CacheCoordinator(config: CacheCoordinatorConfig(
                     usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 0.1,
@@ -253,7 +278,8 @@ final class FlashCanonicalStableProductionTests: XCTestCase {
                 baselineCoordinator.setHybrid(true, requiresRecurrentSSMCompanion: true, requiresSeparateRecurrentPayload: false)
                 baselineCoordinator.setGenPromptSuffixTokens(Array(prompt.suffix(8)))
                 let baselineInput = LMInput(tokens: input.text.tokens, mask: input.text.mask, tokenIds: prompt,
-                    cachePrefixTokenCounts: stable + [52], cacheStablePrefixTokenCounts: [])
+                    cachePrefixTokenCounts: stable + [52], cacheStablePrefixTokenCounts: [],
+                    cacheRestorePolicy: freshRequired ? .freshRequiredToolSelection : .standard)
                 let baseline = try TokenIterator(input: baselineInput, model: real, parameters: parameters,
                     cacheCoordinator: baselineCoordinator, prefillProgressHandler: { baselineProgress.add($0) })
                 XCTAssertEqual(progress.values, baselineProgress.values,
@@ -264,6 +290,11 @@ final class FlashCanonicalStableProductionTests: XCTestCase {
                 XCTAssertEqual(Array(model.preparedLengths.dropFirst(2)), smallAndLarge ? [8, 4] : [4],
                     "Production storage must replay residual4, not full32/36; no injected snapshots")
                 XCTAssertTrue(iterator.cache.map(SubmissionCache.init) == live)
+                if freshRequired {
+                    XCTAssertFalse(coordinator.hasDurableDiskEntry(tokens: Array(prompt.prefix(59)),
+                        mediaSalt: computeCacheSalt(for: input, parameters: parameters)),
+                        "Whole-prompt N-1 tool seed remains forbidden; only declared stable36 is published")
+                }
                 XCTAssertTrue(progress.completed.contains(16) && progress.completed.contains(32)
                     && progress.completed.contains(48), "Original progress must remain visible")
                 for boundary in stable {
