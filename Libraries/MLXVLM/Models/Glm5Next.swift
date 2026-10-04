@@ -74,6 +74,18 @@ enum Glm5NextPrefillMemoryProbe {
 }
 
 public enum Glm5NextIndexerRuntime {
+    static func layoutRangeCountIsRepresentable(_ count: Int) -> Bool {
+        count >= 0 && Int32(exactly: count) != nil
+    }
+
+    /// Build context-sized index layouts on device instead of copying a host integer range.
+    /// Explicit Int32 construction preserves selection and mask indices without Float rounding.
+    static func layoutRange(_ count: Int) -> MLXArray {
+        precondition(layoutRangeCountIsRepresentable(count), "GLM layout count exceeds Int32 range")
+        let stop = Int32(count)
+        return arange(Int(stop), dtype: .int32)
+    }
+
     nonisolated(unsafe) static var poolFP32: Bool = {
         ProcessInfo.processInfo.environment["VMLX_GLM5_INDEX_FP32"] == "1"
     }()
@@ -1242,7 +1254,7 @@ extension Glm5NextIndexer {
         }
 
         let poolCount = (N + poolSize - 1) / poolSize
-        let offsets = MLXArray(Int32(0) ..< Int32(poolCount * poolSize))
+        let offsets = Glm5NextIndexerRuntime.layoutRange(poolCount * poolSize)
             .reshaped(poolCount, poolSize)
         let poolIndices = offsets + start
         let safe = clip(poolIndices, min: MLXArray(Int32(0)), max: MLXArray(Int32(N - 1)))
@@ -1330,7 +1342,7 @@ extension Glm5NextIndexer {
 
         // A pool is a candidate only if its LAST token is visible to this query — which is what
         // makes the selection causal without materialising a per-token comparison.
-        let kvPositions = MLXArray(Int32(0) ..< Int32(N))
+        let kvPositions = Glm5NextIndexerRuntime.layoutRange(N)
         let queryPositions = MLXArray(Int32(queryOffset) ..< Int32(queryOffset + S))
         let causal = kvPositions[.newAxis, 0...] .<= queryPositions[0..., .newAxis]  // (S, N)
         let validKeys = packed[.ellipsis, 2 * headDim] .!= MLXArray(Float(0))  // (B, N)
