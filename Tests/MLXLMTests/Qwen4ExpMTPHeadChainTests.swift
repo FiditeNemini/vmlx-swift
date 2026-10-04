@@ -16,6 +16,22 @@ final class Qwen4ExpMTPHeadChainTests: XCTestCase {
                          sequential: false, sampled: true, cycles: 2)
     }
 
+    func testSampledChunkRejectedPartialAndFullCommitsMatchOracle() throws {
+        for depth in [2, 3] {
+            var observed: Set<String> = []
+            // Fixed independent grid; all rows run, with no target-ID forcing.
+            for vocabulary in [2, 128] {
+                for seed in 9041...9056 {
+                    let accepted = try exercise(depth: depth, seed: seed,
+                        vocabulary: vocabulary, sequential: false, sampled: true)
+                    observed.insert(accepted == 0 ? "reject" : accepted == depth ? "full" : "partial")
+                }
+            }
+            print("MTP-SAMPLED-CHUNK-CATEGORIES depth=\(depth) seeds=9041...9056 vocabularies=[2,128] observed=\(observed.sorted())")
+            XCTAssertEqual(observed, Set(["reject", "partial", "full"]))
+        }
+    }
+
     func testDepthOneCommittedHeadMatchesOracle() throws { _ = try exercise(depth: 1) }
     func testDepthThreeInitialCommittedHeadMatchesOracle() throws { _ = try exercise(depth: 3) }
 
