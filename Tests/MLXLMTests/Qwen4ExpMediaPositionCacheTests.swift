@@ -89,4 +89,33 @@ final class Qwen4ExpMediaPositionCacheTests: XCTestCase {
         guard case .logits(let output) = result else { return XCTFail("Expected suffix logits") }
         assertEqualLogits(reference, output.logits)
     }
+    func testLegacyDiskRecordWithoutPositionRefusesBeforeMutatingSibling() throws {
+        let (model, cache) = try mediaPrefix()
+        var arrays = TQDiskSerializer.serialize(cache: cache, preserveStandardKVStorageDType: true)
+        arrays.removeValue(forKey: "__qsa_1_media_position_offset__")
+        var restored = model.newCache(parameters: nil)
+        XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored, requirePromptBoundary: true), 0)
+        XCTAssertTrue(restored.allSatisfy { $0.offset == 0 && $0.state.isEmpty })
+    }
+
+    func testMalformedPositionMetadataRefusesWholeRecord() throws {
+        let (model, cache) = try mediaPrefix()
+        for damaged in [MLXArray([Int32(1), 2]), MLXArray(Float(1))] {
+            var arrays = TQDiskSerializer.serialize(cache: cache, preserveStandardKVStorageDType: true)
+            arrays["__qsa_1_media_position_offset__"] = damaged
+            var restored = model.newCache(parameters: nil)
+            XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored, requirePromptBoundary: true), 0)
+            XCTAssertTrue(restored.allSatisfy { $0.offset == 0 && $0.state.isEmpty })
+        }
+    }
+
+    func testNativeBackbonePathsUseSameRestoredMediaPositions() throws {
+        let (model, cache) = try mediaPrefix()
+        let token = MLXArray([Int32(3)]).reshaped(1, 1)
+        let reference = model(token, cache: cache.map { $0.copy() })
+        assertEqualLogits(reference, model.nativeBackboneForward(token, cache: cache.map { $0.copy() }).logits)
+        assertEqualLogits(reference, model.nativeAutoregressiveBackboneForward(token, cache: cache.map { $0.copy() }).logits)
+        assertEqualLogits(reference, model.nativeBackboneMTPVerifyForward(token, cache: cache.map { $0.copy() }).logits)
+    }
+
 }

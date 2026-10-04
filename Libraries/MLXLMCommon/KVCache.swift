@@ -612,6 +612,19 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 /// sync with `offset` across trim/rollback or block selection reads keys
 /// from the wrong positions.
 public class QSAKVCache: KVCacheSimple {
+    /// M-RoPE continuation offset belongs to the conversation cache, not the model.
+    /// Required caches reject old disk records that did not persist this value.
+    /// Keeping this scalar on the host avoids a GPU readback on each decode step.
+    public private(set) var requiresMediaPositionOffset = false
+    public var mediaPositionOffset: Int?
+
+    public init(requiringMediaPositionOffset: Bool) {
+        self.requiresMediaPositionOffset = requiringMediaPositionOffset
+        self.mediaPositionOffset = requiringMediaPositionOffset ? 0 : nil
+        useIndexerCapacity = RuntimeEnvironment.value("VMLX_QSA_RAW_CAPACITY") != "0"
+        super.init()
+    }
+
     private var indexerKeyStorage: MLXArray?
     private var indexerKeyCount = 0
     private let useIndexerCapacity: Bool
@@ -773,6 +786,8 @@ public class QSAKVCache: KVCacheSimple {
 
     public override func copy() -> any KVCache {
         let new = QSAKVCache(useIndexerCapacity: useIndexerCapacity)
+        new.requiresMediaPositionOffset = requiresMediaPositionOffset
+        new.mediaPositionOffset = mediaPositionOffset
         new.step = self.step
         new.offset = self.offset
         let s = self.state

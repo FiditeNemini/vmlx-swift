@@ -923,6 +923,10 @@ private func restoreFromV2Arrays(
             continue
         }
         switch entry.data {
+        case .qsaKV(let component):
+            guard let qsa = cache[entry.index] as? QSAKVCache,
+                  !qsa.requiresMediaPositionOffset || component.mediaPositionOffset != nil
+            else { return 0 }
         case .mamba, .cacheList:
             guard canRestoreMambaRecords(entry.data, into: cache[entry.index]) else { return 0 }
         case .qkv(let comp):
@@ -1042,6 +1046,7 @@ private func restoreFromV2Arrays(
                 return 0
             }
             qsa.state = [keys, values, indexer]
+            qsa.mediaPositionOffset = comp.mediaPositionOffset
             if totalTokens == 0 {
                 totalTokens = keys.dim(2)
             }

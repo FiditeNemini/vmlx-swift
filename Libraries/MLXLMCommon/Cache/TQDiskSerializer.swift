@@ -329,6 +329,9 @@ public enum TQDiskSerializer {
                     result["kv_\(i)_keys"] = state[0]
                     result["kv_\(i)_values"] = state[1]
                     result["kv_\(i)_indexer_keys"] = state[2]
+                    if let position = qsa.mediaPositionOffset {
+                        result["__qsa_\(i)_media_position_offset__"] = metaInt32(Int32(position))
+                    }
                     result[kindKey(for: i)] = kindArray(.qsaKV)
                 } else {
                     // A QSA layer whose indexer lane is missing cannot be
@@ -917,6 +920,15 @@ public enum TQDiskSerializer {
         public let keys: MLXArray
         public let values: MLXArray
         public let indexerKeys: MLXArray
+        public let mediaPositionOffset: Int?
+
+        public init(keys: MLXArray, values: MLXArray, indexerKeys: MLXArray,
+                    mediaPositionOffset: Int? = nil) {
+            self.keys = keys
+            self.values = values
+            self.indexerKeys = indexerKeys
+            self.mediaPositionOffset = mediaPositionOffset
+        }
     }
 
     /// Mamba SSM state for a single hybrid layer. `state1` is nil for
@@ -1165,6 +1177,12 @@ public enum TQDiskSerializer {
                     index: i,
                     data: state.count == header.count ? .modelState(header, state) : .requiredMiss))
             case .qsaKV:
+                let positionArray = arrays["__qsa_\(i)_media_position_offset__"]
+                let position = positionArray.flatMap(readMetaInt32).map(Int.init)
+                if positionArray != nil && position == nil {
+                    out.append(IndexedLayerData(index: i, data: .requiredMiss))
+                    continue
+                }
                 if let keys = arrays["kv_\(i)_keys"],
                    let values = arrays["kv_\(i)_values"],
                    let indexer = arrays["kv_\(i)_indexer_keys"]
@@ -1174,7 +1192,8 @@ public enum TQDiskSerializer {
                             index: i,
                             data: .qsaKV(
                                 QSAKVLayerComponents(
-                                    keys: keys, values: values, indexerKeys: indexer))
+                                    keys: keys, values: values, indexerKeys: indexer,
+                                    mediaPositionOffset: position))
                         )
                     )
                 } else {

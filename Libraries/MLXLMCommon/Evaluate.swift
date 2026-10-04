@@ -3375,9 +3375,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         if tokens.count == storageSnapshotTokenCount {
             return storageSnapshot.map { $0.copy() }
         }
+        guard let boundaryInput = originalInput.inputForCacheBoundary(
+            tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
+        let keepsMedia = !originalInput.hasMediaContent || boundaryInput.hasMediaContent
         let trimCount = storageSnapshotTokenCount - tokens.count
         let trimmed = storageSnapshot.map { $0.copy() }
-        if canTrimPromptCache(trimmed),
+        if keepsMedia, canTrimPromptCache(trimmed),
            trimPromptCache(trimmed, numTokens: trimCount) == trimCount
         {
             MLX.eval(trimmed)
@@ -3400,15 +3403,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         do {
-            let boundaryTokens = MLXArray(tokens.map { Int32($0) })
-                .reshaped(1, tokens.count)
-            let boundaryInput = LMInput(
-                text: LMInput.Text(tokens: boundaryTokens),
-                image: originalInput.image,
-                video: originalInput.video,
-                audio: originalInput.audio,
-                mediaTokenIds: originalInput.mediaTokenIds,
-                cacheScopeSalt: originalInput.cacheScopeSalt)
             let cache = model.newCache(parameters: cacheInitParameters)
             let rederiveWindow = cacheInitParameters?.prefillStepSize ?? 512
             switch try model.prepare(

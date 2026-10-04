@@ -1653,14 +1653,6 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     /// checkpoint.
     private var proposalHead: QuantizedLinear?
 
-    /// M-RoPE delta established by the most recent media prefill, keyed by the
-    /// conversation's cache identity so concurrent sessions do not cross.
-    /// Decode positions after a media prefill continue at
-    /// `cache.offset + delta`, matching the reference runtime's
-    /// `_rope_deltas` contract. Text-only conversations keep delta 0.
-    private let ropeDeltaLock = NSLock()
-    nonisolated(unsafe) private var ropeDeltas: [ObjectIdentifier: Int] = [:]
-
     /// What this instance actually carries. Same contract as every other multimodal family here.
     public let modalities: Set<ModelRuntimeRequestModality>
 
@@ -1761,18 +1753,15 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     }
 
     private func setRopeDelta(_ delta: Int, for cache: [KVCache]?) {
-        guard let first = cache?.first else { return }
-        ropeDeltaLock.lock()
-        defer { ropeDeltaLock.unlock() }
-        if ropeDeltas.count > 128 { ropeDeltas.removeAll() }
-        ropeDeltas[ObjectIdentifier(first as AnyObject)] = delta
+        positionCache(in: cache)?.mediaPositionOffset = delta
+    }
+
+    private func positionCache(in cache: [KVCache]?) -> QSAKVCache? {
+        cache?.first(where: { $0 is QSAKVCache }) as? QSAKVCache
     }
 
     private func ropeDelta(for cache: [KVCache]?) -> Int {
-        guard let first = cache?.first else { return 0 }
-        ropeDeltaLock.lock()
-        defer { ropeDeltaLock.unlock() }
-        return ropeDeltas[ObjectIdentifier(first as AnyObject)] ?? 0
+        positionCache(in: cache)?.mediaPositionOffset ?? 0
     }
 
     public var vocabularySize: Int { config.base.vocabSize }
@@ -1790,13 +1779,14 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        textModel.layers.map { layer in
+        let firstAttention = textModel.layers.firstIndex { !$0.isLinear }
+        return textModel.layers.enumerated().map { index, layer in
             if layer.isLinear {
                 return MambaCache(
                     slots: layer.ple == nil ? 2 : 6,
                     persistentSlotCount: layer.ple == nil ? 2 : 4) as KVCache
             }
-            return QSAKVCache() as KVCache
+            return QSAKVCache(requiringMediaPositionOffset: index == firstAttention) as KVCache
         }
     }
 
@@ -1804,7 +1794,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         let inputIds = input.text.tokens
 
         guard input.image != nil || input.video != nil else {
-            setRopeDelta(0, for: cache)
+            if cache.allSatisfy({ $0.offset == 0 }) { setRopeDelta(0, for: cache) }
             // Native MTP calls prepare directly, unlike the batch AR lane's
             // outer segmentation. Honor the same prefill budget here so a
             // cold or required-tool request cannot materialize a whole long
@@ -1985,7 +1975,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         }
         let forward = textModel.forward(
             inputIds[.newAxis], cache: cache,
-            pleEmbeddings: pleEmbeddings)
+            pleEmbeddings: pleEmbeddings, positionOffset: ropeDelta(for: cache))
         return projectToLogits(forward.mixed)
     }
 
@@ -2024,7 +2014,8 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     public func nativeBackboneForward(
         _ inputs: MLXArray, cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        let forward = textModel.forward(inputs, cache: cache)
+        let forward = textModel.forward(
+            inputs, cache: cache, positionOffset: ropeDelta(for: cache))
         return NativeMTPForwardResult(
             logits: projectToLogits(forward.mixed),
             hiddenStates: forward.preMixer)
@@ -2033,7 +2024,8 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     public func nativeAutoregressiveBackboneForward(
         _ inputs: MLXArray, cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        let forward = textModel.forward(inputs, cache: cache, autoregressive: true)
+        let forward = textModel.forward(
+            inputs, cache: cache, positionOffset: ropeDelta(for: cache), autoregressive: true)
         return NativeMTPForwardResult(
             logits: projectToLogits(forward.mixed), hiddenStates: forward.preMixer)
     }
@@ -2042,7 +2034,8 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         _ inputs: MLXArray, cache: [KVCache]?
     ) -> NativeMTPForwardResult {
         let forward = textModel.forward(
-            inputs, cache: cache, recordPrefixCommitStates: true)
+            inputs, cache: cache, recordPrefixCommitStates: true,
+            positionOffset: ropeDelta(for: cache))
         return NativeMTPForwardResult(
             logits: projectToLogits(forward.mixed),
             hiddenStates: forward.preMixer)

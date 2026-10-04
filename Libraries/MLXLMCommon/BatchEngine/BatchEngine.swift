@@ -3565,9 +3565,12 @@ public actor BatchEngine {
                 {
                     return makePromptBoundaryCacheSnapshot(from: seed.cache)
                 }
+                guard let mediaBoundaryInput = slot.originalInput.inputForCacheBoundary(
+                    tokens: tokens, fullPromptTokenIds: promptTokens) else { return nil }
+                let keepsMedia = !slot.originalInput.hasMediaContent || mediaBoundaryInput.hasMediaContent
                 let trimCount = storageSnapshotTokenCount - tokens.count
                 let trimmed = storageTopologySnapshot.map { $0.copy() }
-                if canTrimPromptCache(trimmed),
+                if keepsMedia, canTrimPromptCache(trimmed),
                    trimPromptCache(trimmed, numTokens: trimCount) == trimCount
                 {
                     MLX.eval(trimmed)
@@ -3597,7 +3600,7 @@ public actor BatchEngine {
                         layer.isTrimmable || layer is MambaCache
                             || layer is ArraysCache
                     }
-                    if nonTrimmableAreRecurrent {
+                    if keepsMedia, nonTrimmableAreRecurrent {
                         var trimmedAll = true
                         for layer in rebuilt where layer.isTrimmable {
                             if layer.trim(trimCount) != trimCount {
@@ -3695,15 +3698,8 @@ public actor BatchEngine {
                     if reusableSeed == nil { boundaryReplaySeed = nil }
                     let reusedCount = reusableSeed?.tokens.count ?? 0
                     let remainingTokens = Array(tokens.dropFirst(reusedCount))
-                    let boundaryTokens = MLXArray(remainingTokens.map { Int32($0) })
-                        .reshaped(1, remainingTokens.count)
-                    let boundaryInput = LMInput(
-                        text: LMInput.Text(tokens: boundaryTokens),
-                        image: slot.originalInput.image,
-                        video: slot.originalInput.video,
-                        audio: slot.originalInput.audio,
-                        mediaTokenIds: slot.originalInput.mediaTokenIds,
-                        cacheScopeSalt: slot.originalInput.cacheScopeSalt)
+                    guard let boundaryInput = slot.originalInput.inputForCacheBoundary(
+                        tokens: remainingTokens, fullPromptTokenIds: promptTokens) else { return nil }
                     let cache = reusableSeed.map {
                         // Full chunked prefill clears freed allocator blocks
                         // between chunks. Reuse skips those chunks, so preserve

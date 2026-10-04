@@ -335,6 +335,42 @@ public extension LMInput {
         image != nil || video != nil || audio != nil
     }
 
+    /// Build a fresh-prefill input for an exact cache boundary. Opaque media
+    /// tensors belong to their complete placeholder span: omit them before
+    /// that span, keep them after it, and decline a boundary inside it.
+    /// Model-side token pruning and undeclared media IDs cannot be partitioned.
+    func inputForCacheBoundary(tokens: [Int], fullPromptTokenIds: [Int]) -> LMInput? {
+        guard !tokens.isEmpty else { return nil }
+        var keepMedia = false
+        if hasMediaContent {
+            guard !requiresPostPrepareCacheKey,
+                  tokens.count <= fullPromptTokenIds.count,
+                  tokens.elementsEqual(fullPromptTokenIds.prefix(tokens.count)),
+                  let mediaTokenIds, !mediaTokenIds.isEmpty
+            else { return nil }
+            let media = Set(mediaTokenIds)
+            let inHead = tokens.contains(where: media.contains)
+            let inTail = fullPromptTokenIds.dropFirst(tokens.count).contains(where: media.contains)
+            guard inHead != inTail else { return nil }
+            keepMedia = inHead
+        }
+        var boundaryMask: MLXArray?
+        if let mask = text.mask {
+            guard mask.size == fullPromptTokenIds.count else { return nil }
+            let flat = mask.reshaped(-1)[..<tokens.count]
+            boundaryMask = mask.ndim >= 2 ? flat[.newAxis, 0...] : flat
+        }
+        return LMInput(
+            text: Text(tokens: MLXArray(tokens.map(Int32.init)).reshaped(1, tokens.count),
+                       mask: boundaryMask, tokenIds: tokens),
+            image: keepMedia ? image : nil,
+            video: keepMedia ? video : nil,
+            audio: keepMedia ? audio : nil,
+            mediaTokenIds: mediaTokenIds, cacheScopeSalt: cacheScopeSalt,
+            cachePromptIntent: cachePromptIntent, cacheRestorePolicy: cacheRestorePolicy,
+            toolSchemas: toolSchemas)
+    }
+
     /// Whether a hybrid-cache snapshot taken at `boundary` can safely carry
     /// this request's media-derived state into a later growing-chat request.
     ///
