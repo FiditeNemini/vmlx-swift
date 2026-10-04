@@ -2,7 +2,7 @@ import Foundation
 import MLX
 
 /// Model-owned checkpoint signal. Unlike UI progress, this reports a materialized
-/// complete chunk from an unchanged, cold Qwen4Exp text preparation.
+/// complete chunk from an unchanged, cold model-owned text preparation.
 public enum CanonicalTextPrefillCheckpointReporter {
     private final class Scope {
         let capture: CanonicalStablePrefillCapture
@@ -30,6 +30,17 @@ public enum CanonicalTextPrefillCheckpointReporter {
         beganWithEmptyCache: Bool
     ) {
         guard let scope = Thread.current.threadDictionary[key] as? Scope else { return }
+        guard scope.capture.modelIdentity == nil else { return }
+        scope.capture.receive(input: input, cache: cache, chunkSize: chunkSize,
+                              completed: completed, beganWithEmptyCache: beganWithEmptyCache)
+    }
+
+    public static func reportModelColdTextChunk(
+        modelIdentity: String, input: LMInput, cache: [KVCache], chunkSize: Int,
+        completed: Int, beganWithEmptyCache: Bool
+    ) {
+        guard let scope = Thread.current.threadDictionary[key] as? Scope,
+              scope.capture.modelIdentity == modelIdentity else { return }
         scope.capture.receive(input: input, cache: cache, chunkSize: chunkSize,
                               completed: completed, beganWithEmptyCache: beganWithEmptyCache)
     }
@@ -40,6 +51,7 @@ public enum CanonicalTextPrefillCheckpointReporter {
 final class CanonicalStablePrefillCapture {
     let chunkSize: Int
     let seedCount: Int
+    let modelIdentity: String?
     private let promptTokens: [Int]
     private let salt: String?
     private let owners: [ObjectIdentifier]
@@ -47,17 +59,20 @@ final class CanonicalStablePrefillCapture {
     private(set) var snapshot: [KVCache]?
 
     init?(input: LMInput, promptTokens: [Int], cache: [KVCache],
-          chunkSize: Int, targets: [Int], salt: String?) {
+          chunkSize: Int, targets: [Int], salt: String?,
+          canonicalModel: (any CanonicalRequiredToolCacheModel)? = nil) {
         guard chunkSize > 0, !input.hasMediaContent, !input.requiresPostPrepareCacheKey,
               input.cachePromptIntent != .auxiliary,
               input.text.mask == nil || input.text.mask?.size == promptTokens.count,
               !cache.isEmpty, cache.allSatisfy({ $0.offset == 0 && $0.state.isEmpty }),
-              cache.allSatisfy({ type(of: $0) == MambaCache.self || type(of: $0) == QSAKVCache.self }),
+              canonicalModel.map({ $0.validateCanonicalRequiredToolCache(cache, boundary: 0) })
+                ?? cache.allSatisfy({ type(of: $0) == MambaCache.self || type(of: $0) == QSAKVCache.self }),
               let first = targets.filter({ $0 >= chunkSize && $0 < promptTokens.count }).min()
         else { return nil }
         let seed = (first / chunkSize) * chunkSize
         guard seed > 0 else { return nil }
         self.chunkSize = chunkSize; seedCount = seed
+        modelIdentity = canonicalModel?.canonicalRequiredToolCacheIdentity
         self.promptTokens = promptTokens; self.salt = salt
         owners = cache.map { ObjectIdentifier($0 as AnyObject) }
         schema = cache.map { String(reflecting: type(of: $0)) }

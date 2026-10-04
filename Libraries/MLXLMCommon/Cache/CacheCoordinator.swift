@@ -518,31 +518,86 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// active resume point; do not write a large row merely to evict it again.
     func storeCanonicalCheckpoint(
         tokens: [Int], cache: [KVCache], chunkSize: Int,
-        requestSalt: String?, chainId: String?
+        requestSalt: String?, chainId: String?,
+        canonicalModel: (any CanonicalRequiredToolCacheModel)? = nil,
+        requiredResumeTokens: [Int]? = nil, ordinaryRequestSalt: String? = nil
     ) {
-        guard config.enableDiskCache, let diskCache,
+        guard canonicalModel == nil || !Task.isCancelled, config.enableDiskCache, let diskCache,
             diskCache.indexHasReplayChunkColumn, ssmStateCache.diskStore != nil,
             let chainId, !chainId.isEmpty,
             let contract = CanonicalPrefillCheckpoint(chunkSize: chunkSize),
             !tokens.isEmpty, tokens.count % chunkSize == 0,
             !cache.isEmpty,
-            cache.allSatisfy({ ($0 is KVCacheSimple || $0 is RotatingKVCache) && $0.offset == tokens.count }),
+            canonicalModel.map({ $0.validateCanonicalRequiredToolCache(cache, boundary: tokens.count) })
+                ?? cache.allSatisfy({ ($0 is KVCacheSimple || $0 is RotatingKVCache) && $0.offset == tokens.count }),
             CacheStoreBudget.canStore(cache)
         else { return }
         CombinedDiskCacheQuotaLock.shared.lock()
         defer { CombinedDiskCacheQuotaLock.shared.unlock() }
+        let resumeRows = diskCache.quotaEntries(retiringInvalidRecords: false)
+            .filter { $0.chainId == chainId && !$0.isCanonicalCheckpoint }
+        // A GLM acceleration seed is optional: a normal active resume point
+        // must already exist and remain beside it. Never replace that contract.
+        if canonicalModel != nil {
+            guard let resume = requiredResumeTokens, resume.count > tokens.count,
+                  resume.starts(with: tokens),
+                  hasValidatedDiskEntry(tokens: resume, mediaSalt: ordinaryRequestSalt) else { return }
+            let resumeHash = DiskCache.hashTokens(resume, modelKey: diskCache.modelKey, mediaSalt: ordinaryRequestSalt)
+            guard resumeRows.contains(where: { $0.isResumeBoundary && $0.hash == resumeHash }) else { return }
+        }
         let arrays = TQDiskSerializer.serialize(cache: cache, preserveStandardKVStorageDType: true)
         let bytes = IndexedBytes.total(arrays.values.map { Int64($0.nbytes) })
         let cap = Int64(max(1, diskCache.maxSizeBytes))
         // A conservative header allowance avoids writing right at the cap.
-        let resumeBytes = diskCache.quotaEntries(retiringInvalidRecords: false)
-            .filter { $0.chainId == chainId && !$0.isCanonicalCheckpoint }
-            .map { IndexedBytes.sum($0.bytes, $0.companionBytes) }.max() ?? 0
+        let resumeBytes = resumeRows.map { IndexedBytes.sum($0.bytes, $0.companionBytes) }.max() ?? 0
         guard IndexedBytes.sum(IndexedBytes.sum(bytes, resumeBytes), 131_072) <= cap else { return }
         diskCache.storeCanonicalCheckpoint(
             tokens: tokens, arrays: arrays, contract: contract,
             requestSalt: requestSalt, chainId: chainId, enforceQuota: false)
         enforceCombinedDiskQuotaLocked(activeChain: chainId)
+    }
+
+    /// Qualified solo required-tool continuation only. Unknown context, ordinary
+    /// namespace rows, altered chunk schedules and incomplete typed state miss.
+    func restoreCanonicalRequiredToolPrefix(
+        input: LMInput, model: any CanonicalRequiredToolCacheModel,
+        cache: [KVCache], parameters: GenerateParameters, ordinarySalt: String?,
+        structuralBoundary: Int
+    ) -> (cache: [KVCache], boundary: Int)? {
+        guard !Task.isCancelled, config.enableDiskCache, let diskCache,
+              cache.allSatisfy({ $0.offset == 0 && $0.state.isEmpty }),
+              let ids = input.text.tokenIds, structuralBoundary > 0, structuralBoundary < ids.count,
+              input.cachePrefixTokenCounts.contains(structuralBoundary),
+              let chunk = model.canonicalRequiredToolChunkSize(parameters: parameters),
+              let contract = CanonicalPrefillCheckpoint(chunkSize: chunk),
+              let salt = canonicalRequiredToolSalt(input: input, model: model, parameters: parameters,
+                  cache: cache, ordinarySalt: ordinarySalt),
+              let entry = diskCache.fetchCanonicalCheckpoint(
+                  targetTokens: Array(ids.prefix(structuralBoundary)), contract: contract, requestSalt: salt),
+              contract.canContinue(seedTokens: entry.tokens, targetTokens: Array(ids.prefix(structuralBoundary)),
+                  storedChunkSize: chunk)
+        else { return nil }
+        var staged = cache.map { $0.copy() }
+        let boundary = MLXCacheIOLock.withSerializedMLXCacheIO { () -> Int in
+            let dtype = entry.arrays[TQDiskSerializer.preserveStandardKVStorageDTypeKey]
+            guard dtype?.size == 1, dtype?.dtype == .int32, dtype?.item(Int32.self) == 1 else { return 0 }
+            let count = restoreFromDiskArrays(entry.arrays, into: &staged, requirePromptBoundary: true)
+            guard count == entry.tokens.count, model.validateCanonicalRequiredToolCache(staged, boundary: count) else { return 0 }
+            MLX.eval(staged)
+            return count
+        }
+        guard !Task.isCancelled, boundary == entry.tokens.count,
+              validateRestoredCacheBoundary(staged, matchedTokens: boundary, restoredTokens: boundary, detail: "canonical_required")
+        else {
+            diskCache.markRestoreRejected(tokens: entry.tokens,
+                mediaSalt: contract.storageSalt(requestSalt: salt), countedHit: false)
+            return nil
+        }
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/canonical-required] accepted=\(boundary) layers=\(staged.count) chunk=\(chunk)\n".utf8))
+        }
+        return (staged, boundary)
     }
 
     /// Whether a prompt-boundary store has any tier to land in. With both tiers

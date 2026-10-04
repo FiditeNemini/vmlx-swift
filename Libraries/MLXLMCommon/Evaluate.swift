@@ -1906,9 +1906,31 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
             let requiresDiskBackedRestore = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
             if requiresDiskBackedRestore && self.disableDiskBackedRequiredToolRestore {
-                Self.logger.info(
-                    "TokenIterator: skipped disk-backed required-tool cache restore; warm restore is not proven safe for this topology"
-                )
+                let structuralBoundary = input.cachePrefixTokenCounts
+                    .filter { $0 > 0 && $0 < cacheLookupTokenIds.count }.max()
+                if let model = self.model as? any CanonicalRequiredToolCacheModel,
+                   let structuralBoundary,
+                   let canonical = coordinator.restoreCanonicalRequiredToolPrefix(
+                    input: input, model: model, cache: self.cache, parameters: effectiveParameters,
+                    ordinarySalt: self.mediaSalt, structuralBoundary: structuralBoundary) {
+                    let suffix = Array(cacheLookupTokenIds.dropFirst(canonical.boundary))
+                    self.cache = canonical.cache
+                    inputForPrepare = LMInput(
+                        text: .init(tokens: MLXArray(suffix.map(Int32.init)).expandedDimensions(axis: 0),
+                            mask: input.text.mask.map { $0.reshaped(-1)[canonical.boundary...].expandedDimensions(axis: 0) },
+                            tokenIds: suffix),
+                        cacheScopeSalt: input.cacheScopeSalt,
+                        cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+                        cacheStablePrefixTokenCounts: input.cacheStablePrefixTokenCounts,
+                        cachePromptIntent: input.cachePromptIntent,
+                        cacheRestorePolicy: input.cacheRestorePolicy, toolSchemas: input.toolSchemas,
+                        canonicalRequiredToolContext: input.canonicalRequiredToolContext)
+                    acceptedCacheRestoreDetail = .disk
+                } else {
+                    Self.logger.info(
+                        "TokenIterator: skipped disk-backed required-tool cache restore; warm restore is not proven safe for this topology"
+                    )
+                }
             } else {
                 let result = coordinator.fetch(
                     tokens: cacheLookupTokenIds,
@@ -2217,8 +2239,27 @@ public struct TokenIterator: TokenIteratorProtocol {
             skipBoundary: self.skipDiskBackedToolPromptSeedBoundary)
         // Only the already-existing cold head prepare may report a canonical
         // seed. Warm/media requests retain their original fallback behavior.
+        let canonicalModel = self.model as? any CanonicalRequiredToolCacheModel
+        let canonicalRequiredSalt = canonicalModel.flatMap {
+            canonicalRequiredToolSalt(input: input, model: $0, parameters: effectiveParameters,
+                cache: self.cache, ordinarySalt: self.mediaSalt)
+        }
+        // Scope the new producer to an eligible explicit selection request.
+        // Ordinary/unqualified requests keep the original legacy capture flow.
+        let requiredCanonicalModel = canonicalRequiredSalt == nil ? nil : canonicalModel
         let canonicalTargets: [Int]
         if let coordinator = self.cacheCoordinator, coordinator.canPersistBoundaries,
+           let canonicalModel, canonicalRequiredSalt != nil,
+           canonicalModel.validateCanonicalRequiredToolCache(self.cache, boundary: 0),
+           let strip = self.hybridStripBoundary,
+           let history = input.cachePrefixTokenCounts.filter({
+               $0 >= effectiveParameters.prefillStepSize && $0 < strip
+                   && !input.cacheStablePrefixTokenCounts.contains($0)
+           }).max() {
+            canonicalTargets = [history]
+        } else if requiredCanonicalModel != nil {
+            canonicalTargets = []
+        } else if let coordinator = self.cacheCoordinator, coordinator.canPersistBoundaries,
            // These are fresh in-request checkpoints, not restored disk state.
            // Required-tool restore and whole-prompt N-1 exclusions stay below.
            inputForPrepare.text.tokens.size == self.promptTokenIds.count,
@@ -2233,7 +2274,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         let canonicalCapture = CanonicalStablePrefillCapture(
             input: input, promptTokens: self.promptTokenIds, cache: self.cache,
             chunkSize: effectiveParameters.prefillStepSize,
-            targets: canonicalTargets, salt: self.mediaSalt)
+            targets: canonicalTargets, salt: requiredCanonicalModel == nil ? self.mediaSalt : canonicalRequiredSalt,
+            canonicalModel: requiredCanonicalModel)
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
                 try CanonicalTextPrefillCheckpointReporter.withCapture(canonicalCapture) {
@@ -2474,7 +2516,8 @@ public struct TokenIterator: TokenIteratorProtocol {
                 mediaTokenIds: input.mediaTokenIds,
                 cacheScopeSalt: input.cacheScopeSalt,
                 cachePromptIntent: input.cachePromptIntent,
-                toolSchemas: input.toolSchemas)
+                toolSchemas: input.toolSchemas,
+                canonicalRequiredToolContext: input.canonicalRequiredToolContext)
             : nil
         let tail = LMInput(
             text: LMInput.Text(
@@ -2487,7 +2530,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             mediaTokenIds: input.mediaTokenIds,
             cacheScopeSalt: input.cacheScopeSalt,
             cachePromptIntent: input.cachePromptIntent,
-            toolSchemas: input.toolSchemas)
+            toolSchemas: input.toolSchemas,
+            canonicalRequiredToolContext: input.canonicalRequiredToolContext)
         return (head, tail)
     }
 
@@ -2987,7 +3031,24 @@ public struct TokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
-        defer { canonicalStablePrefillCapture = nil }
+        defer {
+            if !Task.isCancelled,
+               let coordinator = cacheCoordinator,
+               let model = self.model as? any CanonicalRequiredToolCacheModel,
+               let parameters = cacheInitParameters,
+               let capture = canonicalStablePrefillCapture, capture.modelIdentity == model.canonicalRequiredToolCacheIdentity,
+               let snapshot = capture.snapshot,
+               let salt = canonicalRequiredToolSalt(input: originalInput, model: model,
+                    parameters: parameters, cache: snapshot, ordinarySalt: mediaSalt) {
+                coordinator.storeCanonicalCheckpoint(
+                    tokens: Array(promptTokenIds.prefix(capture.seedCount)), cache: snapshot,
+                    chunkSize: capture.chunkSize, requestSalt: salt, chainId: parameters.cacheChainId,
+                    canonicalModel: model,
+                    requiredResumeTokens: hybridStripBoundary.map { Array(promptTokenIds.prefix($0)) },
+                    ordinaryRequestSalt: mediaSalt)
+            }
+            canonicalStablePrefillCapture = nil
+        }
         guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
             return
         }
