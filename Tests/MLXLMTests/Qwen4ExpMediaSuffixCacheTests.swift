@@ -63,7 +63,8 @@ final class Qwen4ExpMediaSuffixCacheTests: XCTestCase {
     private func input(_ ids: [Int32], imageCount: Int = 0, video: Bool = false) -> LMInput {
         let tokens = MLXArray(ids).reshaped(1, ids.count)
         guard imageCount > 0 else { return LMInput(tokens: tokens) }
-        let pixels = MLXArray((0 ..< imageCount * 16 * 1176).map { Float($0 % 31) / 31 })
+        let framePixels = (0 ..< 16 * 1176).map { Float($0 % 31) / 31 }
+        let pixels = MLXArray(Array(repeating: framePixels, count: imageCount).flatMap { $0 })
             .reshaped(imageCount * 16, 1176)
         let frames = Array(repeating: THW(1, 4, 4), count: imageCount)
         return LMInput(text: .init(tokens: tokens),
@@ -105,5 +106,12 @@ final class Qwen4ExpMediaSuffixCacheTests: XCTestCase {
         let b: [Int32] = [1, 124, 126, 126, 126, 126, 2]
         try compareSplit(prefix: input(a), suffix: input(b, imageCount: 1, video: true),
                          full: input(a + b, imageCount: 1, video: true))
+    }
+
+    func testSecondImageAccumulatesExistingMediaPositionOffset() throws {
+        let a: [Int32] = [1, 124, 125, 125, 125, 125, 2, 5, 6]
+        let b: [Int32] = [1, 124, 125, 125, 125, 125, 2]
+        try compareSplit(prefix: input(a, imageCount: 1), suffix: input(b, imageCount: 1),
+                         full: input(a + b, imageCount: 2))
     }
 }

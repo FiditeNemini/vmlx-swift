@@ -1874,11 +1874,19 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             videoTokenId: config.base.videoTokenIndex,
             visionStartTokenId: config.base.visionStartTokenId,
             attentionMask: nil)
-        setRopeDelta(deltas.reshaped(-1)[0].item(Int.self), for: cache)
+        // getRopeIndex describes this incoming segment relative to zero.
+        // A restored prefix already owns earlier rotary positions, including
+        // compression from previous media. Continue from its next position
+        // and accumulate the new segment's delta for later text/decode.
+        let prefixOffset = positionCache(in: cache)?.offset ?? cache.first?.offset ?? 0
+        let prefixDelta = ropeDelta(for: cache)
+        let continuedPositions = positionIds
+            + MLXArray(prefixOffset + prefixDelta).asType(positionIds.dtype)
+        setRopeDelta(prefixDelta + deltas.reshaped(-1)[0].item(Int.self), for: cache)
 
         let headInput = textModel(
             inputIds, embeddings: mergedEmbeddings, cache: cache,
-            positionIds: positionIds)
+            positionIds: continuedPositions)
         return .logits(LMOutput(logits: projectToLogits(headInput)))
     }
 
