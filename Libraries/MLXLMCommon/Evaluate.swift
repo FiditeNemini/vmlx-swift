@@ -3427,6 +3427,19 @@ public struct TokenIterator: TokenIteratorProtocol {
             return nil
         }
 
+        let reconstructionStarted = Date.timeIntervalSinceReferenceDate
+        var canonicalSeedUsed: Int?
+        var reconstructionSucceeded = false
+        defer {
+            if let seed = canonicalSeedUsed,
+               ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+                let elapsed = Date.timeIntervalSinceReferenceDate - reconstructionStarted
+                FileHandle.standardError.write(Data(
+                    ("[vmlx][cache/canonical-residual] seed=\(seed) target=\(tokens.count)"
+                        + " residual_tokens=\(tokens.count - seed)"
+                        + " copy_and_forward_seconds=\(elapsed) success=\(reconstructionSucceeded)\n").utf8))
+            }
+        }
         do {
             try Task.checkCancellation()
             let rederiveWindow = cacheInitParameters?.prefillStepSize ?? 512
@@ -3435,8 +3448,15 @@ public struct TokenIterator: TokenIteratorProtocol {
             if let capture = canonicalStablePrefillCapture,
                let seed = capture.copySeed(for: tokens, salt: mediaSalt, chunkSize: rederiveWindow) {
                 cache = seed
+                canonicalSeedUsed = capture.seedCount
                 let remaining = Array(tokens.dropFirst(capture.seedCount))
-                if remaining.isEmpty { return cache }
+                if remaining.isEmpty {
+                    try Task.checkCancellation()
+                    reconstructionSucceeded = true
+                    return cache
+                }
+                // Preserve processor mask values; Qwen4Exp's current text
+                // prepare ignores this mask. This does not add padding support.
                 let residualMask = boundaryInput.text.mask.map {
                     $0.reshaped(-1)[capture.seedCount...].reshaped(1, remaining.count)
                 }
@@ -3466,6 +3486,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
             MLX.eval(cache)
             try Task.checkCancellation()
+            reconstructionSucceeded = true
             return cache
         } catch {
             Self.logger.debug(

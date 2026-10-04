@@ -45,7 +45,6 @@ final class CanonicalStablePrefillCapture {
     private let owners: [ObjectIdentifier]
     private let schema: [String]
     private(set) var snapshot: [KVCache]?
-    private(set) var snapshotSeconds: TimeInterval = 0
 
     init?(input: LMInput, promptTokens: [Int], cache: [KVCache],
           chunkSize: Int, targets: [Int], salt: String?) {
@@ -78,8 +77,17 @@ final class CanonicalStablePrefillCapture {
         let start = Date.timeIntervalSinceReferenceDate
         let owned = makePromptBoundaryCacheSnapshot(from: cache)
         guard !Task.isCancelled else { return }
-        snapshotSeconds = Date.timeIntervalSinceReferenceDate - start
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
         snapshot = owned
+        if ProcessInfo.processInfo.environment["VMLX_CACHE_FETCH_TRACE"] == "1" {
+            // Metadata-only logical payload count, not allocator/physical footprint.
+            let bytes = owned.reduce(0) { total, layer in
+                total + layer.state.reduce(0) { $0 + $1.nbytes }
+            }
+            FileHandle.standardError.write(Data(
+                ("[vmlx][cache/canonical-capture] seed=\(seedCount) chunk=\(chunkSize)"
+                    + " snapshot_state_bytes=\(bytes) copy_eval_seconds=\(elapsed)\n").utf8))
+        }
     }
 
     func copySeed(for tokens: [Int], salt: String?, chunkSize: Int) -> [KVCache]? {
