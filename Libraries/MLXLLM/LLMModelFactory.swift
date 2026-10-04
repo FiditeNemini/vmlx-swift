@@ -1567,6 +1567,15 @@ public final class LLMModelFactory: ModelFactory {
             // unrelated LLM quantization error winning factory fallback.
             throw ModelFactoryError.unsupportedModelType("glm5_next")
         }
+        if let route = try? JSONDecoder.json5().decode(FactoryRoutingConfiguration.self, from: configData),
+            route.model_type == "qwen4_exp",
+            JANGHModelPreparation.declaresCustomFormat(configuration: configData, sidecar: nil)
+        {
+            // qwen4_exp JANGH bundles are admitted by the VLM factory (Qwen4ExpJANGHPreparation).
+            // Without this, the LLM factory's strict quantization decode rejects `mode: jangtq2`
+            // and that unrelated error wins the factory fallback.
+            throw ModelFactoryError.unsupportedModelType("qwen4_exp")
+        }
         let jangHPreparation = try NaiveN05JANGHPreparation.loadIfDeclared(
             directory: modelDirectory, configurationData: configData)
         if let jangHPreparation { configData = jangHPreparation.banks.ordinaryConfiguration }

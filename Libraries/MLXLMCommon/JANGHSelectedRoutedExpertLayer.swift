@@ -11,12 +11,16 @@ final class JANGHSelectedRoutedExpertLayer: Module, WeightedRoutedExpertLayer, S
     private let parent: String
     private let gateModule: String, upModule: String, downModule: String
     private let width: Int
+    private let routes: Int
     private let limit: Float?
     let supplementalWeightBytes: Int
     let supplementalParameterCount: Int
 
     init(source: JANGHMappedBanks.SourceLease, owner: JANGHExpertMappedBanks,
-         parentModule: String, inputDimensions: Int, activationLimit: Float?) throws {
+         parentModule: String, inputDimensions: Int, activationLimit: Float?, routes: Int = 8) throws {
+        guard (1 ... JANGHSelectedExpertDecode.maxRoutes).contains(routes) else {
+            throw JANGHFormatContract.ValidationError.invalid("selected routed layer route count out of range")
+        }
         guard owner.isBacked(by: source), inputDimensions > 0, activationLimit == nil || (activationLimit!.isFinite && activationLimit! > 0) else {
             throw JANGHFormatContract.ValidationError.invalid("invalid selected routed layer dimensions or clamp")
         }
@@ -44,9 +48,9 @@ final class JANGHSelectedRoutedExpertLayer: Module, WeightedRoutedExpertLayer, S
         }
         self.source = source; self.owner = owner; parent = parentModule
         gateModule = gate; upModule = up; downModule = down
-        width = inputDimensions; limit = activationLimit
+        width = inputDimensions; limit = activationLimit; self.routes = routes
         supplementalWeightBytes = bytes; supplementalParameterCount = parameters
-        kernel = try JANGHSelectedExpertDecode(owner: owner, gateModule: gate, upModule: up, downModule: down)
+        kernel = try JANGHSelectedExpertDecode(owner: owner, gateModule: gate, upModule: up, downModule: down, routes: routes)
         super.init()
     }
 
@@ -58,10 +62,10 @@ final class JANGHSelectedRoutedExpertLayer: Module, WeightedRoutedExpertLayer, S
     func routed(_ input: MLXArray, indices: MLXArray, scores: MLXArray) throws -> MLXArray {
         guard input.ndim >= 2, input.dim(-1) == width, indices.dtype == .uint32,
               indices.ndim == input.ndim, indices.shape.dropLast() == input.shape.dropLast(),
-              indices.dim(-1) == 8, scores.shape == indices.shape else {
-            throw JANGHFormatContract.ValidationError.invalid("selected diagnostic requires admitted top8 shapes")
+              indices.dim(-1) == self.routes, scores.shape == indices.shape else {
+            throw JANGHFormatContract.ValidationError.invalid("selected diagnostic requires the admitted top-k shape")
         }
-        let flat = input.reshaped(-1, width), routes = indices.reshaped(-1, 8)
+        let flat = input.reshaped(-1, width), routes = indices.reshaped(-1, self.routes)
         let weights = scores.reshaped(routes.shape).asType(.float32)
         if flat.dim(0) == 1 {
             // This synchronization is explicit and included in full-model timing.

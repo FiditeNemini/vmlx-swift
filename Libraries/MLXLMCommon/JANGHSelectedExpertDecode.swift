@@ -7,7 +7,7 @@ import CryptoKit
 import Crypto
 #endif
 
-/// B1/top-eight prototype. Only independently mapped expert allocations may be
+/// B1/top-k diagnostic. Only independently mapped expert allocations may be
 /// supplied by the selected-bank owner; array views of a whole bank defeat the
 /// working-set goal even when their visible shapes match. No factory enables it.
 final class JANGHSelectedExpertDecode {
@@ -25,8 +25,16 @@ final class JANGHSelectedExpertDecode {
     private let downRotation: JANGHFormatContract.Rotation
     private let gu: MLXFast.MLXFastKernel, down: MLXFast.MLXFastKernel
     private let rotation = JANGHRowRotation()
+    /// Include the output: gate/up needs 5 + 2R inputs and one output.
+    /// Metal's 31 buffer slots therefore admit at most twelve routes.
+    static let maxRoutes = 12
+    let routes: Int
 
-    init(owner: JANGHExpertMappedBanks, gateModule: String, upModule: String, downModule: String) throws {
+    init(owner: JANGHExpertMappedBanks, gateModule: String, upModule: String, downModule: String, routes: Int = 8) throws {
+        guard (1 ... Self.maxRoutes).contains(routes) else {
+            throw JANGHFormatContract.ValidationError.invalid("selected decode route count out of range")
+        }
+        self.routes = routes
         let contract = owner.contract
         ownerIdentity = owner.identity
         guard let g = contract.projections[gateModule], let u = contract.projections[upModule],
@@ -37,15 +45,15 @@ final class JANGHSelectedExpertDecode {
         self.gateModule = gateModule; self.upModule = upModule; self.downModule = downModule
         gateBits = g.bits; upBits = u.bits; downBits = d.bits
         inputRotation = g.rotation; downRotation = d.rotation
-        let descriptor = "selected-b1-top8-v2|\(gateModule)|\(upModule)|\(downModule)|\(g.bits)|\(u.bits)|\(d.bits)|\(g.rotation)|\(d.rotation)|\(gb.alpha.bitPattern)|\(gb.beta.bitPattern)|\(ub.alpha.bitPattern)|\(ub.beta.bitPattern)|\(db.alpha.bitPattern)|\(db.beta.bitPattern)"
+        let descriptor = "selected-b1-top\(routes)-v2|\(gateModule)|\(upModule)|\(downModule)|\(g.bits)|\(u.bits)|\(d.bits)|\(g.rotation)|\(d.rotation)|\(gb.alpha.bitPattern)|\(gb.beta.bitPattern)|\(ub.alpha.bitPattern)|\(ub.beta.bitPattern)|\(db.alpha.bitPattern)|\(db.beta.bitPattern)"
         identity = SHA256.hash(data: Data(descriptor.utf8)).map { String(format: "%02x", $0) }.joined()
         let gateDot = JANGHDecodeQDot.source(bits:g.bits,packed:"gateBank",rowBase:"size_t(row0 + r) * WG",columnBase:"block + lane * 16u",values:"values",accumulator:"pg",alpha:Float(gb.alpha),beta:Float(gb.beta))
         let upDot = JANGHDecodeQDot.source(bits:u.bits,packed:"upBank",rowBase:"size_t(row0 + r) * WU",columnBase:"block + lane * 16u",values:"values",accumulator:"pu",alpha:Float(ub.alpha),beta:Float(ub.beta))
         func bankChoice(_ name: String) -> String {
-            (0..<7).map { "route == \($0) ? \(name)\($0) : " }.joined() + "\(name)7"
+            (0..<(routes - 1)).map { "route == \($0) ? \(name)\($0) : " }.joined() + "\(name)\(routes - 1)"
         }
-        let gateNames = (0..<8).map { "gate\($0)" }, upNames = (0..<8).map { "up\($0)" }
-        // 21 input buffers plus one output; no full bank or per-route copy.
+        let gateNames = (0..<routes).map { "gate\($0)" }, upNames = (0..<routes).map { "up\($0)" }
+        // 5 + 2R input buffers plus one output; no full bank or per-route copy.
         gu = MLXFast.metalKernel(name:"jangh_selected_gu_"+identity,
             inputNames:["x"] + gateNames + upNames + ["gs","us","ids","limitValue"],outputNames:["out"],source:"""
             uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
@@ -104,13 +112,13 @@ final class JANGHSelectedExpertDecode {
             }
             """,ensureRowContiguous:false)
         let downDot = JANGHDecodeQDot.source(bits:d.bits,packed:"downBank",rowBase:"size_t(row0+r)*WORDS",columnBase:"block+lane*16u",values:"values",accumulator:"accum[r]",alpha:Float(db.alpha),beta:Float(db.beta))
-        // 12 inputs plus output; routes are accumulated sequentially in F32.
+        // 4 + R inputs plus output; routes are accumulated sequentially in F32.
         down = MLXFast.metalKernel(name:"jangh_selected_down_"+identity,
-            inputNames:["hidden"]+(0..<8).map { "down\($0)" }+["scales","ids","scores"],outputNames:["out"],source:"""
+            inputNames:["hidden"]+(0..<routes).map { "down\($0)" }+["scales","ids","scores"],outputNames:["out"],source:"""
             uint lane=thread_index_in_simdgroup, sg=simdgroup_index_in_threadgroup;
             uint row0=threadgroup_position_in_grid.y*8u+sg*4u;
             float total[4]={0,0,0,0};
-            for (uint route=0;route<8;++route) {
+            for (uint route=0;route<\(routes)u;++route) {
                 uint expert=ids[route];
                 if (expert>=EXPERTS) {
                     if (lane==0) for (uint r=0;r<4;++r)
@@ -150,7 +158,7 @@ final class JANGHSelectedExpertDecode {
     }
     private func validate(_ selection: JANGHExpertMappedBanks.Selection, module: String, inputWidth: Int, bits: Int) throws -> (Int,Int,Int) {
         let product=inputWidth.multipliedReportingOverflow(by:bits)
-        guard selection.ownerIdentity==ownerIdentity, selection.module==module, selection.expertIDs.count==8, selection.packed.count==8,
+        guard selection.ownerIdentity==ownerIdentity, selection.module==module, selection.expertIDs.count==routes, selection.packed.count==routes,
             !product.overflow, product.partialValue<=Int(UInt32.max), inputWidth>0, inputWidth.isMultiple(of:32),
             selection.scales.ndim==2, selection.scales.dtype == .float16,
             selection.scales.dim(0)>0, selection.scales.dim(0)<=Int(UInt32.max),
@@ -181,14 +189,14 @@ final class JANGHSelectedExpertDecode {
         let rotated=downRotation == .hadamard32, rows=rotated ? 32 : 8, threads=rotated ? 256 : 64
         let values=gu([contiguous(input)]+gate.packed+up.packed+[gate.scales,up.scales,MLXArray(gate.expertIDs),MLXArray([limit ?? 0])],
             template:[("K",input.dim(1)),("N",n),("EXPERTS",e),("ROWS",rows),("WG",wg),("WU",wu),("ROT_OUT",rotated)],
-            grid:(threads,(n+rows-1)/rows,8),threadGroup:(threads,1,1),outputShapes:[[8,n]],outputDTypes:[.float32])[0]
+            grid:(threads,(n+rows-1)/rows,routes),threadGroup:(threads,1,1),outputShapes:[[routes,n]],outputDTypes:[.float32])[0]
         return Hidden(values:values,expertIDs:gate.expertIDs,kernelIdentity:identity,ownerIdentity:ownerIdentity)
     }
     func projectPreparedHidden(_ hidden: Hidden, down selection: JANGHExpertMappedBanks.Selection,
         scores: MLXArray, outputDType: DType) throws -> MLXArray {
-        guard hidden.ownerIdentity==ownerIdentity, hidden.kernelIdentity==identity, hidden.values.ndim==2, hidden.values.dim(0)==8,
+        guard hidden.ownerIdentity==ownerIdentity, hidden.kernelIdentity==identity, hidden.values.ndim==2, hidden.values.dim(0)==routes,
             hidden.values.dtype == .float32, hidden.expertIDs==selection.expertIDs,
-            scores.shape==[1,8],scores.dtype == .float32,[.float16,.bfloat16,.float32].contains(outputDType)
+            scores.shape==[1,routes],scores.dtype == .float32,[.float16,.bfloat16,.float32].contains(outputDType)
         else { throw JANGHFormatContract.ValidationError.invalid("invalid selected hidden/route contract") }
         let (e,n,words)=try validate(selection,module:downModule,inputWidth:hidden.values.dim(1),bits:downBits)
         return down([contiguous(hidden.values)]+selection.packed+[selection.scales,MLXArray(selection.expertIDs),contiguous(scores)],

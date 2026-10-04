@@ -1416,9 +1416,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         guard !tokens.isEmpty, tokens.count < promptTokenIds.count else {
             return nil
         }
+        guard let boundaryInput = originalInput.inputForCacheBoundary(
+            tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
+        let keepsMedia = !originalInput.hasMediaContent || boundaryInput.hasMediaContent
         let trimCount = promptTokenIds.count - tokens.count
         let trimmed = promptSnapshot.map { $0.copy() }
-        if canTrimPromptCache(trimmed),
+        if keepsMedia, canTrimPromptCache(trimmed),
            trimPromptCache(trimmed, numTokens: trimCount) == trimCount
         {
             MLX.eval(trimmed)
@@ -1445,15 +1448,6 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         do {
-            let boundaryTokens = MLXArray(tokens.map { Int32($0) })
-                .reshaped(1, tokens.count)
-            let boundaryInput = LMInput(
-                text: LMInput.Text(tokens: boundaryTokens),
-                image: originalInput.image,
-                video: originalInput.video,
-                audio: originalInput.audio,
-                mediaTokenIds: originalInput.mediaTokenIds,
-                cacheScopeSalt: originalInput.cacheScopeSalt)
             let boundaryCache = model.newCache(parameters: cacheInitParameters)
             switch try model.prepare(
                 boundaryInput,

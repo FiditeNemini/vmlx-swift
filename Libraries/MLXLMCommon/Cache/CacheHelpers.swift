@@ -923,6 +923,10 @@ private func restoreFromV2Arrays(
             continue
         }
         switch entry.data {
+        case .qsaKV(let component):
+            guard let qsa = cache[entry.index] as? QSAKVCache,
+                  !qsa.requiresMediaPositionOffset || component.mediaPositionOffset != nil
+            else { return 0 }
         case .mamba, .cacheList:
             guard canRestoreMambaRecords(entry.data, into: cache[entry.index]) else { return 0 }
         case .qkv(let comp):
@@ -1042,6 +1046,7 @@ private func restoreFromV2Arrays(
                 return 0
             }
             qsa.state = [keys, values, indexer]
+            qsa.mediaPositionOffset = comp.mediaPositionOffset
             if totalTokens == 0 {
                 totalTokens = keys.dim(2)
             }
@@ -1765,7 +1770,10 @@ private func restoreMambaLayer(
     // Restore by index: compactMap would shift an occupied slot across a nil
     // hole. Also clear scratch left over from a previous verify request.
     for slot in 0..<mamba.slotCount {
-        mamba[slot] = comp.occupiedStates[slot]
+        // ArraysCache updates occupied wrappers in place. Adopting the disk
+        // dictionary's wrapper lets one continuation mutate the source and
+        // sibling restores. Own the recurrent state just as cache.copy() does.
+        mamba[slot] = comp.occupiedStates[slot].map(ownedStateCopy)
     }
     mamba.clearVerifyStaging()
     mamba.offset = comp.offset

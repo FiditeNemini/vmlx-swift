@@ -2279,16 +2279,29 @@ enum Qwen35Language {
             layerIdx: Int = -1,
             allowFusedGateUpCache: Bool = true,
             compileDecodeRegions: Bool = false,
-            decodeEquivalentVerifierRows: Bool = false
+            decodeEquivalentVerifierRows: Bool = false,
+            routedExperts: (any WeightedRoutedExpertLayer)? = nil
         ) {
             self.normTopkProb = args.normTopkProb
             self.numExperts = args.numExperts
             self.topK = args.numExpertsPerTok
+            // The compiled router / shared-expert regions are independent of the switch, so a custom
+            // routed bank keeps them (speed parity); the bank itself is called eagerly via callRouted.
             self.compileDecodeRegions = compileDecodeRegions
             self.decodeEquivalentVerifierRows = decodeEquivalentVerifierRows
 
             _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
             let weightFormat = args.weightFormat.lowercased()
+            if let routedExperts {
+                _switchMLP.wrappedValue = routedExperts
+                _sharedExpert.wrappedValue = MLP(
+                    dimensions: args.hiddenSize,
+                    hiddenDimensions: args.sharedExpertIntermediateSize
+                )
+                _sharedExpertGate.wrappedValue = Linear(args.hiddenSize, 1, bias: false)
+                super.init()
+                return
+            }
             let usesTurboQuant =
                 weightFormat == "mxtq"
                 || weightFormat.hasPrefix("jangtq")
@@ -2447,6 +2460,10 @@ enum Qwen35Language {
                     routed = affine(x, inds)
                     eagerCombined = nil
                 }
+            } else if let weighted = switchMLP as? any WeightedRoutedExpertLayer {
+                // JANGH (and future custom) banks: router-weighted sum fused in the bank.
+                routed = nil
+                eagerCombined = weighted.callRouted(x, indices: inds, scores: scores)
             } else {
                 fatalError("Unsupported Qwen35 VLM MoE switch_mlp: \(type(of: switchMLP))")
             }

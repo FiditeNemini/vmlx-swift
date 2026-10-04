@@ -1158,7 +1158,8 @@ private final class Qwen4ExpDecoderLayer: Module {
     @ModuleInfo(key: "ple") var pleModule: Qwen4ExpPLE?
     private var profileCount = 0
 
-    init(_ config: Qwen4ExpConfiguration, layerIndex: Int) {
+    init(_ config: Qwen4ExpConfiguration, layerIndex: Int,
+         routedExperts: (any WeightedRoutedExpertLayer)? = nil) {
         self.layerIndex = layerIndex
         let text = config.base.textConfiguration
         let types = config.extras.layerTypes ?? (0 ..< text.hiddenLayers).map {
@@ -1176,7 +1177,8 @@ private final class Qwen4ExpDecoderLayer: Module {
         _mlp.wrappedValue = Qwen35Language.SparseMoeBlock(
             text, layerIdx: layerIndex, allowFusedGateUpCache: false,
             compileDecodeRegions: true,
-            decodeEquivalentVerifierRows: config.hasUniformQ4G64TrunkRoutedExperts)
+            decodeEquivalentVerifierRows: config.hasUniformQ4G64TrunkRoutedExperts,
+            routedExperts: routedExperts)
         _attentionResidual.wrappedValue = Qwen4ExpGatedResidual(config)
         _mlpResidual.wrappedValue = Qwen4ExpGatedResidual(config)
         if let pleIndex = config.extras.pleLayerIds.firstIndex(of: layerIndex + 1) {
@@ -1483,13 +1485,14 @@ private final class Qwen4ExpTextModel: Module {
     @ModuleInfo(key: "layers") var layers: [Qwen4ExpDecoderLayer]
     @ModuleInfo(key: "hyper_connection_mixer") var mixer: Qwen4ExpGatedResidual
 
-    init(_ config: Qwen4ExpConfiguration) {
+    init(_ config: Qwen4ExpConfiguration,
+         routedExperts: [Int: any WeightedRoutedExpertLayer] = [:]) {
         self.config = config
         let text = config.base.textConfiguration
         _embedding.wrappedValue = Embedding(
             embeddingCount: text.vocabularySize, dimensions: text.hiddenSize)
         _layers.wrappedValue = (0 ..< text.hiddenLayers).map {
-            Qwen4ExpDecoderLayer(config, layerIndex: $0)
+            Qwen4ExpDecoderLayer(config, layerIndex: $0, routedExperts: routedExperts[$0])
         }
         _mixer.wrappedValue = Qwen4ExpGatedResidual(config, combines: false)
         super.init()
@@ -1650,14 +1653,6 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     /// checkpoint.
     private var proposalHead: QuantizedLinear?
 
-    /// M-RoPE delta established by the most recent media prefill, keyed by the
-    /// conversation's cache identity so concurrent sessions do not cross.
-    /// Decode positions after a media prefill continue at
-    /// `cache.offset + delta`, matching the reference runtime's
-    /// `_rope_deltas` contract. Text-only conversations keep delta 0.
-    private let ropeDeltaLock = NSLock()
-    nonisolated(unsafe) private var ropeDeltas: [ObjectIdentifier: Int] = [:]
-
     /// What this instance actually carries. Same contract as every other multimodal family here.
     public let modalities: Set<ModelRuntimeRequestModality>
 
@@ -1708,15 +1703,43 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     /// What was actually built.
     public let plan: ResolvedConstructionPlan
 
+    /// JANGH construction: routed experts are pre-mapped custom banks (Qwen4ExpJANGHPreparation).
+    /// MTP experts stay ordinary affine. The exact tq2_* tensor names are excluded from the
+    /// generic (resident-copy) load; a mismatch between banks and names is an error.
+    public convenience init(
+        _ config: Qwen4ExpConfiguration,
+        requesting: Set<ModelRuntimeRequestModality>?,
+        routedExperts: [Int: any WeightedRoutedExpertLayer],
+        customRoutedTensorNames: Set<String>
+    ) throws {
+        let expected = Set(routedExperts.keys.flatMap { layer in
+            ["gate_proj", "up_proj", "down_proj"].flatMap { role in
+                ["tq2_packed", "tq2_scales"].map { "model.layers.\(layer).mlp.switch_mlp.\(role).\($0)" }
+            }
+        })
+        guard Set(routedExperts.keys) == Set(0 ..< config.base.textConfiguration.hiddenLayers),
+              customRoutedTensorNames == expected else {
+            throw Qwen4ExpJANGHError.invalidCustomTensorExclusions
+        }
+        self.init(config, plan: try Self.resolveConstruction(config, requesting: requesting),
+                  routedExperts: routedExperts, customRoutedTensorNames: customRoutedTensorNames)
+    }
+
+    /// Exact tq2_* tensor names owned by the mapped JANGH banks (empty for affine bundles).
+    let customRoutedTensorNames: Set<String>
+
     /// The one real initialiser. Private: a plan comes only from `resolveConstruction`.
     private init(
         _ config: Qwen4ExpConfiguration,
-        plan: ResolvedConstructionPlan
+        plan: ResolvedConstructionPlan,
+        routedExperts: [Int: any WeightedRoutedExpertLayer] = [:],
+        customRoutedTensorNames: Set<String> = []
     ) {
         self.modalities = plan.served
         self.plan = plan
         self.config = config
-        _textModel.wrappedValue = Qwen4ExpTextModel(config)
+        self.customRoutedTensorNames = customRoutedTensorNames
+        _textModel.wrappedValue = Qwen4ExpTextModel(config, routedExperts: routedExperts)
         _head.wrappedValue = Linear(
             config.base.textConfiguration.hiddenSize,
             config.base.textConfiguration.vocabularySize, bias: false)
@@ -1730,18 +1753,15 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     }
 
     private func setRopeDelta(_ delta: Int, for cache: [KVCache]?) {
-        guard let first = cache?.first else { return }
-        ropeDeltaLock.lock()
-        defer { ropeDeltaLock.unlock() }
-        if ropeDeltas.count > 128 { ropeDeltas.removeAll() }
-        ropeDeltas[ObjectIdentifier(first as AnyObject)] = delta
+        positionCache(in: cache)?.mediaPositionOffset = delta
+    }
+
+    private func positionCache(in cache: [KVCache]?) -> QSAKVCache? {
+        cache?.first(where: { $0 is QSAKVCache }) as? QSAKVCache
     }
 
     private func ropeDelta(for cache: [KVCache]?) -> Int {
-        guard let first = cache?.first else { return 0 }
-        ropeDeltaLock.lock()
-        defer { ropeDeltaLock.unlock() }
-        return ropeDeltas[ObjectIdentifier(first as AnyObject)] ?? 0
+        positionCache(in: cache)?.mediaPositionOffset ?? 0
     }
 
     public var vocabularySize: Int { config.base.vocabSize }
@@ -1759,13 +1779,14 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        textModel.layers.map { layer in
+        let firstAttention = textModel.layers.firstIndex { !$0.isLinear }
+        return textModel.layers.enumerated().map { index, layer in
             if layer.isLinear {
                 return MambaCache(
                     slots: layer.ple == nil ? 2 : 6,
                     persistentSlotCount: layer.ple == nil ? 2 : 4) as KVCache
             }
-            return QSAKVCache() as KVCache
+            return QSAKVCache(requiringMediaPositionOffset: index == firstAttention) as KVCache
         }
     }
 
@@ -1773,7 +1794,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         let inputIds = input.text.tokens
 
         guard input.image != nil || input.video != nil else {
-            setRopeDelta(0, for: cache)
+            if cache.allSatisfy({ $0.offset == 0 }) { setRopeDelta(0, for: cache) }
             // Native MTP calls prepare directly, unlike the batch AR lane's
             // outer segmentation. Honor the same prefill budget here so a
             // cold or required-tool request cannot materialize a whole long
@@ -1853,11 +1874,19 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             videoTokenId: config.base.videoTokenIndex,
             visionStartTokenId: config.base.visionStartTokenId,
             attentionMask: nil)
-        setRopeDelta(deltas.reshaped(-1)[0].item(Int.self), for: cache)
+        // getRopeIndex describes this incoming segment relative to zero.
+        // A restored prefix already owns earlier rotary positions, including
+        // compression from previous media. Continue from its next position
+        // and accumulate the new segment's delta for later text/decode.
+        let prefixOffset = positionCache(in: cache)?.offset ?? cache.first?.offset ?? 0
+        let prefixDelta = ropeDelta(for: cache)
+        let continuedPositions = positionIds
+            + MLXArray(prefixOffset + prefixDelta).asType(positionIds.dtype)
+        setRopeDelta(prefixDelta + deltas.reshaped(-1)[0].item(Int.self), for: cache)
 
         let headInput = textModel(
             inputIds, embeddings: mergedEmbeddings, cache: cache,
-            positionIds: positionIds)
+            positionIds: continuedPositions)
         return .logits(LMOutput(logits: projectToLogits(headInput)))
     }
 
@@ -1954,7 +1983,7 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         }
         let forward = textModel.forward(
             inputIds[.newAxis], cache: cache,
-            pleEmbeddings: pleEmbeddings)
+            pleEmbeddings: pleEmbeddings, positionOffset: ropeDelta(for: cache))
         return projectToLogits(forward.mixed)
     }
 
@@ -1993,7 +2022,8 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     public func nativeBackboneForward(
         _ inputs: MLXArray, cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        let forward = textModel.forward(inputs, cache: cache)
+        let forward = textModel.forward(
+            inputs, cache: cache, positionOffset: ropeDelta(for: cache))
         return NativeMTPForwardResult(
             logits: projectToLogits(forward.mixed),
             hiddenStates: forward.preMixer)
@@ -2002,7 +2032,8 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     public func nativeAutoregressiveBackboneForward(
         _ inputs: MLXArray, cache: [KVCache]?
     ) -> NativeMTPForwardResult {
-        let forward = textModel.forward(inputs, cache: cache, autoregressive: true)
+        let forward = textModel.forward(
+            inputs, cache: cache, positionOffset: ropeDelta(for: cache), autoregressive: true)
         return NativeMTPForwardResult(
             logits: projectToLogits(forward.mixed), hiddenStates: forward.preMixer)
     }
@@ -2011,7 +2042,8 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
         _ inputs: MLXArray, cache: [KVCache]?
     ) -> NativeMTPForwardResult {
         let forward = textModel.forward(
-            inputs, cache: cache, recordPrefixCommitStates: true)
+            inputs, cache: cache, recordPrefixCommitStates: true,
+            positionOffset: ropeDelta(for: cache))
         return NativeMTPForwardResult(
             logits: projectToLogits(forward.mixed),
             hiddenStates: forward.preMixer)
@@ -2077,7 +2109,8 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
     }
 
     public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
-        key.contains("ngram_embedding.shards")
+        customRoutedTensorNames.contains(key)
+            || key.contains("ngram_embedding.shards")
             || key.contains("ngram_heads_")
             || key.contains("layer_multipliers")
     }
@@ -2309,4 +2342,8 @@ extension Qwen4Exp: NativeMTPProposalHeadInstalling {
         )
         return copy
     }
+}
+
+public enum Qwen4ExpJANGHError: Error {
+    case invalidCustomTensorExclusions
 }

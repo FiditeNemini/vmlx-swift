@@ -8,9 +8,12 @@ public struct JANGHRoutedModelLayout: Sendable {
     public let intermediateSize: Int
     public let expertCount: Int
     public let sparseLayers: Set<Int>
+    /// Routed experts per token (top-k). Only the selected-expert (SSD/LRU) path uses it.
+    public let routesPerToken: Int
 
     public init(modelType: String, hiddenSize: Int, intermediateSize: Int,
-                expertCount: Int, sparseLayers: Set<Int>) {
+                expertCount: Int, sparseLayers: Set<Int>, routesPerToken: Int = 8) {
+        self.routesPerToken = routesPerToken
         self.modelType = modelType
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -28,6 +31,7 @@ public final class JANGHModelPreparation {
     public let moduleByLayer: [Int: String]
     let source: JANGHMappedBanks.SourceLease
     private let hiddenSize: Int
+    private let routesPerToken: Int
 
     /// Shared declaration gate for architecture factories. This only selects
     /// strict admission; it never establishes support from a label alone.
@@ -88,6 +92,7 @@ public final class JANGHModelPreparation {
             directory: directory, metadata: metadata, contract: partition.contract,
             dimensions: dimensions)
         hiddenSize = layout.hiddenSize
+        routesPerToken = layout.routesPerToken
         ordinaryConfiguration = partition.ordinaryConfiguration
         excludedTensorNames = Set(partition.customModules.flatMap {
             [$0 + ".tq2_packed", $0 + ".tq2_scales"]
@@ -136,7 +141,8 @@ public final class JANGHModelPreparation {
         let owner = try JANGHExpertMappedBanks(source: source, cacheByteLimit: cacheByteLimit, storage: storage)
         return try moduleByLayer.mapValues { parent -> any WeightedRoutedExpertLayer in
             try JANGHSelectedRoutedExpertLayer(source: source, owner: owner, parentModule: parent,
-                                               inputDimensions: hiddenSize, activationLimit: activationLimit)
+                                               inputDimensions: hiddenSize, activationLimit: activationLimit,
+                                               routes: routesPerToken)
         }
     }
 
