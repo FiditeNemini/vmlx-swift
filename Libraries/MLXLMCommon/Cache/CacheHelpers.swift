@@ -1770,7 +1770,10 @@ private func restoreMambaLayer(
     // Restore by index: compactMap would shift an occupied slot across a nil
     // hole. Also clear scratch left over from a previous verify request.
     for slot in 0..<mamba.slotCount {
-        mamba[slot] = comp.occupiedStates[slot]
+        // ArraysCache updates occupied wrappers in place. Adopting the disk
+        // dictionary's wrapper lets one continuation mutate the source and
+        // sibling restores. Own the recurrent state just as cache.copy() does.
+        mamba[slot] = comp.occupiedStates[slot].map(ownedStateCopy)
     }
     mamba.clearVerifyStaging()
     mamba.offset = comp.offset

@@ -118,4 +118,35 @@ final class Qwen4ExpMediaPositionCacheTests: XCTestCase {
         assertEqualLogits(reference, model.nativeBackboneMTPVerifyForward(token, cache: cache.map { $0.copy() }).logits)
     }
 
+    func testActualSafetensorsMediaCachePreservesDecodePositions() throws {
+        let (model, cache) = try mediaPrefix()
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen4-media-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try MLX.save(arrays: TQDiskSerializer.serialize(
+            cache: cache, preserveStandardKVStorageDType: true), url: file)
+        let arrays = try MLX.loadArrays(url: file)
+        var restored = model.newCache(parameters: nil)
+        XCTAssertEqual(restoreFromDiskArrays(arrays, into: &restored, requirePromptBoundary: true), 7)
+        let token = MLXArray([Int32(3)]).reshaped(1, 1)
+        assertEqualLogits(model(token, cache: cache), model(token, cache: restored))
+    }
+
+    func testIndependentRestoresFromOnePayloadDoNotAdvanceEachOther() throws {
+        let (model, cache) = try mediaPrefix()
+        let arrays = TQDiskSerializer.serialize(cache: cache, preserveStandardKVStorageDType: true)
+        MLX.eval(Array(arrays.values))
+        var first = model.newCache(parameters: nil)
+        var second = model.newCache(parameters: nil)
+        XCTAssertEqual(restoreFromDiskArrays(arrays, into: &first, requirePromptBoundary: true), 7)
+        XCTAssertEqual(restoreFromDiskArrays(arrays, into: &second, requirePromptBoundary: true), 7)
+        let token = MLXArray([Int32(3)]).reshaped(1, 1)
+        let reference = model(token, cache: cache.map { $0.copy() })
+        MLX.eval(reference)
+        let firstLogits = model(token, cache: first)
+        MLX.eval(firstLogits)
+        assertEqualLogits(reference, firstLogits)
+        assertEqualLogits(reference, model(token, cache: second))
+    }
+
 }
