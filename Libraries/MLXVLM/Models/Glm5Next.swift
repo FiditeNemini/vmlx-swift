@@ -2136,7 +2136,73 @@ public final class Glm5NextSharedHead: Module {
 
 // MARK: - LanguageModel conformance
 
-extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
+extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel, CanonicalRequiredToolCacheModel {
+
+    public var canonicalRequiredToolCacheIdentity: String {
+        "glm5-solo-cold-bf16-absorbed-tf32-default1-v1"
+    }
+
+    public func canonicalRequiredToolChunkSize(parameters: GenerateParameters) -> Int? {
+        let chunk = Int(ProcessInfo.processInfo.environment["VMLX_GLM5_PREFILL_STEP"] ?? "") ?? parameters.prefillStepSize
+        // Quantized embeddings store packed integers; their effective output
+        // dtype follows the explicit override or the dequantization scales.
+        let embedding = languageModel.embedTokens
+        let embeddingDType = (embedding as? QuantizedEmbedding)
+            .map { $0.outputDType ?? $0.scales.dtype } ?? embedding.weight.dtype
+        guard preservesCheckpointParameterDTypes, embeddingDType == .bfloat16,
+              chunk == 512, parameters.kvBits == nil, parameters.maxKVSize == nil,
+              Glm5NextIndexerRuntime.absorbMLA, Glm5NextIndexerRuntime.gatherSelected,
+              !Glm5NextIndexerRuntime.poolFP32,
+              languageModel.layers.prefix(languageModel.numDecoderLayers).allSatisfy({
+                  $0.linearAttention?.fusedConv ?? true
+              }) else { return nil }
+        // MLX core defaults to TF32=1. Explicit0/unknown math policy cannot
+        // produce or consume this qualified namespace. No flag is overridden.
+        let tf32 = ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"]
+        guard tf32 == nil || Int(tf32!) == 1 else { return nil }
+        // Requested compiled decode is harmless here: IndexedKV is not a
+        // promotable cache, so the existing setupCompiledDecode guard leaves
+        // the entire configured GLM cache array and eager forward unchanged.
+        guard case .none = parameters.kvMode else { return nil }
+        return chunk
+    }
+
+    public func validateCanonicalRequiredToolCache(_ cache: [KVCache], boundary: Int) -> Bool {
+        guard boundary >= 0, cache.count == schedule.count, !cache.isEmpty else { return false }
+        for (kind, layer) in zip(schedule, cache) {
+            guard layer.offset == boundary else { return false }
+            switch kind {
+            case .linearAttention:
+                guard type(of: layer) == MambaCache.self, let mamba = layer as? MambaCache,
+                      mamba.persistentSlotCount == 2 else { return false }
+                if boundary == 0 {
+                    guard mamba.state.isEmpty else { return false }
+                } else {
+                    guard let convolution = mamba[0], let recurrent = mamba[1],
+                          convolution.dtype == .bfloat16, recurrent.dtype == .float32,
+                          convolution.shape == [1, config.textConfig.linearAttnConfig.shortConvKernelSize - 1,
+                              3 * config.textConfig.linearAttnConfig.numHeads * config.textConfig.linearAttnConfig.headDim],
+                          recurrent.shape == [1, config.textConfig.linearAttnConfig.numHeads,
+                              config.textConfig.linearAttnConfig.headDim, config.textConfig.linearAttnConfig.headDim]
+                    else { return false }
+                }
+            case .deepseekSparseAttention:
+                guard type(of: layer) == Glm5NextIndexedKVCache.self,
+                      let indexed = layer as? Glm5NextIndexedKVCache, indexed.absorbed else { return false }
+                if boundary == 0 {
+                    guard indexed.state.isEmpty else { return false }
+                } else {
+                    let arrays = indexed.state
+                    guard arrays.count == 3, arrays.allSatisfy({ $0.dtype == .bfloat16 }),
+                          arrays[0].shape == [1, 1, boundary, config.textConfig.kvLoraRank],
+                          arrays[1].shape == [1, 1, boundary, 1],
+                          arrays[2].shape == [1, boundary, 2 * config.textConfig.indexHeadDim + 1]
+                    else { return false }
+                }
+            }
+        }
+        return true
+    }
 
     public var vocabularySize: Int { config.textConfig.vocabSize }
 
@@ -2202,12 +2268,19 @@ extension Glm5Next: LanguageModel, VisionLanguageModelProtocol, VLMModel {
                         tokenIds: input.text.tokenIds))
             }
 
+            let beganCanonicalCold = CanonicalTextPrefillCheckpointReporter.isActive
+                && cache.allSatisfy({ $0.offset == 0 && $0.state.isEmpty })
             var offset = 0
             while offset + step < promptTokenCount {
                 try Task.checkCancellation()
                 let end = offset + step
                 _ = try languageModel(ids[0..., offset ..< end], mask: nil, caches: cache)
                 MLX.eval(cache)
+                if beganCanonicalCold {
+                    CanonicalTextPrefillCheckpointReporter.reportModelColdTextChunk(
+                        modelIdentity: canonicalRequiredToolCacheIdentity, input: input, cache: cache,
+                        chunkSize: step, completed: end, beganWithEmptyCache: true)
+                }
                 PrefillProgressReporter.reportCompletedUnits(end)
                 offset = end
                 Glm5NextPrefillMemoryProbe.report(tokens: end, caches: cache)
@@ -2727,7 +2800,9 @@ public final class Glm5NextProcessor: UserInputProcessor {
                 cacheScopeSalt: cacheScopeSalt(from: input.additionalContext),
                 cachePrefixTokenCounts: boundaries.all,
                 cacheStablePrefixTokenCounts: boundaries.stable,
-                toolSchemas: input.tools)
+                toolSchemas: input.tools,
+                canonicalRequiredToolContext: CanonicalRequiredToolContext(
+                    additionalContext: input.additionalContext, tools: input.tools))
         }
 
         var patches = [MLXArray]()

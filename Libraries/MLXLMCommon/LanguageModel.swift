@@ -98,6 +98,8 @@ public struct LMInput {
     /// the actual request contract instead of accepting a tool-shaped object by
     /// name alone.
     public let toolSchemas: [ToolSpec]?
+    /// GLM-only canonical selection metadata. Never changes ordinary cache salts.
+    public let canonicalRequiredToolContext: CanonicalRequiredToolContext?
 
     /// Additional prompt-prefix lengths that are safe to store in the cache.
     ///
@@ -239,7 +241,8 @@ public struct LMInput {
         cacheStablePrefixTokenCounts: [Int] = [],
         cachePromptIntent: CachePromptIntent = .generation,
         cacheRestorePolicy: CacheRestorePolicy = .standard,
-        toolSchemas: [ToolSpec]? = nil
+        toolSchemas: [ToolSpec]? = nil,
+        canonicalRequiredToolContext: CanonicalRequiredToolContext? = nil
     ) {
         self.init(
             text: .init(tokens: tokens, mask: mask, tokenIds: tokenIds),
@@ -248,7 +251,8 @@ public struct LMInput {
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             cachePromptIntent: cachePromptIntent,
             cacheRestorePolicy: cacheRestorePolicy,
-            toolSchemas: toolSchemas)
+            toolSchemas: toolSchemas,
+            canonicalRequiredToolContext: canonicalRequiredToolContext)
     }
 
     public init(
@@ -261,7 +265,8 @@ public struct LMInput {
         cacheStablePrefixTokenCounts: [Int] = [],
         cachePromptIntent: CachePromptIntent = .generation,
         cacheRestorePolicy: CacheRestorePolicy = .standard,
-        toolSchemas: [ToolSpec]? = nil
+        toolSchemas: [ToolSpec]? = nil,
+        canonicalRequiredToolContext: CanonicalRequiredToolContext? = nil
     ) {
         self.text = text
         self.image = image
@@ -274,6 +279,7 @@ public struct LMInput {
         self.cachePromptIntent = cachePromptIntent
         self.cacheRestorePolicy = cacheRestorePolicy
         self.toolSchemas = toolSchemas
+        self.canonicalRequiredToolContext = canonicalRequiredToolContext
     }
 
     public func withToolSchemas(_ schemas: [ToolSpec]?) -> LMInput {
@@ -288,7 +294,8 @@ public struct LMInput {
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             cachePromptIntent: cachePromptIntent,
             cacheRestorePolicy: cacheRestorePolicy,
-            toolSchemas: schemas)
+            toolSchemas: schemas,
+            canonicalRequiredToolContext: canonicalRequiredToolContext)
     }
 
     /// Return an otherwise-identical input with an explicit prompt intent.
@@ -304,7 +311,8 @@ public struct LMInput {
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             cachePromptIntent: intent,
             cacheRestorePolicy: cacheRestorePolicy,
-            toolSchemas: toolSchemas)
+            toolSchemas: toolSchemas,
+            canonicalRequiredToolContext: canonicalRequiredToolContext)
     }
 
     /// Return an otherwise-identical input with an explicit restore policy.
@@ -320,7 +328,8 @@ public struct LMInput {
             cacheStablePrefixTokenCounts: cacheStablePrefixTokenCounts,
             cachePromptIntent: cachePromptIntent,
             cacheRestorePolicy: policy,
-            toolSchemas: toolSchemas)
+            toolSchemas: toolSchemas,
+            canonicalRequiredToolContext: canonicalRequiredToolContext)
     }
 }
 
@@ -368,7 +377,8 @@ public extension LMInput {
             audio: keepMedia ? audio : nil,
             mediaTokenIds: mediaTokenIds, cacheScopeSalt: cacheScopeSalt,
             cachePromptIntent: cachePromptIntent, cacheRestorePolicy: cacheRestorePolicy,
-            toolSchemas: toolSchemas)
+            toolSchemas: toolSchemas,
+            canonicalRequiredToolContext: canonicalRequiredToolContext)
     }
 
     /// Whether a hybrid-cache snapshot taken at `boundary` can safely carry
