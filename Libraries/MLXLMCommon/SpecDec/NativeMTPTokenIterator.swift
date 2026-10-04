@@ -364,6 +364,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// before the next commit so an unverified draft can never persist.
     private var headChainPairs = 0
 
+    private var canAlignHeadCache: Bool {
+        Self.alignedHeadCacheEnabled && mtpCache.allSatisfy { $0.isTrimmable }
+    }
+
     /// Static so callers can trim without holding a mutating borrow on
     /// `self` across the surrounding expression (the caches are reference
     /// types, so the rows really are dropped).
@@ -904,6 +908,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             processor: processor)
         drafts = draftBatch.tokens
         draftProbabilities = draftBatch.probabilities
+        // Keep the confirmed bridge; deeper head rows are speculative.
+        headChainPairs = canAlignHeadCache
+            ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
         self.mtpDraftTime += NativeMTPClock.now() - draftStart
@@ -1864,7 +1871,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 ?? verifier.hiddenStates[0..., drafts.count ..< (drafts.count + 1), 0...]
             // Full accept: commit (h0,d1) … (h_{k-1},dk), (hk,bonus). The
             // bonus pair is the one the old retained cache always dropped.
-            if Self.alignedHeadCacheEnabled, repairedHiddenForNextMTP == nil {
+            if canAlignHeadCache, repairedHiddenForNextMTP == nil {
                 Self.trimHeadChain(mtpCache, rows: headChainPairs)
                 headChainPairs = 0
                 // Copy out of `self` first: recordMaterializeSync is
@@ -1923,7 +1930,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // confirmed pairs with backbone hiddens. Recreating the cache
             // here is what the old path did, and it is exactly the context
             // loss that held acceptance down.
-            if Self.alignedHeadCacheEnabled, repairedHiddenForNextMTP == nil, committedCache {
+            if canAlignHeadCache, repairedHiddenForNextMTP == nil, committedCache {
                 Self.trimHeadChain(mtpCache, rows: headChainPairs)
                 headChainPairs = 0
                 let ids = Array(requestedInputIds.dropFirst().prefix(accepted))
@@ -1965,7 +1972,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // Levels beyond the first append speculative rows to the head
         // cache; record how many so the next cycle trims them before
         // committing confirmed pairs over the top.
-        headChainPairs = Self.alignedHeadCacheEnabled
+        headChainPairs = canAlignHeadCache
             ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
@@ -2334,7 +2341,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             processor: processor)
         drafts = draftBatch.tokens
         draftProbabilities = draftBatch.probabilities
-        headChainPairs = Self.alignedHeadCacheEnabled
+        headChainPairs = canAlignHeadCache
             ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
@@ -2689,6 +2696,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         var hiddenForNextMTP: MLXArray?
         var targetTokenIds: [Int] = []
         targetTokenIds.reserveCapacity(drafts.count + 1)
+        let alignHeadHistory = canAlignHeadCache && !mtpCache.isEmpty
+        var confirmedHidden: [MLXArray] = []
+        if alignHeadHistory { confirmedHidden.reserveCapacity(drafts.count + 1) }
 
         verifyCalls += 1
         sequentialVerifierCount += 1
@@ -2720,7 +2730,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 }
             }
 
-            hiddenForNextMTP = Self.lastHidden(verifier.hiddenStates)
+            let committedHidden = Self.lastHidden(verifier.hiddenStates)
+            hiddenForNextMTP = committedHidden
+            if alignHeadHistory { confirmedHidden.append(committedHidden) }
 
             if speculativeSampler.isGreedy {
                 let sampleStart = NativeMTPClock.now()
@@ -2753,8 +2765,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     bonusCount += 1
                 } else {
                     rejectedCount += 1
-                    mtpCache = model.makeNativeMTPCache()
-                    mtpCacheRefreshCount += 1
+                    if !alignHeadHistory {
+                        mtpCache = model.makeNativeMTPCache()
+                        mtpCacheRefreshCount += 1
+                    }
                 }
                 break
             }
@@ -2781,7 +2795,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                     accepted += 1
                     let acceptedDraft = drafts[index]
                     processor?.didSample(token: acceptedDraft)
-                    pendingTokens.append(recordMaterializeSync { acceptedDraft.item(Int.self) })
+                    let acceptedID = recordMaterializeSync { acceptedDraft.item(Int.self) }
+                    targetTokenIds.append(acceptedID)
+                    pendingTokens.append(acceptedID)
                     currentInput = acceptedDraft
                     continue
                 }
@@ -2794,11 +2810,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 }
                 processor?.didSample(token: correction)
                 nextToken = correction
-                pendingTokens.append(recordMaterializeSync { correction.item(Int.self) })
+                let correctionID = recordMaterializeSync { correction.item(Int.self) }
+                targetTokenIds.append(correctionID)
+                pendingTokens.append(correctionID)
                 rejectedCount += 1
                 residualCorrectionCount += 1
-                mtpCache = model.makeNativeMTPCache()
-                mtpCacheRefreshCount += 1
+                if !alignHeadHistory {
+                    mtpCache = model.makeNativeMTPCache()
+                    mtpCacheRefreshCount += 1
+                }
                 break
             }
 
@@ -2808,7 +2828,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             }
             processor?.didSample(token: bonus)
             nextToken = bonus
-            pendingTokens.append(recordMaterializeSync { bonus.item(Int.self) })
+            let bonusID = recordMaterializeSync { bonus.item(Int.self) }
+            targetTokenIds.append(bonusID)
+            pendingTokens.append(bonusID)
             bonusCount += 1
             break
         }
@@ -2830,6 +2852,18 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             FileHandle.standardError.write(Data(line.utf8))
         }
 
+        var alignedCommitHidden: MLXArray?
+        var alignedCommitTokens: MLXArray?
+        if alignHeadHistory {
+            // Sequential verification confirmed every collected pair, including
+            // the correction or bonus. Keep that history across rejection.
+            Self.trimHeadChain(mtpCache, rows: headChainPairs)
+            headChainPairs = 0
+            alignedCommitHidden = concatenated(confirmedHidden, axis: 1)
+            alignedCommitTokens = MLXArray(targetTokenIds.map(Int32.init))
+                .reshaped(1, targetTokenIds.count)
+        }
+
         nextMain = nextToken
         updateDepthAfterCommittedCycle(accepted: accepted)
         if forceAutoregressiveFallback || arSafetyPaused {
@@ -2840,8 +2874,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let draftStart = NativeMTPClock.now()
         let draftBatch = Self.makeDrafts(
             model: model,
-            hidden: hiddenForNextMTP,
-            nextToken: nextToken,
+            hidden: alignedCommitHidden ?? hiddenForNextMTP,
+            nextToken: alignedCommitTokens ?? nextToken,
             mtpCache: mtpCache,
             depth: currentDepth,
             sampler: sampler,
@@ -2849,6 +2883,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             processor: processor)
         drafts = draftBatch.tokens
         draftProbabilities = draftBatch.probabilities
+        headChainPairs = alignHeadHistory
+            ? Swift.max(0, draftBatch.tokens.count - 1) : 0
         mtpForwardCount += draftBatch.forwardCount
         materializeSyncTime += draftBatch.materializeSyncTime
         mtpDraftTime += NativeMTPClock.now() - draftStart
