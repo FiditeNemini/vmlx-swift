@@ -154,6 +154,9 @@ public struct MLXStudioModelStore: Sendable {
         if key.contains("z-image") || key.contains("zimage") {
             return "z-image-turbo"
         }
+        if key.contains("qwen-image-2-1") || key.contains("qwen-image-21") || key.contains("qwenimage21") {
+            return "qwen-image-2.1"
+        }
         if key.contains("qwen-image") || key.contains("qwenimage") {
             return key.contains("edit") ? "qwen-image-edit" : "qwen-image"
         }
@@ -251,6 +254,7 @@ public struct MLXStudioModelStore: Sendable {
         }
         let componentDirs: [(LocalFluxComponent, String)] = [
             (.tokenizer, "tokenizer"),
+            (.tokenizer, "processor"),
             (.transformer, "transformer"),
             (.unconditionalTransformer, "unconditional_transformer"),
             (.scheduler, "scheduler"),
@@ -400,6 +404,7 @@ public struct MLXStudioModelStore: Sendable {
         case "flux2-klein": return "FLUX.2 Klein"
         case "flux2-klein-edit": return "FLUX.2 Klein Edit"
         case "z-image-turbo": return "Z-Image Turbo"
+        case "qwen-image-2.1": return "Qwen-Image-2.1"
         case "qwen-image": return "Qwen-Image"
         case "qwen-image-edit": return "Qwen-Image-Edit"
         case "fibo": return "FIBO"

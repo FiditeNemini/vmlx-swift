@@ -20,6 +20,7 @@ public enum VMLXFluxModels {
         _ = ZImage._register
         _ = QwenImage._register
         _ = QwenImageEdit._register
+        _ = QwenImage21._register
         _ = FIBO._register
         _ = Ideogram4._register
         _ = SeedVR2._register
