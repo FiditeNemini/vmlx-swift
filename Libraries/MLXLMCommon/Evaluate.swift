@@ -2245,8 +2245,10 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
             }
         }
-        try Task.checkCancellation()
-        if canonicalCapture?.snapshot != nil { self.canonicalStablePrefillCapture = canonicalCapture }
+        if canonicalCapture?.snapshot != nil {
+            try Task.checkCancellation()
+            self.canonicalStablePrefillCapture = canonicalCapture
+        }
         prefillProgressHandler?(PrefillProgress(
             stage: .complete,
             completedUnitCount: promptTokenCount,
@@ -3427,7 +3429,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             return nil
         }
 
-        let reconstructionStarted = Date.timeIntervalSinceReferenceDate
+        let reconstructionStarted = canonicalStablePrefillCapture == nil
+            ? 0 : Date.timeIntervalSinceReferenceDate
         var canonicalSeedUsed: Int?
         var reconstructionSucceeded = false
         defer {
@@ -3441,7 +3444,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             }
         }
         do {
-            try Task.checkCancellation()
+            if canonicalStablePrefillCapture != nil { try Task.checkCancellation() }
             let rederiveWindow = cacheInitParameters?.prefillStepSize ?? 512
             let cache: [KVCache]
             let replayInput: LMInput
@@ -3485,7 +3488,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 break
             }
             MLX.eval(cache)
-            try Task.checkCancellation()
+            if canonicalSeedUsed != nil { try Task.checkCancellation() }
             reconstructionSucceeded = true
             return cache
         } catch {

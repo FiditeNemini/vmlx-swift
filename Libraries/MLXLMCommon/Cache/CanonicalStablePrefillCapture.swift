@@ -53,7 +53,7 @@ final class CanonicalStablePrefillCapture {
               input.text.mask == nil || input.text.mask?.size == promptTokens.count,
               !cache.isEmpty, cache.allSatisfy({ $0.offset == 0 && $0.state.isEmpty }),
               cache.allSatisfy({ type(of: $0) == MambaCache.self || type(of: $0) == QSAKVCache.self }),
-              let first = targets.filter({ $0 > 0 && $0 < promptTokens.count }).min()
+              let first = targets.filter({ $0 >= chunkSize && $0 < promptTokens.count }).min()
         else { return nil }
         let seed = (first / chunkSize) * chunkSize
         guard seed > 0 else { return nil }

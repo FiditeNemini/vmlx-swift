@@ -9,7 +9,7 @@ import XCTest
 @testable import MLXVLM
 
 final class FlashCanonicalStableProductionTests: XCTestCase {
-    private func withFixture(routedBits: [Int] = [], routedGroupSize: Int = 64, mtpEnabled: Bool = false,
+    private static func withFixture(routedBits: [Int] = [], routedGroupSize: Int = 64, mtpEnabled: Bool = false,
                              inputProjectionBits: Int? = nil, gdnHeadDimension: Int = 16,
                              pleLayerIDs: [Int] = [1], additionalLinearLayer: Bool = false,
                              distinctHCNorms: Bool = false,
@@ -223,11 +223,14 @@ final class FlashCanonicalStableProductionTests: XCTestCase {
 
     func testSingleStableBoundaryUsesProductionResidual() throws { try exercise(multiple: false) }
     func testMultipleStableBoundariesUseProductionResidual() throws { try exercise(multiple: true) }
-    private func exercise(multiple: Bool) throws {
+    func testSmallStableBoundaryDoesNotPreventLaterCanonicalCapture() throws {
+        try exercise(multiple: true, smallAndLarge: true)
+    }
+    private func exercise(multiple: Bool, smallAndLarge: Bool = false) throws {
         try MLXMetalTestLock.withLock {
-            try withFixture(routedBits: [2, 3, 4], inputProjectionBits: 2) { real in
+            try Self.withFixture(routedBits: [2, 3, 4], inputProjectionBits: 2) { real in
                 let prompt = (0..<60).map { 2 + ($0 * 17) % 113 }
-                let stable = multiple ? [33, 37] : [37]
+                let stable = smallAndLarge ? [9, 37] : (multiple ? [33, 37] : [37])
                 let parameters = GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 16)
                 let input = LMInput(tokens: MLXArray(prompt.map(Int32.init)).reshaped(1, prompt.count),
                     mask: MLXArray.ones([1, prompt.count], dtype: .int8), tokenIds: prompt, cachePrefixTokenCounts: stable + [52], cacheStablePrefixTokenCounts: stable)
@@ -243,9 +246,22 @@ final class FlashCanonicalStableProductionTests: XCTestCase {
                 var iterator = try TokenIterator(input: input, model: model, parameters: parameters,
                     cacheCoordinator: coordinator, prefillProgressHandler: { progress.add($0) })
                 XCTAssertEqual(model.preparedLengths, [52, 8])
+                let baselineProgress = ProgressRows()
+                let baselineCoordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+                    usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 0.1,
+                    diskCacheDir: directory.appendingPathComponent("baseline"), modelKey: "tiny-canonical-production"))
+                baselineCoordinator.setHybrid(true, requiresRecurrentSSMCompanion: true, requiresSeparateRecurrentPayload: false)
+                baselineCoordinator.setGenPromptSuffixTokens(Array(prompt.suffix(8)))
+                let baselineInput = LMInput(tokens: input.text.tokens, mask: input.text.mask, tokenIds: prompt,
+                    cachePrefixTokenCounts: stable + [52], cacheStablePrefixTokenCounts: [])
+                let baseline = try TokenIterator(input: baselineInput, model: real, parameters: parameters,
+                    cacheCoordinator: baselineCoordinator, prefillProgressHandler: { baselineProgress.add($0) })
+                XCTAssertEqual(progress.values, baselineProgress.values,
+                    "Complete progress sequence must match same geometry with no eligible stable capture")
+                XCTAssertTrue(iterator.cache.map(SubmissionCache.init) == baseline.cache.map(SubmissionCache.init))
                 let live = iterator.cache.map(SubmissionCache.init)
                 iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
-                XCTAssertEqual(Array(model.preparedLengths.dropFirst(2)), [4],
+                XCTAssertEqual(Array(model.preparedLengths.dropFirst(2)), smallAndLarge ? [8, 4] : [4],
                     "Production storage must replay residual4, not full32/36; no injected snapshots")
                 XCTAssertTrue(iterator.cache.map(SubmissionCache.init) == live)
                 XCTAssertTrue(progress.completed.contains(16) && progress.completed.contains(32)
@@ -277,19 +293,28 @@ final class FlashCanonicalStableProductionTests: XCTestCase {
 
     private final class ProgressRows: @unchecked Sendable {
         let lock = NSLock()
-        private var rows: [Int] = []
+        private var rows: [PrefillProgress] = []
         func add(_ value: PrefillProgress) {
-            lock.lock(); defer { lock.unlock() }; rows.append(value.completedUnitCount)
+            lock.lock(); defer { lock.unlock() }; rows.append(value)
         }
-        var completed: [Int] { lock.lock(); defer { lock.unlock() }; return rows }
+        var values: [PrefillProgress] { lock.lock(); defer { lock.unlock() }; return rows }
+        var completed: [Int] { lock.lock(); defer { lock.unlock() }; return rows.map(\.completedUnitCount) }
     }
 
     func testCollectorRejectsWrongOriginOwnersAndKeys() throws {
         try MLXMetalTestLock.withLock {
-            try withFixture(inputProjectionBits: 2) { real in
+            try Self.withFixture(inputProjectionBits: 2) { real in
                 let ids = Array(2..<62)
                 let input = LMInput(tokens: MLXArray(ids.map(Int32.init)).reshaped(1, 60), tokenIds: ids)
                 let cache = real.newCache(parameters: nil)
+                let image = LMInput(text: input.text, image: .init(pixels: MLXArray.zeros([1, 1, 1, 3])))
+                XCTAssertNil(CanonicalStablePrefillCapture(input: image, promptTokens: ids,
+                    cache: cache, chunkSize: 16, targets: [36], salt: "request-a"))
+                let video = LMInput(text: input.text,
+                    video: .init(pixels: MLXArray.zeros([1, 1, 1, 3]), embeddingTokenCount: 1))
+                XCTAssertTrue(video.requiresPostPrepareCacheKey)
+                XCTAssertNil(CanonicalStablePrefillCapture(input: video, promptTokens: ids,
+                    cache: cache, chunkSize: 16, targets: [36], salt: "request-a"))
                 let auxiliary = LMInput(tokens: input.text.tokens, tokenIds: ids, cachePromptIntent: .auxiliary)
                 XCTAssertNil(CanonicalStablePrefillCapture(input: auxiliary, promptTokens: ids,
                     cache: cache, chunkSize: 16, targets: [36], salt: "request-a"))
@@ -317,6 +342,38 @@ final class FlashCanonicalStableProductionTests: XCTestCase {
                 XCTAssertNil(capture.copySeed(for: Array(ids.prefix(36)), salt: "request-a", chunkSize: 8))
                 XCTAssertNil(capture.copySeed(for: [99] + Array(ids[1..<36]), salt: "request-a", chunkSize: 16))
                 XCTAssertNotNil(capture.copySeed(for: Array(ids.prefix(36)), salt: "request-a", chunkSize: 16))
+            }
+        }
+    }
+
+    func testCancelledProductionStoreDoesNotPublishStableSeed() async throws {
+        try await Task.detached { try Self.cancelledStore() }.value
+    }
+
+    private static func cancelledStore() throws {
+        try MLXMetalTestLock.withLock {
+            try withFixture(routedBits: [2, 3, 4], inputProjectionBits: 2) { real in
+                let ids = Array(2..<62)
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent("canonical-cancel-\(UUID().uuidString)")
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+                    usePagedCache: false, enableDiskCache: true, diskCacheMaxGB: 0.1,
+                    diskCacheDir: directory, modelKey: "tiny-canonical-cancel"))
+                coordinator.setHybrid(true, requiresRecurrentSSMCompanion: true, requiresSeparateRecurrentPayload: false)
+                coordinator.setGenPromptSuffixTokens(Array(ids.suffix(8)))
+                let parameters = GenerateParameters(maxTokens: 1, temperature: 0, prefillStepSize: 16)
+                let input = LMInput(tokens: MLXArray(ids.map(Int32.init)).reshaped(1, 60), tokenIds: ids,
+                    cachePrefixTokenCounts: [37, 52], cacheStablePrefixTokenCounts: [37])
+                let model = CaptureModel(real)
+                var iterator = try TokenIterator(input: input, model: model, parameters: parameters, cacheCoordinator: coordinator)
+                let before = iterator.cache.map(SubmissionCache.init)
+                withUnsafeCurrentTask { $0?.cancel() }
+                XCTAssertTrue(Task.isCancelled)
+                iterator.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+                XCTAssertFalse(coordinator.hasDurableDiskEntry(tokens: Array(ids.prefix(36)),
+                    mediaSalt: computeCacheSalt(for: input, parameters: parameters)))
+                XCTAssertEqual(model.preparedLengths, [52, 8])
+                XCTAssertTrue(iterator.cache.map(SubmissionCache.init) == before)
             }
         }
     }
