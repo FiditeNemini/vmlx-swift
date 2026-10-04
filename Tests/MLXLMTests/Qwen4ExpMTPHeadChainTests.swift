@@ -11,6 +11,11 @@ import XCTest
 /// Fresh process: VMLX_NATIVE_MTP_AR_SAFETY=0 VMLX_MTP_VERIFY_PREFETCH=0
 /// and VMLX_MTP_ALIGNED_HEAD_CACHE unset/1. Diagnostic controls only.
 final class Qwen4ExpMTPHeadChainTests: XCTestCase {
+    func testSampledChunkCommittedHeadMatchesOracleAcrossCycles() throws {
+        _ = try exercise(depth: 3, seed: 9041, vocabulary: 128,
+                         sequential: false, sampled: true, cycles: 2)
+    }
+
     func testDepthOneCommittedHeadMatchesOracle() throws { _ = try exercise(depth: 1) }
     func testDepthThreeInitialCommittedHeadMatchesOracle() throws { _ = try exercise(depth: 3) }
 
