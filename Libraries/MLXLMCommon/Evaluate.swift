@@ -1681,6 +1681,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Prefill already passes through every one of these boundaries, so the
     /// state is free at that moment; keeping a copy costs one cache copy.
     var stableBoundarySnapshots: [Int: [KVCache]] = [:]
+    private var canonicalStablePrefillCapture: CanonicalStablePrefillCapture?
 
     /// Absolute `promptTokenIds.count - 1` boundary for text-only
     /// standalone rotating/SWA cache topologies.
@@ -2214,15 +2215,38 @@ public struct TokenIterator: TokenIteratorProtocol {
             input: input,
             cache: self.cache,
             skipBoundary: self.skipDiskBackedToolPromptSeedBoundary)
+        // Only the already-existing cold head prepare may report a canonical
+        // seed. Warm/media requests retain their original fallback behavior.
+        let canonicalTargets: [Int]
+        if let coordinator = self.cacheCoordinator, coordinator.canPersistBoundaries,
+           !self.disableDiskBackedRequiredToolRestore,
+           !self.skipDiskBackedToolPromptSeedBoundary,
+           inputForPrepare.text.tokens.size == self.promptTokenIds.count,
+           cacheRequiresDiskBackedCoordinatorRestore(self.cache),
+           let strip = self.hybridStripBoundary {
+            canonicalTargets = input.cacheStablePrefixTokenCounts
+                .filter { $0 > 1 && $0 < strip }
+                .map { $0 - 1 }
+                .filter { !coordinator.hasDurableDiskEntry(
+                    tokens: Array(self.promptTokenIds.prefix($0)), mediaSalt: self.mediaSalt) }
+        } else { canonicalTargets = [] }
+        let canonicalCapture = CanonicalStablePrefillCapture(
+            input: input, promptTokens: self.promptTokenIds, cache: self.cache,
+            chunkSize: effectiveParameters.prefillStepSize,
+            targets: canonicalTargets, salt: self.mediaSalt)
         self.promptPrefillTime = try measure {
             try MLXPressGenerationProfile.time("prompt.prepare_total") {
-                try PrefillProgressReporter.withHandler(modelPrepareProgressHandler) {
-                    try prepare(
-                        input: inputForPrepare,
-                        windowSize: effectiveParameters.prefillStepSize)
+                try CanonicalTextPrefillCheckpointReporter.withCapture(canonicalCapture) {
+                    try PrefillProgressReporter.withHandler(modelPrepareProgressHandler) {
+                        try prepare(
+                            input: inputForPrepare,
+                            windowSize: effectiveParameters.prefillStepSize)
+                    }
                 }
             }
         }
+        try Task.checkCancellation()
+        if canonicalCapture?.snapshot != nil { self.canonicalStablePrefillCapture = canonicalCapture }
         prefillProgressHandler?(PrefillProgress(
             stage: .complete,
             completedUnitCount: promptTokenCount,
@@ -2961,6 +2985,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         generatedTokenIds: [Int],
         includeGeneratedBoundary: Bool
     ) {
+        defer { canonicalStablePrefillCapture = nil }
         guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
             return
         }
@@ -3403,10 +3428,27 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         do {
-            let cache = model.newCache(parameters: cacheInitParameters)
+            try Task.checkCancellation()
             let rederiveWindow = cacheInitParameters?.prefillStepSize ?? 512
+            let cache: [KVCache]
+            let replayInput: LMInput
+            if let capture = canonicalStablePrefillCapture,
+               let seed = capture.copySeed(for: tokens, salt: mediaSalt, chunkSize: rederiveWindow) {
+                cache = seed
+                let remaining = Array(tokens.dropFirst(capture.seedCount))
+                if remaining.isEmpty { return cache }
+                let residualMask = boundaryInput.text.mask.map {
+                    $0.reshaped(-1)[capture.seedCount...].reshaped(1, remaining.count)
+                }
+                replayInput = LMInput(
+                    tokens: MLXArray(remaining.map(Int32.init)).reshaped(1, remaining.count),
+                    mask: residualMask, tokenIds: remaining)
+            } else {
+                cache = model.newCache(parameters: cacheInitParameters)
+                replayInput = boundaryInput
+            }
             switch try model.prepare(
-                boundaryInput,
+                replayInput,
                 cache: cache,
                 windowSize: rederiveWindow)
             {
@@ -3423,6 +3465,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 break
             }
             MLX.eval(cache)
+            try Task.checkCancellation()
             return cache
         } catch {
             Self.logger.debug(

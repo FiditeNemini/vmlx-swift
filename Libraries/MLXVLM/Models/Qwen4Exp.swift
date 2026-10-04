@@ -1802,6 +1802,9 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
             let tokens = inputIds.ndim == 1 ? inputIds.expandedDimensions(axis: 0) : inputIds
             let step = windowSize ?? 512
             let count = tokens.dim(1)
+            let beganWithEmptyCache = CanonicalTextPrefillCheckpointReporter.isActive
+                && !cache.isEmpty
+                && cache.allSatisfy { $0.offset == 0 && $0.state.isEmpty }
             var offset = 0
             if step > 0 {
                 while count - offset > step {
@@ -1809,6 +1812,9 @@ public final class Qwen4Exp: Module, VLMModel, Qwen4ExpModelDirectoryConfigurabl
                     _ = forwardTokens(tokens[0..., offset..<(offset + step)], cache: cache)
                     MLX.eval(cache)
                     offset += step
+                    CanonicalTextPrefillCheckpointReporter.reportQwen4ExpColdTextChunk(
+                        input: input, cache: cache, chunkSize: step, completed: offset,
+                        beganWithEmptyCache: beganWithEmptyCache)
                     PrefillProgressReporter.reportCompletedUnits(offset)
                     MLX.Memory.clearCache()
                 }
