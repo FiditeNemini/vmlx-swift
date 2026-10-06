@@ -72,7 +72,9 @@ struct JANGHConfigurationPartition: Sendable {
         // JANGH banks. Other complete triples may be valid future formats, but
         // are unsupported here (shared-expert and attention aliases in the
         // generic decoder must not broaden custom-bank admission implicitly).
+        let denseK2 = modelType == "k2_horizon" && root["mlp_layout"] as? String == "dense_jangh_down"
         for name in customModules {
+            if denseK2 { continue } // Exact down-only namespace was validated by the format contract.
             let components = name.split(separator: ".", omittingEmptySubsequences: false)
             guard components.count == 6, components[0] == "model",
                 components[1] == "layers", let layer = Int(components[2]), layer >= 0,

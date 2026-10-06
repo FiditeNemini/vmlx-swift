@@ -228,6 +228,18 @@ public struct ReasoningParser: Sendable {
             return out
         }
 
+        if startTag == "<ifm|think>",
+            !K2HorizonToolCallParser().startTagAliases.contains(where: buffer.contains)
+        {
+            let tags = openerSpellings + closerSpellings
+            for length in stride(from: buffer.count, through: 2, by: -1) {
+                let suffix = String(buffer.suffix(length))
+                if tags.contains(where: { $0.hasPrefix(suffix) && $0 != suffix }) {
+                    buffer.removeLast(length)
+                    break
+                }
+            }
+        }
         var out = drain(allowPartialTagAtEnd: false)
         if !buffer.isEmpty {
             // Anything left over after the final drain is plain text — emit
@@ -744,6 +756,28 @@ public struct ReasoningParser: Sendable {
                         $0, among: firstTagIsOpener ? openerSpellings : closerSpellings)
                 } == true
 
+            // K2 tool payloads own literal think tags in argument strings.
+            // Keep the native envelope intact for the downstream tool parser.
+            if startTag == "<ifm|think>", !insideReasoning,
+                let tool = K2HorizonToolCallParser().startTagAliases.compactMap({ buffer.range(of: $0) })
+                    .min(by: { $0.lowerBound < $1.lowerBound }),
+                firstTagRange.map({ tool.lowerBound < $0.lowerBound }) ?? true
+            {
+                let before = String(buffer[..<tool.lowerBound])
+                if !before.isEmpty { out.append(.content(before)) }
+                buffer = String(buffer[tool.lowerBound...])
+                if let end = K2HorizonToolCallParser().completeToolCallEnd(in: buffer) {
+                    out.append(.content(String(buffer[..<end])))
+                    buffer.removeSubrange(buffer.startIndex..<end)
+                    continue
+                }
+                if !allowPartialTagAtEnd {
+                    out.append(.content(buffer))
+                    buffer.removeAll(keepingCapacity: false)
+                }
+                break
+            }
+
             if preservesQwenToolCallPayloads, !insideReasoning,
                 let tool = buffer.range(of: "<tool_call>"),
                 firstTagRange.map({ tool.lowerBound < $0.lowerBound }) ?? true
@@ -849,6 +883,9 @@ public struct ReasoningParser: Sendable {
                     ? ["<function name=\""] : []
                 if preservesQwenToolCallPayloads && !insideReasoning {
                     literalOpeners.append("<tool_call>")
+                }
+                if startTag == "<ifm|think>", !insideReasoning {
+                    literalOpeners += K2HorizonToolCallParser().startTagAliases
                 }
                 let longestTag = (openerSpellings + closerSpellings + literalOpeners)
                     .map(\.count).max() ?? 0
@@ -1106,6 +1143,11 @@ extension ReasoningParser {
                 // that we don't want to silently strip it.
                 stripStrayTags: false,
                 startTagAliases: ["\u{2B55}thought\n"])
+        case "k2_horizon", "k2horizon":
+            return ReasoningParser(
+                startTag: "<ifm|think>", endTag: "</ifm|think>", startInReasoning: true,
+                startTagAliases: ["<ifm|think_fast>", "<ifm|think_faster>"],
+                endTagAliases: ["</ifm|think_fast>", "</ifm|think_faster>"])
         case "none", "off", "disabled", "mistral", "gemma":
             return nil
         case "muse_glimmer", "muse-glimmer", "muse", "atem":
@@ -1359,6 +1401,8 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
         .replacingOccurrences(of: "-", with: "_")
         .replacingOccurrences(of: ".", with: "_")
     let compact = normalized.replacingOccurrences(of: "_", with: "")
+
+    if compact == "k2horizon" { return "k2_horizon" }
 
     // Official Hunyuan v3 uses `:opensource`-suffixed think markers; the
     // dedicated stamp resolves to that parser (see `fromCapabilityName`).

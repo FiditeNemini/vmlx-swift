@@ -84,7 +84,18 @@ struct JANGHFormatContract: Sendable {
             modules[name] = projection
         }
         guard !modules.isEmpty else { throw ValidationError.invalid("no JANGH projections") }
+        let denseK2 = root["model_type"] as? String == "k2_horizon"
+            && root["mlp_layout"] as? String == "dense_jangh_down"
         for name in modules.keys {
+            if denseK2 {
+                let parts = name.split(separator: ".", omittingEmptySubsequences: false)
+                guard parts.count == 5, parts[0] == "model", parts[1] == "layers",
+                      let layer = Int(parts[2]), layer >= 0, String(layer) == parts[2],
+                      parts[3] == "mlp", parts[4] == "down_proj" else {
+                    throw ValidationError.invalid("unsupported K2 dense JANGH projection \(name)")
+                }
+                continue
+            }
             let parent = String(name[..<name.lastIndex(of: ".")!])
             guard let gate = modules[parent + ".gate_proj"],
                 let up = modules[parent + ".up_proj"], modules[parent + ".down_proj"] != nil,

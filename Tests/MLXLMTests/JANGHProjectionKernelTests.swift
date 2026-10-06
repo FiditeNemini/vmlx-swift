@@ -15,7 +15,8 @@ final class JANGHProjectionKernelTests: XCTestCase {
     }
 
     private func kernel(
-        bits: Int, rotation: String, alpha override: Double? = nil, beta betaOverride: Double? = nil
+        bits: Int, rotation: String, alpha override: Double? = nil, beta betaOverride: Double? = nil,
+        fuseFloatRotation: Bool = false
     ) throws
         -> JANGHProjectionKernel
     {
@@ -44,7 +45,7 @@ final class JANGHProjectionKernelTests: XCTestCase {
         ]
         let contract = try JANGHFormatContract(
             configuration: JSONSerialization.data(withJSONObject: config))
-        return try JANGHProjectionKernel(contract: contract, module: module + ".gate_proj")
+        return try JANGHProjectionKernel(contract: contract, module: module + ".gate_proj", fuseFloatRotation: fuseFloatRotation)
     }
 
     // Deliberately independent scalar bit writer; no Metal unpack expression reused.
@@ -130,6 +131,63 @@ final class JANGHProjectionKernelTests: XCTestCase {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    func testDenseDecodeFloatRotationAcrossWidthsAndDispatchBoundary() throws {
+        try MLXMetalTestLock.withLock {
+            for bits in [2, 3, 4, 6, 8] {
+                let (alpha, beta) = coefficients(bits)
+                for width in [32, 96, 544] {
+                    let outputs = 9 // output tail and K=544 block tail are intentional
+                    var codes = [UInt32]()
+                    for index in 0..<(outputs * width) {
+                        let code: Int = (index * 13 + index / width + 7) % (1 << bits)
+                        codes.append(UInt32(code))
+                    }
+                    let packed = MLXArray(pack(codes, bits: bits), [1, outputs, width * bits / 32])
+                    let scales = MLXArray([Float16](repeating: 0.125, count: outputs), [1, outputs])
+                    let op = try kernel(bits: bits, rotation: "hadamard32", fuseFloatRotation: true)
+                    XCTAssertNotEqual(op.identity, try kernel(bits: bits, rotation: "hadamard32").identity)
+                    for count in [1, 63, 64] {
+                        var values = [Float]()
+                        for index in 0..<(count * width) { values.append(Float((index * 7) % 23 - 11) / 31) }
+                        for dtype in [DType.bfloat16, .float16, .float32] {
+                            let input = MLXArray(values, [count, width]).asType(dtype)
+                            let roundedInput = input.asType(.float32).asArray(Float.self)
+                            let actual = try op.project(input, packed: packed, scales: scales,
+                                indices: MLXArray.zeros([count], type: UInt32.self)).asArray(Float.self)
+                            for token in 0..<count {
+                                let row = Array(roundedInput[(token * width)..<((token + 1) * width)])
+                                // Independent dense Sylvester transform; no activation-dtype
+                                // round after H32. This detects the former BF16 intermediate.
+                                let rotated = h32(row)
+                                for output in 0..<outputs {
+                                    var expected: Double = 0
+                                    for column in 0..<width {
+                                        let u = Double(codes[output * width + column]) - Double((1 << bits) - 1) / 2
+                                        expected += Double(rotated[column]) * u * (alpha + beta * u * u)
+                                    }
+                                    expected *= 0.125
+                                    XCTAssertEqual(Double(actual[token * outputs + output]), expected,
+                                        accuracy: max(0.00003, abs(expected) * 0.00003),
+                                        "dense float H32 bits=\(bits) K=\(width) rows=\(count) dtype=\(dtype)")
+                                }
+                            }
+                        }
+                    }
+                }
+                // A non-rotated declaration must retain exactly the old operator.
+                let none = try kernel(bits: bits, rotation: "none")
+                let fusedNone = try kernel(bits: bits, rotation: "none", fuseFloatRotation: true)
+                let packed = MLXArray(pack([UInt32](repeating: 1, count: 32), bits: bits), [1, 1, bits])
+                let input = MLXArray.ones([1, 32], dtype: .bfloat16)
+                let scales = MLXArray([Float16(1)], [1, 1])
+                let ids = MLXArray([UInt32(0)])
+                let original = try none.project(input, packed: packed, scales: scales, indices: ids)
+                let unchanged = try fusedNone.project(input, packed: packed, scales: scales, indices: ids)
+                XCTAssertTrue(all(original .== unchanged).item(Bool.self))
             }
         }
     }

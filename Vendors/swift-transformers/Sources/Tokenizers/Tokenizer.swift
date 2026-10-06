@@ -266,7 +266,19 @@ public enum ChatTemplateArgument {
 ///
 /// This is the main protocol that defines all tokenizer operations, including text processing,
 /// chat template application, and special token handling.
+/// A lossless piece from a plain ByteLevel decoder. Added tokens terminate
+/// the preceding byte run and are emitted literally, including non-special ones.
+public enum ByteLevelDecodingPiece: Sendable {
+    case bytes([UInt8])
+    case literal(String)
+    case ignored
+}
+
 public protocol Tokenizer: Sendable {
+    /// Available only when incremental byte decoding is equivalent to decode.
+    /// Generation retains special tokens, matching skipSpecialTokens=false.
+    var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? { get }
+
     /// Tokenizes the input text into a sequence of tokens.
     ///
     /// - Parameter text: The input text to tokenize
@@ -458,6 +470,7 @@ public protocol Tokenizer: Sendable {
 }
 
 extension Tokenizer {
+    public var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? { nil }
     public var hasChatTemplate: Bool { false }
     public func configuredChatTemplate(forTools: Bool) -> String? { nil }
 
@@ -552,6 +565,18 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     private let tokenizerConfig: Config
 
     private let cleanUpTokenizationSpaces: Bool
+
+    public var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? {
+        // Do not bypass subclass overrides, decoder sequences, or cleanup rules.
+        guard type(of: self) == PreTrainedTokenizer.self,
+              decoder is ByteLevelDecoder, !cleanUpTokenizationSpaces else { return nil }
+        return { [self] id in
+            guard let token = model.convertIdToToken(id) else { return .ignored }
+            if addedTokens.contains(token) { return .literal(token) }
+            // Same mapping and invalid-vocabulary contract as ByteLevelDecoder.
+            return .bytes(token.map { byteDecoder[String($0)]! })
+        }
+    }
 
     /// Cache for compiled Jinja templates keyed by their literal template string
     private var compiledChatTemplateCache: [String: Template] = [:]

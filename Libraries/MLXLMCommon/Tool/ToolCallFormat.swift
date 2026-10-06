@@ -194,6 +194,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `functions.name:0<|tool_call_argument_begin|>{"key": "value"}`
     case kimiK2 = "kimi_k2"
 
+    case k2Horizon = "k2_horizon"
+
     /// MiniMax M2 format with invoke/parameter tags.
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
@@ -265,6 +267,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return GemmaFunctionParser()
         case .gemma4:
             return Gemma4ToolCallParser()
+        case .k2Horizon:
+            return K2HorizonToolCallParser()
         case .kimiK2:
             return KimiK2ToolCallParser()
         case .minimaxM2:
@@ -296,7 +300,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// formats because the parser only accepts explicit protocol envelopes.
     public var parsesToolCallsFromReasoningChannel: Bool {
         switch self {
-        case .dsml, .minicpm5:
+        case .dsml, .minicpm5, .k2Horizon:
             // These contracts place complete reasoning inside
             // <think>...</think> before any tool call. Tool-shaped examples or
             // malformed protocol text inside reasoning_content are therefore
@@ -348,6 +352,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         let type = modelType.lowercased()
         let normalized = normalizedAlias(type)
         let compact = compactAlias(type)
+
+        if compact == "k2horizon" { return .k2Horizon }
 
         // Llama family (need secondary signal for Llama 3 vs 1/2).
         // Kept byte-compatible with upstream ml-explore/mlx-swift-lm.
@@ -709,6 +715,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case "lfm2", "lfm2_5":
             return .lfm2
         // KimiK2 — `functions.name:0<|tool_call_argument_begin|>{…}`.
+        case "k2_horizon", "k2horizon":
+            return .k2Horizon
         case "kimi", "kimik2", "kimi_k2":
             return .kimiK2
         // DSV4 DSML — authoritative stamp from
