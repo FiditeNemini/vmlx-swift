@@ -257,6 +257,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
     private var pendingTokens: [Int] = []
     private var pendingIndex = 0
+    /// Copy drafts (NativeMTPCopyProposer.swift): the request's suffix-match proposer, fed every confirmed
+    /// token; `copyFed` = how much of the current `pendingTokens` buffer it has seen.
+    private var copyProposer: NativeMTPCopyProposer?
+    private var copyFed = 0
+    /// The drafts now in `drafts` are a copy window (kept out of the head/depth controller's statistics).
+    private var draftsAreCopy = false
     private var nextMain: MLXArray?
     private var drafts: [MLXArray] = []
     private var draftProbabilities: [MLXArray] = []
@@ -405,6 +411,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// Resolved promotion ceiling: fixed requests never exceed their chosen
     /// depth; explicitly adaptive requests may explore to their bounded cap.
     private let adaptiveDepthCeiling: Int
+    /// Cost-model depth owner for explicitly adaptive requests (NativeMTPDepthChooser.swift).
+    private var depthChooser: NativeMTPDepthChooser?
+    private var depthChooserLastStamp: (cycle: Int, time: TimeInterval)?
+    /// After an AR-safety demotion the chooser stays at or below that depth until the safety
+    /// window has refilled, so the next cycle cannot simply undo the demotion.
+    private var depthChooserHold: (depth: Int, untilCycle: Int)?
     private(set) var seedMainForwardTime: TimeInterval = 0
     private(set) var verifyMainForwardTime: TimeInterval = 0
     private(set) var replayMainForwardTime: TimeInterval = 0
@@ -611,6 +623,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.adaptiveDepthCeiling = resolvedDepth.maximumDepth
         self.depth = resolvedDepth.initialDepth
         self.currentDepth = resolvedDepth.initialDepth
+        if case .adaptive = effectiveParameters.nativeMTPDepthPolicy, NativeMTPDepthChooser.enabled,
+            resolvedDepth.maximumDepth > 1
+        {
+            self.depthChooser = NativeMTPDepthChooser(
+                initialDepth: resolvedDepth.initialDepth, maximumDepth: resolvedDepth.maximumDepth,
+                costs: NativeMTPDepthCostTable.shared(for: model as AnyObject))
+        }
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
         let promptTokenStart = NativeMTPClock.now()
         let promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -908,6 +927,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             speculativeSampler: speculativeSampler,
             processor: processor)
         drafts = draftBatch.tokens
+        draftsAreCopy = false
         draftProbabilities = draftBatch.probabilities
         // Keep the confirmed bridge; deeper head rows are speculative.
         headChainPairs = canAlignHeadCache
@@ -950,8 +970,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         if pendingIndex >= pendingTokens.count {
+            feedCopyProposer()
             pendingTokens.removeAll(keepingCapacity: true)
             pendingIndex = 0
+            copyFed = 0
             do {
                 if forceAutoregressiveFallback || arSafetyPaused
                     || (!Self.arSafetyDisabled && arSafetySeedStepSec == nil)
@@ -1963,8 +1985,23 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 requiresRepair: repairedHiddenForNextMTP != nil))
         if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
+            draftsAreCopy = false
             draftProbabilities.removeAll(keepingCapacity: true)
             return
+        }
+        if draftsAreCopy {
+            copyProposer?.observe(drafted: drafts.count, accepted: accepted)
+        }
+        // Copy window for the next cycle (greedy staged verify only). With a proposal the head still drafts
+        // ONE level: that forward commits this cycle's confirmed pairs to the aligned head cache (later head
+        // drafts need that context); its single draft is then superseded by the copies.
+        var copyWindow: [Int] = []
+        if stagedVerify, speculativeSampler.isGreedy, processor == nil, NativeMTPCopyProposer.enabled {
+            if copyProposer == nil { copyProposer = NativeMTPCopyProposer(prompt: promptTokenIds) }
+            feedCopyProposer()
+            let queued = pendingTokens.count - pendingIndex
+            let room = (maxTokens ?? Int.max / 2) - tokenCount - queued - 1
+            copyWindow = copyProposer?.propose(room: room) ?? []
         }
         let draftStart = NativeMTPClock.now()
         let draftBatch = Self.makeDrafts(
@@ -1972,12 +2009,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             hidden: alignedCommitHidden ?? hiddenForNextMTP,
             nextToken: alignedCommitTokens ?? nextToken,
             mtpCache: mtpCache,
-            depth: currentDepth,
+            depth: copyWindow.isEmpty ? currentDepth : 1,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
             processor: processor)
-        drafts = draftBatch.tokens
-        draftProbabilities = draftBatch.probabilities
+        if copyWindow.isEmpty {
+            drafts = draftBatch.tokens
+            draftProbabilities = draftBatch.probabilities
+            draftsAreCopy = false
+        } else {
+            let dtype = nextToken.dtype
+            drafts = copyWindow.map { MLXArray([Int32($0)]).asType(dtype) }
+            draftProbabilities = []
+            draftsAreCopy = true
+        }
         // Levels beyond the first append speculative rows to the head
         // cache; record how many so the next cycle trims them before
         // committing confirmed pairs over the top.
@@ -2316,6 +2361,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let previous = currentDepth
         recordDepthLoss()
         currentDepth -= 1
+        if depthChooser != nil {
+            depthChooserHold = (currentDepth, verifyCalls + Self.arSafetyWindow + 1)
+            depthChooserLastStamp = nil
+        }
         adaptiveDepthDownshiftCount += 1
         adaptiveWallClockDemotes += 1
         arSafetyRing.removeAll(keepingCapacity: true)
@@ -2351,6 +2400,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         lastAdaptiveCycleTimestamp = nil
         adaptiveFallbackReason = reason
         drafts.removeAll(keepingCapacity: true)
+        draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
         FileHandle.standardError.write(Data("[NativeMTP] ar_safety paused: \(reason)\n".utf8))
     }
@@ -2419,6 +2469,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             speculativeSampler: speculativeSampler,
             processor: processor)
         drafts = draftBatch.tokens
+        draftsAreCopy = false
         draftProbabilities = draftBatch.probabilities
         headChainPairs = canAlignHeadCache
             ? Swift.max(0, draftBatch.tokens.count - 1) : 0
@@ -2443,9 +2494,23 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             && speculativeRows == 0 && !requiresRepair
     }
 
+    private mutating func feedCopyProposer() {
+        guard copyProposer != nil, copyFed < pendingTokens.count else { return }
+        copyProposer!.append(pendingTokens[copyFed...])
+        copyFed = pendingTokens.count
+    }
+
     private mutating func updateDepthAfterCommittedCycle(
         accepted: Int, preserveConfirmedHead: Bool
     ) {
+        if draftsAreCopy {
+            // A copy window says nothing about the head's per-depth acceptance; it still counts
+            // toward measured MTP-vs-AR throughput. Its wall time must not be billed to a head depth.
+            arSafetyAfterVerifyCycle(accepted: accepted)
+            lastAdaptiveCycleTimestamp = nil
+            depthChooserLastStamp = nil
+            return
+        }
         let previousDepth = currentDepth
         let previousTrips = arSafetyTrips
         arSafetyAfterVerifyCycle(accepted: accepted)
@@ -2468,6 +2533,38 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // steady-state cost, so complete warmup by cycle count alone.
             if !hybridSafetyWarmupComplete, verifyCalls >= Self.hybridWarmupCycleCount {
                 hybridSafetyWarmupComplete = true
+            }
+            return
+        }
+        if var chooser = depthChooser, stagedVerifierCommitCount > 0, speculativeSampler.isGreedy,
+            !forceAutoregressiveFallback
+        {
+            let now = NativeMTPClock.now()
+            let period = depthChooserLastStamp.flatMap { last in
+                last.cycle == verifyCalls - 1 ? now - last.time : nil
+            }
+            depthChooserLastStamp = (verifyCalls, now)
+            var ceiling = adaptiveDepthCeiling
+            if let hold = depthChooserHold {
+                if verifyCalls < hold.untilCycle { ceiling = Swift.min(ceiling, hold.depth) }
+                else { depthChooserHold = nil }
+            }
+            let cycleDepth = currentDepth
+            chooser.observe(cycleDepth: cycleDepth, accepted: accepted, seconds: period, ceiling: ceiling)
+            depthChooser = chooser
+            let next = chooser.depth
+            if next != currentDepth {
+                if next < currentDepth {
+                    adaptiveDepthDownshiftCount += 1
+                    adaptiveWallClockDemotes += 1
+                    if !preserveConfirmedHead {
+                        mtpCache = model.makeNativeMTPCache()
+                        mtpCacheRefreshCount += 1
+                    }
+                } else {
+                    adaptiveDepthPromotionCount += 1
+                }
+                currentDepth = next
             }
             return
         }
@@ -2726,6 +2823,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         forceAutoregressiveFallback = true
         adaptiveFallbackReason = reason
         drafts.removeAll(keepingCapacity: true)
+        draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
         mtpCache = model.makeNativeMTPCache()
         mtpCacheRefreshCount += 1
@@ -2774,6 +2872,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // Any drafts made before this AR step were built for the previous
         // position; they are stale now.
         drafts.removeAll(keepingCapacity: true)
+        draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
         arSafetyAfterARStep(
             stepSec: NativeMTPClock.now() - verifyStart,
@@ -2970,6 +3069,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 requiresRepair: false))
         if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
+            draftsAreCopy = false
             draftProbabilities.removeAll(keepingCapacity: true)
             return
         }
@@ -2984,6 +3084,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             speculativeSampler: speculativeSampler,
             processor: processor)
         drafts = draftBatch.tokens
+        draftsAreCopy = false
         draftProbabilities = draftBatch.probabilities
         headChainPairs = alignHeadHistory
             ? Swift.max(0, draftBatch.tokens.count - 1) : 0
