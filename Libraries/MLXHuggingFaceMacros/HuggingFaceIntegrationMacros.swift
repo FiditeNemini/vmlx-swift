@@ -104,6 +104,17 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         upstream.convertIdToToken(id)
                     }
 
+                    var incrementalByteLevelDecoder: (@Sendable (Int) -> MLXLMCommon.ByteLevelDecodingPiece)? {
+                        guard let decoder = upstream.incrementalByteLevelDecoder else { return nil }
+                        return { id in
+                            switch decoder(id) {
+                            case .bytes(let bytes): return .bytes(bytes)
+                            case .literal(let text): return .literal(text)
+                            case .ignored: return .ignored
+                            }
+                        }
+                    }
+
                     var bosToken: String? { upstream.bosToken }
                     var eosToken: String? { upstream.eosToken }
                     var unknownToken: String? { upstream.unknownToken }
