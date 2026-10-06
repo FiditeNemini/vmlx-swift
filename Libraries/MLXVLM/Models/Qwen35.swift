@@ -282,9 +282,11 @@ enum Qwen4ExpCompiledGDNInputs {
         mode: QuantizationMode,
         batchedRows: Bool = false
     ) -> MLXArray? {
-        // Rows as a batch over a leading singleton weight bank: MLX keeps M=1 per batch element, i.e. the
-        // single-row qmv arithmetic of the AR tail, in ONE compiled region instead of one region per row.
+        #if DEBUG
         let batchAddressing = batchedRows
+        #else
+        let batchAddressing = false
+        #endif
         guard !batchedRows || (batchAddressing && (2...8).contains(output.dim(0))
             && output.ndim == 4 && gate.shape == output.shape
             && outWeight.ndim == 2 && outScales.ndim == 2 && outBiases.shape == outScales.shape)
@@ -1846,9 +1848,6 @@ enum Qwen35Language {
                 headVDim: headVDim)
         }
 
-        static let batchedVerifyTail =
-            ProcessInfo.processInfo.environment["VMLX_GDN_BATCHED_TAIL"] != "0"
-
         private func compiledDecodeTail(
             _ output: MLXArray, gate: MLXArray, batchedRows: Bool = false
         ) -> MLXArray? {
@@ -2111,17 +2110,7 @@ enum Qwen35Language {
             // outProj is a row-independent matmul, so the whole output stage
             // may run at padded M and be sliced back afterwards. All cache
             // and staging writes above already saw only the real rows.
-            if exactRowVerifier, !FlashVerificationScope.diagnosticSiteOff("gdntail") {
-                // One batched region for all verify rows (rows -> batch axis, M=1 each): same per-row
-                // arithmetic as the AR tail, ~1 launch set instead of S. VMLX_GDN_BATCHED_TAIL=0 restores
-                // the per-row loop below.
-                if Self.batchedVerifyTail, out.dim(0) == 1,
-                    let tail = compiledDecodeTail(
-                        out.reshaped(S, 1, out.dim(2), out.dim(3)),
-                        gate: z.reshaped(S, 1, z.dim(2), z.dim(3)), batchedRows: true)
-                {
-                    return tail.reshaped(1, S, -1)
-                }
+            if exactRowVerifier {
                 let rows = (0..<S).map { row -> MLXArray in
                     let rowOutput = out[0..., row..<(row + 1), 0..., 0...]
                     let rowGate = z[0..., row..<(row + 1), 0..., 0...]

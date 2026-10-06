@@ -24,8 +24,6 @@ public enum FlashVerificationScope {
 
     /// Whether this tensor belongs to the active small-row Flash target verification.
     /// Does not establish scope or admit ordinary prefill, AR, or draft-head calls.
-    public static func diagnosticSiteOff(_ site: String) -> Bool { diagnosticOffSites.contains(site) }
-
     public static func usesRowExactVerification(inputShape: [Int], site: String = "") -> Bool {
         if !site.isEmpty, diagnosticOffSites.contains(site) { return false }
         return rows > 0 && inputShape.count == 3 && inputShape[0] == 1
