@@ -1,0 +1,137 @@
+// BENCH_ROWEXACT=1 — teacher-forced row-exactness of the native-MTP verify forward (Swift twin of the
+// vMLX Python tests/test_row_exact_verify.py idea). For one prompt:
+//   1. AR reference: prefill, then N greedy single-token steps through nativeAutoregressiveBackboneForward
+//      (the S1 path MTP's AR steps use); keep every step's logits.
+//   2. For each verify width W (BENCH_ROWEXACT_WIDTHS, default 2,4,8): prefill afresh, then feed the SAME
+//      token stream in windows of W through nativeBackboneMTPVerifyForward in the staged verifier mode the
+//      iterator uses, commit each full window (commitStagedVerifiedBlock), and compare every row's logits
+//      with the AR logits of the same position: bitwise equality, max |diff|, argmax agreement.
+// A row-exact verifier must report bitwise=all for every W. Env: BENCH_ROWEXACT_TOKENS (default 96),
+// BENCH_ROWEXACT_PROMPT (default: the speed probe's first prose prompt).
+
+import Foundation
+import MLX
+import MLXHuggingFace
+import MLXLMCommon
+import MLXVLM
+import VMLXTokenizers
+
+func runRowExactBench(modelPath: String) async throws {
+    let env = ProcessInfo.processInfo.environment
+    let modelDir = URL(fileURLWithPath: modelPath)
+    let steps = Int(env["BENCH_ROWEXACT_TOKENS"] ?? "96") ?? 96
+    let widths = (env["BENCH_ROWEXACT_WIDTHS"] ?? "2,4,8").split(separator: ",").compactMap { Int($0) }
+    let promptText = env["BENCH_ROWEXACT_PROMPT"]
+        ?? "Write a detailed essay of about 400 words on the history of the printing press and its effect on literacy in Europe."
+    let context = try await MLXLMCommon.loadModel(
+        from: modelDir, using: #huggingFaceTokenizerLoader(),
+        loadConfiguration: LoadConfiguration(nativeMTP: true)).0
+    guard let model = context.model as? any NativeMTPAutoregressiveBackboneModel,
+        let staged = context.model as? any DFlash2StagedVerifyRollbackModel
+    else { print("[ROWEXACT] model lacks native AR / staged verify"); return }
+    var input = UserInput(prompt: promptText)
+    input.additionalContext = ["enable_thinking": false]
+    let prompt = try await context.processor.prepare(input: input).text.tokens.reshaped(1, -1)
+
+    func prefill() -> ([KVCache], Int) {
+        let cache = model.newCache(parameters: GenerateParameters())
+        let out = model.nativeBackboneForward(prompt, cache: cache)
+        let first = argMax(out.logits[0, -1], axis: -1).item(Int.self)
+        MLX.eval(cache)
+        return (cache, first)
+    }
+
+    // 1. AR reference.
+    var (cache, token) = prefill()
+    var stream: [Int] = [token]
+    var arLogits: [MLXArray] = []
+    for _ in 0 ..< steps {
+        let tokenInput = MLXArray([Int32(token)]).reshaped(1, 1)
+        // BENCH_ROWEXACT_AR=plain: nativeBackboneForward (S=1, no autoregressive flag) as the reference.
+        let out = env["BENCH_ROWEXACT_AR"] == "plain"
+            ? model.nativeBackboneForward(tokenInput, cache: cache)
+            : model.nativeAutoregressiveBackboneForward(tokenInput, cache: cache)
+        let row = out.logits[0, -1].asType(.float32)
+        MLX.eval(row)
+        arLogits.append(row)
+        token = argMax(row, axis: -1).item(Int.self)
+        stream.append(token)
+    }
+    if env["BENCH_ROWEXACT_LAYERS"] == "1" {
+        // Layer bisect: AR step on t0 vs verify window [t0, t1], row 0, after every layer.
+        var (c1, t0) = prefill()
+        Qwen4ExpRowExactCapture.layers = []; Qwen4ExpRowExactCapture.parts = []
+        Qwen4ExpRowExactCapture.enabled = true
+        let a = model.nativeAutoregressiveBackboneForward(MLXArray([Int32(t0)]).reshaped(1, 1), cache: c1)
+        MLX.eval(a.logits); let arLayers = Qwen4ExpRowExactCapture.layers
+        let arParts = Qwen4ExpRowExactCapture.parts
+        MLX.eval(arLayers)
+        Qwen4ExpRowExactCapture.enabled = false
+        (c1, _) = prefill()
+        Qwen4ExpRowExactCapture.layers = []; Qwen4ExpRowExactCapture.parts = []
+        Qwen4ExpRowExactCapture.enabled = true
+        let v = NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+            model.nativeBackboneMTPVerifyForward(MLXArray([Int32(t0), Int32(stream[1])]).reshaped(1, 2), cache: c1)
+        }
+        MLX.eval(v.logits); let vLayers = Qwen4ExpRowExactCapture.layers
+        let vParts = Qwen4ExpRowExactCapture.parts
+        for ((name, x), (_, y)) in zip(arParts, vParts) {
+            let xr = x.reshaped(x.dim(0), x.dim(1), -1)[0, 0].asType(.float32)
+            let yr = y.reshaped(y.dim(0), y.dim(1), -1)[0, 0].asType(.float32)
+            let d = abs(xr - yr)
+            print(String(format: "[ROWEXACT] layer0.%@ shape=%@/%@ dtype=%@/%@ maxdiff=%.4g nonzero=%d", name,
+                         x.shape.description, y.shape.description, String(describing: x.dtype),
+                         String(describing: y.dtype), d.max().item(Float.self), (d .> 0).sum().item(Int.self)))
+        }
+        MLX.eval(vLayers)
+        Qwen4ExpRowExactCapture.enabled = false
+        for (i, (x, y)) in zip(arLayers, vLayers).enumerated() {
+            let d = abs(x[0, 0].asType(.float32) - y[0, 0].asType(.float32))
+            print(String(format: "[ROWEXACT] layer=%d maxdiff=%.4g nonzero=%d", i, d.max().item(Float.self),
+                         (d .> 0).sum().item(Int.self)))
+        }
+    }
+    print("[ROWEXACT] model=\(modelDir.lastPathComponent) prompt=\(prompt.dim(1)) steps=\(steps) ar=\(env["BENCH_ROWEXACT_AR"] ?? "native-autoregressive")")
+
+    // 2. Verify windows over the same stream.
+    for w in widths {
+        (cache, _) = prefill()
+        var p = 0
+        var bitwise = 0, compared = 0, argmaxMiss = 0
+        var firstMismatch: Int?
+        var maxDiff: Float = 0
+        while p + w <= steps {
+            let ids = MLXArray(stream[p ..< p + w].map { Int32($0) }).reshaped(1, w)
+            let out = NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                model.nativeBackboneMTPVerifyForward(ids, cache: cache)
+            }
+            let rows = out.logits[0].asType(.float32)
+            MLX.eval(rows)
+            guard staged.commitStagedVerifiedBlock(cache: cache, acceptedInputs: w, blockLength: w) else {
+                print("[ROWEXACT] W=\(w) commit failed at \(p)"); break
+            }
+            if p == 0 {
+                print("[ROWEXACT] debug W=\(w) verify_logits=\(out.logits.dtype) \(out.logits.shape) ar_row=\(arLogits[0].shape)")
+                for j in 0 ..< w {
+                    let d = abs(rows[j] - arLogits[j])
+                    print(String(format: "[ROWEXACT] debug row=%d maxdiff=%.4g meandiff=%.4g nonzero=%d argmax=%d ar_argmax=%d",
+                                 j, d.max().item(Float.self), d.mean().item(Float.self),
+                                 (d .> 0).sum().item(Int.self), argMax(rows[j], axis: -1).item(Int.self),
+                                 argMax(arLogits[j], axis: -1).item(Int.self)))
+                }
+            }
+            for j in 0 ..< w {
+                let ref = arLogits[p + j]
+                let got = rows[j]
+                let diff = abs(got - ref).max().item(Float.self)
+                compared += 1
+                if diff == 0 { bitwise += 1 } else if firstMismatch == nil { firstMismatch = p + j }
+                maxDiff = max(maxDiff, diff)
+                if argMax(got, axis: -1).item(Int.self) != stream[p + j + 1] { argmaxMiss += 1 }
+            }
+            p += w
+        }
+        print(String(format: "[ROWEXACT] W=%d rows=%d bitwise=%d argmax_miss=%d max_abs_diff=%.4g first_mismatch=%@",
+                     w, compared, bitwise, argmaxMiss, maxDiff, firstMismatch.map(String.init) ?? "none"))
+    }
+}

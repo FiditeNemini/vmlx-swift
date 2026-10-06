@@ -8,6 +8,18 @@ import MLXNN
 
 
 
+/// Diagnostic only (RunBench BENCH_ROWEXACT): when `enabled`, every layer's output of the next forward is
+/// appended to `layers` so a verify row can be compared with the AR step layer by layer.
+public enum Qwen4ExpRowExactCapture {
+    nonisolated(unsafe) public static var enabled = false
+    nonisolated(unsafe) public static var layers: [MLXArray] = []
+    nonisolated(unsafe) public static var parts: [(String, MLXArray)] = []
+    static func part(_ layer: Int, _ name: String, _ value: MLXArray?) {
+        guard enabled, layer == 0, let value else { return }
+        parts.append((name, value))
+    }
+}
+
 enum Qwen4ExpRowExactProjection {
     /// Preserve qualified q8 single-row addressing for actual Flash verification.
     static func q8Projection(_ module: Linear, _ x: MLXArray) -> MLXArray? {
@@ -1403,8 +1415,11 @@ private final class Qwen4ExpDecoderLayer: Module {
         }
         // PLE changes the residual before attention; a norm prepared before PLE
         // would be stale. The caller also avoids preparing it for these layers.
+        Qwen4ExpRowExactCapture.part(layerIndex, "after_ple", hyper)
         let (attentionInput, inject) = attentionResidual.mix(
             hyper, normalizedInput: ple == nil ? normalizedInput : nil)
+        Qwen4ExpRowExactCapture.part(layerIndex, "attn_mix_input", attentionInput)
+        Qwen4ExpRowExactCapture.part(layerIndex, "attn_mix_inject", inject)
         let attentionOutput = isLinear
             ? linearAttention!(
                 attentionInput, cache: cache as? MambaCache,
@@ -1417,10 +1432,14 @@ private final class Qwen4ExpDecoderLayer: Module {
         let preparedMLP = fuseHCCombineNorm
             ? mlpResidual.combineAndNormalize(hyper, block: attentionOutput, injection: inject!)
             : nil
+        Qwen4ExpRowExactCapture.part(layerIndex, "attn_out", attentionOutput)
         hyper = preparedMLP?.residual
             ?? attentionResidual.combine(hyper, block: attentionOutput, injection: inject!)
+        Qwen4ExpRowExactCapture.part(layerIndex, "attn_combined", hyper)
         let (mlpInput, mlpInject) = mlpResidual.mix(hyper, normalizedInput: preparedMLP?.normalized)
+        Qwen4ExpRowExactCapture.part(layerIndex, "mlp_mix_input", mlpInput)
         let block = mlp(mlpInput)
+        Qwen4ExpRowExactCapture.part(layerIndex, "moe_out", block)
         if fuseHCCombineNorm,
             let prepared = nextMixer?.combineAndNormalize(hyper, block: block, injection: mlpInject!)
         {
@@ -1687,6 +1706,7 @@ private final class Qwen4ExpTextModel: Module {
                 nextMixer: fuseHCCombineNorm ? nextMixer : nil)
             hidden = result.hidden
             normalizedNext = result.normalizedNext
+            if Qwen4ExpRowExactCapture.enabled { Qwen4ExpRowExactCapture.layers.append(hidden) }
             if earlySubmit {
                 if let normalizedNext { asyncEval(hidden, normalizedNext) }
                 else { asyncEval(hidden) }

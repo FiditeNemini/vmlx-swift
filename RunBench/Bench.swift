@@ -580,6 +580,18 @@ struct Bench {
             try await runNoGuardSamplingProbe(modelPath: modelPath, maxNew: maxNew)
             return
         }
+        if (env["BENCH_ROWEXACT"] ?? "0") == "1" {
+            try await runRowExactBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_ROWCOST"] ?? "0") == "1" {
+            try await runRowCostBench(modelPath: modelPath)
+            return
+        }
+        if (env["BENCH_SPEED"] ?? "0") == "1" {
+            try await runSpeedProbe(modelPath: modelPath)
+            return
+        }
         if (env["BENCH_PROD"] ?? "0") == "1" {
             try await runProdMatrix(modelPath: modelPath, maxNew: maxNew)
             return
