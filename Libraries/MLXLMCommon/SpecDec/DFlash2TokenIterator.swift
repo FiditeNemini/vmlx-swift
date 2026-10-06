@@ -749,10 +749,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         if let maxTokens, tokenCount >= maxTokens {
             if Self.traceEnabled, stats.verifyCalls > 0 {
                 let line = String(
-                    format: "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs arFallback=%d\n",
+                    format: "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs arFallback=%d widths=%@\n",
                     stats.verifyCalls, stats.acceptanceLength, stats.draftSeconds,
                     stats.verifySeconds, stats.commitSeconds,
-                    stats.autoregressiveFallbackTokens)
+                    stats.autoregressiveFallbackTokens,
+                    stats.widthCycles.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }
+                        .joined(separator: ","))
                 FileHandle.standardError.write(Data(line.utf8))
             }
             // Release the compiled traces at end of generation. They

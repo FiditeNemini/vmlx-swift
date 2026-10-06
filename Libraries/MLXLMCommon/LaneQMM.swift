@@ -160,10 +160,15 @@ extension LaneQMM {
         lock.unlock()
         guard fresh else { return }
         let start = Date()
-        // Untiled by default: several Swift model paths read projection weights directly into their own
-        // fused kernels (not through the module call), and those must keep seeing MLX's packed layout.
-        // VMLX_LANE_QMM_TILED=1 opts into the tiled layout (faster, only safe for module-call-only models).
-        let report = install(model: module, tile: ProcessInfo.processInfo.environment["VMLX_LANE_QMM_TILED"] == "1")
+        // Tiling policy. Several Swift S=1 paths read projection weights directly into their own fused
+        // kernels (Qwen35 GDN: the fused in_proj_qkv/z/b/a decode projection and the compiled out_proj tail),
+        // and those must keep MLX's packed layout. Default "safe" tiles every other lane module (attention,
+        // dense MLP: 27B JANG_4D 8-row forward 74.0 -> 67.4 ms with everything tiled). VMLX_LANE_QMM_TILED=0
+        // tiles nothing; =1 tiles everything (diagnostic: corrupts S=1 output on models with direct readers).
+        let tiling = ProcessInfo.processInfo.environment["VMLX_LANE_QMM_TILED"]
+        let report = install(model: module, tile: tiling != "0", tileFilter: { path in
+            tiling == "1" || !directWeightReaderPaths.contains { path.contains($0) }
+        })
         lastInstallReport = report
         // Lane-flat = every packed (uint32) weight of the language model now runs on the lane, so verify
         // cost is ~flat in rows. JANGH codebook MLPs (Qwen3.8-27B JANGH2) keep it False.
@@ -182,10 +187,19 @@ extension LaneQMM {
 
     public struct InstallReport: Sendable { public var lane = 0; public var tiled = 0; public var skipped = 0 }
 
+    /// Module paths whose packed `.weight` is read directly by fused S=1 kernels (never tiled by default).
+    static let directWeightReaderPaths = ["linear_attn.in_proj", "linear_attn.out_proj"]
+
+    /// Below this many rows an UNTILED lane module runs MLX's quantized matmul (qmv), which is faster
+    /// there (27B JANG_4D 1-row forward: qmv 48.9 ms vs lane 61.4 ms). VMLX_LANE_QMM_MIN_ROWS overrides.
+    static let minRows = Int(ProcessInfo.processInfo.environment["VMLX_LANE_QMM_MIN_ROWS"] ?? "") ?? 4
+
     /// Route `model`'s plain affine QuantizedLinear layers through the lane matmul (per-module swap; other
     /// models in the process keep MLX). Tiles weights in ~2 GB batches so the old layout is freed promptly.
     @discardableResult
-    public static func install(model: Module, tile: Bool = true) -> InstallReport {
+    public static func install(
+        model: Module, tile: Bool = true, tileFilter: (String) -> Bool = { _ in true }
+    ) -> InstallReport {
         var report = InstallReport()
         guard available() else { return report }
         var updates: [(String, Module)] = []
@@ -201,7 +215,7 @@ extension LaneQMM {
             let sbt = packScales(q.scales, qb)
             var w = q.weight
             var isTiled = false
-            if tile, w.dim(0) % nt == 0 {
+            if tile, tileFilter(path), w.dim(0) % nt == 0 {
                 w = tileWeight(w, bits: q.bits, group: q.groupSize)
                 isTiled = true
                 report.tiled += 1
@@ -221,7 +235,8 @@ extension LaneQMM {
     }
 }
 
-/// QuantizedLinear whose <= 128-row bf16 calls run the lane matmul. Wider calls (prompt prefill chunks) and
+/// QuantizedLinear whose <= 128-row bf16 calls run the lane matmul (untiled modules: >= `LaneQMM.minRows` rows;
+/// fewer rows take MLX's qmv on the unchanged weight). Wider calls (prompt prefill chunks) and
 /// other dtypes run MLX's own quantized matmul on the MLX-layout weight, rebuilt per call when tiled (one
 /// weight copy per call: ~2-3 % of a 2048-row chunk, measured in Python).
 public final class LaneQuantizedLinear: QuantizedLinear {
@@ -240,7 +255,7 @@ public final class LaneQuantizedLinear: QuantizedLinear {
         var rows = 1
         for d in x.shape.dropLast() { rows *= d }
         var y: MLXArray
-        if rows <= LaneQMM.maxRows && x.dtype == .bfloat16 {
+        if rows <= LaneQMM.maxRows && x.dtype == .bfloat16 && (laneTiled || rows >= LaneQMM.minRows) {
             y = LaneQMM.laneMatmul(x, weight: weight, sbt: laneSBT, bits: bits, group: groupSize,
                                    tiled: laneTiled)
         } else {

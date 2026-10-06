@@ -21,9 +21,13 @@ func runRowCostBench(modelPath: String) async throws {
     let rowsList = (env["BENCH_ROWCOST_ROWS"] ?? "1,2,3,4,5,6,8").split(separator: ",").compactMap { Int($0) }
     let context = try await MLXLMCommon.loadModel(
         from: modelDir, using: #huggingFaceTokenizerLoader(),
-        loadConfiguration: LoadConfiguration(nativeMTP: true)).0
+        loadConfiguration: LoadConfiguration(nativeMTP: env["BENCH_ROWCOST_NOMTP"] != "1")).0
     guard let model = context.model as? any NativeMTPModel else {
         print("[ROWCOST] model is not a NativeMTPModel"); return
+    }
+    if env["BENCH_ROWCOST_LANE"] == "1" {
+        // The DFlash2 target lane install (VMLX_LANE_QMM_TILED=1 selects the tiled layout).
+        LaneQMM.installForDFlash2Target(model)
     }
     let text = String(repeating: "The history of printing presses in Europe changed literacy and trade. ", count: 40)
     var input = UserInput(prompt: text)
