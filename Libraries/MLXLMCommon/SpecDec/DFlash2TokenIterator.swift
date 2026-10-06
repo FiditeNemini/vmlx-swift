@@ -67,6 +67,8 @@ public enum DFlash2RuntimeError: Error, LocalizedError {
 /// can show acceptance without a debug build.
 public struct DFlash2GenerationStats: Sendable, Equatable {
     public var blockSize: Int = 0
+    /// Cycles run at each verify width (DFlash2WidthChooser).
+    public var widthCycles: [Int: Int] = [:]
     public var verifyCalls: Int = 0
     public var draftedTokens: Int = 0
     public var acceptedTokens: Int = 0
@@ -197,6 +199,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Whether full-size blocks run the staged verify (attention caches
     /// promoted to Compilable buffers; GDN commits from staging slots).
     private var useStagedVerify = false
+    /// Per-cycle verify width chooser (nil = fixed `blockSize`).
+    private var widthChooser: DFlash2WidthChooser?
     /// The first staged cycle runs EAGERLY to allocate the staging slots;
     /// `compile()` needs those objects to exist before the trace.
     private var stagedVerifyWarm = false
@@ -352,6 +356,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             effectiveParameters.maxKVSize = policy.maxKVSize
         }
 
+        // DFlash2 decodes only through multi-row verify forwards. MLX's quantized matmul switches
+        // kernels with the row count; the lane matmul (LaneQMM.swift, Metal 4 matrix units) costs about
+        // the same for 1...16 rows. Installed once per target model, target only (the drafter keeps MLX).
+        LaneQMM.installForDFlash2Target(target)
+
         self.target = target
         self.drafter = drafter
         self.orderedLayerIDs = config.targetLayerIds
@@ -379,6 +388,21 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             && ProcessInfo.processInfo.environment["VMLX_DFLASH2_ADAPTIVE_BLOCK"] == "1"
         self.adaptiveBlockSize =
             self.adaptiveBlockSizeEnabled ? Self.recallLearnedBlockSize() : nil
+        // Per-cycle verify width (DFlash2WidthChooser): (8, 16) on lane-flat targets, else (5, 8, 16).
+        // The configured `blockSize` stays the trained width so the staged verify keeps its shape;
+        // other widths take the eager input-capture path. Off when the caller pinned a size, when the
+        // legacy probe ladder is on, or with VMLX_DFLASH2_WIDTHS=0.
+        if requestedBlockSize == nil, !self.adaptiveBlockSizeEnabled,
+            ProcessInfo.processInfo.environment["VMLX_DFLASH2_WIDTHS"] != "0"
+        {
+            let widths = DFlash2WidthChooser.plan(
+                trained: config.blockSize, laneFlat: LaneQMM.isLaneFlat(target))
+            if widths != [effectiveBlockSize] {
+                self.widthChooser = DFlash2WidthChooser(
+                    widths: widths,
+                    costs: DFlash2WidthCostTable.shared(for: target as AnyObject, widths: widths))
+            }
+        }
         self.maskTokenID = config.maskTokenId
         self.maxTokens = effectiveParameters.maxTokens
         self.promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -775,10 +799,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
 
         // The block spends one position on the anchor, so a block of size
         // `bs` yields at most `bs` new tokens (bs-1 drafts + 1 bonus).
-        let bs = Swift.min(adaptiveBlockSize ?? blockSize, budget + 1)
+        let bs = Swift.min(widthChooser?.width ?? adaptiveBlockSize ?? blockSize, budget + 1)
         if bs <= 1 || drafterDisabled {
             return runAutoregressiveStep()
         }
+        let cycleStart = Date.timeIntervalSinceReferenceDate
         guard let flight = issueVerify(bs: bs) else {
             // The drafter forward produced a degenerate result — an MLX
             // error inside its layer stack degraded to a scalar husk
@@ -796,7 +821,15 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     + "continuing autoregressively.\n").utf8))
             return runAutoregressiveStep()
         }
-        return completeVerify(flight)
+        let ok = completeVerify(flight)
+        if ok, widthChooser != nil {
+            // Wall time of the whole cycle (draft + verify + accept + commit) is the width's real cost.
+            widthChooser!.observe(
+                verifyWidth: bs, tokens: pendingTokens.count,
+                seconds: Date.timeIntervalSinceReferenceDate - cycleStart)
+            stats.widthCycles[bs, default: 0] += 1
+        }
+        return ok
     }
 
     /// Build one cycle's draft + verify graphs and DISPATCH them, without
