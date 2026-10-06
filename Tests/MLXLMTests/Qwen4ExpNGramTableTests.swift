@@ -135,7 +135,7 @@ struct Qwen4ExpNGramTableTests {
             payloadBytesRead: 60,
             backingFileCount: 1,
             backingFileBytes: UInt64(bytes.count),
-            noCacheFileCount: 1))
+            noCacheFileCount: Qwen4ExpNGramTable.uncachedReads ? 1 : 0))
 
         for parallel in [false, true] {
             let before = table.ioStats()
@@ -246,7 +246,8 @@ struct Qwen4ExpNGramTableTests {
             #expect(stats.gatherCalls == 1)
             #expect(stats.rowsRead == 3)
             #expect(stats.payloadBytesRead > 0)
-            #expect(stats.noCacheFileCount == stats.backingFileCount)
+            #expect(stats.noCacheFileCount
+                == (Qwen4ExpNGramTable.uncachedReads ? stats.backingFileCount : 0))
         }
     }
 }

@@ -54,8 +54,9 @@ private struct Qwen4ExpTensorDescriptor: Sendable {
 /// Minimal safetensors descriptor reader for Qwen PLE.
 ///
 /// This is deliberately independent of model residency tiers and never mmaps payloads.
-/// The header and requested rows are read with `pread` from an `F_NOCACHE`
-/// descriptor so the multi-gigabyte n-gram table remains an SSD lookup table.
+/// The header and requested rows are read with `pread` through the unified page cache (reclaimable;
+/// `Qwen4ExpNGramTable.warmPageCache` fills it once after load). `VMLX_QWEN4_PLE_NOCACHE=1` restores the
+/// previous `F_NOCACHE` descriptor (every lookup an SSD read).
 private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
     let url: URL
     let fileSize: UInt64
@@ -73,8 +74,10 @@ private final class Qwen4ExpSafetensorsReader: @unchecked Sendable {
                 throw Qwen4ExpNGramTableError.statFailed(url, errno)
             }
             let size = UInt64(status.st_size)
-            guard fcntl(opened, F_NOCACHE, 1) == 0 else {
-                throw Qwen4ExpNGramTableError.noCacheFailed(url, errno)
+            if Qwen4ExpNGramTable.uncachedReads {
+                guard fcntl(opened, F_NOCACHE, 1) == 0 else {
+                    throw Qwen4ExpNGramTableError.noCacheFailed(url, errno)
+                }
             }
             guard size >= 8 else {
                 throw Qwen4ExpNGramTableError.truncatedHeader(url)
@@ -197,6 +200,65 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
             if firstError == nil { firstError = error }
             errorLock.unlock()
         }
+    }
+
+    /// `VMLX_QWEN4_PLE_NOCACHE=1`: per-token row reads bypass the page cache (the previous default).
+    ///
+    /// WHY page-cached by default (2026-10-06, max2, external PCIe SSD, Flash-Next JANG_4S): with
+    /// F_NOCACHE every decode token issued ~48 synchronous 16 KB SSD reads (iostat: 1,000-1,800 IOPS on
+    /// the model volume during plain AR); decode became SSD-latency-bound, the GPU idled between layers and
+    /// its clock governor dropped (9 W, 735-1,100 MHz at "99 % active"): plain AR fell from 53.4 to 31.8
+    /// tok/s on identical code as the drive's latency drifted. vMLX Python (table_reader.py) and
+    /// TensorFold read the table through the page cache and warm it once after load; lookups are then RAM
+    /// hits. Page-cache pages are clean and reclaimable: under memory pressure macOS evicts them and
+    /// lookups fall back to drive reads — never an error, never a refusal.
+    static let uncachedReads: Bool = {
+        let raw = (ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_NOCACHE"] ?? "0").lowercased()
+        return ["1", "true", "yes", "on"].contains(raw)
+    }()
+
+    /// `VMLX_QWEN4_PLE_WARM=0` disables the one-time background warm.
+    static let warmEnabled: Bool = {
+        let raw = (ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_WARM"] ?? "1").lowercased()
+        return !["0", "false", "no", "off"].contains(raw)
+    }()
+
+    private static let warmLock = NSLock()
+    nonisolated(unsafe) private static var warmedFiles: Set<String> = []
+
+    /// One sequential pass over each backing file (32 MiB preads on a background thread) so later
+    /// per-token row lookups are page-cache hits. Port of Python `_start_page_cache_warm`.
+    static func warmPageCache(_ urls: [URL]) {
+        guard warmEnabled, !uncachedReads else { return }
+        warmLock.lock()
+        let fresh = urls.filter { warmedFiles.insert($0.path).inserted }
+        warmLock.unlock()
+        guard !fresh.isEmpty else { return }
+        let thread = Thread {
+            let started = Date()
+            let chunk = 32 << 20
+            let buffer = UnsafeMutableRawPointer.allocate(byteCount: chunk, alignment: 16_384)
+            defer { buffer.deallocate() }
+            var done: UInt64 = 0
+            for url in fresh {
+                let fd = Darwin.open(url.path, O_RDONLY)
+                guard fd >= 0 else { continue }
+                var offset: off_t = 0
+                while true {
+                    let got = Darwin.pread(fd, buffer, chunk, offset)
+                    if got <= 0 { break }
+                    offset += off_t(got)
+                    done += UInt64(got)
+                }
+                Darwin.close(fd)
+            }
+            let seconds = Date().timeIntervalSince(started)
+            log(String(format: "page-cache warm done: %.2f GB in %.1f s (%.2f GB/s, %d files)",
+                       Double(done) / 1e9, seconds, Double(done) / 1e9 / Swift.max(seconds, 1e-6), fresh.count))
+        }
+        thread.name = "vmlx-qwen4-ple-page-warm"
+        thread.qualityOfService = .utility
+        thread.start()
     }
 
     private static let parallelRows: Bool = {
@@ -358,11 +420,13 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         self.sourceDirectory = modelDirectory
         self.backingFileCount = openedFiles.count
         self.backingFileBytes = openedFiles.values.reduce(0) { $0 + $1.fileSize }
-        self.noCacheFileCount = openedFiles.count
+        self.noCacheFileCount = Self.uncachedReads ? openedFiles.count : 0
         self.dimensions = commonDimensions ?? 0
         self.rowCount = nextStart
+        Self.warmPageCache(openedFiles.keys.sorted { $0.path < $1.path })
         Self.log(String(format:
-            "ssd-row-reader ready backend=pread-fnocache cache=F_NOCACHE row_schedule=%@ files=%d backing_file_bytes=%.3f_GiB rows=%lld dimensions=%d source=%@",
+            "ssd-row-reader ready backend=%@ row_schedule=%@ files=%d backing_file_bytes=%.3f_GiB rows=%lld dimensions=%d source=%@",
+            Self.uncachedReads ? "pread-fnocache cache=F_NOCACHE" : "pread-pagecache warm=\(Self.warmEnabled)",
             Self.parallelRows ? "parallel" : "sequential-opt-out",
             backingFileCount,
             Double(backingFileBytes) / 1_073_741_824.0,
@@ -493,7 +557,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         telemetryLock.unlock()
         if calls == 1 || calls % 128 == 0 {
             Self.log(
-                "ssd-row-read backend=pread-fnocache cache=F_NOCACHE "
+                "ssd-row-read backend=\(Self.uncachedReads ? "pread-fnocache" : "pread-pagecache") "
                     + "call=\(calls) rows=\(rows) bytes=\(bytesRead) "
                     + "cumulative_rows=\(totalRows) cumulative_bytes=\(totalBytes) "
                     + "source=\(sourceDirectory.path)")
