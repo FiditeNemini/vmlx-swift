@@ -151,6 +151,64 @@ public enum Qwen4ExpBF16Affine {
         header: qmvHeader,
         ensureRowContiguous: false)
 
+    // Full-block specialization of the existing scalar QMV arithmetic.
+    // Admission below excludes input/output tails and larger prefill batches.
+    private static let fullBlockQ4Kernel = MLXFast.metalKernel(
+        name: "qwen4_exp_bf16_f16_affine_qmv_q4_full_block",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["out"],
+        source: """
+            constexpr int values_per_thread = 16;
+            constexpr int block_size = 512;
+            constexpr int groups = K / 64;
+            constexpr int packed_row_bytes = K / 2;
+            const uint input_row = threadgroup_position_in_grid.x;
+            const uint n0 = threadgroup_position_in_grid.y * 8
+                + simdgroup_index_in_threadgroup * 4;
+            const uint lane = thread_index_in_simdgroup;
+            const device uchar* ws = (const device uchar*)w
+                + n0 * packed_row_bytes + lane * 8;
+            const device float16_t* ss = scales + n0 * groups + lane / 4;
+            const device float16_t* bs = biases + n0 * groups + lane / 4;
+            const device bfloat16_t* xs = x + input_row * K + lane * values_per_thread;
+            device bfloat16_t* ys = out + input_row * N + n0;
+            float result[4] = {0.0f};
+            float x_thread[values_per_thread];
+            constexpr float divisors[4] = {1.0f, 16.0f, 256.0f, 4096.0f};
+            for (int k = 0; k < K; k += block_size) {
+              float sum = 0.0f;
+              for (int i = 0; i < values_per_thread; ++i) {
+                float value = float(xs[i]);
+                sum += value;
+                x_thread[i] = value / divisors[i & 3];
+              }
+              for (int r = 0; r < 4; ++r) {
+                const device ushort* words = (const device ushort*)(ws + r * packed_row_bytes);
+                float accum = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                  ushort word = words[i];
+                  int base = 4 * i;
+                  accum += x_thread[base] * (word & 0x000f);
+                  accum += x_thread[base + 1] * (word & 0x00f0);
+                  accum += x_thread[base + 2] * (word & 0x0f00);
+                  accum += x_thread[base + 3] * (word & 0xf000);
+                }
+                float scale = float(ss[r * groups]);
+                float bias = float(bs[r * groups]);
+                result[r] += scale * accum + sum * bias;
+              }
+              ws += block_size / 2;
+              ss += block_size / 64;
+              bs += block_size / 64;
+              xs += block_size;
+            }
+            for (int r = 0; r < 4; ++r) {
+              result[r] = simd_sum(result[r]);
+              if (lane == 0) ys[r] = static_cast<bfloat16_t>(result[r]);
+            }
+            """,
+        ensureRowContiguous: false)
+
     // METAL-ONLY: case 2. Metal kernel, off unless `Qwen4ExpBF16QuantizedSwitchLinear`
     // is installed, which `loadWeights` does only when it enables
     // `qwen4ExpNativeBF16Affine`; the default path computes the same with MLX ops.
@@ -223,6 +281,56 @@ public enum Qwen4ExpBF16Affine {
     }
 
     public static func dense(
+        _ input: MLXArray, _ weight: MLXArray,
+        scales: MLXArray, biases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> MLXArray {
+        guard usesFullBlockQ4(
+            input: input, weight: weight, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits, mode: mode),
+            let biases
+        else {
+            return denseLegacy(
+                input, weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits, mode: mode)
+        }
+        reportDispatch(
+            operation: "dense", input: input, weight: weight, scales: scales,
+            biases: biases, groupSize: groupSize, bits: bits, native: true)
+        let inputDimensions = weight.dim(1) * 8
+        let outputDimensions = weight.dim(0)
+        let rows = input.size / inputDimensions
+        var outputShape = input.shape
+        outputShape[outputShape.count - 1] = outputDimensions
+        return fullBlockQ4Kernel(
+            [input, weight, scales, biases],
+            template: [("K", inputDimensions), ("N", outputDimensions), ("ROWS", rows)],
+            grid: (rows * 32, (outputDimensions / 8) * 2, 1),
+            threadGroup: (32, 2, 1),
+            outputShapes: [outputShape], outputDTypes: [.bfloat16])[0]
+    }
+
+    /// Pure admission keeps unsupported dtypes, quantizations and tail shapes
+    /// on their existing paths. Rows flatten the leading input dimensions.
+    static func usesFullBlockQ4(
+        input: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Bool {
+        guard supports(
+            input: input, weight: weight, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits, mode: mode),
+            bits == 4, groupSize == 64, input.ndim >= 2, weight.ndim == 2
+        else { return false }
+        let k = weight.dim(1) * 8
+        let n = weight.dim(0)
+        guard k > 0, k % 512 == 0, n > 0, n % 8 == 0, input.dim(-1) == k
+        else { return false }
+        return (1...8).contains(input.size / k)
+    }
+
+    /// Original dense dispatch retained as the unsupported-shape fallback and
+    /// exact arithmetic reference for generated-operand regression tests.
+    static func denseLegacy(
         _ input: MLXArray, _ weight: MLXArray,
         scales: MLXArray, biases: MLXArray?,
         groupSize: Int, bits: Int, mode: QuantizationMode
