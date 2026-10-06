@@ -30,6 +30,14 @@ struct K2HorizonJANGHPreparation {
         let result: Self
         switch c.mlpLayout {
         case "switch1":
+            // Routed execution switches to tiled prefill at 64 routed rows.
+            // Both prefill backends require K divisible by 64: hiddenSize for
+            // gate/up and intermediateSize for down. Decode alone accepts 32.
+            guard c.hiddenSize.isMultiple(of: 64), c.intermediateSize.isMultiple(of: 64) else {
+                throw K2HorizonConfiguration.ContractError.unsupported(
+                    "K2 switch1 JANGH requires hidden_size and intermediate_size divisible by 64 for prefill"
+                )
+            }
             result = Self(
                 configuration: c,
                 routed: try JANGHModelPreparation(

@@ -252,6 +252,105 @@ final class K2HorizonJANGHTests: XCTestCase {
         }
     }
 
+    private func switchConfiguration(hidden: Int, intermediate: Int) -> [String: Any] {
+        var root = configuration()
+        root["mlp_layout"] = "switch1"
+        root["hidden_size"] = hidden
+        root["intermediate_size"] = intermediate
+        root["head_dim"] = hidden / 4
+        root["num_hidden_layers"] = 1
+        var plan: [String: Any] = ["mode": "affine", "bits": 8, "group_size": 32]
+        for role in ["gate_proj", "up_proj", "down_proj"] {
+            plan["model.layers.0.mlp.switch_mlp." + role] = [
+                "mode": "jangtq2", "bits": 4, "rotation": "hadamard32",
+            ]
+        }
+        root["quantization"] = plan
+        root["quantization_config"] = plan
+        return root
+    }
+
+    func testSwitch1PrefillGeometryRejectsBeforeReadingTensorIndex() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // Both are valid H32/decode dimensions, but one prefill projection's K is unsupported.
+        for (hidden, intermediate) in [(32, 64), (64, 96)] {
+            let root = switchConfiguration(hidden: hidden, intermediate: intermediate)
+            XCTAssertThrowsError(
+                try K2HorizonJANGHPreparation.loadIfDeclared(
+                    directory: directory, configurationData: data(root))
+            ) { error in
+                guard let contract = error as? K2HorizonConfiguration.ContractError,
+                    case .unsupported(let message) = contract
+                else {
+                    return XCTFail("expected typed prefill geometry rejection, got \(error)")
+                }
+                XCTAssertEqual(
+                    message,
+                    "K2 switch1 JANGH requires hidden_size and intermediate_size divisible by 64 for prefill"
+                )
+            }
+        }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
+        // No custom format: the JANGH gate must not restrict ordinary switch1 dimensions.
+        var ordinary = switchConfiguration(hidden: 32, intermediate: 64)
+        ordinary.removeValue(forKey: "jangtq")
+        let affine: [String: Any] = ["mode": "affine", "bits": 8, "group_size": 32]
+        ordinary["quantization"] = affine
+        ordinary["quantization_config"] = affine
+        XCTAssertNil(
+            try K2HorizonJANGHPreparation.loadIfDeclared(
+                directory: directory, configurationData: data(ordinary)))
+    }
+
+    func testSwitch1PrefillGeometryAcceptsAlignedHeadersWithoutConstructingModel() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var headers: [String: Any] = [:]
+        var index: [String: String] = [:]
+        var payload = Data()
+        for role in ["gate_proj", "up_proj", "down_proj"] {
+            let input = role == "down_proj" ? 128 : 64
+            let output = role == "down_proj" ? 64 : 128
+            let path = "model.layers.0.mlp.switch_mlp." + role
+            let packed = Data(repeating: 0, count: input * output / 2)
+            let scales = [Float16](repeating: 0.5, count: output).withUnsafeBytes { Data($0) }
+            for (suffix, bytes, dtype, shape) in [
+                ("tq2_packed", packed, "U32", [1, output, input / 8]),
+                ("tq2_scales", scales, "F16", [1, output]),
+            ] {
+                let start = payload.count
+                payload.append(bytes)
+                headers[path + "." + suffix] = [
+                    "dtype": dtype, "shape": shape, "data_offsets": [start, payload.count],
+                ]
+                index[path + "." + suffix] = "model.safetensors"
+            }
+        }
+        var header = try data(headers)
+        let padded = ((header.count + 8 + 4095) / 4096) * 4096 - 8
+        header.append(Data(repeating: 32, count: padded - header.count))
+        var length = UInt64(header.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(header)
+        file.append(payload)
+        try file.write(to: directory.appendingPathComponent("model.safetensors"))
+        try data(["weight_map": index]).write(
+            to: directory.appendingPathComponent("model.safetensors.index.json"))
+        let preparation = try XCTUnwrap(
+            K2HorizonJANGHPreparation.loadIfDeclared(
+                directory: directory,
+                configurationData: data(switchConfiguration(hidden: 64, intermediate: 128))))
+        XCTAssertNotNil(preparation.routed)
+        XCTAssertNil(preparation.dense)
+        XCTAssertEqual(preparation.routed?.excludedTensorNames.count, 6)
+        // Header admission only: do not call construct/makeRoutedExperts or execute any MLX primitive.
+    }
+
     func testMissingAffineExceptionAndOutOfRangeLayerFailClosed() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             UUID().uuidString)
