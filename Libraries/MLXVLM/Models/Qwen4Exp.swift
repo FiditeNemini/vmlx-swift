@@ -11,7 +11,7 @@ import MLXNN
 enum Qwen4ExpRowExactProjection {
     /// Preserve qualified q8 single-row addressing for actual Flash verification.
     static func q8Projection(_ module: Linear, _ x: MLXArray) -> MLXArray? {
-        guard FlashVerificationScope.usesRowExactVerification(inputShape: x.shape),
+        guard FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "q8"),
             !CompiledDecodeTrace.isActive, x.ndim == 3, x.dim(0) == 1,
             (2...8).contains(x.dim(1)), x.dtype == .bfloat16,
             jangAllowsRawQuantizedProjection(module),
@@ -21,14 +21,24 @@ enum Qwen4ExpRowExactProjection {
             let biases = q.biases, biases.dtype == .float16
         else { return nil }
         let rows = x.dim(1)
-        // Leading singleton bank dimension broadcasts without physical copies.
-        // MLX currently promotes metadata/activations to F32 here; retain the
-        // existing QuantizedLinear BF16 output contract. Cost is unmeasured.
-        return quantizedMM(
-            x.reshaped(rows, 1, x.dim(-1)), q.weight[.newAxis, 0..., 0...],
-            scales: q.scales[.newAxis, 0..., 0...], biases: biases[.newAxis, 0..., 0...],
-            groupSize: 64, bits: 8, mode: .affine)
-            .reshaped(1, rows, q.weight.dim(0)).asType(x.dtype)
+        // Leading singleton bank dimension broadcasts without physical copies:
+        // M=1 per batch element keeps MLX's single-row qmv arithmetic, but
+        // streams the weight once PER ROW (lm_head 636 MB/row at q8).
+        func batched(_ input: MLXArray) -> MLXArray {
+            quantizedMM(
+                input.reshaped(input.dim(0), 1, input.dim(-1)), q.weight[.newAxis, 0..., 0...],
+                scales: q.scales[.newAxis, 0..., 0...], biases: biases[.newAxis, 0..., 0...],
+                groupSize: 64, bits: 8, mode: .affine)
+                .reshaped(input.dim(0), q.weight.dim(0)).asType(input.dtype)
+        }
+        // Same per-row arithmetic, weights streamed once for all rows (bitwise-admitted per shape).
+        let flat = x.reshaped(rows, x.dim(-1))
+        if let fused = Qwen4ExpBF16Affine.mlxQ8Rows(
+            flat, weight: q.weight, scales: q.scales, biases: biases, reference: batched)
+        {
+            return fused.reshaped(1, rows, q.weight.dim(0))
+        }
+        return batched(flat).reshaped(1, rows, q.weight.dim(0))
     }
 
 
@@ -477,7 +487,7 @@ private final class Qwen4ExpGatedResidual: Module {
     }
 
     func mix(_ hyper: MLXArray, normalizedInput: MLXArray? = nil) -> (MLXArray, MLXArray?) {
-        let joinedVerifyProjection = FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape)
+        let joinedVerifyProjection = FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape, site: "hcjoin")
             && combines && hcCount == 4 && hiddenSize == 2560
             && hyper.dim(2) == 10240
             && (normalizedInput.map { $0.shape == hyper.shape && $0.dtype == hyper.dtype } ?? true)
@@ -564,7 +574,7 @@ private final class Qwen4ExpGatedResidual: Module {
             mixedDown = parts[0]
             injected = parts[1]
         } else {
-            if FlashVerificationScope.usesRowExactVerification(inputShape: normalized.shape),
+            if FlashVerificationScope.usesRowExactVerification(inputShape: normalized.shape, site: "hcdown"),
                 !CompiledDecodeTrace.isActive, normalized.ndim == 3,
                 normalized.dim(0) == 1, (2...8).contains(normalized.dim(1)),
                 normalized.dtype == .bfloat16, mixDown.weight.dtype == .bfloat16,
@@ -584,7 +594,7 @@ private final class Qwen4ExpGatedResidual: Module {
         let scaled = mixedDown / Float(hcCount)
         var weights = silu(scaled)
         let projected: MLXArray
-        if FlashVerificationScope.usesRowExactVerification(inputShape: weights.shape),
+        if FlashVerificationScope.usesRowExactVerification(inputShape: weights.shape, site: "hcup"),
             combines, hcCount == 4, hiddenSize == 2560,
             !(mixUp is QuantizedLinear), mixUp.bias == nil,
             let rowInvariant = Qwen4ExpHCUpProjection.project(weights, weight: mixUp.weight)
@@ -1218,7 +1228,7 @@ private final class Qwen4ExpAttention: Module {
             mask = .array(causal)
         }
         let attended: MLXArray
-        if FlashVerificationScope.usesRowExactVerification(inputShape: x.shape),
+        if FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "attn"),
             (3...8).contains(S), B == 1, let cache,
             case .array(let causal) = mask
         {
@@ -1625,7 +1635,7 @@ private final class Qwen4ExpTextModel: Module {
         let verifyEarlySubmit = inputIds.ndim == 2 && inputIds.dim(0) == 1
             && (2...8).contains(inputIds.dim(1))
             && FlashVerificationScope.usesRowExactVerification(
-                inputShape: inputIds.shape + [config.base.textConfiguration.hiddenSize])
+                inputShape: inputIds.shape + [config.base.textConfiguration.hiddenSize], site: "early")
             && recordPrefixCommitStates && pleEmbeddings == nil
             && !CompiledDecodeTrace.isActive
         let earlySubmit = verifyEarlySubmit || Qwen4ExpEarlySubmission.allows(
