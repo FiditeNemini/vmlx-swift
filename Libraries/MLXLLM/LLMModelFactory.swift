@@ -23,6 +23,14 @@ public enum LLMTypeRegistry {
     // Split into functions to help the compiler type-check the large model registry
     private static func coreModels() -> [String: ModelCreator] {
         [
+            "k2_horizon": { data, requesting in
+                guard requesting == nil || requesting == [.text], !NativeMTPActivation.isExplicitlyRequested,
+                      !JANGHModelPreparation.declaresCustomFormat(configuration: data, sidecar: nil) else {
+                    throw K2HorizonConfiguration.ContractError.unsupported(
+                        "K2 requires text-only autoregressive loading; custom banks require a model directory")
+                }
+                return try K2HorizonModel(JSONDecoder.json5().decode(K2HorizonConfiguration.self, from: data))
+            },
             "naive_n05_flash": { data, requesting in
                 guard !JANGHModelPreparation.declaresCustomFormat(configuration: data, sidecar: nil)
                 else {
@@ -1354,13 +1362,15 @@ struct LLMUserInputProcessor: UserInputProcessor {
     /// SYSTEM turn). Then the kwarg is passed through untouched; the legacy
     /// Bailing directive prepend is only for templates that do not read it.
     let templateReadsEnableThinking: Bool
+    let k2ReasoningDeclaration: K2HorizonTemplateContract.FixedReasoningDeclaration?
 
     internal init(
         tokenizer: any Tokenizer, configuration: ModelConfiguration,
         modelType: String?,
         messageGenerator: MessageGenerator,
         defaultAdditionalContext: [String: any Sendable]? = nil,
-        templateReadsEnableThinking: Bool = false
+        templateReadsEnableThinking: Bool = false,
+        k2ReasoningDeclaration: K2HorizonTemplateContract.FixedReasoningDeclaration? = nil
     ) {
         self.tokenizer = tokenizer
         self.configuration = configuration
@@ -1368,9 +1378,12 @@ struct LLMUserInputProcessor: UserInputProcessor {
         self.messageGenerator = messageGenerator
         self.defaultAdditionalContext = defaultAdditionalContext
         self.templateReadsEnableThinking = templateReadsEnableThinking
+        self.k2ReasoningDeclaration = k2ReasoningDeclaration
     }
 
     func prepare(input: UserInput) throws -> LMInput {
+        try K2HorizonTemplateContract.validateContext(
+            input.additionalContext, modelType: modelType, declaration: k2ReasoningDeclaration)
         // Two per-family adapters, each translating the generic request
         // surface into ITS template's contract. Both are no-ops for every
         // other family (they gate on `modelType` first), so the order between
@@ -1388,11 +1401,14 @@ struct LLMUserInputProcessor: UserInputProcessor {
             additionalContext: additionalContext,
             templateReadsEnableThinking: templateReadsEnableThinking
         )
-        let messages = NemotronToolChoiceTemplateContext.apply(
+        let nemotronMessages = NemotronToolChoiceTemplateContext.apply(
             to: bailingMessages,
             modelType: modelType,
             additionalContext: additionalContext
         )
+        try K2HorizonTemplateContract.validateContext(
+            additionalContext, modelType: modelType, declaration: k2ReasoningDeclaration)
+        let messages = K2HorizonTemplateContract.prepare(messages: nemotronMessages, modelType: modelType)
         do {
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: input.tools, additionalContext: additionalContext)
@@ -1576,6 +1592,9 @@ public final class LLMModelFactory: ModelFactory {
             // and that unrelated error wins the factory fallback.
             throw ModelFactoryError.unsupportedModelType("qwen4_exp")
         }
+        let k2JANGHPreparation = try K2HorizonJANGHPreparation.loadIfDeclared(
+            directory: modelDirectory, configurationData: configData)
+        if let k2JANGHPreparation { configData = k2JANGHPreparation.ordinaryConfiguration }
         let jangHPreparation = try NaiveN05JANGHPreparation.loadIfDeclared(
             directory: modelDirectory, configurationData: configData)
         if let jangHPreparation { configData = jangHPreparation.banks.ordinaryConfiguration }
@@ -1587,7 +1606,7 @@ public final class LLMModelFactory: ModelFactory {
         // config.json — without this merge the factory never sees "mxtq" and
         // falls through to the standard non-TQ model path.
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
-        if jangHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
+        if jangHPreparation == nil, k2JANGHPreparation == nil, let jangData = try? Data(contentsOf: jangConfigURL),
             var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
             let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
@@ -1787,7 +1806,7 @@ public final class LLMModelFactory: ModelFactory {
                 configData = merged
             }
         }
-        if jangHPreparation == nil {
+        if jangHPreparation == nil && k2JANGHPreparation == nil {
             configData = Self.mergeJANGTQSidecarStartupMetadata(
                 configData,
                 modelDirectory: modelDirectory)
@@ -1851,7 +1870,9 @@ public final class LLMModelFactory: ModelFactory {
         }
         let model: LanguageModel
         do {
-            if let jangHPreparation {
+            if let k2JANGHPreparation {
+                model = try k2JANGHPreparation.construct(requesting: configuration.requestedModalities)
+            } else if let jangHPreparation {
                 model = try jangHPreparation.construct(requesting: configuration.requestedModalities)
             } else {
                 model = try await typeRegistry.createModel(
@@ -1860,7 +1881,7 @@ public final class LLMModelFactory: ModelFactory {
             }
         } catch {
             // A rejected custom bank must never fall back to an ordinary model.
-            if jangHPreparation != nil { throw error }
+            if jangHPreparation != nil || k2JANGHPreparation != nil { throw error }
             // Top-level model_type failed (e.g. "mistral3" is a VLM type not in LLM registry,
             // or the config couldn't be decoded for that type).
             // Try text_config.model_type as fallback (e.g. "mistral4" text decoder).
@@ -2040,14 +2061,14 @@ public final class LLMModelFactory: ModelFactory {
         // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            quantization: jangConfig != nil || jangHPreparation != nil
+            quantization: jangConfig != nil || jangHPreparation != nil || k2JANGHPreparation != nil
                 ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
             // loadWeights treats config.json's explicit per-layer dict as
             // declared evidence, then validates it against exact manifests,
             // semantic widths, and packed tensor geometry.
             perLayerQuantization: baseConfig.perLayerQuantization,
-            jangConfig: jangHPreparation == nil ? jangConfig : nil,
+            jangConfig: jangHPreparation == nil && k2JANGHPreparation == nil ? jangConfig : nil,
             loadPreservedMTP: loadNativeMTP)
 
         let tokenizer = try await tokenizerTask
@@ -2088,7 +2109,11 @@ public final class LLMModelFactory: ModelFactory {
                 generationConfig: generationConfig,
                 chatConfig: jangConfig?.chat,
                 chatTemplate: chatTemplate),
-            templateReadsEnableThinking: BailingThinkingTemplateContext.templateReadsEnableThinking(chatTemplate))
+            templateReadsEnableThinking: BailingThinkingTemplateContext.templateReadsEnableThinking(chatTemplate),
+            k2ReasoningDeclaration: K2HorizonTemplateContract.fixedReasoningDeclaration(
+                metadata: K2HorizonTemplateContract.matches(baseConfig.modelType)
+                    ? (try? Data(contentsOf: jangConfigURL)) : nil,
+                modelType: baseConfig.modelType))
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

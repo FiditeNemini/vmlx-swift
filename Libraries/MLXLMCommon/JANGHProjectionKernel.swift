@@ -16,20 +16,45 @@ final class JANGHProjectionKernel {
     private let rotation: JANGHFormatContract.Rotation
     private let qmv: MLXFast.MLXFastKernel
     private let h32: MLXFast.MLXFastKernel
+    private let fuseFloatRotation: Bool
 
-    init(contract: JANGHFormatContract, module: String) throws {
+    /// Dense decode keeps H32 in float registers through the dot. The default
+    /// preserves the existing activation-dtype rotation contract for other users.
+    init(contract: JANGHFormatContract, module: String, fuseFloatRotation: Bool = false) throws {
         guard let projection = contract.projections[module],
             let book = contract.codebooks[projection.bits]
         else { throw JANGHFormatContract.ValidationError.invalid("missing JANGH projection") }
         bits = projection.bits
         rotation = projection.rotation
+        self.fuseFloatRotation = fuseFloatRotation
+        let version = fuseFloatRotation ? "jangh-qmv-dense-float-h32-v2" : "jangh-qmv-v1"
         let description =
-            "jangh-qmv-v1|\(bits)|\(rotation.rawValue)|\(book.alpha.bitPattern)|\(book.beta.bitPattern)"
+            "\(version)|\(bits)|\(rotation.rawValue)|\(book.alpha.bitPattern)|\(book.beta.bitPattern)"
         identity = SHA256.hash(data: Data(description.utf8)).map { String(format: "%02x", $0) }
             .joined()
         let alpha = String(Float(book.alpha)) + "f"
         let beta = String(Float(book.beta)) + "f"
         let center = String(Float((1 << bits) - 1) / 2) + "f"
+        // Each lane holds 16 consecutive values. Four local butterfly stages
+        // and one lane-pair shuffle form H32 without an intermediate BF16/F16
+        // store. K%32 guarantees both lanes of every live pair are present;
+        // inactive pairs carry zeros and participate in the same shuffle.
+        let fusedRotation = fuseFloatRotation && rotation == .hadamard32 ? """
+            for (uint stage = 1u; stage < 16u; stage <<= 1u) {
+                for (uint i = 0; i < 16u; ++i) {
+                    if ((i & stage) == 0u) {
+                        float a = values[i], b = values[i + stage];
+                        values[i] = a + b;
+                        values[i + stage] = a - b;
+                    }
+                }
+            }
+            for (uint i = 0; i < 16u; ++i) {
+                float other = simd_shuffle_xor(values[i], 1u);
+                values[i] = ((lane & 1u) ? other - values[i] : values[i] + other)
+                    * 0.17677669529663687f;
+            }
+            """ : ""
         let source = """
             uint lane = thread_index_in_simdgroup;
             uint row0 = threadgroup_position_in_grid.y * 8u + simdgroup_index_in_threadgroup * 4u;
@@ -47,6 +72,7 @@ final class JANGHProjectionKernel {
                     uint column = block + lane * 16u + i;
                     values[i] = column < K ? float(x[size_t(dispatch / XDIV) * K + column]) : 0.0f;
                 }
+                \(fusedRotation)
                 for (uint r = 0; r < 4; ++r) {
                     if (row0 + r >= N) continue;
                     size_t row = (size_t(expert) * N + row0 + r) * WORDS;
@@ -127,7 +153,7 @@ final class JANGHProjectionKernel {
         else { throw JANGHFormatContract.ValidationError.invalid("invalid JANGH packed geometry") }
         try JANGHBankLayout.requireReadyRowContiguous(packed, role: "packed projection")
         try JANGHBankLayout.requireReadyRowContiguous(scales, role: "projection scales")
-        let x = rotation == .hadamard32 ? try hadamard32(input) : input
+        let x = rotation == .hadamard32 && !fuseFloatRotation ? try hadamard32(input) : input
         return qmv(
             [
                 contiguous(x), packed, scales,
