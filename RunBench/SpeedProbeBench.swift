@@ -2,12 +2,13 @@
 // so Swift and Python speeds on the same machine and bundle compare like for like.
 //
 // Same prompts (prose x3, code x3, easy_code x2, easy_prose x2), greedy, thinking off, max 300 tokens,
-// one 16-token warm-up discarded. Decode tok/s = (generated tokens - 1) / (last chunk time - first chunk time),
-// exactly the Python probe's definition (it excludes TTFT/prefill).
+// one 16-token warm-up discarded. Decode tok/s uses engine generation tokens / generateTime;
+// chunk timestamps are diagnostic only because streaming chunks may be coalesced.
 //
 // Production path: BatchEngine.generate (the host chat window's route -> solo fast path for MTP/DFlash2).
 // Arms (BENCH_SPEED_ARM):
-//   ar        plain decode
+//   default   bundle-aware production selection (the default when no arm is supplied)
+//   ar        explicit plain decode
 //   adaptive  .nativeMTP(depth: BENCH_SPEED_MTP_DEPTH=3) + .adaptive(maximumDepth: BENCH_SPEED_MTP_MAX=5),
 //             the Osaurus app's Adaptive mapping (MLXBatchAdapter.nativeMTPDepthPolicy)
 //   dflash2   .dflash2(drafterPath: <bundle>/dflash2, blockSize: BENCH_SPEED_DFLASH2_BLOCK or nil)
@@ -45,17 +46,30 @@ private let speedPrompts: [(String, [String])] = [
 func runSpeedProbe(modelPath: String) async throws {
     let env = ProcessInfo.processInfo.environment
     let modelDir = URL(fileURLWithPath: modelPath)
-    let arm = env["BENCH_SPEED_ARM"] ?? "ar"
+    let arm = env["BENCH_SPEED_ARM"] ?? "default"
+    let configData = try Data(contentsOf: modelDir.appendingPathComponent("config.json"))
+    let jang = try? JangLoader.loadConfig(at: modelDir)
+    let status = try? MTPBundleInspector.inspect(modelDirectory: modelDir, jangConfig: jang)
+    let settings = VMLXServerRuntimeSettings()
+    let defaultStrategy = settings.resolvedMTPDraftStrategy(
+        configData: configData, jangConfig: jang, status: status, bundleDirectory: modelDir)
+    let defaultLoad = settings.resolvedLoadConfiguration(
+        configData: configData, jangConfig: jang, status: status)
     let maxTokens = Int(env["BENCH_SPEED_MAXTOK"] ?? "300") ?? 300
     let loadStart = CFAbsoluteTimeGetCurrent()
     let context: ModelContext
-    if arm == "adaptive" {
+    if arm == "default" {
+        context = try await MLXLMCommon.loadModel(
+            from: modelDir, using: #huggingFaceTokenizerLoader(),
+            loadConfiguration: defaultLoad).0
+    } else if arm == "adaptive" {
         context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader(),
             loadConfiguration: LoadConfiguration(nativeMTP: true)).0
     } else {
         context = try await MLXLMCommon.loadModel(from: modelDir, using: #huggingFaceTokenizerLoader())
     }
+    print("[BENCH_SPEED_RESOLUTION] requested=\(arm) bundleDefault=\(String(describing: defaultStrategy))")
     print(String(format: "[BENCH_SPEED] arm=%@ model=%@ load=%.1fs type=%@", arm, modelDir.lastPathComponent,
                  CFAbsoluteTimeGetCurrent() - loadStart, String(describing: type(of: context.model))))
     nonisolated(unsafe) let ctx = context
@@ -65,6 +79,11 @@ func runSpeedProbe(modelPath: String) async throws {
         var p = GenerateParameters(maxTokens: budget, temperature: 0, topP: 1, topK: 0, minP: 0,
                                    repetitionPenalty: nil)
         switch arm {
+        case "default":
+            p.draftStrategy = defaultStrategy
+            if defaultStrategy?.nativeMTPDepth != nil {
+                p.nativeMTPDepthPolicy = .adaptive(maximumDepth: 5)
+            }
         case "adaptive":
             let depth = Int(env["BENCH_SPEED_MTP_DEPTH"] ?? "3") ?? 3
             let maxDepth = Int(env["BENCH_SPEED_MTP_MAX"] ?? "5") ?? 5

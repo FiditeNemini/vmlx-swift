@@ -2,6 +2,8 @@
 
 Native MTP verifies proposals against the target model. Greedy verification must reproduce ordinary autoregressive decoding; increasing accepted proposals is not a correctness substitute. Product controls remain Off and Adaptive. The sampler and model template are unchanged.
 
+See [Speculative decoding defaults](SPECULATIVE_DECODING_DEFAULTS.md) for bundle detection, explicit overrides and request fallback.
+
 ## Arithmetic scope
 
 `FlashVerificationScope` is established only by the Flash target-verification entry point, through the output head. It admits batch one and two through eight verification rows. Ordinary prefill, AR, other model families and draft-head execution do not establish this scope.
