@@ -601,7 +601,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             effectiveParameters.maxKVSize = policy.maxKVSize
         }
         guard let nativeMTPParameters = effectiveParameters.nativeMTPEffectiveParameters(
-            for: input)
+            for: input, model: model)
         else {
             throw NativeMTPRuntimeError.unsupportedSampling(
                 "native MTP is enabled only for text-only requests with no active penalties or suppress/reasoning-budget processors, and requires either an unbounded KV window or a prompt plus declared output ceiling that fits wholly inside the configured window; sampled requests run the exact-pq accept path")

@@ -3086,6 +3086,9 @@ enum Qwen35Language {
 
             var captured: [Int: MLXArray] = [:]
             captured.reserveCapacity(captureLayerIDs.count)
+            let pipelineTreeVerify = DFlash2TreeScope.current != nil
+                && !CompiledDecodeTrace.isActive
+                && ProcessInfo.processInfo.environment["VMLX_DFLASH2_TREE_PIPELINE"] != "0"
 
             for (index, layer) in layers.enumerated() {
                 let layerSSMMask = layer.isLinear ? ssmMask : nil
@@ -3099,6 +3102,12 @@ enum Qwen35Language {
                 )
                 if captureLayerIDs.contains(index) {
                     captured[index] = hiddenStates
+                }
+                // Tree verify runs eager: submit every 4 layers (and after layer 0) so the GPU
+                // starts while the host is still building the rest of the 64-layer graph — the
+                // donors' pipelined verify build. Same graph, same bits.
+                if pipelineTreeVerify, index + 1 < layers.count, index == 0 || index % 4 == 3 {
+                    asyncEval(hiddenStates)
                 }
             }
 
@@ -4300,7 +4309,7 @@ extension Qwen35Language.Attention {
     /// the cache; `compactTreeWindow` keeps the accepted path at commit.
     func treeAttention(_ x: MLXArray, cache: KVCache, scope: DFlash2TreeScope) -> MLXArray {
         let L = x.dim(1)
-        let start = cache.offset
+        let start = cache.offset + scope.positionDelta
         let qSplit = qProj(x).reshaped(1, L, numAttentionHeads, -1).split(parts: 2, axis: -1)
         let gate = qSplit[1].reshaped(1, L, -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
@@ -4310,7 +4319,7 @@ extension Qwen35Language.Attention {
             x: values, positionIds: scope.plan.positionIds(start: start))
         (queries, keys) = Qwen35Language.applyMultimodalRotaryPosEmb(
             q: queries, k: keys, cos: cosValues, sin: sinValues)
-        let mask = scope.attentionMask(prefix: start, dtype: queries.dtype)
+        let mask = scope.attentionMask(prefix: cache.offset, dtype: queries.dtype)
         let output = JangHadamardAttention.attention(
             queries: queries, keys: keys, values: values, cache: cache, scale: scale,
             mask: .array(mask),
@@ -4329,7 +4338,8 @@ extension Qwen35: DFlash2TreeVerifyModel {
     public func dflash2TreeForward(
         _ inputs: MLXArray, cache: [KVCache], captureLayerIDs: Set<Int>, scope: DFlash2TreeScope
     ) -> (MLXArray, [Int: MLXArray]) {
-        DFlash2TreeScope.with(scope) {
+        scope.positionDelta = dflash2PositionDelta
+        return DFlash2TreeScope.with(scope) {
             languageModel.textOnlyForwardCapturing(
                 inputs, cache: cache, captureLayerIDs: captureLayerIDs)
         }
@@ -4385,5 +4395,209 @@ public enum Qwen35DFlash2TreeKernelProbe {
         q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, b: MLXArray, state: MLXArray
     ) -> (MLXArray, MLXArray) {
         vlmGatedDeltaKernel(q: q, k: k, v: v, g: g, b: b, state: state)
+    }
+}
+
+/// Verify-cost attribution on real weights: per-layer ms of each sub-op at a given row count
+/// (each timed alone, eval'd, median of `reps`). Diagnostic only (RunBench BENCH_PARTS).
+public enum Qwen35DFlash2PartsProbe {
+    public static func run(model: Any, rowsList: [Int], reps: Int) -> [String] {
+        guard let m = model as? Qwen35 else { return ["[PARTS] not a Qwen35 VLM model"] }
+        let layers = m.languageModel.model.layers
+        guard let gdnLayer = layers.first(where: { $0.isLinear }), let gdn = gdnLayer.linearAttn,
+            let attnLayer = layers.first(where: { !$0.isLinear }), let attn = attnLayer.selfAttn
+        else { return ["[PARTS] layer kinds missing"] }
+        let hidden = gdn.hiddenSize
+        var lines: [String] = []
+        func time(_ body: () -> [MLXArray]) -> Double {
+            var samples: [Double] = []
+            for rep in 0 ..< (reps + 2) {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                MLX.eval(body())
+                let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                if rep >= 2 { samples.append(ms) }
+            }
+            samples.sort()
+            return samples[samples.count / 2]
+        }
+        for rows in rowsList {
+            let x = (MLXRandom.normal([1, rows, hidden]) * 0.05).asType(.bfloat16)
+            MLX.eval(x)
+            let nKeep = max(0, gdn.convKernelSize - 1)
+            let plan = DFlash2TreePlan(tokens: Array(0 ..< rows), parents: Array(-1 ..< (rows - 1)))
+            let windows = plan.convWindows(nKeep: nKeep)
+            let mixed = gdn.inProjQKV(x)
+            let a = gdn.inProjA(x)
+            let b = gdn.inProjB(x)
+            let convState = MLXArray.zeros([1, nKeep, gdn.convDim], dtype: .bfloat16)
+            MLX.eval(mixed, a, b, windows)
+            let convOut = silu(gdn.conv1d(
+                take(concatenated([convState, mixed], axis: 1)[0], windows.reshaped(-1), axis: 0)
+                    .reshaped(rows, nKeep + 1, gdn.convDim))).reshaped(1, rows, gdn.convDim)
+            let split = MLX.split(convOut, indices: [gdn.keyDim, 2 * gdn.keyDim], axis: -1)
+            let q = split[0].reshaped(1, rows, gdn.numKHeads, gdn.headKDim)
+            let k = split[1].reshaped(1, rows, gdn.numKHeads, gdn.headKDim)
+            let v = split[2].reshaped(1, rows, gdn.numVHeads, gdn.headVDim)
+            let g = computeGatedDeltaG(gdn.aLog, a, gdn.dtBias)
+            let state = MLXArray.zeros(
+                [1, gdn.numVHeads, gdn.headVDim, gdn.headKDim], dtype: .float32)
+            let y = (MLXRandom.normal([1, rows, gdn.numVHeads, gdn.headVDim]) * 0.1)
+                .asType(.bfloat16)
+            let z = gdn.inProjZ(x).reshaped(1, rows, gdn.numVHeads, gdn.headVDim)
+            MLX.eval(q, k, v, g, y, z)
+            var parts: [(String, Double)] = []
+            parts.append(("gdn_inproj4", time {
+                [gdn.inProjQKV(x), gdn.inProjZ(x), gdn.inProjB(x), gdn.inProjA(x)]
+            }))
+            parts.append(("gdn_conv", time {
+                [silu(gdn.conv1d(
+                    take(concatenated([convState, mixed], axis: 1)[0], windows.reshaped(-1), axis: 0)
+                        .reshaped(rows, nKeep + 1, gdn.convDim)))]
+            }))
+            parts.append(("gdn_qknorm_g", time {
+                [MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6),
+                 MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6),
+                 computeGatedDeltaG(gdn.aLog, a, gdn.dtBias)]
+            }))
+            parts.append(("gdn_rec_chain", time {
+                [vlmGatedDeltaKernel(q: q, k: k, v: v, g: g, b: b, state: state).0]
+            }))
+            parts.append(("gdn_rec_tree", time {
+                [vlmGatedDeltaTree(q: q, k: k, v: v, g: g, b: b, state: state,
+                                   parents: plan.parents)]
+            }))
+            parts.append(("gdn_normgate_out", time {
+                let normed = gdn.norm(y, gate: z)
+                return [gdn.outProj(normed.reshaped(1, rows, -1))]
+            }))
+            parts.append(("mlp", time { [(gdnLayer.mlp as! UnaryLayer)(x)] }))
+            parts.append(("attn_proj", time {
+                [attn.qProj(x), attn.kProj(x), attn.vProj(x)]
+            }))
+            parts.append(("attn_oproj", time {
+                [attn.oProj(MLXRandom.normal([1, rows, attn.numAttentionHeads * attn.headDim])
+                    .asType(.bfloat16))]
+            }))
+            parts.append(("layernorms2", time {
+                [gdnLayer.inputLayerNorm(x), gdnLayer.postAttentionLayerNorm(x)]
+            }))
+            parts.append(("lm_head", time { [m.projectToLogits(x)] }))
+            // Achieved bandwidth per projection bit width (every MLP projection of every layer).
+            var byBits: [Int: (bytes: Double, ms: Double)] = [:]
+            for layer in layers {
+                guard let mlp = layer.mlp as? Qwen35Language.MLP else { continue }
+                for module in [mlp.gateProj, mlp.upProj, mlp.downProj] {
+                    guard let q = module as? QuantizedLinear else { continue }
+                    let input = q === (mlp.downProj as AnyObject)
+                        ? (MLXRandom.normal([1, rows, q.weight.dim(1) * 32 / q.bits]) * 0.05)
+                            .asType(.bfloat16)
+                        : x
+                    MLX.eval(input)
+                    let ms = time { [module(input)] }
+                    let bytes = Double(q.weight.nbytes + q.scales.nbytes + (q.biases?.nbytes ?? 0))
+                    let previous = byBits[q.bits] ?? (0, 0)
+                    byBits[q.bits] = (previous.bytes + bytes, previous.ms + ms)
+                }
+            }
+            lines.append("[PARTS] rows=\(rows) mlp by bits: " + byBits.sorted { $0.key < $1.key }.map {
+                String(format: "%dbit %.0fMB %.2fms %.0fGB/s", $0.key, $0.value.bytes / 1e6,
+                       $0.value.ms, $0.value.bytes / 1e6 / $0.value.ms)
+            }.joined(separator: " | "))
+            let gdnCount = layers.filter(\.isLinear).count
+            let attnCount = layers.count - gdnCount
+            lines.append(
+                "[PARTS] rows=\(rows) per-layer ms: "
+                    + parts.map { String(format: "%@=%.3f", $0.0, $0.1) }.joined(separator: " "))
+            let total = parts.reduce(0.0) { sum, part in
+                switch part.0 {
+                case let n where n.hasPrefix("gdn_rec_tree"): return sum
+                case let n where n.hasPrefix("gdn_"): return sum + part.1 * Double(gdnCount)
+                case "mlp", "layernorms2": return sum + part.1 * Double(layers.count)
+                case let n where n.hasPrefix("attn_"): return sum + part.1 * Double(attnCount)
+                default: return sum + part.1
+                }
+            }
+            lines.append(String(format: "[PARTS] rows=%d model-scaled serial total=%.1f ms", rows, total))
+        }
+        return lines
+    }
+}
+
+extension Qwen35: DFlash2MediaPrefillModel {
+    public func dflash2MediaPrefill(
+        _ input: LMInput, cache: [KVCache], captureLayerIDs: Set<Int>, stepSize: Int,
+        onChunk: ([Int: MLXArray]) -> Void
+    ) throws -> MLXArray {
+        let inputIds = input.text.tokens
+        guard let visionModel else {
+            throw VLMError.processing("media prefill needs the vision tower")
+        }
+        let visionDType = visionModel.patchEmbed.proj.weight.dtype
+        var pixelParts: [MLXArray] = []
+        var imageFrames: [THW]?
+        var videoFrames: [THW]?
+        if let image = input.image {
+            pixelParts.append(image.pixels.asType(visionDType))
+            imageFrames = image.frames
+        }
+        if let video = input.video {
+            pixelParts.append(video.pixels.asType(visionDType))
+            videoFrames = video.frames
+        }
+        guard !pixelParts.isEmpty,
+            let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
+                .nilIfEmpty
+        else { throw VLMError.processing("media prefill without image or video pixels") }
+        // Exactly `prepare`'s embedding: vision features scattered onto their placeholders.
+        let textEmbeds = languageModel.model.embedTokens(inputIds)
+        let (visionHidden, _) = visionModel(concatenated(pixelParts), gridTHW: frames)
+        let (embeddings, _) = try mergeInputIdsWithImageFeatures(
+            imageFeatures: visionHidden.asType(textEmbeds.dtype),
+            imageRowCount: mergedRowCount(for: imageFrames),
+            inputEmbeds: textEmbeds,
+            inputIds: inputIds,
+            imageTokenIndex: config.imageTokenIndex,
+            videoTokenIndex: config.videoTokenIndex)
+        let typedCache = castCache(cache)
+        // Full-prompt M-RoPE positions, resolved ONCE (sets this request's decode delta);
+        // chunks slice them together with the embeddings, as `prepare` does.
+        guard let positions = languageModel.resolvedPositionIds(
+            inputs: inputIds, cache: typedCache, mask: nil, providedPositionIds: nil,
+            imageGridTHW: imageFrames, videoGridTHW: videoFrames, resetForMedia: true)
+        else { throw VLMError.processing("media prefill could not resolve M-RoPE positions") }
+        MLX.eval(embeddings, positions)
+        let total = inputIds.dim(1)
+        let step = Swift.max(1, stepSize)
+        var offset = 0
+        var lastLogits: MLXArray?
+        while offset < total {
+            try Task.checkCancellation()
+            let end = Swift.min(total, offset + step)
+            let (hidden, captured) = languageModel.model.callAsFunctionCapturing(
+                inputIds[0..., offset ..< end],
+                inputsEmbeds: embeddings[0..., offset ..< end, 0...],
+                cache: typedCache,
+                positionIds: positions[0..., 0..., offset ..< end],
+                captureLayerIDs: captureLayerIDs)
+            onChunk(captured)
+            if end == total {
+                lastLogits = languageModel.headLogits(hidden[0..., (end - offset - 1)..., 0...])
+            } else {
+                MLX.eval(cache)
+                MLX.Memory.clearCache()
+            }
+            offset = end
+        }
+        guard let lastLogits else { throw VLMError.processing("empty media prompt") }
+        return lastLogits
+    }
+
+    public var dflash2PositionDelta: Int {
+        guard let deltas = languageModel.ropeDeltas else { return 0 }
+        return deltas.reshaped(-1)[0].item(Int.self)
+    }
+
+    public func dflash2ResetPositionState() {
+        languageModel.resetPositionState()
     }
 }

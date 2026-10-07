@@ -2636,3 +2636,7 @@ final class Qwen4ExpMHCSubstageBridge {
     }
 }
 #endif
+
+/// Qwen4Exp keeps the media M-RoPE offset IN the cache (`mediaPositionOffset`) and every native
+/// forward applies it (`ropeDelta(for:)`), so copies and disk restores carry it too.
+extension Qwen4Exp: NativeMTPMediaCapable {}

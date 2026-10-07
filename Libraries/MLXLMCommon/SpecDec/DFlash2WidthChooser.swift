@@ -77,13 +77,18 @@ struct DFlash2WidthChooser {
         if let raw = ProcessInfo.processInfo.environment["VMLX_DFLASH2_BLOCK"], let n = Int(raw) {
             return [max(2, min(n, 2 * t))]
         }
-        if laneFlat { return [t, 2 * t] }
-        return Array(Set([min(5, t), t, 2 * t])).sorted()
+        // Width 1 = a plain AR step, measured like any other width: when speculation emits fewer
+        // tokens per second than AR (27B JANGH2 sampled prose: 24 vs 29 tok/s), the chooser
+        // picks AR; decayed acceptance drifting back to the prior plus the periodic re-time
+        // re-probes speculation. `VMLX_DFLASH2_AR_OPTION=0` removes it.
+        let ar = ProcessInfo.processInfo.environment["VMLX_DFLASH2_AR_OPTION"] == "0" ? [] : [1]
+        if laneFlat { return ar + [t, 2 * t] }
+        return ar + Array(Set([min(5, t), t, 2 * t])).sorted()
     }
 
     init(widths: [Int], costs: DFlash2WidthCostTable) {
         self.widths = widths.sorted()
-        self.width = self.widths[0]
+        self.width = self.widths.first(where: { $0 > 1 }) ?? self.widths[0]
         let top = self.widths.last ?? 2
         self.trials = Array(repeating: 0, count: top)
         self.hits = Array(repeating: 0, count: top)

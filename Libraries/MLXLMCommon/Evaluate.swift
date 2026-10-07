@@ -564,8 +564,14 @@ public struct GenerateParameters: Sendable {
     /// safety policy supplies a large finite window even for a 1K-token run;
     /// treating the mere presence of that cap as ineligible silently turned
     /// every such MTP request into plain AR.
-    public func nativeMTPEffectiveParameters(for input: LMInput) -> GenerateParameters? {
-        guard isNativeMTPPenaltyFree, !input.hasMediaContent else { return nil }
+    public func nativeMTPEffectiveParameters(for input: LMInput, model: Any? = nil)
+        -> GenerateParameters?
+    {
+        // Media is speculated only by models whose native forwards continue at the media-shifted
+        // (M-RoPE) positions after a VLM prefill (`NativeMTPMediaCapable`).
+        guard isNativeMTPPenaltyFree,
+            !input.hasMediaContent || NativeMTPMediaPolicy.allows(model: model)
+        else { return nil }
         // NativeMTPTokenIterator needs at least one draft/verify cycle. Treat
         // one-token probes as ordinary AR here so callers do not select the
         // exclusive MTP lane only for iterator construction to throw.
@@ -585,8 +591,8 @@ public struct GenerateParameters: Sendable {
         return resolved
     }
 
-    public func canUseNativeMTP(for input: LMInput) -> Bool {
-        nativeMTPEffectiveParameters(for: input) != nil
+    public func canUseNativeMTP(for input: LMInput, model: Any? = nil) -> Bool {
+        nativeMTPEffectiveParameters(for: input, model: model) != nil
     }
 }
 
@@ -4371,7 +4377,7 @@ public func generate(
     // model's own MTP head does not also run. Ordering here is the
     // backstop; hosts are expected to send only one strategy.
     if let strategy = parameters.draftStrategy, let drafterPath = strategy.dflash2DrafterPath,
-        DFlash2TokenIterator.unservableReason(parameters, input: input) == nil
+        DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
     {
         guard let dflashTarget = context.model as? any DFlash2Target else {
             throw DFlash2RuntimeError.drafterTargetMismatch(
@@ -4410,7 +4416,7 @@ public func generate(
     }
     if let strategy = parameters.draftStrategy,
         case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
-        parameters.canUseNativeMTP(for: input)
+        parameters.canUseNativeMTP(for: input, model: context.model)
     {
         guard let nativeModel = context.model as? any NativeMTPModel else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
@@ -4858,7 +4864,7 @@ public func generateTokensTask(
     // Same ordering rule as `generate`: a selected DFlash 2 drafter
     // replaces native MTP rather than stacking with it.
     if let strategy = parameters.draftStrategy, let drafterPath = strategy.dflash2DrafterPath,
-        DFlash2TokenIterator.unservableReason(parameters, input: input) == nil
+        DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
     {
         guard let dflashTarget = context.model as? any DFlash2Target else {
             throw DFlash2RuntimeError.drafterTargetMismatch(
@@ -4892,7 +4898,7 @@ public func generateTokensTask(
     }
     if let strategy = parameters.draftStrategy,
         case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
-        parameters.canUseNativeMTP(for: input)
+        parameters.canUseNativeMTP(for: input, model: context.model)
     {
         guard let nativeModel = context.model as? any NativeMTPModel else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
@@ -6038,4 +6044,16 @@ internal func _decodePromptTail(
     guard !tokenIds.isEmpty else { return nil }
     let tail = Array(tokenIds.suffix(max(1, tokens)))
     return tokenizer.decode(tokenIds: tail, skipSpecialTokens: false)
+}
+
+/// A native-MTP model whose prefill runs the VLM path and whose native forwards (bridge, AR,
+/// verify, draft seed) continue at the media-shifted M-RoPE positions — so a request carrying
+/// images/video can speculate after its media prefill instead of decoding plain AR.
+public protocol NativeMTPMediaCapable {}
+
+public enum NativeMTPMediaPolicy {
+    public static func allows(model: Any?) -> Bool {
+        model is NativeMTPMediaCapable
+            && ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_MEDIA"] != "0"
+    }
 }

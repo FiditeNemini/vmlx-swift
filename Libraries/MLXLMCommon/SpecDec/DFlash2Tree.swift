@@ -91,12 +91,15 @@ public struct DFlash2TreePlan {
 }
 
 /// Per-request scope a tree verify forward runs inside: the plan, plus what each recurrent layer
-/// left for the commit. Generation is single-threaded per iterator; the scope is set only for the
-/// duration of one forward and one commit.
+/// left for the commit. Bound TASK-LOCALLY for the duration of one forward only, so a concurrent
+/// forward of another model (or another request) on another task never sees it — a process-wide
+/// static here would send an unrelated Qwen3.5-family forward down the tree branch.
 public final class DFlash2TreeScope: @unchecked Sendable {
-    nonisolated(unsafe) public static var current: DFlash2TreeScope?
+    @TaskLocal public static var current: DFlash2TreeScope?
 
     public let plan: DFlash2TreePlan
+    /// Added to the cache offset for row positions (M-RoPE delta after a media prefill).
+    public var positionDelta = 0
     /// Per recurrent layer cache identity: whatever its commit needs (q, k, v, a, b, conv source…).
     public var records: [ObjectIdentifier: [MLXArray]] = [:]
     private var maskCache: (prefix: Int, mask: MLXArray)?
@@ -121,10 +124,7 @@ public final class DFlash2TreeScope: @unchecked Sendable {
     }
 
     public static func with<T>(_ scope: DFlash2TreeScope, _ body: () -> T) -> T {
-        let previous = current
-        current = scope
-        defer { current = previous }
-        return body()
+        $current.withValue(scope) { body() }
     }
 }
 
@@ -291,4 +291,25 @@ public enum DFlash2TreeAcceptance {
             return (path, bonus, tried, probabilitySum)
         }
     }
+}
+
+/// A DFlash 2 target that can prefill a prompt carrying images/video through its vision path
+/// while capturing the drafter's hidden-state taps, then continue with text-only drafting and
+/// verify at the media-shifted (M-RoPE) positions. Without it a media request decodes plain AR.
+public protocol DFlash2MediaPrefillModel {
+    /// Full-prompt prefill of `input` (vision tower → merged embeddings → full-prompt M-RoPE
+    /// positions) in chunks of `stepSize`; `onChunk` receives each chunk's captured hiddens.
+    /// Returns the last row's logits `[1, 1, V]`.
+    func dflash2MediaPrefill(
+        _ input: LMInput, cache: [KVCache], captureLayerIDs: Set<Int>, stepSize: Int,
+        onChunk: ([Int: MLXArray]) -> Void
+    ) throws -> MLXArray
+
+    /// Text rows after a media prefill sit `delta` positions away from their cache offset
+    /// (M-RoPE compresses a media span). 0 when the current request carries no media.
+    var dflash2PositionDelta: Int { get }
+
+    /// Clear media position state left by an EARLIER request (text-only requests must not
+    /// inherit another request's M-RoPE delta).
+    func dflash2ResetPositionState()
 }
