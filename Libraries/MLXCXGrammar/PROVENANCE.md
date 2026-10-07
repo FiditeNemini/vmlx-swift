@@ -8,3 +8,5 @@ No guided-generation loop, completion/whitespace biases, tokenizer heuristics or
 The namespace macros isolate C++ xgrammar and picojson symbols. The existing package C++20 setting compiles the donor's C++17-compatible source; no global language-standard change is introduced.
 
 Local C++20 compatibility: moved the SequenceFormat and OrFormat constructor bodies after all recursive variant alternatives in structural_tag.h. No grammar behavior change.
+
+Local JSON key correctness fix: GetPropertyPattern first serializes the property name as a JSON string and then applies the existing JSONStrToPrintableStr EBNF quoting helper, matching VisitConst. This preserves quote, backslash, control and Unicode key semantics instead of inserting raw property names into EBNF literals. CPU regression: testPropertyNamesPreserveJSONEscapingAndUnicode.

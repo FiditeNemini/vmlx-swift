@@ -311,6 +311,63 @@ public final class JSONSchemaGrammar: @unchecked Sendable {
             }
         }
         try walk(root, "#", 0)
+        // Inspect numeric source spellings before Foundation/picojson can round
+        // them. Enum/const values and array bounds require plain integer literals.
+        let source = Array(bytes)
+        var cursor = 0
+        func skipSpace() {
+            while cursor < source.count, [UInt8(32), 9, 10, 13].contains(source[cursor]) { cursor += 1 }
+        }
+        func stringToken() throws -> String {
+            let start = cursor
+            cursor += 1
+            while cursor < source.count {
+                let byte = source[cursor]
+                cursor += 1
+                if byte == 92 { cursor += 1 }
+                else if byte == 34 { break }
+            }
+            return try JSONSerialization.jsonObject(
+                with: Data(source[start..<cursor]), options: [.fragmentsAllowed]) as! String
+        }
+        func inspectNumbers(_ exact: Bool, _ path: String) throws {
+            skipSpace()
+            guard cursor < source.count else { return }
+            switch source[cursor] {
+            case 34: _ = try stringToken()
+            case 123:
+                cursor += 1; skipSpace()
+                while cursor < source.count, source[cursor] != 125 {
+                    let key = try stringToken()
+                    skipSpace(); cursor += 1
+                    try inspectNumbers(exact || (schemaPaths.contains(path) && ["enum", "const", "minItems", "maxItems"].contains(key)), path + "/" + component(key))
+                    skipSpace()
+                    if cursor < source.count, source[cursor] == 44 { cursor += 1; skipSpace() }
+                    else { break }
+                }
+                cursor += 1
+            case 91:
+                cursor += 1; skipSpace()
+                var index = 0
+                while cursor < source.count, source[cursor] != 93 {
+                    try inspectNumbers(exact, path + "/" + String(index))
+                    index += 1
+                    skipSpace()
+                    if cursor < source.count, source[cursor] == 44 { cursor += 1 } else { break }
+                }
+                cursor += 1
+            default:
+                let start = cursor
+                while cursor < source.count, ![UInt8(32), 9, 10, 13, 44, 93, 125].contains(source[cursor]) { cursor += 1 }
+                let token = String(decoding: source[start..<cursor], as: UTF8.self)
+                if exact, let first = token.first, first == "-" || first.isNumber {
+                    guard let integer = Int64(token), (-9_007_199_254_740_991...9_007_199_254_740_991).contains(integer) else {
+                        throw JSONSchemaGrammarError.unsupportedSchema(path: "#", keyword: "enum/const numbers and array bounds require safe integer literals")
+                    }
+                }
+            }
+        }
+        try inspectNumbers(false, "#")
         // Resolve only paths already visited as schemas. Annotation/instance-data
         // objects must never become schemas merely because a reference names them.
         for (ref, path) in refs {

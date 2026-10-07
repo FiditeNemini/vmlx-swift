@@ -2316,7 +2316,9 @@ std::string JSONSchemaConverter::GetPropertyPattern(
   std::string key;
   switch (json_format) {
     case JSONFormat::kJSON: {
-      key += "\"\\\"" + prop_name + "\\\"\"";
+      // Encode JSON key bytes first, then quote that JSON spelling for EBNF.
+      // Raw property names can contain quotes, backslashes and controls.
+      key += "\"" + JSONStrToPrintableStr(picojson::value(prop_name).serialize()) + "\"";
       break;
     }
     case JSONFormat::kXML: {

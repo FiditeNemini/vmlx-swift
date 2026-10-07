@@ -20,6 +20,60 @@ final class JSONSchemaGrammarTests: XCTestCase {
         }
     }
 
+    func testPropertyNamesPreserveJSONEscapingAndUnicode() throws {
+        for name in ["quote\"key", "back\\slash", "literal\\n", "line\nfeed", "tab\tkey", "nul\0key", "café😀"] {
+            let schemaObject: [String: Any] = [
+                "type": "object", "properties": [name: ["type": "boolean"]],
+                "required": [name], "additionalProperties": false,
+            ]
+            let schema = String(decoding: try JSONSerialization.data(withJSONObject: schemaObject), as: UTF8.self)
+            let output = String(decoding: try JSONSerialization.data(withJSONObject: [name: true]), as: UTF8.self)
+            let wrong = String(decoding: try JSONSerialization.data(withJSONObject: ["different": true]), as: UTF8.self)
+            let tokenizer = try JSONSchemaGrammarTokenizer(
+                vocabulary: ["<eos>", output, wrong], vocabularyType: .raw, stopTokenIDs: [0])
+            let grammar = try JSONSchemaGrammar(tokenizer: tokenizer, schema: schema)
+            let initial = try grammar.nextTokenMask()
+            XCTAssertTrue(allows(initial, 1), "Valid escaped property \(name.debugDescription)")
+            XCTAssertFalse(allows(initial, 2), "Wrong property must remain forbidden")
+            try grammar.accept(tokenID: 1)
+            try grammar.accept(tokenID: 0)
+            XCTAssertTrue(try grammar.isTerminated())
+        }
+    }
+
+    func testNumericConstantsRejectLossySourceSpellingsRecursively() throws {
+        for value in ["0.1", "9007199254740990.1", "9007199254740992", "18446744073709551615", "1e0", "[1,0.5]", "{\"x\":0.5}"] {
+            for keyword in ["const", "enum"] {
+                let body = keyword == "enum" ? "[\(value)]" : value
+                XCTAssertThrowsError(try JSONSchemaGrammar.validateSupportedSchema("{\"\(keyword)\":\(body)}")) { error in
+                    guard case JSONSchemaGrammarError.unsupportedSchema = error else {
+                        return XCTFail("Expected typed unsupported number, got \(error)")
+                    }
+                }
+            }
+        }
+        for value in ["-9007199254740991", "9007199254740991", "[1,-2]", "{\"x\":3}"] {
+            try JSONSchemaGrammar.validateSupportedSchema("{\"const\":\(value)}")
+        }
+        try JSONSchemaGrammar.validateSupportedSchema(##"{"type":"number","default":0.1}"##)
+        try JSONSchemaGrammar.validateSupportedSchema(##"{"type":"object","properties":{"const":{"type":"number"}},"additionalProperties":false}"##)
+    }
+
+    func testArrayBoundsRequirePlainIntegerSourceSpellings() throws {
+        for keyword in ["minItems", "maxItems"] {
+            for value in ["1.0000000000000001", "1.0", "1e0"] {
+                XCTAssertThrowsError(try JSONSchemaGrammar.validateSupportedSchema(
+                    "{\"type\":\"array\",\"\(keyword)\":\(value)}")) { error in
+                    guard case JSONSchemaGrammarError.unsupportedSchema = error else {
+                        return XCTFail("Expected typed unsupported bound, got \(error)")
+                    }
+                }
+            }
+            try JSONSchemaGrammar.validateSupportedSchema(
+                "{\"type\":\"array\",\"\(keyword)\":1}")
+        }
+    }
+
     func testObjectMaskAndExplicitStopIDs() throws {
         let grammar = try JSONSchemaGrammar(tokenizer: tokenizer(), schema: schema)
         let initial = try grammar.nextTokenMask()
