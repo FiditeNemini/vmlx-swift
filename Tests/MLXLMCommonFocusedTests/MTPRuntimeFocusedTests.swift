@@ -1842,6 +1842,16 @@ struct MTPRuntimeFocusedTests {
         #expect(complete.hasCompleteMTPArtifact)
         #expect(complete.tensorCount == 4)
 
+        // Both branches of split fusion are required; either alone leaves an initialized projection.
+        for missing in ["mtp.fc_hidden.weight", "mtp.fc_embedding.weight"] {
+            let partial = head.filter { $0.key != missing }
+            let status = try bundle("mtp-missing-" + missing, index: indexFor(partial), shards: [shard: partial])
+            #expect(status.bundleHasMTP)
+            #expect(!status.hasCompleteMTPArtifact)
+            #expect(!status.speculativeDecodeEnabled)
+            #expect(status.incompleteTopologyReason == "no fusion projection")
+        }
+
         // Complete head physically in the indexed shard but omitted from the index: still discovered.
         var partialIndex = indexFor(head)
         partialIndex = partialIndex.filter { !$0.key.hasPrefix("mtp.") }

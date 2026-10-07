@@ -2023,13 +2023,15 @@ public enum MTPBundleInspector {
     /// Matched on dotted name components, never on a model name; every installed MTP family (Flash-Next affine
     /// and JANGH, Allosaurus, Ling, Nemotron Lightning, Ornith, Qwen3.8 sources) satisfies it.
     static func mtpTopologyGap(_ names: [String]) -> String? {
-        let fusion: Set<String> = ["fc", "fc_hidden", "fc_embedding", "eh_proj", "input_proj"]
+        let fusion: Set<String> = ["fc", "eh_proj", "input_proj"]
         let compute: Set<String> = [
             "self_attn", "attn", "attention", "linear_attn", "mixer", "mlp", "experts", "shared_expert",
             "feed_forward", "block_sparse_moe",
         ]
         let components = names.map { Set($0.lowercased().split(separator: ".").map(String.init)) }
-        let hasFusion = components.contains { !$0.isDisjoint(with: fusion) }
+        let hasSplitFusion = components.contains { $0.contains("fc_hidden") }
+            && components.contains { $0.contains("fc_embedding") }
+        let hasFusion = hasSplitFusion || components.contains { !$0.isDisjoint(with: fusion) }
         let hasCompute = components.contains { !$0.isDisjoint(with: compute) }
         switch (hasFusion, hasCompute) {
         case (true, true): return nil

@@ -593,7 +593,7 @@ public struct LoadBundleFacts: Sendable, Equatable {
     }
 
     /// Sum of `*.ple.ngram_embedding.*` tensor payloads, read from safetensors headers only (no weights).
-    /// `0` for bundles without an n-gram table or on any read failure.
+    /// Unreadable headers and invalid spans are ignored, conservatively retaining those bytes as weights.
     static func ngramTableBytes(bundleURL url: URL) -> UInt64 {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
@@ -608,12 +608,22 @@ public struct LoadBundleFacts: Sendable, Equatable {
                 headerData.count == Int(length),
                 let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
             else { continue }
+            // A header describes offsets relative to the payload, not the file.
+            // Never subtract untrusted signed offsets: Int.min...Int.max can
+            // trap before the actual weight loader gets to reject the shard.
+            guard let fileSize = try? handle.seekToEnd(), fileSize >= 8 + length else { continue }
+            let payloadBytes = fileSize - 8 - length
             for (name, value) in header where name.contains(".ple.ngram_embedding.") {
-                if let offsets = (value as? [String: Any])?["data_offsets"] as? [Int], offsets.count == 2,
-                    offsets[1] >= offsets[0]
-                {
-                    total &+= UInt64(offsets[1] - offsets[0])
-                }
+                guard let offsets = (value as? [String: Any])?["data_offsets"] as? [Int],
+                    offsets.count == 2, offsets[0] >= 0, offsets[1] >= offsets[0],
+                    UInt64(offsets[1]) <= payloadBytes
+                else { continue }
+                let bytes = UInt64(offsets[1]) - UInt64(offsets[0])
+                let sum = total.addingReportingOverflow(bytes)
+                // If accounting cannot be represented, subtract nothing from
+                // the resident estimate rather than wrap to a smaller value.
+                guard !sum.overflow else { return 0 }
+                total = sum.partialValue
             }
         }
         return total
