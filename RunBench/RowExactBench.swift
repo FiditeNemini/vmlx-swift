@@ -91,6 +91,65 @@ func runRowExactBench(modelPath: String) async throws {
                          (d .> 0).sum().item(Int.self)))
         }
     }
+    if let atRaw = env["BENCH_ROWEXACT_LAYERS_AT"], let at = Int(atRaw), at >= 0, at + 1 < stream.count {
+        // Layer bisect at position `at`: AR-step 0..<at, copy the cache, then AR step `at` vs verify [t_at, t_at+1].
+        var (c0, _) = prefill()
+        for i in 0 ..< at {
+            let o = model.nativeAutoregressiveBackboneForward(MLXArray([Int32(stream[i])]).reshaped(1, 1), cache: c0)
+            MLX.eval(o.logits)
+        }
+        MLX.eval(c0)
+        let cAR = c0.map { $0.copy() }, cV = c0.map { $0.copy() }
+        MLX.eval(cAR); MLX.eval(cV)
+        Qwen4ExpRowExactCapture.layers = []; Qwen4ExpRowExactCapture.parts = []
+        Qwen4ExpRowExactCapture.enabled = true
+        let a = model.nativeAutoregressiveBackboneForward(MLXArray([Int32(stream[at])]).reshaped(1, 1), cache: cAR)
+        MLX.eval(a.logits)
+        let arLayers = Qwen4ExpRowExactCapture.layers
+        Qwen4ExpRowExactCapture.layers = []
+        let v = NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+            model.nativeBackboneMTPVerifyForward(
+                MLXArray([Int32(stream[at]), Int32(stream[at + 1])]).reshaped(1, 2), cache: cV)
+        }
+        MLX.eval(v.logits)
+        let vLayers = Qwen4ExpRowExactCapture.layers
+        Qwen4ExpRowExactCapture.enabled = false
+        let row = abs(a.logits[0, -1].asType(.float32) - v.logits[0, 0].asType(.float32)).max().item(Float.self)
+        print(String(format: "[ROWEXACT] at=%d logits_row0_maxdiff=%.4g", at, row))
+        for (i, (x, y)) in zip(arLayers, vLayers).enumerated() {
+            let d = abs(x[0, 0].asType(.float32) - y[0, 0].asType(.float32))
+            let m = d.max().item(Float.self)
+            if m > 0 {
+                print(String(format: "[ROWEXACT] at=%d first_diff_layer=%d maxdiff=%.4g nonzero=%d", at, i, m,
+                             (d .> 0).sum().item(Int.self)))
+                // Component bisect inside that layer, from the same pre-step state.
+                Qwen4ExpRowExactCapture.partLayer = i
+                let c1 = c0.map { $0.copy() }, c2 = c0.map { $0.copy() }
+                MLX.eval(c1); MLX.eval(c2)
+                Qwen4ExpRowExactCapture.parts = []; Qwen4ExpRowExactCapture.enabled = true
+                MLX.eval(model.nativeAutoregressiveBackboneForward(
+                    MLXArray([Int32(stream[at])]).reshaped(1, 1), cache: c1).logits)
+                let ap = Qwen4ExpRowExactCapture.parts
+                Qwen4ExpRowExactCapture.parts = []
+                MLX.eval(NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
+                    model.nativeBackboneMTPVerifyForward(
+                        MLXArray([Int32(stream[at]), Int32(stream[at + 1])]).reshaped(1, 2), cache: c2)
+                }.logits)
+                let vp = Qwen4ExpRowExactCapture.parts
+                Qwen4ExpRowExactCapture.enabled = false
+                Qwen4ExpRowExactCapture.partLayer = 0
+                for ((name, x), (_, y)) in zip(ap, vp) {
+                    let xr = x.reshaped(x.dim(0), x.dim(1), -1)[0, 0].asType(.float32)
+                    let yr = y.reshaped(y.dim(0), y.dim(1), -1)[0, 0].asType(.float32)
+                    let dd = abs(xr - yr)
+                    print(String(format: "[ROWEXACT] at=%d layer=%d %@ dtype=%@/%@ maxdiff=%.4g nonzero=%d", at, i, name,
+                                 String(describing: x.dtype), String(describing: y.dtype),
+                                 dd.max().item(Float.self), (dd .> 0).sum().item(Int.self)))
+                }
+                break
+            }
+        }
+    }
     print("[ROWEXACT] model=\(modelDir.lastPathComponent) prompt=\(prompt.dim(1)) steps=\(steps) ar=\(env["BENCH_ROWEXACT_AR"] ?? "native-autoregressive")")
 
     // 2. Verify windows over the same stream.

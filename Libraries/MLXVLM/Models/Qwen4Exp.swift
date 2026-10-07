@@ -14,8 +14,9 @@ public enum Qwen4ExpRowExactCapture {
     nonisolated(unsafe) public static var enabled = false
     nonisolated(unsafe) public static var layers: [MLXArray] = []
     nonisolated(unsafe) public static var parts: [(String, MLXArray)] = []
+    nonisolated(unsafe) public static var partLayer = 0
     static func part(_ layer: Int, _ name: String, _ value: MLXArray?) {
-        guard enabled, layer == 0, let value else { return }
+        guard enabled, layer == partLayer, let value else { return }
         parts.append((name, value))
     }
 }
@@ -606,8 +607,12 @@ private final class Qwen4ExpGatedResidual: Module {
         let scaled = mixedDown / Float(hcCount)
         var weights = silu(scaled)
         let projected: MLXArray
+        // Not gated on `combines`: the FINAL hyper-connection mixer (combines == false) has the same
+        // [10240, 320] up-projection, and leaving it on the multi-row matmul made verify row != AR row in the
+        // last mixer (found 2026-10-06 by BENCH_ROWEXACT_LAYERS_AT on 2L pos 52 / 6S pos 1: every decoder layer
+        // bitwise equal, logits off by 0.0625, first differing "layer" = the final mixer).
         if FlashVerificationScope.usesRowExactVerification(inputShape: weights.shape, site: "hcup"),
-            combines, hcCount == 4, hiddenSize == 2560,
+            hcCount == 4, hiddenSize == 2560,
             !(mixUp is QuantizedLinear), mixUp.bias == nil,
             let rowInvariant = Qwen4ExpHCUpProjection.project(weights, weight: mixUp.weight)
         {
@@ -1721,6 +1726,7 @@ private final class Qwen4ExpTextModel: Module {
             if auditDTypes { layerDTypes.append(hidden.dtype) }
         }
         let result = mixer.mix(hidden, normalizedInput: normalizedNext).0
+        if Qwen4ExpRowExactCapture.enabled { Qwen4ExpRowExactCapture.layers.append(result) }
         if let rotaryContext {
             let shape = "\(rotaryContext.factorCount)|\(rotaryContext.reuseCount)"
             if reportedRotaryReuseShapes.insert(shape).inserted {
