@@ -1,6 +1,7 @@
 // Copyright 2026 Osaurus AI. All rights reserved.
 // SPDX-License-Identifier: MIT
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -8,6 +9,17 @@ import Testing
 
 @Suite("VMLX server runtime settings")
 struct VMLXServerRuntimeSettingsTests {
+    // Swift Testing can run outside the XCTest bundle that contains the Metal
+    // resource. Explicit test-only path keeps the fixture independent of that runner.
+    private static let metalFixture: Void = {
+        if let path = ProcessInfo.processInfo.environment["VMLX_TEST_METALLIB_PATH"] {
+            precondition(FileManager.default.isReadableFile(atPath: path))
+            precondition(mlx_metal_set_metallib_path(path) == 0)
+        }
+    }()
+
+    init() { _ = Self.metalFixture }
+
     @Test("explicit allocator maxima survive resident-family performance policy")
     func explicitAllocatorMaximumSurvivesResidentPolicy() {
         let gib = UInt64(1 << 30)

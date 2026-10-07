@@ -406,6 +406,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                 // Manual depth can bypass missing measurement, never an
                 // explicit bundle safety block.
                 return (status?.hasCompleteMTPArtifact == true
+                    && status?.isExplicitlyBlocked != true
                     && status?.nativeMTPTuning?.manualBlocked != true) ? .speculative : .blocked
             }
             return (status?.canAutoLaunchMTP == true) ? .speculative : .blocked
@@ -451,7 +452,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                     recommendation: nil,
                     reason: "MTP explicit depth must be 1, 2, or 3 (got \(depth)).")
             }
-            if status?.nativeMTPTuning?.manualBlocked == true {
+            if status?.isExplicitlyBlocked == true || status?.nativeMTPTuning?.manualBlocked == true {
                 return .init(
                     launchMode: .blocked,
                     recommendation: nil,

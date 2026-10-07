@@ -53,9 +53,8 @@ struct NativeMTPManualDepthTests {
                 reason: "live workload regressed versus autoregressive decode"))
     }
 
-    /// Auto has no winning depth, but manual diagnostics remain permitted.
-    /// This is the existing Flash-Next 4M shape and must not be changed by the
-    /// Ornith-specific `manual_blocked` contract.
+    /// An explicit bundle block also vetoes legacy manual diagnostics.
+    /// Only the qualified family policy may supersede a known historical block.
     private static var autoOnlyBlockedStatus: MTPBundleStatus {
         MTPBundleStatus(
             bundleHasMTP: true,
@@ -200,26 +199,21 @@ struct NativeMTPManualDepthTests {
         }
     }
 
-    @Test("an Auto-only block does not disable explicit diagnostics")
-    func autoOnlyBlockStillAllowsManualDepth() throws {
+    @Test("an explicit bundle block also disables legacy manual diagnostics")
+    func bundleBlockRejectsManualDepth() throws {
         let settings = Self.settings(mode: .forceOn, explicitDepth: 2)
-        #expect(
-            settings.effectiveMTPLaunchMode(for: Self.autoOnlyBlockedStatus)
-                == .speculative)
+        #expect(settings.effectiveMTPLaunchMode(for: Self.autoOnlyBlockedStatus) == .blocked)
         let launch = settings.resolvedMTPLaunch(
-            configData: Self.config(),
-            jangConfig: nil,
-            status: Self.autoOnlyBlockedStatus)
-        #expect(launch.launchMode == .speculative)
-        #expect(launch.recommendation?.depth == 2)
-
+            configData: Self.config(), jangConfig: nil, status: Self.autoOnlyBlockedStatus)
+        #expect(launch.launchMode == .blocked)
+        #expect(launch.recommendation == nil)
         try NativeMTPActivation.$explicitRequestOverride.withValue(true) {
             try NativeMTPActivation.$manualDepthOverride.withValue(2) {
-                let allowed = try NativeMTPActivation.shouldLoadNativeMTPWeights(
-                    configData: Self.config(),
-                    baseModelType: "qwen3_5",
-                    status: Self.autoOnlyBlockedStatus)
-                #expect(allowed)
+                #expect(throws: NativeMTPActivationError.self) {
+                    _ = try NativeMTPActivation.shouldLoadNativeMTPWeights(
+                        configData: Self.config(), baseModelType: "qwen3_5",
+                        status: Self.autoOnlyBlockedStatus)
+                }
             }
         }
     }
