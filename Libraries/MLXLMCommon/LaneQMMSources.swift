@@ -186,6 +186,35 @@ public enum LaneQMM {
           }
         """#
 
+    /// 8-bit codes ARE bytes: MLX packs an 8-bit weight as a row-major [N][K] uint8 matrix, so the matrix
+    /// unit can take it straight from device memory as a `uint8_t` operand — no bit-stream widening into
+    /// threadgroup memory, no staging barriers (what `bytesSource` does for 5/6/8-bit). Same descriptor,
+    /// same per-group fma epilogue and K-slice reduction as the 4-bit kernels, so the result is admitted
+    /// bitwise against `bytesSource` (LaneQMMDirect8Tests). Untiled: rows of the MLX layout; tiled: a
+    /// (tile, group) block is NT columns x 64 contiguous bytes.
+    static let main8Source: String = {
+        let replaced = mainSource.replacingOccurrences(
+            of: "tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tB((device uchar*)Wq",
+            with: "tensor<device uint8_t, dextents<int32_t, 2>, tensor_inline> tB((device uint8_t*)Wq")
+        precondition(!replaced.contains("uint4b_format"), "main8Source: 4-bit operand left")
+        return replaced
+    }()
+
+    static let main8TiledSource: String = {
+        let replaced = mainTiledSource
+            .replacingOccurrences(
+                of: "tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tB((device uchar*)Wq",
+                with: "tensor<device uint8_t, dextents<int32_t, 2>, tensor_inline> tB((device uint8_t*)Wq")
+            .replacingOccurrences(
+                of: "tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> b(",
+                with: "tensor<device uint8_t, dextents<int32_t, 2>, tensor_inline> b(")
+            .replacingOccurrences(
+                of: "(device uchar*)Wq + (int64_t)(threadgroup_position_in_grid.x * KG + g) * (NT * GS / 2)",
+                with: "(device uint8_t*)Wq + (int64_t)(threadgroup_position_in_grid.x * KG + g) * (NT * GS)")
+        precondition(!replaced.contains("uint4b_format"), "main8TiledSource: 4-bit operand left")
+        return replaced
+    }()
+
     static let bytesSource = #"""
 
           static_assert(NT == 32, "one column per lane");

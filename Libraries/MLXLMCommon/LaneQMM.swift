@@ -127,7 +127,20 @@ extension LaneQMM {
         let block = mp <= rowBlock ? mp : rowBlock
         let edge = mp % block != 0 ? 1 : 0
         let y: MLXArray
-        if bits != 4 {
+        if bits == 8, group == 64, direct8Enabled {
+            y =
+                kernel(
+                    tiled ? "main8_tiled" : "main8", body: tiled ? main8TiledSource : main8Source,
+                    inputs: ["X", "XS", "Wq", "SBt", "mdims"], outputs: ["Y"],
+                    constants: [
+                        ("TMR", block / 16), ("N", n), ("K", k), ("NT", nt), ("SK", sk),
+                        ("GS", group), ("EDGE", edge),
+                    ])(
+                    [x2, xs, weight, sbt, mdims],
+                    grid: (((n + nt - 1) / nt) * 32 * sk, (mp + block - 1) / block, 1),
+                    threadGroup: (32 * sk, 1, 1), outputShapes: [[m, n]], outputDTypes: [.bfloat16])[
+                    0]
+        } else if bits != 4 {
             precondition(bits > 4 && group == 64, "lane bytes kernel: 5/6/8-bit, groups of 64")
             y =
                 kernel(
@@ -157,6 +170,11 @@ extension LaneQMM {
         }
         return y.reshaped(lead + [n])
     }
+
+    /// 8-bit weights straight from device memory (`main8*`); `VMLX_LANE_QMM_DIRECT8=0` keeps the
+    /// widening bytes kernel.
+    nonisolated(unsafe) static var direct8Enabled =
+        ProcessInfo.processInfo.environment["VMLX_LANE_QMM_DIRECT8"] != "0"
 
     // MARK: install
 

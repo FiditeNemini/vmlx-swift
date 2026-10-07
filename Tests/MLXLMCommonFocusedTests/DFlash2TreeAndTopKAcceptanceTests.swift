@@ -224,4 +224,42 @@ final class DFlash2TreeAndTopKAcceptanceTests: XCTestCase {
         XCTAssertEqual(keys.reshaped(-1).asArray(Float.self), [0, 1, 2, 3, 5, 7])
         XCTAssertEqual(values.reshaped(-1).asArray(Float.self), [0, 10, 20, 30, 50, 70])
     }
+
+    // MARK: lane matmul — direct 8-bit kernel
+
+    /// `main8` / `main8_tiled` read 8-bit codes straight from device memory; they must give the
+    /// widening bytes kernel's bits exactly (same matmul2d descriptor, same epilogue).
+    func testLaneDirect8MatchesBytesKernelBitwise() throws {
+        try FocusedMLXTestSupport.withLock {
+            guard LaneQMM.available() else { throw XCTSkip("no Metal-4 tensor ops") }
+            MLXRandom.seed(21)
+            let n = 256, k = 1024
+            let w = (MLXRandom.normal([n, k]) * 0.05).asType(.bfloat16)
+            let (q, s, b) = MLX.quantized(w, groupSize: 64, bits: 8)
+            let sbt = LaneQMM.packScales(s.asType(.bfloat16), b!.asType(.bfloat16))
+            let tiledQ = LaneQMM.tileWeight(q, bits: 8)
+            defer { LaneQMM.direct8Enabled = true }
+            for rows in [1, 5, 16, 33] {
+                let x = MLXRandom.normal([rows, k]).asType(.bfloat16)
+                for (weight, tiled) in [(q, false), (tiledQ, true)] {
+                    LaneQMM.direct8Enabled = false
+                    let reference = LaneQMM.laneMatmul(
+                        x, weight: weight, sbt: sbt, bits: 8, tiled: tiled)
+                    LaneQMM.direct8Enabled = true
+                    let direct = LaneQMM.laneMatmul(
+                        x, weight: weight, sbt: sbt, bits: 8, tiled: tiled)
+                    XCTAssertEqual(
+                        direct.asType(.float32).asArray(Float.self),
+                        reference.asType(.float32).asArray(Float.self),
+                        "rows \(rows) tiled \(tiled)")
+                }
+                let dense = matmul(
+                    x.asType(.float32),
+                    dequantized(q, scales: s, biases: b, groupSize: 64, bits: 8).asType(.float32).T)
+                let direct = LaneQMM.laneMatmul(x, weight: q, sbt: sbt, bits: 8, tiled: false)
+                XCTAssertTrue(
+                    allClose(direct.asType(.float32), dense, rtol: 0.02, atol: 0.05).item(Bool.self))
+            }
+        }
+    }
 }
