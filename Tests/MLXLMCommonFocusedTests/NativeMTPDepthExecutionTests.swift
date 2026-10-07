@@ -31,8 +31,14 @@ final class NativeMTPDepthExecutionTests: XCTestCase {
                 }
             }
             XCTAssertEqual(tokens, (0..<240).map { (2 + $0) % 32 })
-            XCTAssertGreaterThan(iterator.sequentialVerifierCount, 0)
-            XCTAssertEqual(iterator.stagedVerifierCommitCount, 0)
+            // Sampled requests verify through the staged batched verifier (one readback per cycle) unless
+            // VMLX_NATIVE_MTP_SAMPLED_STAGED=0 restores the sequential path.
+            if NativeMTPTokenIterator.sampledStagedVerifyEnabled {
+                XCTAssertGreaterThan(iterator.stagedVerifierCommitCount, 0)
+            } else {
+                XCTAssertGreaterThan(iterator.sequentialVerifierCount, 0)
+                XCTAssertEqual(iterator.stagedVerifierCommitCount, 0)
+            }
             XCTAssertGreaterThan(iterator.rejectedCount, 0)
             XCTAssertGreaterThan(iterator.autoregressiveFallbackTokenCount, 2)
             XCTAssertGreaterThan(iterator.verifyCalls, verifiesAtChange)
