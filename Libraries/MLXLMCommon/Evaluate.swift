@@ -771,6 +771,13 @@ public struct SpeculativeSamplingController {
             logits = logits.asType(.float32)
         }
 
+        let vocabularySize = logits.dim(-1)
+        if topK > 0, topK <= 256, topK < vocabularySize, logits.dim(0) == 1,
+            Self.topKFastPathEnabled
+        {
+            return topKProbabilities(logits, vocabularySize: vocabularySize)
+        }
+
         var logprobs = logSoftmax(logits * (1 / MLXArray(temperature)))
         if topP > 0 && topP < 1 {
             logprobs = applyTopP(logprobs, topP: MLXArray(topP))
@@ -783,6 +790,36 @@ public struct SpeculativeSamplingController {
         }
 
         return softmax(logprobs, axis: -1, precise: true)
+    }
+
+    static let topKFastPathEnabled =
+        ProcessInfo.processInfo.environment["VMLX_SPEC_TOPK_PROBS"] != "0"
+
+    /// Same distribution as the full-vocabulary path above when a top-k filter is set — the kept
+    /// set is `topK ∩ nucleus ∩ minP`, and every member of the nucleus test can be decided from
+    /// the K largest log-probabilities (token i survives top-p iff the mass of strictly larger
+    /// tokens is < topP, and all of those are inside the top K) — but without the 248k-wide
+    /// argSort the top-p filter needs. Runs once per native-MTP draft step and fallback sample.
+    private func topKProbabilities(_ logits: MLXArray, vocabularySize: Int) -> MLXArray {
+        let x = logits.asType(.float32) * (1 / MLXArray(temperature))
+        let lse = logSumExp(x, axis: -1, keepDims: true)
+        let ids = argPartition(-x, kth: topK - 1, axis: -1)[0..., ..<topK]
+        let unsorted = takeAlong(x, ids, axis: -1) - lse
+        let order = argSort(-unsorted, axis: -1)
+        let sortedIDs = takeAlong(ids, order, axis: -1)
+        let logprobs = takeAlong(unsorted, order, axis: -1)
+        var keep = MLXArray.ones(logprobs.shape, type: Bool.self)
+        if topP > 0 && topP < 1 {
+            let p = exp(logprobs)
+            keep = keep .&& ((cumsum(p, axis: -1) - p) .< MLXArray(topP))
+        }
+        if minP > 0 {
+            keep = keep .&& (logprobs .>= (logprobs[0..., 0 ..< 1] + MLXArray(log(minP))))
+        }
+        let kept = softmax(MLX.where(keep, logprobs, negInf), axis: -1, precise: true)
+        return putAlong(
+            MLXArray.zeros([1, vocabularySize], type: Float.self), sortedIDs, values: kept,
+            axis: -1)
     }
 
     public func sample(logits: MLXArray) -> Sample {

@@ -266,6 +266,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     private var nextMain: MLXArray?
     private var drafts: [MLXArray] = []
     private var draftProbabilities: [MLXArray] = []
+    /// Sampled requests with a top-k filter: batched lossless acceptance on the host from one
+    /// readback per cycle (SpeculativeTopKAcceptance.swift). `nil` = greedy or no top-k.
+    private let topKAcceptance: SpeculativeTopKAcceptance.Filter?
+    private var hostRNG: SpeculativeHostRNG
 
     // MARK: - Verify prefetch
     //
@@ -612,6 +616,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.processor = effectiveParameters.processor()
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
+        self.topKAcceptance = SpeculativeTopKAcceptance.Filter(
+            temperature: effectiveParameters.temperature, topP: effectiveParameters.topP,
+            topK: effectiveParameters.topK, minP: effectiveParameters.minP)
+        self.hostRNG = SpeculativeHostRNG(seed: effectiveParameters.randomSeed)
         self.maxTokens = effectiveParameters.maxTokens
         // One resolved policy governs initialization, recovery and promotion.
         // The environment bounds exploration but cannot raise a fixed request.
@@ -1512,8 +1520,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // The mode string is passed task-locally around the verify forward
         // ONLY; it must never leak into prefill/seed/sequential forwards.
         let explicitHybridMode = Self.nativeMTPHybridVerifySetting(verifierModeSetting)
+        // Sampled requests take the staged verify too: the staged commit only needs the
+        // accepted row count, which the sampled acceptance produces exactly like greedy does.
+        // Before 2026-10-07 every sampled hybrid request (= every default app request, the
+        // bundle sampler is T=1.0) went through serial verifier repair.
         let stagedCapable = usesHybridMambaCache
-            && speculativeSampler.isGreedy
+            && (speculativeSampler.isGreedy || Self.sampledStagedVerifyEnabled)
             && processor == nil
             && model is DFlash2StagedVerifyRollbackModel
         let stagedVerify = stagedCapable
@@ -1595,11 +1607,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 cache,
                 verifierMode: verifierModeSetting)
         let canCommitVerifierCache = Self.canCommitVerifierCache(cache)
-        let requiresSequentialRepair = Self.requiresSequentialVerifierRepair(
+        let requiresSequentialRepair = !stagedVerify && Self.requiresSequentialVerifierRepair(
             cache,
             speculativeSampler: speculativeSampler,
             verifierMode: verifierModeSetting)
-        let needsBatchedVerifierRecovery = speculativeSampler.isGreedy && processor == nil
+        let needsBatchedVerifierRecovery = (speculativeSampler.isGreedy || stagedVerify)
+            && processor == nil
         let checkpoint: NativeMTPCacheCheckpoint?
         if let consumedPrefetch {
             // The forward already ran at submit time; a checkpoint taken now
@@ -1665,7 +1678,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         chunkVerifierCount += 1
 
         let sampleStart = NativeMTPClock.now()
-        guard let verifyDecision = Self.verifyDrafts(
+        let fastSampled = sampledTopKDecision(logits: verifier.logits, draftTokenIds:
+            requestedInputIds.dropFirst().map(Int.init))
+        guard let verifyDecision = fastSampled ?? Self.verifyDrafts(
             logits: verifier.logits,
             drafts: drafts,
             draftTokenIds: requestedInputIds.dropFirst().map(Int.init),
@@ -1996,7 +2011,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // ONE level: that forward commits this cycle's confirmed pairs to the aligned head cache (later head
         // drafts need that context); its single draft is then superseded by the copies.
         var copyWindow: [Int] = []
-        if stagedVerify, speculativeSampler.isGreedy, processor == nil,
+        if stagedVerify, speculativeSampler.isGreedy || topKAcceptance != nil, processor == nil,
             NativeMTPCopyProposer.enabled
         {
             if copyProposer == nil { copyProposer = NativeMTPCopyProposer(prompt: promptTokenIds) }
@@ -3113,6 +3128,73 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let probabilities: [MLXArray]
         let forwardCount: Int
         let materializeSyncTime: TimeInterval
+    }
+
+    static var sampledStagedVerifyEnabled: Bool {
+        ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_SAMPLED_STAGED"] != "0"
+    }
+
+    /// Sampled acceptance for the whole verify slab from ONE readback (top-k requests only).
+    /// Copy windows have no draft distribution: they are deterministic proposals, q = one-hot.
+    private mutating func sampledTopKDecision(logits: MLXArray, draftTokenIds: [Int])
+        -> VerifyDecision?
+    {
+        guard !speculativeSampler.isGreedy, processor == nil, let filter = topKAcceptance,
+            draftsAreCopy || draftProbabilities.count == drafts.count
+        else { return nil }
+        let rows = drafts.count + 1
+        let (ids, logprobs) = SpeculativeTopKAcceptance.topK(
+            logits: logits[0..., 0 ..< rows, 0...], filter: filter)
+        var qKept: MLXArray? = nil
+        var qDraft: MLXArray? = nil
+        if !draftsAreCopy, !drafts.isEmpty {
+            let q = concatenated(
+                draftProbabilities.map { $0.reshaped(1, -1) }, axis: 0)  // [D, V]
+            qKept = takeAlong(q, ids[0 ..< drafts.count, 0...], axis: -1)
+            let d = MLXArray(draftTokenIds.map(Int32.init)).reshaped(-1, 1)
+            qDraft = takeAlong(q, d, axis: -1)
+        }
+        let syncStart = NativeMTPClock.now()
+        MLX.eval([ids, logprobs] + [qKept, qDraft].compactMap { $0 })
+        let idRows = ids.asArray(Int32.self)
+        let lpRows = logprobs.asArray(Float.self)
+        let qKeptHost = qKept?.asType(.float32).asArray(Float.self)
+        let qDraftHost = qDraft?.asType(.float32).asArray(Float.self)
+        let syncTime = NativeMTPClock.now() - syncStart
+        let k = ids.dim(1)
+        var p: [[(id: Int, p: Double)]] = []
+        var qAtKept: [[Double]] = []
+        var qAtDraft: [Double] = []
+        for r in 0 ..< rows {
+            let lo = r * k
+            let dist = SpeculativeTopKAcceptance.distribution(
+                ids: idRows[lo ..< lo + k], logprobs: lpRows[lo ..< lo + k], filter: filter)
+            p.append(dist)
+            guard r < drafts.count else { continue }
+            if let qKeptHost, let qDraftHost {
+                // qKept is aligned with the UNSORTED top-k ids; map by id.
+                var byID: [Int: Double] = [:]
+                for j in 0 ..< k { byID[Int(idRows[lo + j])] = Double(qKeptHost[lo + j]) }
+                qAtKept.append(dist.map { byID[$0.id] ?? 0 })
+                qAtDraft.append(Double(qDraftHost[r]))
+            } else {
+                let draft = draftTokenIds[r]
+                qAtKept.append(dist.map { $0.id == draft ? 1 : 0 })
+                qAtDraft.append(1)
+            }
+        }
+        let decision = SpeculativeTopKAcceptance.acceptChain(
+            drafts: Array(draftTokenIds.prefix(drafts.count)), p: p, qAtKept: qAtKept,
+            qAtDraft: qAtDraft, rng: &hostRNG)
+        let next = decision.tokenIds[decision.accepted]
+        let dtype = drafts.first?.dtype ?? .int32
+        return VerifyDecision(
+            accepted: decision.accepted,
+            nextToken: MLXArray([Int32(next)]).asType(dtype),
+            targetTokenIds: decision.tokenIds,
+            acceptanceProbabilitySum: decision.acceptanceProbabilitySum,
+            acceptanceProbabilityCount: decision.acceptanceProbabilityCount,
+            materializeSyncTime: syncTime)
     }
 
     private static func verifyDrafts(
