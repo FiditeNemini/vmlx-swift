@@ -13,6 +13,39 @@ import XCTest
 
 final class DFlash2TreeAndTopKAcceptanceTests: XCTestCase {
 
+    // MARK: cost table target lifetime
+
+    func testWidthCostsPersistForTheSameLivingTarget() {
+        let target = NSObject()
+        let table = DFlash2WidthCostTable.shared(for: target, widths: [1, 5, 8, 16])
+        table.observe(width: 5, seconds: 0.1)
+        table.observe(width: 5, seconds: 0.2)
+        let reused = DFlash2WidthCostTable.shared(for: target, widths: [1, 5, 8, 16])
+        XCTAssertTrue(table === reused)
+        XCTAssertEqual(reused.cost(of: 5), 0.2)
+        withExtendedLifetime(target) {}
+    }
+
+    func testWidthCostsDoNotRetainOrLeakAcrossUnloadedTargets() {
+        final class Target {}
+        weak var releasedTarget: Target?
+        // Repeated lifetimes exercise allocator address reuse without requiring a particular
+        // allocation address. Every newly loaded target must start with a cold cost table.
+        for generation in 0 ..< 1_000 {
+            autoreleasepool {
+                let target = Target()
+                releasedTarget = target
+                let table = DFlash2WidthCostTable.shared(for: target, widths: [1, 5, 8, 16])
+                XCTAssertNil(table.cost(of: 5), "inherited costs at generation \(generation)")
+                table.observe(width: 5, seconds: 1)
+                table.observe(width: 5, seconds: 1)
+                XCTAssertEqual(table.cost(of: 5), 1)
+                withExtendedLifetime(target) {}
+            }
+            XCTAssertNil(releasedTarget, "cost table retained model at generation \(generation)")
+        }
+    }
+
     // MARK: top-K distribution == the controller's full-vocabulary filter
 
     /// Host reference of `SpeculativeSamplingController.probabilities` (full vocab: temperature,

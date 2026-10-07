@@ -43,16 +43,28 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
         return cost[width]
     }
 
-    nonisolated(unsafe) private static var tables: [ObjectIdentifier: DFlash2WidthCostTable] = [:]
+    private final class Entry {
+        weak var target: AnyObject?
+        let table: DFlash2WidthCostTable
+
+        init(target: AnyObject, table: DFlash2WidthCostTable) {
+            self.target = target
+            self.table = table
+        }
+    }
+
+    nonisolated(unsafe) private static var tables: [ObjectIdentifier: Entry] = [:]
     private static let tablesLock = NSLock()
 
     static func shared(for target: AnyObject, widths: [Int]) -> DFlash2WidthCostTable {
         tablesLock.lock()
         defer { tablesLock.unlock() }
         let key = ObjectIdentifier(target)
-        if let t = tables[key] { return t }
+        // ObjectIdentifier can be reused after a model unloads. Preserve learned costs only
+        // for the same living target, without keeping its weights resident.
+        if let entry = tables[key], entry.target === target { return entry.table }
         let t = DFlash2WidthCostTable()
-        tables[key] = t
+        tables[key] = Entry(target: target, table: t)
         return t
     }
 }
