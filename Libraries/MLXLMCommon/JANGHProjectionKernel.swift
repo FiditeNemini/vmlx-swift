@@ -177,7 +177,7 @@ final class JANGHProjectionKernel {
 /// JANG_4D. This kernel keeps the SAME per-row statement order (x values, then for each of 4 rows a partial fma chain
 /// over the lane's 16 values, `accum += partial`, simd_sum, `* scale`) but loads the lane's packed words once per
 /// (row, block) into registers and reads levels from a table holding the exact bit patterns of the formula's
-/// float result. Admitted per (K, N, bits) only after a bitwise comparison with `JANGHProjectionKernel`
+/// float result. Admitted per immutable projection and input variant after a bitwise comparison with `JANGHProjectionKernel`
 /// (`JANGHDenseFastAdmission`); otherwise the caller keeps the original kernel.
 final class JANGHDenseFastQMV {
     private let kernel: MLXFast.MLXFastKernel
@@ -244,24 +244,38 @@ final class JANGHDenseFastQMV {
     }
 }
 
-/// One bitwise admission per (K, N, bits, codebook) per process. `VMLX_JANGH_DENSE_FAST=0` disables (A/B).
-enum JANGHDenseFastAdmission {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var verdicts: [String: Bool] = [:]
-    static let enabled = ProcessInfo.processInfo.environment["VMLX_JANGH_DENSE_FAST"] != "0"
+/// An admission belongs to one immutable projection/bank owner, never a process-wide
+/// shape. Geometry/dtype variants are keyed separately by the owner.
+final class JANGHDenseFastAdmission {
+    private let lock = NSLock()
+    private var verdicts: [String: Bool] = [:]
+    private let isEnabled: Bool
+    static let enabled = RuntimeEnvironment.value("VMLX_JANGH_DENSE_FAST") != "0"
 
-    /// `compare` runs the fast and the reference kernel on the SAME probe and returns (fast, reference).
-    static func admits(key: String, compare: () throws -> (MLXArray, MLXArray)) -> Bool {
-        guard enabled else { return false }
+    init(enabled: Bool) { isEnabled = enabled }
+
+    static func bitwiseEqual(_ got: MLXArray, _ want: MLXArray) -> Bool {
+        guard got.shape == want.shape, got.dtype == want.dtype else { return false }
+        let bits: DType
+        switch got.dtype {
+        case .float32: bits = .uint32
+        case .float16, .bfloat16: bits = .uint16
+        default: return false
+        }
+        return all(got.view(dtype: bits) .== want.view(dtype: bits)).item(Bool.self)
+    }
+
+    func admits(key: String, compare: () throws -> (MLXArray, MLXArray)) -> Bool {
+        guard isEnabled, !CompiledDecodeTrace.isActive else { return false }
         lock.lock()
-        if let v = verdicts[key] { lock.unlock(); return v }
-        lock.unlock()
+        defer { lock.unlock() }
+        if let verdict = verdicts[key] { return verdict }
         let equal: Bool
         if let (got, want) = try? compare() {
-            equal = got.shape == want.shape && all(got .== want).item(Bool.self)
+            equal = Self.bitwiseEqual(got, want)
         } else { equal = false }
-        lock.lock(); verdicts[key] = equal; lock.unlock()
-        FileHandle.standardError.write(Data("[JANGH] dense fast qmv \(key) admitted=\(equal)\n".utf8))
+        verdicts[key] = equal
+        FileHandle.standardError.write(Data("[JANGH] projection admission \(key) admitted=\(equal)\n".utf8))
         return equal
     }
 }

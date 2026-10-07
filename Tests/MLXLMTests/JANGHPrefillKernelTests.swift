@@ -5,6 +5,16 @@ import XCTest
 
 /// Packed prefill primitives only; no model installation or performance claim.
 final class JANGHPrefillKernelTests: XCTestCase {
+    func testSmallTileRequiresExplicitDenseOwnerOptIn() throws {
+        let config = try contract(2, 4)
+        let legacy = try JANGHPrefillKernel(
+            contract: config, module: module + ".gate_proj", upModule: module + ".up_proj")
+        XCTAssertFalse(legacy.enableDenseSmallTile)
+        let dense = try JANGHPrefillKernel(
+            contract: config, module: module + ".gate_proj", enableDenseSmallTile: true)
+        XCTAssertTrue(dense.enableDenseSmallTile)
+    }
+
     private let module = "model.layers.0.mlp.switch_mlp"
     private let beta = Float(0.0000001)
     private struct Bank {

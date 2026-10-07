@@ -62,7 +62,8 @@ public final class JANGHDenseModelPreparation {
         var out: [String: JANGHDenseLinear] = [:]
         for (path, input) in pathInputs {
             out[path] = try JANGHDenseLinear(
-                banks: banks, module: path, inputDimensions: input, sortedThreshold: sortedThreshold)
+                banks: banks, module: path, inputDimensions: input, sortedThreshold: sortedThreshold,
+                qwen35Optimizations: true)
         }
         return out
     }
@@ -158,11 +159,15 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
     private let inputDimensions: Int
     private let sortedThreshold: Int
     private let fast: JANGHDenseFastQMV?
+    private let fastAdmission = JANGHDenseFastAdmission(enabled: JANGHDenseFastAdmission.enabled)
     private let fastKey: String
     public let supplementalWeightBytes: Int
     public let supplementalParameterCount: Int
 
-    init(banks: JANGHMappedBanks, module: String, inputDimensions: Int, sortedThreshold: Int = 64) throws {
+    init(
+        banks: JANGHMappedBanks, module: String, inputDimensions: Int,
+        sortedThreshold: Int = 64, qwen35Optimizations: Bool = false
+    ) throws {
         self.sortedThreshold = Swift.max(1, sortedThreshold)
         let bank = try banks.projection(module)
         guard bank.packed.dim(0) == 1, bank.scales.dim(0) == 1 else {
@@ -171,11 +176,12 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
         }
         storage = Storage(bank)
         decode = try JANGHProjectionKernel(contract: banks.contract, module: module)
-        prefill = try JANGHPrefillKernel(contract: banks.contract, module: module)
+        prefill = try JANGHPrefillKernel(
+            contract: banks.contract, module: module, enableDenseSmallTile: qwen35Optimizations)
         rotation = banks.contract.projections[module]!.rotation
         let bits = banks.contract.projections[module]!.bits
         let book = banks.contract.codebooks[bits]
-        fast = (book != nil && JANGHDenseFastQMV.eligible(k: inputDimensions, n: bank.scales.dim(1), bits: bits))
+        fast = (qwen35Optimizations && book != nil && JANGHDenseFastQMV.eligible(k: inputDimensions, n: bank.scales.dim(1), bits: bits))
             ? JANGHDenseFastQMV(bits: bits, alpha: book!.alpha, beta: book!.beta) : nil
         fastKey = "K=\(inputDimensions) N=\(bank.scales.dim(1)) bits=\(bits) rot=\(rotation.rawValue) book=\(book.map { "\($0.alpha.bitPattern)/\($0.beta.bitPattern)" } ?? "-")"
         self.inputDimensions = inputDimensions
@@ -206,12 +212,11 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
                 let decodeInput = rotation == .hadamard32 ? x.asType(.float32) : x
                 let packed = storage.bank.packed, scales = storage.bank.scales
                 if let fast, !CompiledDecodeTrace.isActive,
-                    JANGHDenseFastAdmission.admits(key: fastKey, compare: {
-                        let probe = (MLXRandom.normal([1, inputDimensions]) * 0.5).asType(.float32)
-                        let rotated = rotation == .hadamard32 ? try decode.hadamard32(probe) : probe
-                        let zero = MLXArray.zeros([1], type: UInt32.self)
+                    fastAdmission.admits(key: "\(fastKey) dtype=\(decodeInput.dtype) rows=\(count)", compare: {
+                        // Use actual operands; admission must never consume request RNG.
+                        let rotated = rotation == .hadamard32 ? try decode.hadamard32(decodeInput) : decodeInput
                         return (fast.project(rotated, packed: packed, scales: scales),
-                                try decode.project(probe, packed: packed, scales: scales, indices: zero))
+                                try decode.project(decodeInput, packed: packed, scales: scales, indices: indices))
                     })
                 {
                     let rotated = rotation == .hadamard32 ? try decode.hadamard32(decodeInput) : decodeInput

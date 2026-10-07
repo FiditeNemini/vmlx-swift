@@ -8,6 +8,7 @@ import MLXFast
 /// the same packed representation on older devices.
 final class JANGHPrefillKernel {
     enum Backend: String { case nax, steel }
+    let enableDenseSmallTile: Bool
     private let bits: Int
     private let upBits: Int
     private let codebookHeader: String
@@ -15,7 +16,11 @@ final class JANGHPrefillKernel {
     private let lock = NSLock()
     private let rotation = JANGHRowRotation()
 
-    init(contract: JANGHFormatContract, module: String, upModule: String? = nil) throws {
+    init(
+        contract: JANGHFormatContract, module: String, upModule: String? = nil,
+        enableDenseSmallTile: Bool = false
+    ) throws {
+        self.enableDenseSmallTile = enableDenseSmallTile
         guard let projection = contract.projections[module],
             upModule == nil || contract.projections[upModule!] != nil
         else { throw JANGHFormatContract.ValidationError.invalid("missing prefill projection") }
@@ -41,27 +46,12 @@ final class JANGHPrefillKernel {
 
     /// Largest row count routed to the 16-row NAX tile. `VMLX_JANGH_NAX_SMALL_TILE_MAX=0` keeps the 64-row tile.
     static let smallTileMaxRows: Int = {
-        if let raw = ProcessInfo.processInfo.environment["VMLX_JANGH_NAX_SMALL_TILE_MAX"], let v = Int(raw) { return v }
+        if let raw = RuntimeEnvironment.value("VMLX_JANGH_NAX_SMALL_TILE_MAX"), let v = Int(raw) { return v }
         return 16
     }()
 
-    // One verdict per shape per process (not per projection instance: 27B has 192 dense projections).
-    private static let verdictLock = NSLock()
-    nonisolated(unsafe) private static var smallTileVerdicts: [String: Bool] = [:]
-
-    private func smallTileAdmitted(key: String, compare: () -> (MLXArray, MLXArray)) -> Bool {
-        let lock = Self.verdictLock
-        lock.lock()
-        if let v = Self.smallTileVerdicts[key] { lock.unlock(); return v }
-        lock.unlock()
-        // Admission needs eager evaluation; inside a compiled trace keep the proven 64-row tile.
-        if CompiledDecodeTrace.isActive { return false }
-        let (got, want) = compare()
-        let equal = all(got .== want).item(Bool.self)
-        lock.lock(); Self.smallTileVerdicts[key] = equal; lock.unlock()
-        FileHandle.standardError.write(Data("[JANGH] NAX 16-row tile \(key) admitted=\(equal)\n".utf8))
-        return equal
-    }
+    // Only immutable dense-bank owners opt in; routed/K2 callers retain their old tile.
+    private let smallTileAdmission = JANGHDenseFastAdmission(enabled: true)
 
     static var nativeBackend: Backend {
         #if os(macOS)
@@ -174,9 +164,9 @@ final class JANGHPrefillKernel {
                     threadGroup: (threads, 1, 1), outputShapes: [[m, n]], outputDTypes: [input.dtype])[0]
             }
             // Verify windows (<= 16 rows) use the 16-row tile (2 simdgroups = 64 threads): same per-element MMA
-            // sequence as the 64-row tile, so it is admitted once per shape only if bitwise equal to it.
-            if m <= Self.smallTileMaxRows, smallTileAdmitted(
-                key: "\(input.dtype)_\(k)_\(n)_\(bits)_\(upPacked != nil)_\(rotateOutput)",
+            // sequence as the 64-row tile, so it is admitted per dense owner/input variant only if bitwise equal to it.
+            if enableDenseSmallTile, experts == 1, m <= Self.smallTileMaxRows, smallTileAdmission.admits(
+                key: "\(input.dtype)_\(m)_\(k)_\(n)_\(bits)_\(upBits)_\(upPacked != nil)_\(rotateOutput)_\(limit?.bitPattern ?? 0)",
                 compare: { (run(16), run(64)) })
             {
                 return run(16)
