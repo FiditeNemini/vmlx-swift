@@ -34,6 +34,8 @@ private final class RecordingDFlash2Target: Module, LanguageModel, HiddenStateCa
     TokenEmbedderModel, @unchecked Sendable
 {
     private(set) var forwarded: [Int] = []
+    private(set) var lastOffsets: [Int] = []
+    private(set) var recurrentSum: Float = 0
     let hidden: Int
     let vocab: Int
 
@@ -103,6 +105,7 @@ private final class RecordingDFlash2Target: Module, LanguageModel, HiddenStateCa
             }
             mamba.state = [MLXArray([running]).reshaped([1, 1, 1])]
             mamba.offset += ids.count
+            recurrentSum = running
         }
 
         if let kv = cache?.last as? KVCacheSimple {
@@ -112,6 +115,7 @@ private final class RecordingDFlash2Target: Module, LanguageModel, HiddenStateCa
                 values: MLXArray.zeros([1, 1, n, 2]))
         }
 
+        lastOffsets = cache?.map(\.offset) ?? []
         let h = embed(inputs)
         var captured: [Int: MLXArray] = [:]
         for id in captureLayerIDs { captured[id] = h }
@@ -290,6 +294,68 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
         XCTAssertEqual(
             Array(target.forwarded.suffix(genPromptSuffix.count)), genPromptSuffix,
             "the tail actually forwarded must end at the new generation prompt")
+    }
+
+    /// An exact hybrid snapshot cannot be rewound by trimming only KV.
+    /// With N-1 available, reuse it; with only N available, safely re-prefill.
+    func testExactHybridHitKeepsRecurrentAndKVBoundariesAligned() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        for includePreviousBoundary in [false, true] {
+            let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+            let coordinator = makeCoordinator()
+            let prompt = turn1User + genPromptSuffix
+            let mediaSalt = computeCacheSalt(for: input(prompt), parameters: parameters())
+            let lengths = includePreviousBoundary ? [prompt.count - 1, prompt.count] : [prompt.count]
+            for length in lengths {
+                let prefix = Array(prompt.prefix(length))
+                let cache = target.newCache(parameters: parameters())
+                _ = target(
+                    MLXArray(prefix.map(Int32.init)).expandedDimensions(axis: 0),
+                    cache: cache, captureLayerIDs: [0])
+                MLX.eval(cache)
+                coordinator.storeAfterGeneration(
+                    promptTokens: prefix, perLayerData: extractLayerData(from: cache),
+                    ssmStates: extractSSMStates(from: cache), cache: cache,
+                    mediaSalt: mediaSalt)
+            }
+            // Confirm this test actually seeded the exact N boundary.
+            let probe = coordinator.fetch(tokens: prompt, mediaSalt: mediaSalt)
+            guard case .hit(let matched, _, _, let blocks, _, _) = probe else {
+                return XCTFail("exact hybrid snapshot was not stored")
+            }
+            coordinator.release(blocks: blocks)
+            XCTAssertEqual(matched, prompt.count)
+            target.resetRecording()
+            _ = try DFlash2TokenIterator(
+                input: input(prompt), target: target, drafter: makeDrafter(), blockSize: nil,
+                parameters: parameters(), cacheCoordinator: coordinator)
+            XCTAssertEqual(target.forwarded, includePreviousBoundary ? [prompt.last!] : prompt)
+            XCTAssertEqual(target.lastOffsets, [prompt.count, prompt.count])
+            XCTAssertEqual(target.recurrentSum, Float(prompt.reduce(0, +)))
+        }
+    }
+
+    func testMediaIsRejectedBeforeTargetForwarding() throws {
+        let lock = lockSerializedMLXTest()
+        defer { lock.unlock() }
+        let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
+        let mediaInputs = [
+            LMInput(text: input(turn1User).text,
+                    image: .init(pixels: MLXArray.zeros([1, 3, 2, 2]))),
+            LMInput(text: input(turn1User).text,
+                    video: .init(pixels: MLXArray.zeros([1, 3, 2, 2]))),
+            LMInput(text: input(turn1User).text,
+                    audio: .init(waveform: MLXArray.zeros([16]))),
+        ]
+        XCTAssertNil(DFlash2TokenIterator.unservableReason(parameters(), input: input(turn1User)))
+        for media in mediaInputs {
+            XCTAssertNotNil(DFlash2TokenIterator.unservableReason(parameters(), input: media))
+            XCTAssertThrowsError(try DFlash2TokenIterator(
+                input: media, target: target, drafter: makeDrafter(), blockSize: nil,
+                parameters: parameters()))
+        }
+        XCTAssertTrue(target.forwarded.isEmpty)
     }
 
     /// Reasoning effort is part of the cache key (the host stamps it into

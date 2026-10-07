@@ -4334,7 +4334,7 @@ public func generate(
     // model's own MTP head does not also run. Ordering here is the
     // backstop; hosts are expected to send only one strategy.
     if let strategy = parameters.draftStrategy, let drafterPath = strategy.dflash2DrafterPath,
-        DFlash2TokenIterator.unservableReason(parameters) == nil
+        DFlash2TokenIterator.unservableReason(parameters, input: input) == nil
     {
         guard let dflashTarget = context.model as? any DFlash2Target else {
             throw DFlash2RuntimeError.drafterTargetMismatch(
@@ -4814,7 +4814,7 @@ public func generateTokensTask(
     // Same ordering rule as `generate`: a selected DFlash 2 drafter
     // replaces native MTP rather than stacking with it.
     if let strategy = parameters.draftStrategy, let drafterPath = strategy.dflash2DrafterPath,
-        DFlash2TokenIterator.unservableReason(parameters) == nil
+        DFlash2TokenIterator.unservableReason(parameters, input: input) == nil
     {
         guard let dflashTarget = context.model as? any DFlash2Target else {
             throw DFlash2RuntimeError.drafterTargetMismatch(

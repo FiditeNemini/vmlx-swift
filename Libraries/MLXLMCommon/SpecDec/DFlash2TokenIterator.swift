@@ -267,7 +267,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// there is nothing to draft.
     static let minimumBlockSize = 2
 
-    static func unservableReason(_ parameters: GenerateParameters) -> String? {
+    static func unservableReason(_ parameters: GenerateParameters, input: LMInput? = nil) -> String? {
+        // This iterator forwards token IDs directly; it cannot consume the
+        // embeddings produced by the model-specific media prepare path.
+        if input?.hasMediaContent == true {
+            return "media input requires ordinary model preparation"
+        }
         // A penalty of exactly 1.0 (repetition) or 0 (presence/frequency)
         // is the identity. Bundles ship those as explicit defaults —
         // Qwen3.8 stamps `repetition_penalty: 1.0` — so treating "set" as
@@ -330,7 +335,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         if let maxTokens = parameters.maxTokens, maxTokens <= 1 {
             throw DFlash2RuntimeError.maxTokensTooSmall
         }
-        if let reason = Self.unservableReason(parameters) {
+        if let reason = Self.unservableReason(parameters, input: input) {
             throw DFlash2RuntimeError.unsupportedSampling(reason)
         }
 
@@ -451,6 +456,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             let result = coordinator.fetch(
                 tokens: tokensToPrefill,
                 mediaSalt: mediaSalt,
+                skipExactDiskBoundary: cacheRequiresDiskBackedCoordinatorRestore(self.cache),
                 preferredDiskBoundaries: input.cacheStablePrefixTokenCounts,
                 chainId: parameters.cacheChainId)
             if case .hit(
@@ -458,12 +464,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 let diskArrays) = result
             {
                 var restored = false
+                var restoredTokenCount = 0
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(
                         from: blocks, into: self.cache,
                         preserveStandardKVStorageDType: coordinator.config.preserveStandardKVStorageDType)
                     coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
+                        restoredTokenCount = restoredTokens
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: self.cache, boundary: matchedTokens)
                         }
@@ -475,8 +483,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 // drafter's cache is separate), so an entry that does not
                 // fit it fits neither, and is reported the same way.
                 if let diskArrays, !restored {
-                    if restoreFromDiskArrays(
-                                diskArrays, into: &self.cache, requirePromptBoundary: true) > 0 {
+                    let diskRestoredTokens = restoreFromDiskArrays(
+                        diskArrays, into: &self.cache, requirePromptBoundary: true)
+                    if diskRestoredTokens > 0 {
+                        restoredTokenCount = diskRestoredTokens
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: self.cache, boundary: matchedTokens)
                         }
@@ -489,6 +499,23 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                             reason: "payload does not fit the runtime cache")
                     }
                 }
+                if restored,
+                    !validateRestoredCacheBoundary(
+                        self.cache, matchedTokens: matchedTokens,
+                        restoredTokens: restoredTokenCount, detail: "dflash2")
+                {
+                    if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: tokensToPrefill, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "restored offsets do not match the boundary")
+                    }
+                    restored = false
+                }
+                if !restored {
+                    // A rejected payload may already have mutated some layers.
+                    self.cache = target.newCache(parameters: effectiveParameters)
+                }
                 if restored, Self.traceEnabled {
                     let offsets = Set(self.cache.map(\.offset)).sorted()
                     let kvLens = self.cache.compactMap { ($0 as? KVCacheSimple)?.state.first?.dim(2) }
@@ -497,7 +524,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                             .utf8))
                 }
                 if restored {
-                    if input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens) {
+                    // A full hit needs one token replayed for drafter hidden state.
+                    // Recurrent/ring companions cannot be rewound by trimming KV.
+                    // fetch skips exact disk hits, but other tiers still need this guard.
+                    let unsafeFullHit = remainingTokens.isEmpty
+                        && (cacheRequiresDiskBackedCoordinatorRestore(self.cache)
+                            || self.cache.contains { !$0.isTrimmable })
+                    if unsafeFullHit || input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens) {
                         self.cache = target.newCache(parameters: effectiveParameters)
                     } else if remainingTokens.isEmpty, let last = tokensToPrefill.last {
                         // A full hit still has to re-run the final token so

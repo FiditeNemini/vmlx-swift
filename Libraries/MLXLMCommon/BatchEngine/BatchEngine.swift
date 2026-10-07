@@ -729,7 +729,7 @@ public actor BatchEngine {
         // any speculation, which is the worst kind of failure because it
         // looks exactly like success.
         if parameters.draftStrategy?.usesDFlash2 == true,
-            DFlash2TokenIterator.unservableReason(parameters) == nil
+            DFlash2TokenIterator.unservableReason(parameters, input: input) == nil
         {
             guard canStartExclusiveSoloPath else {
                 Self.logger.error(
@@ -1296,7 +1296,7 @@ public actor BatchEngine {
                     structuredOutput: soloParameters.jsonSchema != nil)
             } else if let strategy = soloParameters.draftStrategy,
                 let drafterPath = strategy.dflash2DrafterPath,
-                DFlash2TokenIterator.unservableReason(soloParameters) == nil
+                DFlash2TokenIterator.unservableReason(soloParameters, input: input) == nil
             {
                 guard let dflashTarget = context.model as? any DFlash2Target else {
                     throw DFlash2RuntimeError.drafterTargetMismatch(
