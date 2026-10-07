@@ -511,7 +511,10 @@ let package = Package(
 
         .target(
             name: "MLXLMCommon",
-            dependencies: ["MLX", "MLXFast", "MLXNN", "MLXOptimizers", "MLXRandom", "CmlxGraphShim", "MLXCXGrammar"],
+            dependencies: [
+                "MLX", "MLXFast", "MLXNN", "MLXOptimizers", "MLXRandom", "CmlxGraphShim",
+                "MLXCXGrammar",
+            ],
             path: "Libraries/MLXLMCommon",
             exclude: mlxLMCommonExcludedFiles,
             // Compile this target in the Swift 5 language mode. The package is

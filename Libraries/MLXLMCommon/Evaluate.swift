@@ -1752,7 +1752,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters
     ) throws {
         guard parameters.jsonSchema == nil else {
-            throw GenerationFailure(stage: .preparation, cause: "Structured output requires the context-based generation API")
+            throw GenerationFailure(
+                stage: .preparation,
+                cause: "Structured output requires the context-based generation API")
         }
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
@@ -1849,7 +1851,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.processor = effectiveParameters.processor()
         if let schema = effectiveParameters.jsonSchema {
             guard let tokenizer else {
-                throw GenerationFailure(stage: .preparation, cause: "Structured output requires tokenizer metadata")
+                throw GenerationFailure(
+                    stage: .preparation, cause: "Structured output requires tokenizer metadata")
             }
             self.processor = try JSONSchemaLogitProcessor(
                 schema: schema, tokenizer: tokenizer, stopTokenIDs: stopTokenIDs,
@@ -2816,7 +2819,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         if var processor {
             logits = processor.process(logits: logits)
             if let failure = (processor as? any ConstraintFailureReporting)?.constraintFailure {
-                self.generationFailure = GenerationFailure(stage: .decoding, cause: failure.localizedDescription)
+                self.generationFailure = GenerationFailure(
+                    stage: .decoding, cause: failure.localizedDescription)
                 self.processor = processor
                 // Internal sentinel only: next() checks the failure before emitting or advancing it.
                 return MLXArray(Int32(0))
@@ -2825,7 +2829,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             processor.didSample(token: y)
             self.processor = processor
             if let failure = (processor as? any ConstraintFailureReporting)?.constraintFailure {
-                self.generationFailure = GenerationFailure(stage: .decoding, cause: failure.localizedDescription)
+                self.generationFailure = GenerationFailure(
+                    stage: .decoding, cause: failure.localizedDescription)
             }
             if let rawRow { probeNonFiniteLogits(rawRow, sampled: y) }
             return y
@@ -3705,7 +3710,11 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         numDraftTokens: Int
     ) throws {
         guard parameters.jsonSchema == nil else {
-            throw GenerationFailure(stage: .preparation, cause: "Schema-constrained speculative decoding is not supported; use context-based autoregressive generation")
+            throw GenerationFailure(
+                stage: .preparation,
+                cause:
+                    "Schema-constrained speculative decoding is not supported; use context-based autoregressive generation"
+            )
         }
         _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
 
@@ -4136,7 +4145,11 @@ public func generate(
     didGenerate: ([Int]) -> GenerateDisposition
 ) throws -> GenerateResult {
     guard parameters.jsonSchema == nil else {
-        throw GenerationFailure(stage: .preparation, cause: "Structured output requires the asynchronous generation API with terminal failure metadata")
+        throw GenerationFailure(
+            stage: .preparation,
+            cause:
+                "Structured output requires the asynchronous generation API with terminal failure metadata"
+        )
     }
     let iterator = try TokenIterator(
         input: input, model: context.model, parameters: parameters)
@@ -4201,7 +4214,11 @@ public func generate(
     didGenerate: (Int) -> GenerateDisposition
 ) throws -> GenerateCompletionInfo {
     guard parameters.jsonSchema == nil else {
-        throw GenerationFailure(stage: .preparation, cause: "Structured output requires the asynchronous generation API with terminal failure metadata")
+        throw GenerationFailure(
+            stage: .preparation,
+            cause:
+                "Structured output requires the asynchronous generation API with terminal failure metadata"
+        )
     }
     let iterator = try TokenIterator(
         input: input, model: context.model, parameters: parameters)
@@ -4423,7 +4440,8 @@ public func generate(
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
         cacheCoordinator: cacheCoordinator, tokenizer: context.tokenizer,
-        stopTokenIDs: buildStopTokenIds(modelConfiguration: context.configuration, tokenizer: context.tokenizer))
+        stopTokenIDs: buildStopTokenIds(
+            modelConfiguration: context.configuration, tokenizer: context.tokenizer))
     let (stream, _) = generateTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -4578,11 +4596,15 @@ public func generateTask(
         promptTail
         ?? _decodePromptTail(
             tokenIds: iterator.promptTokenIds, tokenizer: tokenizer, tokens: 64)
-    let effectiveStopStrings = structuredOutput ? [] : mergeStopStrings(
-        extraStopStrings,
-        resolveStopSequences(
-            modelConfiguration: modelConfiguration,
-            tokenizer: tokenizer).textStopStrings)
+    let effectiveStopStrings =
+        structuredOutput
+        ? []
+        : mergeStopStrings(
+            extraStopStrings,
+            resolveStopSequences(
+                modelConfiguration: modelConfiguration,
+                tokenizer: tokenizer
+            ).textStopStrings)
 
     // Existing callers pass an already-constructed iterator (prefill ran at
     // construction time). Wrap it in a one-shot factory so it crosses into the
@@ -4631,11 +4653,15 @@ public func generateTaskDeferred(
         promptTail
         ?? _decodePromptTail(
             tokenIds: promptTokenIds, tokenizer: tokenizer, tokens: 64)
-    let effectiveStopStrings = structuredOutput ? [] : mergeStopStrings(
-        extraStopStrings,
-        resolveStopSequences(
-            modelConfiguration: modelConfiguration,
-            tokenizer: tokenizer).textStopStrings)
+    let effectiveStopStrings =
+        structuredOutput
+        ? []
+        : mergeStopStrings(
+            extraStopStrings,
+            resolveStopSequences(
+                modelConfiguration: modelConfiguration,
+                tokenizer: tokenizer
+            ).textStopStrings)
 
     return generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -4688,7 +4714,8 @@ public func generateTokens(
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
         cacheCoordinator: cacheCoordinator, tokenizer: context.tokenizer,
-        stopTokenIDs: buildStopTokenIds(modelConfiguration: context.configuration, tokenizer: context.tokenizer))
+        stopTokenIDs: buildStopTokenIds(
+            modelConfiguration: context.configuration, tokenizer: context.tokenizer))
     let (stream, _) = generateTokenTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -4837,7 +4864,8 @@ public func generateTokensTask(
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
         cacheCoordinator: cacheCoordinator, tokenizer: context.tokenizer,
-        stopTokenIDs: buildStopTokenIds(modelConfiguration: context.configuration, tokenizer: context.tokenizer))
+        stopTokenIDs: buildStopTokenIds(
+            modelConfiguration: context.configuration, tokenizer: context.tokenizer))
     return generateTokenTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -5091,10 +5119,12 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 unclosedReasoning: unclosedReasoning,
                 nativeMTPStats: iterator.nativeMTPStats,
                 toolCallProtocolFailure: handler.toolCallProtocolFailure,
-                generationFailure: iterator.generationFailure ?? (
-                    iterator.structuredOutputComplete != nil
+                generationFailure: iterator.generationFailure
+                    ?? (iterator.structuredOutputComplete != nil
                         && (stopReason != .stop || iterator.structuredOutputComplete != true)
-                        ? GenerationFailure(stage: .decoding, cause: "Structured output stopped before its schema was complete")
+                        ? GenerationFailure(
+                            stage: .decoding,
+                            cause: "Structured output stopped before its schema was complete")
                         : nil)
             )
             _ = continuation.yield(handler.infoEvent(info))
@@ -5652,7 +5682,8 @@ struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         }
         self.reasoningParser = structuredOutput ? nil : reasoningParser
         // Grammar-approved EOS, not a substring inside JSON, ends this response.
-        self.stopStringMatcher = structuredOutput ? StopStringMatcher(stopStrings: []) : stopStringMatcher
+        self.stopStringMatcher =
+            structuredOutput ? StopStringMatcher(stopStrings: []) : stopStringMatcher
     }
 
     /// Feed a raw decoded chunk through the reasoning parser (if any) and

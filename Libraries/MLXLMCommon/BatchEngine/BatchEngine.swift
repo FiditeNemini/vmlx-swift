@@ -28,13 +28,15 @@ private func cancelledBatchStream(
 ) -> (id: BatchRequestID, stream: AsyncStream<BatchGeneration>) {
     let id = BatchRequestID()
     let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
-    continuation.yield(.info(GenerateCompletionInfo(
-        promptTokenCount: promptTokenCount,
-        generationTokenCount: 0,
-        promptTime: 0,
-        generationTime: 0,
-        stopReason: .cancelled, generationFailure: generationFailure
-    )))
+    continuation.yield(
+        .info(
+            GenerateCompletionInfo(
+                promptTokenCount: promptTokenCount,
+                generationTokenCount: 0,
+                promptTime: 0,
+                generationTime: 0,
+                stopReason: .cancelled, generationFailure: generationFailure
+            )))
     continuation.finish()
     return (id, stream)
 }
@@ -43,13 +45,15 @@ private func cancelledGenerationStream(
     promptTokenCount: Int, generationFailure: GenerationFailure? = nil
 ) -> AsyncStream<Generation> {
     let (stream, continuation) = AsyncStream<Generation>.makeStream()
-    continuation.yield(.info(GenerateCompletionInfo(
-        promptTokenCount: promptTokenCount,
-        generationTokenCount: 0,
-        promptTime: 0,
-        generationTime: 0,
-        stopReason: .cancelled, generationFailure: generationFailure
-    )))
+    continuation.yield(
+        .info(
+            GenerateCompletionInfo(
+                promptTokenCount: promptTokenCount,
+                generationTokenCount: 0,
+                promptTime: 0,
+                generationTime: 0,
+                stopReason: .cancelled, generationFailure: generationFailure
+            )))
     continuation.finish()
     return stream
 }
@@ -496,11 +500,14 @@ public actor BatchEngine {
         var parameters = parameters
         if parameters.jsonSchema != nil {
             do {
-                try validateStructuredOutputRequest(input: input, parameters: parameters, context: context)
+                try validateStructuredOutputRequest(
+                    input: input, parameters: parameters, context: context)
                 parameters.draftStrategy = nil
             } catch {
-                return cancelledBatchStream(promptTokenCount: input.text.tokens.size,
-                    generationFailure: GenerationFailure(stage: .preparation, cause: error.localizedDescription))
+                return cancelledBatchStream(
+                    promptTokenCount: input.text.tokens.size,
+                    generationFailure: GenerationFailure(
+                        stage: .preparation, cause: error.localizedDescription))
             }
         }
         do {
@@ -607,11 +614,14 @@ public actor BatchEngine {
         var parameters = parameters
         if parameters.jsonSchema != nil {
             do {
-                try validateStructuredOutputRequest(input: input, parameters: parameters, context: context)
+                try validateStructuredOutputRequest(
+                    input: input, parameters: parameters, context: context)
                 parameters.draftStrategy = nil
             } catch {
-                return cancelledGenerationStream(promptTokenCount: input.text.tokens.size,
-                    generationFailure: GenerationFailure(stage: .preparation, cause: error.localizedDescription))
+                return cancelledGenerationStream(
+                    promptTokenCount: input.text.tokens.size,
+                    generationFailure: GenerationFailure(
+                        stage: .preparation, cause: error.localizedDescription))
             }
         }
         do {
@@ -837,10 +847,14 @@ public actor BatchEngine {
                 }
                 return nil
             }()
-            var reasoningParser = structuredOutput ? nil : ReasoningParser.forPrompt(
-                stampName: reasoningParserName,
-                promptTail: promptTail)
-            var stopMatcher = StopStringMatcher(stopStrings: structuredOutput ? [] : extraStopStrings)
+            var reasoningParser =
+                structuredOutput
+                ? nil
+                : ReasoningParser.forPrompt(
+                    stampName: reasoningParserName,
+                    promptTail: promptTail)
+            var stopMatcher = StopStringMatcher(
+                stopStrings: structuredOutput ? [] : extraStopStrings)
             var stopMatched = false
             func emitChunkThroughStop(_ text: String) {
                 guard stopMatcher.isEnabled else {
@@ -1927,8 +1941,11 @@ public actor BatchEngine {
                         schema: schema, tokenizer: context.tokenizer, stopTokenIDs: stopTokenIDs,
                         base: slot.processor)
                 } catch {
-                    finishSlot(&slot, reason: .cancelled, generationFailure:
-                        GenerationFailure(stage: .preparation, cause: error.localizedDescription))
+                    finishSlot(
+                        &slot, reason: .cancelled,
+                        generationFailure:
+                            GenerationFailure(
+                                stage: .preparation, cause: error.localizedDescription))
                     continue
                 }
             }
@@ -3381,8 +3398,10 @@ public actor BatchEngine {
         do {
             return try slot.sampleToken(from: logits)
         } catch {
-            finishSlot(&slot, reason: .cancelled, generationFailure:
-                GenerationFailure(stage: .decoding, cause: error.localizedDescription))
+            finishSlot(
+                &slot, reason: .cancelled,
+                generationFailure:
+                    GenerationFailure(stage: .decoding, cause: error.localizedDescription))
             slot.isFinished = true
             return nil
         }
@@ -3398,9 +3417,13 @@ public actor BatchEngine {
         var slot = liveSlot
         var generationFailure = generationFailure
         if slot.parameters.jsonSchema != nil, generationFailure == nil,
-           reason != .stop || (slot.processor as? any ConstraintFailureReporting)?.constraintIsComplete != true {
-            generationFailure = GenerationFailure(stage: .decoding,
-                cause: (slot.processor as? any ConstraintFailureReporting)?.constraintFailure?.localizedDescription
+            reason != .stop
+                || (slot.processor as? any ConstraintFailureReporting)?.constraintIsComplete != true
+        {
+            generationFailure = GenerationFailure(
+                stage: .decoding,
+                cause: (slot.processor as? any ConstraintFailureReporting)?.constraintFailure?
+                    .localizedDescription
                     ?? "Generation ended before the JSON schema matcher accepted a stop token")
         }
         slot.nanTrace?.finish(totalSteps: slot.generatedTokenCount)
