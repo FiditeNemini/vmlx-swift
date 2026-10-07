@@ -175,6 +175,28 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
         XCTAssertNil(VMLXDFlash2DrafterInfo.read(at: dir))
     }
 
+    func testNestedWeightsAndSymlinksMatchLoaderLayout() throws {
+        let dir = try makeDrafter()
+        let original = dir.appendingPathComponent("model.safetensors")
+        let nested = dir.appendingPathComponent("weights")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let moved = nested.appendingPathComponent("part.safetensors")
+        try FileManager.default.moveItem(at: original, to: moved)
+        XCTAssertNotNil(VMLXDFlash2DrafterInfo.read(at: dir))
+        let backing = root.appendingPathComponent("backing.bin")
+        try FileManager.default.moveItem(at: moved, to: backing)
+        try FileManager.default.createSymbolicLink(at: moved, withDestinationURL: backing)
+        XCTAssertNotNil(VMLXDFlash2DrafterInfo.read(at: dir))
+    }
+
+    func testMalformedHeadersAndNegativeLayerIDsAreRejected() throws {
+        let invalidLayers = try makeDrafter(name: "negative", targetLayerIDs: [-1, 4])
+        XCTAssertNil(VMLXDFlash2DrafterInfo.read(at: invalidLayers))
+        let invalidFile = try makeDrafter(name: "malformed")
+        try Data(repeating: 0, count: 32).write(to: invalidFile.appendingPathComponent("model.safetensors"))
+        XCTAssertNil(VMLXDFlash2DrafterInfo.read(at: invalidFile))
+    }
+
     func testIndexMustReferencePresentTensorAndShard() throws {
         let dir = try makeDrafter()
         try Data(#"{"weight_map":{"fixture.weight":"missing.safetensors"}}"#.utf8)
