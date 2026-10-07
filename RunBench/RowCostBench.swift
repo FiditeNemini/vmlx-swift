@@ -51,7 +51,9 @@ func runRowCostBench(modelPath: String) async throws {
         for rows in rowsList {
             var samples: [Double] = []
             var builds: [Double] = []
+            NativeMTPPhaseDiagnostics.reset()
             for rep in 0 ..< (reps + 3) {
+                if rep == 3 { NativeMTPPhaseDiagnostics.reset() }
                 let cache = base.map { $0.copy() }
                 MLX.eval(cache)
                 let ids = MLXArray(
@@ -60,7 +62,15 @@ func runRowCostBench(modelPath: String) async throws {
                 .reshaped(1, rows)
                 let t0 = CFAbsoluteTimeGetCurrent()
                 let out: NativeMTPForwardResult
-                if mode == "exact" && rows > 1 {
+                if mode == "tree", let treeModel = model as? DFlash2TreeVerifyModel {
+                    let plan = DFlash2TreePlan(
+                        tokens: (0 ..< rows).map { 1000 + $0 }, parents: Array(-1 ..< (rows - 1)))
+                    let scope = DFlash2TreeScope(plan: plan)
+                    let (logits, captured) = treeModel.dflash2TreeForward(
+                        ids, cache: cache, captureLayerIDs: [5, 19, 33, 47, 61], scope: scope)
+                    out = NativeMTPForwardResult(
+                        logits: logits, hiddenStates: captured.values.first ?? logits)
+                } else if mode == "exact" && rows > 1 {
                     // The iterator's actual verify mode (NativeMTPTokenIterator.verifyCycle, staged path).
                     out = NativeMTPVerifierStatePolicy.withVerifierMode("input_capture_staged") {
                         model.nativeBackboneMTPVerifyForward(ids, cache: cache)
@@ -78,6 +88,14 @@ func runRowCostBench(modelPath: String) async throws {
             }
             samples.sort()
             builds.sort()
+            if NativeMTPPhaseDiagnostics.enabled {
+                // Per-phase ms per forward (phases eval in isolation: serialized, no overlap).
+                let snap = NativeMTPPhaseDiagnostics.snapshot(reset: true)
+                let perForward = snap.seconds.sorted { $0.key < $1.key }.map { key, sec in
+                    String(format: "%@=%.2f", key, sec * 1000 / Double(reps))
+                }.joined(separator: " ")
+                print("[ROWCOST_PHASES] mode=\(mode) rows=\(rows) \(perForward)")
+            }
             print(
                 String(
                     format: "[ROWCOST] mode=%@ rows=%d ms=%.2f min=%.2f build=%.2f", mode, rows,

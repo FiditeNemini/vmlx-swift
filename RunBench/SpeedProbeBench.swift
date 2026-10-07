@@ -99,6 +99,13 @@ func runSpeedProbe(modelPath: String) async throws {
         var p = GenerateParameters(
             maxTokens: budget, temperature: 0, topP: 1, topK: 0, minP: 0,
             repetitionPenalty: nil)
+        // BENCH_SPEED_SAMPLED=1: the bundle sampler the app sends by default (Qwen3.8: T 1.0, top_p 0.95, top_k 20).
+        if env["BENCH_SPEED_SAMPLED"] == "1" {
+            p.temperature = 1.0
+            p.topP = 0.95
+            p.topK = 20
+            p.randomSeed = UInt64(env["BENCH_SPEED_SEED"] ?? "1234") ?? 1234
+        }
         switch arm {
         case "default":
             p.draftStrategy = defaultStrategy
