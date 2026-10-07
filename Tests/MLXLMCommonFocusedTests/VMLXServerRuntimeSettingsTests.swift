@@ -47,11 +47,11 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
-    @Test("a pre-contract-5 stored off migrates once to the family default; later choices stick")
-    func mtpOffMigratesOnceToFamilyDefault() {
+    @Test("stored Off remains Off across schema migration")
+    func mtpOffSurvivesSchemaMigration() {
         var legacy = VMLXServerRuntimeSettings(mtp: .init(mode: .off), schemaVersion: 4)
         legacy.migrateToCurrentSchema()
-        #expect(legacy.mtp.mode == .familyDefault)
+        #expect(legacy.mtp.mode == .off)
         #expect(legacy.schemaVersion == VMLXServerRuntimeSettings.contractVersion)
         var chosen = VMLXServerRuntimeSettings(mtp: .init(mode: .off), schemaVersion: 5)
         chosen.migrateToCurrentSchema()
@@ -91,13 +91,18 @@ struct VMLXServerRuntimeSettingsTests {
         try FileManager.default.createDirectory(at: drafter, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let drafterConfig = #"""
-            {"architectures": ["DFlash2DraftModel"], "vocab_size": 248320, "num_target_layers": 64,
+            {"architectures": ["DFlash2DraftModel"], "vocab_size": 248320, "hidden_size":5120, "num_target_layers": 64,
              "dflash_config": {"block_size": 8, "target_layer_ids": [5, 19, 33, 47, 61],
              "mask_token_id": 248070, "selector_rank": 256, "selector_top_k": 16, "conv_kernel_size": 2}}
             """#
         try Data(drafterConfig.utf8).write(to: drafter.appendingPathComponent("config.json"))
-        try Data().write(to: drafter.appendingPathComponent("model.safetensors"))
-        let targetConfig = Data(#"{"model_type": "qwen3_5", "text_config": {"vocab_size": 248320, "num_hidden_layers": 64}}"#.utf8)
+        let header = Data(#"{"fixture.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.utf8)
+        var length = UInt64(header.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(header)
+        file.append(Data(repeating: 0, count: 4))
+        try file.write(to: drafter.appendingPathComponent("model.safetensors"))
+        let targetConfig = Data(#"{"model_type": "qwen3_5", "text_config": {"vocab_size": 248320, "hidden_size":5120, "num_hidden_layers": 64}}"#.utf8)
         guard VMLXDFlash2DrafterInfo.read(at: drafter) != nil else {
             Issue.record("fixture is not recognised as a DFlash 2 drafter; update it to the reader's discriminator")
             return

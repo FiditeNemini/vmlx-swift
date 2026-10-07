@@ -73,8 +73,12 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: config)
             .write(to: dir.appendingPathComponent("config.json"))
         if withWeights {
-            try Data(repeating: 0, count: 2048)
-                .write(to: dir.appendingPathComponent("model.safetensors"))
+            let header = Data(#"{"fixture.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.utf8)
+            var length = UInt64(header.count).littleEndian
+            var file = withUnsafeBytes(of: &length) { Data($0) }
+            file.append(header)
+            file.append(Data(repeating: 0, count: 4))
+            try file.write(to: dir.appendingPathComponent("model.safetensors"))
         }
         return dir
     }
@@ -152,15 +156,38 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
         XCTAssertNil(blockSize, "block size should default to the checkpoint's own")
     }
 
-    func testDrafterIsUsedEvenWhenMTPModeIsOff() throws {
-        // Downloading a drafter and pointing the runtime at it IS the
-        // request for speculation. Requiring a second switch would mean a
-        // user who did the hard part still gets no speedup and no reason
-        // why.
+    func testOffDisablesSelectedDrafterWithoutDeletingSelection() throws {
         let dir = try makeDrafter()
-        let strategy = settings(drafter: dir, mode: .off).resolvedMTPDraftStrategy(
-            configData: targetConfig(), jangConfig: nil, status: nil)
-        XCTAssertTrue(strategy?.usesDFlash2 == true)
+        var settings = settings(drafter: dir, mode: .off)
+        XCTAssertNil(settings.resolvedMTPDraftStrategy(configData: targetConfig(), jangConfig: nil, status: nil))
+        XCTAssertEqual(settings.mtp.dflash2DrafterPath, dir.path)
+        settings.mtp.mode = .auto
+        XCTAssertTrue(settings.resolvedMTPDraftStrategy(configData: targetConfig(), jangConfig: nil, status: nil)?.usesDFlash2 == true)
+    }
+
+    func testIncompleteAndTruncatedDraftersAreNotSelectable() throws {
+        XCTAssertNil(VMLXDFlash2DrafterInfo.read(at: try makeDrafter(name: "bare", withWeights: false)))
+        let dir = try makeDrafter()
+        let file = dir.appendingPathComponent("model.safetensors")
+        var bytes = try Data(contentsOf: file)
+        bytes.removeLast()
+        try bytes.write(to: file)
+        XCTAssertNil(VMLXDFlash2DrafterInfo.read(at: dir))
+    }
+
+    func testIndexMustReferencePresentTensorAndShard() throws {
+        let dir = try makeDrafter()
+        try Data(#"{"weight_map":{"fixture.weight":"missing.safetensors"}}"#.utf8)
+            .write(to: dir.appendingPathComponent("model.safetensors.index.json"))
+        XCTAssertNil(VMLXDFlash2DrafterInfo.read(at: dir))
+    }
+
+    func testMissingDimensionsAndDifferentTargetLayerCountDoNotFit() throws {
+        let info = try XCTUnwrap(VMLXDFlash2DrafterInfo.read(at: try makeDrafter()))
+        XCTAssertNotNil(info.mismatchReason(configData: nil))
+        XCTAssertNotNil(info.mismatchReason(configData: Data(#"{"vocab_size":248320}"#.utf8)))
+        XCTAssertNotNil(info.mismatchReason(configData: targetConfig(layers: 65)))
+        XCTAssertNil(info.mismatchReason(configData: targetConfig()))
     }
 
     func testVocabularyMismatchFallsBackInsteadOfEngaging() throws {

@@ -15,9 +15,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// 4: Automatic uses 30% of available space (free + owned payloads).
     ///    Explicit settings, including historical 10% values, are preserved.
     ///
-    /// 5: MTP mode default moved from `.off` to `.familyDefault` (Eric, 2026-10-06). Every install since
-    ///    2026-09-16 persisted the then-default `.off` without a user choosing it, so a stored `.off` written
-    ///    before contract 5 is migrated ONCE to `.familyDefault`; any choice saved after that sticks.
+    /// 5: New installations use `.familyDefault`. Existing stored modes,
+    /// including legacy Off, remain explicit data and are never inferred away.
     public static let contractVersion = 5
 
     public var network: VMLXServerNetworkSettings
@@ -74,9 +73,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// user's saved choice. Earlier migrations could not distinguish a chosen
     /// 10% from the old default, so do not infer intent from the number alone.
     public mutating func migrateToCurrentSchema() {
-        if (schemaVersion ?? 1) < 5, mtp.mode == .off {
-            mtp.mode = .familyDefault
-        }
+        // A stored Off may be an explicit choice. There is no reliable legacy
+        // provenance that permits replacing it with an automatic family default.
         schemaVersion = max(schemaVersion ?? 1, Self.contractVersion)
     }
 
@@ -534,10 +532,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         // model. It is checked BEFORE the native-MTP launch decision
         // because the two are alternatives, not layers: a selected
         // drafter means "draft with this", not "draft with this as well".
-        // Note this is deliberately independent of `mtp.mode` — a user
-        // who downloads a drafter and points the runtime at it has asked
-        // for speculation, and making them also flip Mode to Auto would
-        // be a second switch for one decision.
+        // Off (AR) disables every speculative strategy, including a previously
+        // selected external drafter. Selection is retained for re-enabling.
         if let selection = resolvedDFlash2Selection(configData: configData, bundleDirectory: bundleDirectory) {
             return .dflash2(
                 drafterPath: URL(fileURLWithPath: selection.path),
@@ -562,6 +558,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     public func resolvedDFlash2Selection(
         configData: Data?, bundleDirectory: URL? = nil
     ) -> VMLXDFlash2DrafterInfo? {
+        guard mtp.mode != .off else { return nil }
         if let path = mtp.dflash2DrafterPath, !path.isEmpty,
             let info = VMLXDFlash2DrafterInfo.read(at: URL(fileURLWithPath: path)),
             info.mismatchReason(configData: configData) == nil
