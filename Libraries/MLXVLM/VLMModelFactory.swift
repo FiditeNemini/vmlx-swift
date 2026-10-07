@@ -484,7 +484,17 @@ public final class VLMModelFactory: ModelFactory {
         let qwen4JANGHPreparation = jangHPreparation == nil
             ? try Qwen4ExpJANGHPreparation.loadIfDeclared(directory: modelDirectory, configurationData: configData)
             : nil
-        if let qwen4JANGHPreparation { configData = qwen4JANGHPreparation.banks.ordinaryConfiguration }
+        if let qwen4JANGHPreparation {
+            configData = qwen4JANGHPreparation.banks.ordinaryConfiguration
+        }
+        let qwen35JANGHPreparation =
+            (jangHPreparation == nil && qwen4JANGHPreparation == nil)
+            ? try Qwen35JANGHPreparation.loadIfDeclared(
+                directory: modelDirectory, configurationData: configData)
+            : nil
+        if let qwen35JANGHPreparation {
+            configData = qwen35JANGHPreparation.dense.ordinaryConfiguration
+        }
         let baseConfig: BaseConfiguration
         do {
             baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
@@ -655,6 +665,10 @@ public final class VLMModelFactory: ModelFactory {
             } else if let qwen4JANGHPreparation {
                 model = try qwen4JANGHPreparation.construct(
                     configurationData: mergedConfigData, requesting: configuration.requestedModalities)
+            } else if let qwen35JANGHPreparation {
+                model = try qwen35JANGHPreparation.construct(
+                    configurationData: mergedConfigData,
+                    requesting: configuration.requestedModalities)
             } else {
                 model = try await typeRegistry.createModel(
                     configuration: mergedConfigData, modelType: dispatchModelType,

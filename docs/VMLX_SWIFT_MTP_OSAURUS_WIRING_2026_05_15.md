@@ -1,5 +1,8 @@
 # vMLX Swift MTP / Osaurus Wiring Plan - 2026-05-15
 
+> Historical measurement/implementation record. For current product defaults and controls, see [Speculative decoding defaults](SPECULATIVE_DECODING_DEFAULTS.md). Fixed-depth probes here are diagnostics, not current user settings.
+
+
 This document records the Swift-side MTP status and activation contract for
 Osaurus. Native MTP now exists as an explicit, tensor-gated runtime path for
 Qwen3.6, but it is still not an automatic production launch mode. Auto-launch

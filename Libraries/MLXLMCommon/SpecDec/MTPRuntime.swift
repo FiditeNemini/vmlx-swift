@@ -561,6 +561,9 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
     /// Bundle-local blocks remain authoritative except for the exact frozen
     /// 4M block whose recorded runtime limitation PR #365 removed.
     public let measuredFamilyAutoDepth: Int?
+    /// Why the physically present MTP tensors do not form a usable head (no fusion projection or no compute
+    /// block). `nil` = topology complete, or not inspected (hand-built statuses). Set only by the inspector.
+    public let incompleteTopologyReason: String?
 
     public init(
         bundleHasMTP: Bool = false,
@@ -573,8 +576,10 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
         configEvidence: [String] = [],
         nativeMTPTuning: NativeMTPTuning? = nil,
         quantizationFingerprint: String? = nil,
-        measuredFamilyAutoDepth: Int? = nil
+        measuredFamilyAutoDepth: Int? = nil,
+        incompleteTopologyReason: String? = nil
     ) {
+        self.incompleteTopologyReason = incompleteTopologyReason
         self.bundleHasMTP = bundleHasMTP
         self.configuredLayers = configuredLayers
         self.tensorCount = tensorCount
@@ -589,7 +594,7 @@ public struct MTPBundleStatus: Codable, Sendable, Equatable {
     }
 
     public var hasCompleteMTPArtifact: Bool {
-        bundleHasMTP && configuredLayers > 0 && tensorCount > 0
+        bundleHasMTP && configuredLayers > 0 && tensorCount > 0 && incompleteTopologyReason == nil
     }
 
     public var hasUsableNativeMTPTuning: Bool {
@@ -1805,6 +1810,11 @@ public enum MTPBundleInspector {
             }
         }
 
+        let topologyGap = bundleHasMTP ? mtpTopologyGap(mtpNames) : nil
+        if let topologyGap {
+            statusEvidence.append("mtp_topology_incomplete=\(topologyGap)")
+        }
+
         let mode: MTPRuntimeMode
         if !bundleHasMTP && metadataClaimsMTP {
             mode = .metadataOnlyMissingWeights
@@ -1827,7 +1837,8 @@ public enum MTPBundleInspector {
             configEvidence: Array(Set(statusEvidence)).sorted(),
             nativeMTPTuning: nativeMTPTuning,
             quantizationFingerprint: quantizationFingerprint,
-            measuredFamilyAutoDepth: measuredFamilyAutoDepth)
+            measuredFamilyAutoDepth: measuredFamilyAutoDepth,
+            incompleteTopologyReason: topologyGap)
     }
 
     private static func configuredMTPLayers(
@@ -1885,13 +1896,16 @@ public enum MTPBundleInspector {
         // complete. Union the index keys with the header scan; headers cost
         // one small read per shard and this runs only at load-time
         // inspection.
+        // Names come from shard HEADERS only, and only entries whose byte range lies inside the file. The index
+        // selects which shards are inspected but never contributes a name on its own: an index entry whose shard
+        // is missing, whose shard does not contain it, or whose payload is truncated is not a loadable tensor
+        // (final sweep 2026-10-07: each of those made a one-tensor or phantom head look complete).
         var names: Set<String> = []
         var indexedFiles: Set<String> = []
         let indexURL = directory.appendingPathComponent("model.safetensors.index.json")
         if let index = try loadJSONObjectIfExists(indexURL),
             let weightMap = index["weight_map"] as? [String: Any]
         {
-            names.formUnion(weightMap.keys)
             indexedFiles.formUnion(weightMap.values.compactMap { $0 as? String })
         }
 
@@ -1993,7 +2007,38 @@ public enum MTPBundleInspector {
         else {
             return []
         }
-        return header.keys.filter { $0 != "__metadata__" }
+        let fileSize = try handle.seekToEnd()
+        let payload = fileSize >= 8 + headerLength ? fileSize - 8 - headerLength : 0
+        return header.compactMap { name, value in
+            guard name != "__metadata__", let entry = value as? [String: Any],
+                let offsets = entry["data_offsets"] as? [Int], offsets.count == 2,
+                offsets[0] >= 0, offsets[1] >= offsets[0], UInt64(offsets[1]) <= payload
+            else { return nil }
+            return name
+        }
+    }
+
+    /// A usable head needs a fusion projection (Qwen `fc` / `fc_hidden`+`fc_embedding`, DeepSeek-style
+    /// `eh_proj`, `input_proj`) AND at least one compute block (attention, Mamba-style `mixer`, MLP or experts).
+    /// Matched on dotted name components, never on a model name; every installed MTP family (Flash-Next affine
+    /// and JANGH, Allosaurus, Ling, Nemotron Lightning, Ornith, Qwen3.8 sources) satisfies it.
+    static func mtpTopologyGap(_ names: [String]) -> String? {
+        let fusion: Set<String> = ["fc", "eh_proj", "input_proj"]
+        let compute: Set<String> = [
+            "self_attn", "attn", "attention", "linear_attn", "mixer", "mlp", "experts", "shared_expert",
+            "feed_forward", "block_sparse_moe",
+        ]
+        let components = names.map { Set($0.lowercased().split(separator: ".").map(String.init)) }
+        let hasSplitFusion = components.contains { $0.contains("fc_hidden") }
+            && components.contains { $0.contains("fc_embedding") }
+        let hasFusion = hasSplitFusion || components.contains { !$0.isDisjoint(with: fusion) }
+        let hasCompute = components.contains { !$0.isDisjoint(with: compute) }
+        switch (hasFusion, hasCompute) {
+        case (true, true): return nil
+        case (false, true): return "no fusion projection"
+        case (true, false): return "no attention, mixer or MLP block"
+        case (false, false): return "no fusion projection and no compute block"
+        }
     }
 
     private static func isMTPName(_ name: String, mtpLayerPrefixes: [String]) -> Bool {

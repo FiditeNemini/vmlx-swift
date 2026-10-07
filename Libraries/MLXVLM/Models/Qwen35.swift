@@ -853,6 +853,90 @@ private func vlmGatedDeltaKernel(
     return (outputs[0], outputs[1])
 }
 
+// MARK: - DFlash 2 tree GatedDelta (port of TensorFold lane_tree._TREE_SOURCE, Apache-2.0)
+//
+// One verify window holding a draft TREE: row r continues from its parent's state, not from row
+// r-1. Each thread keeps the state of every row in registers (`states[MAXW][n_per_t]`, Dk/32
+// floats per row) so a child reads its parent's state without touching device memory; only y is
+// written. The per-step arithmetic is the chain kernel's (`makeVLMGatedDeltaKernel`) verbatim, so
+// a chain-shaped tree produces the chain kernel's bits. The committed state is NOT produced here:
+// the commit replays the kept path from the pre-window state with the chain kernel.
+private let vlmGatedDeltaTreeKernel: MLXFast.MLXFastKernel = {
+    let source = """
+        auto n = thread_position_in_grid.z;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+        auto i_state = state_in + (hv_idx * Dv + dv_idx) * Dk;
+        float s0[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          s0[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
+        }
+        float states[MAXW][n_per_t];
+        const int W = rows[0];
+        for (int node = 0; node < W; ++node) {
+          const int parent = parents[node];
+          float state[n_per_t];
+          for (int i = 0; i < n_per_t; ++i) state[i] = parent < 0 ? s0[i] : states[parent][i];
+          auto q_ = q + (node * Hk + hk_idx) * Dk;
+          auto k_ = k + (node * Hk + hk_idx) * Dk;
+          auto v_ = v + (node * Hv + hv_idx) * Dv;
+          const float g_ = static_cast<float>(g[node * Hv + hv_idx]);
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * g_;
+            kv_mem += state[i] * k_[s_idx];
+          }
+          kv_mem = simd_sum(kv_mem);
+          auto beta_value = 1.0f
+              / (1.0f + metal::fast::exp(-static_cast<float>(b[node * Hv + hv_idx])));
+          auto delta = (v_[dv_idx] - kv_mem) * beta_value;
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + k_[s_idx] * delta;
+            out += state[i] * q_[s_idx];
+          }
+          out = simd_sum(out);
+          if (thread_index_in_simdgroup == 0) {
+            y[(node * Hv + hv_idx) * Dv + dv_idx] = static_cast<InT>(out);
+          }
+          for (int i = 0; i < n_per_t; ++i) states[node][i] = state[i];
+        }
+    """
+    return MLXFast.metalKernel(
+        name: "vlm_gated_delta_tree",
+        inputNames: ["q", "k", "v", "g", "b", "state_in", "parents", "rows"],
+        outputNames: ["y"],
+        source: source)
+}()
+
+/// y `[1, W, Hv, Dv]` for a draft tree (B == 1, W ≤ 16). `state` `[1, Hv, Dv, Dk]` float32.
+private func vlmGatedDeltaTree(
+    q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, b: MLXArray, state: MLXArray,
+    parents: [Int]
+) -> MLXArray {
+    let W = k.dim(1)
+    let Hk = k.dim(2)
+    let Dk = k.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    precondition(W <= 16 && Dk % 32 == 0)
+    let outputs = vlmGatedDeltaTreeKernel(
+        [q, k, v, g, b, state, MLXArray(parents.map(Int32.init)), MLXArray([Int32(W)])],
+        template: [
+            ("InT", q.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("MAXW", 16),
+        ],
+        grid: (32, Dv, Hv),
+        threadGroup: (32, 4, 1),
+        outputShapes: [[1, W, Hv, Dv]],
+        outputDTypes: [q.dtype])
+    return outputs[0]
+}
+
 private func gatedDeltaUpdate(
     q: MLXArray,
     k: MLXArray,
@@ -1371,6 +1455,9 @@ enum Qwen35Language {
             cache: KVCache?,
             positionIds: MLXArray?
         ) -> MLXArray {
+            if let scope = DFlash2TreeScope.current, let cache, x.dim(0) == 1 {
+                return treeAttention(x, cache: cache, scope: scope)
+            }
             let B = x.dim(0)
             let L = x.dim(1)
 
@@ -1472,9 +1559,16 @@ enum Qwen35Language {
     }
 
     final class MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "gate_proj") var gateProj: Linear
-        @ModuleInfo(key: "down_proj") var downProj: Linear
-        @ModuleInfo(key: "up_proj") var upProj: Linear
+        // UnaryLayer, not Linear: dense JANGH bundles (Qwen3.8-27B JANGH2) install `JANGHDenseLinear` here
+        // (Qwen35JANGHPreparation). Affine/plain paths still take the Linear fast path in `project`.
+        @ModuleInfo(key: "gate_proj") var gateProj: UnaryLayer
+        @ModuleInfo(key: "down_proj") var downProj: UnaryLayer
+        @ModuleInfo(key: "up_proj") var upProj: UnaryLayer
+
+        private func project(_ module: UnaryLayer, _ x: MLXArray) -> MLXArray {
+            if let linear = module as? Linear { return qwen4ExpProjection(linear, x) }
+            return module(x)
+        }
 
         init(dimensions: Int, hiddenDimensions: Int) {
             _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -1485,10 +1579,10 @@ enum Qwen35Language {
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
             // Fused silu(gate) * up via compiled swiglu (1 Metal dispatch vs 2).
-            let gate = qwen4ExpProjection(gateProj, x)
-            let up = qwen4ExpProjection(upProj, x)
+            let gate = project(gateProj, x)
+            let up = project(upProj, x)
             let activated = _vlmCompiledSwiGLU(gate, up)
-            let result = qwen4ExpProjection(downProj, activated)
+            let result = project(downProj, activated)
             return result
         }
     }
@@ -1889,10 +1983,15 @@ enum Qwen35Language {
             recordPrefixCommitStates: Bool = false,
             fuseQKNormalization: Bool = false
         ) -> MLXArray {
+            if let scope = DFlash2TreeScope.current, let cache, inputs.dim(0) == 1 {
+                return treeForward(inputs, cache: cache, scope: scope)
+            }
             let B = inputs.dim(0)
             let S = inputs.dim(1)
             // Exact-row target verification only; AR and ordinary prefill retain their paths.
-            let exactRowVerifier = FlashVerificationScope.usesRowExactVerification(inputShape: inputs.shape)
+            let exactRowVerifier =
+                FlashVerificationScope.usesRowExactVerification(
+                    inputShape: inputs.shape, site: "gdn")
                 && verifyTileFamily == Qwen4ExpVerifyTile.Family.qwen4Exp
                 && recordPrefixCommitStates && B == 1 && (2...8).contains(S)
                 && NativeMTPVerifierStatePolicy.mode == .inputCaptureStaged
@@ -2152,6 +2251,89 @@ enum Qwen35Language {
             }
         }
 
+        /// DFlash 2 tree verify: every row runs its OWN root path. The depthwise conv reads each
+        /// row's path window (gathered rows of `[conv state; window]`), the recurrence runs the
+        /// tree kernel from the committed state, and nothing committed is written — the commit
+        /// replays the kept path (`commitTree`). Projections go through the same modules as the
+        /// chain verify (LaneQMM when installed).
+        private func treeForward(
+            _ inputs: MLXArray, cache: MambaCache, scope: DFlash2TreeScope
+        ) -> MLXArray {
+            let W = inputs.dim(1)
+            let diag = NativeMTPPhaseDiagnostics.enabled
+            var t = Date.timeIntervalSinceReferenceDate
+            func mark(_ phase: String, _ arrays: MLXArray...) {
+                guard diag else { return }
+                MLX.eval(arrays)
+                let now = Date.timeIntervalSinceReferenceDate
+                NativeMTPPhaseDiagnostics.record(phase, seconds: now - t)
+                t = now
+            }
+            let nKeep = max(0, convKernelSize - 1)
+            let convState: MLXArray
+            if let cached = cache[0], cached.ndim == 3, cached.dim(0) == 1, cached.dim(2) == convDim {
+                convState = cached
+            } else {
+                convState = MLXArray.zeros([1, nKeep, convDim], dtype: inputs.dtype)
+            }
+            let mixedQKV = inProjQKV(inputs)
+            let z = inProjZ(inputs).reshaped(1, W, numVHeads, headVDim)
+            let b = inProjB(inputs)
+            let a = inProjA(inputs)
+            mark("tree_gdn_inproj", mixedQKV, z, b, a)
+            let source = concatenated([convState, mixedQKV], axis: 1)[0]  // [nKeep + W, convDim]
+            let windows = scope.convWindows(nKeep: nKeep)  // [W, nKeep + 1]
+            let gathered = take(source, windows.reshaped(-1), axis: 0)
+                .reshaped(W, nKeep + 1, convDim)
+            let convOut = silu(conv1d(gathered)).reshaped(1, W, convDim)
+            let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            let q = split[0].reshaped(1, W, numKHeads, headKDim)
+            let k = split[1].reshaped(1, W, numKHeads, headKDim)
+            let v = split[2].reshaped(1, W, numVHeads, headVDim)
+            let invScale = pow(Float(headKDim), -0.5)
+            let qNormed = MLXArray(pow(invScale, 2), dtype: q.dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormed = MLXArray(invScale, dtype: k.dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            var state = cache[1] ?? MLXArray.zeros([1, numVHeads, headVDim, headKDim], dtype: .float32)
+            if state.dtype != .float32 { state = state.asType(.float32) }
+            mark("tree_gdn_conv_norm", qNormed, kNormed, v)
+            let g = computeGatedDeltaG(aLog, a, dtBias)
+            let y = vlmGatedDeltaTree(
+                q: qNormed, k: kNormed, v: v, g: g, b: b, state: state,
+                parents: scope.plan.parents)
+            scope.records[ObjectIdentifier(cache)] = [qNormed, kNormed, v, a, b, mixedQKV, convState]
+            mark("tree_gdn_recurrence", y)
+            let normed = norm(y, gate: z)
+            let out = outProj(normed.reshaped(1, W, -1))
+            mark("tree_gdn_out", out)
+            return out
+        }
+
+        /// Keep `keptRows` (root path) of the last tree window: recurrent state = chain replay of
+        /// the kept rows from the untouched committed state; conv state = the last `nKeep` rows of
+        /// `[conv state; kept rows' projections]`.
+        func commitTree(cache: MambaCache, scope: DFlash2TreeScope, keptRows: [Int]) -> Bool {
+            guard let record = scope.records[ObjectIdentifier(cache)], record.count == 7,
+                !keptRows.isEmpty
+            else { return false }
+            let index = MLXArray(keptRows.map(Int32.init))
+            func rows(_ x: MLXArray) -> MLXArray { take(x, index, axis: 1) }
+            let (_, newState) = gatedDeltaUpdate(
+                q: rows(record[0]), k: rows(record[1]), v: rows(record[2]),
+                a: rows(record[3]), b: rows(record[4]),
+                aLog: aLog, dtBias: dtBias, state: cache[1], mask: nil)
+            cache[1] = newState
+            let nKeep = max(0, convKernelSize - 1)
+            if nKeep > 0 {
+                let source = concatenated([record[6], rows(record[5])], axis: 1)
+                let end = source.dim(1)
+                cache[0] = source[0..., (end - nKeep) ..< end, 0...]
+            }
+            cache.offset += keptRows.count
+            return true
+        }
+
         /// Commit for the STAGED (compile-compatible) verify: the forward
         /// left cache[0]/cache[1]/offset untouched and wrote everything
         /// into the staging slots. Runs on EVERY staged cycle — a full
@@ -2402,7 +2584,7 @@ enum Qwen35Language {
             guard compileDecodeRegions else { return nil }
             // Preserve the actual AR router region for each admitted verification row.
             // Keep expert evaluation batched; do not change selection or sampling.
-            if FlashVerificationScope.usesRowExactVerification(inputShape: x.shape),
+            if FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "router"),
                 !CompiledDecodeTrace.isActive, x.dtype == .bfloat16,
                 !(gate is QuantizedLinear), gate.bias == nil
             {
@@ -2904,6 +3086,9 @@ enum Qwen35Language {
 
             var captured: [Int: MLXArray] = [:]
             captured.reserveCapacity(captureLayerIDs.count)
+            let pipelineTreeVerify = DFlash2TreeScope.current != nil
+                && !CompiledDecodeTrace.isActive
+                && ProcessInfo.processInfo.environment["VMLX_DFLASH2_TREE_PIPELINE"] != "0"
 
             for (index, layer) in layers.enumerated() {
                 let layerSSMMask = layer.isLinear ? ssmMask : nil
@@ -2917,6 +3102,12 @@ enum Qwen35Language {
                 )
                 if captureLayerIDs.contains(index) {
                     captured[index] = hiddenStates
+                }
+                // Tree verify runs eager: submit every 4 layers (and after layer 0) so the GPU
+                // starts while the host is still building the rest of the 64-layer graph — the
+                // donors' pipelined verify build. Same graph, same bits.
+                if pipelineTreeVerify, index + 1 < layers.count, index == 0 || index % 4 == 3 {
+                    asyncEval(hiddenStates)
                 }
             }
 
@@ -3280,8 +3471,16 @@ enum Qwen35Language {
 // MARK: - Model
 
 public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel,
-    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping
+    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping,
+    SafetensorsLoadKeyExcluding
 {
+    /// Dense JANGH bank tensors (`*.tq2_packed` / `*.tq2_scales`) owned by installed `JANGHDenseLinear`
+    /// modules; the generic safetensors loader must not try to bind them. Empty for ordinary bundles.
+    public var customDenseTensorNames: Set<String> = []
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        !customDenseTensorNames.isEmpty && customDenseTensorNames.contains(key)
+    }
+
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel?
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
@@ -4104,3 +4303,317 @@ final class Qwen4ExpGDNReplayBridge {
     }
 }
 #endif
+extension Qwen35Language.Attention {
+    /// DFlash 2 tree verify: rows sit at `start + depth` (siblings share a position) and each row
+    /// attends to the committed prefix plus exactly its own root path. All W rows are appended to
+    /// the cache; `compactTreeWindow` keeps the accepted path at commit.
+    func treeAttention(_ x: MLXArray, cache: KVCache, scope: DFlash2TreeScope) -> MLXArray {
+        let L = x.dim(1)
+        let start = cache.offset + scope.positionDelta
+        let qSplit = qProj(x).reshaped(1, L, numAttentionHeads, -1).split(parts: 2, axis: -1)
+        let gate = qSplit[1].reshaped(1, L, -1)
+        var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+        var keys = kNorm(kProj(x).reshaped(1, L, numKeyValueHeads, -1)).transposed(0, 2, 1, 3)
+        let values = vProj(x).reshaped(1, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
+        let (cosValues, sinValues) = rotaryEmbedding(
+            x: values, positionIds: scope.plan.positionIds(start: start))
+        (queries, keys) = Qwen35Language.applyMultimodalRotaryPosEmb(
+            q: queries, k: keys, cos: cosValues, sin: sinValues)
+        let mask = scope.attentionMask(prefix: cache.offset, dtype: queries.dtype)
+        let output = JangHadamardAttention.attention(
+            queries: queries, keys: keys, values: values, cache: cache, scale: scale,
+            mask: .array(mask),
+            enabled: JangHadamardAttention.applies(query: qProj, key: kProj, value: vProj)
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(1, L, -1)
+        return oProj(compiledSigmoidMultiply(output, gate))
+    }
+}
+
+
+// MARK: - DFlash 2 draft-tree verify (dense Qwen3.5 / Qwen3.8-27B)
+
+extension Qwen35: DFlash2TreeVerifyModel {
+    public func dflash2TreeForward(
+        _ inputs: MLXArray, cache: [KVCache], captureLayerIDs: Set<Int>, scope: DFlash2TreeScope
+    ) -> (MLXArray, [Int: MLXArray]) {
+        scope.positionDelta = dflash2PositionDelta
+        return DFlash2TreeScope.with(scope) {
+            languageModel.textOnlyForwardCapturing(
+                inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+        }
+    }
+
+    public func dflash2CommitTree(cache: [KVCache], scope: DFlash2TreeScope, keptRows: [Int])
+        -> Bool
+    {
+        let window = scope.plan.rows
+        for (index, layer) in languageModel.model.layers.enumerated() {
+            guard index < cache.count else { return false }
+            if layer.isLinear {
+                guard let mamba = cache[index] as? MambaCache, let gdn = layer.linearAttn,
+                    gdn.commitTree(cache: mamba, scope: scope, keptRows: keptRows)
+                else { return false }
+            } else {
+                guard let kv = cache[index] as? KVCacheSimple,
+                    kv.compactTreeWindow(window: window, keptRows: keptRows)
+                else { return false }
+            }
+        }
+        return true
+    }
+
+    public func dflash2SupportsTree(cache: [KVCache]) -> Bool {
+        let layers = languageModel.model.layers
+        guard cache.count >= layers.count else { return false }
+        for (index, layer) in layers.enumerated() {
+            if layer.isLinear {
+                guard cache[index] is MambaCache, let gdn = layer.linearAttn,
+                    gdn.headKDim % 32 == 0
+                else { return false }
+            } else {
+                // Exact type: subclasses (compilable / quantized / rotating) store rows differently.
+                guard type(of: cache[index]) == KVCacheSimple.self else { return false }
+            }
+        }
+        return true
+    }
+}
+
+/// Test probe for the tree GatedDelta kernel: (tree y, chain y over the same rows).
+public enum Qwen35DFlash2TreeKernelProbe {
+    public static func tree(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, b: MLXArray, state: MLXArray,
+        parents: [Int]
+    ) -> MLXArray {
+        vlmGatedDeltaTree(q: q, k: k, v: v, g: g, b: b, state: state, parents: parents)
+    }
+
+    /// The production chain kernel (same inputs, rows in order) → (y, final state).
+    public static func chain(
+        q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, b: MLXArray, state: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        vlmGatedDeltaKernel(q: q, k: k, v: v, g: g, b: b, state: state)
+    }
+}
+
+/// Verify-cost attribution on real weights: per-layer ms of each sub-op at a given row count
+/// (each timed alone, eval'd, median of `reps`). Diagnostic only (RunBench BENCH_PARTS).
+public enum Qwen35DFlash2PartsProbe {
+    public static func run(model: Any, rowsList: [Int], reps: Int) -> [String] {
+        guard let m = model as? Qwen35 else { return ["[PARTS] not a Qwen35 VLM model"] }
+        let layers = m.languageModel.model.layers
+        guard let gdnLayer = layers.first(where: { $0.isLinear }), let gdn = gdnLayer.linearAttn,
+            let attnLayer = layers.first(where: { !$0.isLinear }), let attn = attnLayer.selfAttn
+        else { return ["[PARTS] layer kinds missing"] }
+        let hidden = gdn.hiddenSize
+        var lines: [String] = []
+        func time(_ body: () -> [MLXArray]) -> Double {
+            var samples: [Double] = []
+            for rep in 0 ..< (reps + 2) {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                MLX.eval(body())
+                let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                if rep >= 2 { samples.append(ms) }
+            }
+            samples.sort()
+            return samples[samples.count / 2]
+        }
+        for rows in rowsList {
+            let x = (MLXRandom.normal([1, rows, hidden]) * 0.05).asType(.bfloat16)
+            MLX.eval(x)
+            let nKeep = max(0, gdn.convKernelSize - 1)
+            let plan = DFlash2TreePlan(tokens: Array(0 ..< rows), parents: Array(-1 ..< (rows - 1)))
+            let windows = plan.convWindows(nKeep: nKeep)
+            let mixed = gdn.inProjQKV(x)
+            let a = gdn.inProjA(x)
+            let b = gdn.inProjB(x)
+            let convState = MLXArray.zeros([1, nKeep, gdn.convDim], dtype: .bfloat16)
+            MLX.eval(mixed, a, b, windows)
+            let convOut = silu(gdn.conv1d(
+                take(concatenated([convState, mixed], axis: 1)[0], windows.reshaped(-1), axis: 0)
+                    .reshaped(rows, nKeep + 1, gdn.convDim))).reshaped(1, rows, gdn.convDim)
+            let split = MLX.split(convOut, indices: [gdn.keyDim, 2 * gdn.keyDim], axis: -1)
+            let q = split[0].reshaped(1, rows, gdn.numKHeads, gdn.headKDim)
+            let k = split[1].reshaped(1, rows, gdn.numKHeads, gdn.headKDim)
+            let v = split[2].reshaped(1, rows, gdn.numVHeads, gdn.headVDim)
+            let g = computeGatedDeltaG(gdn.aLog, a, gdn.dtBias)
+            let state = MLXArray.zeros(
+                [1, gdn.numVHeads, gdn.headVDim, gdn.headKDim], dtype: .float32)
+            let y = (MLXRandom.normal([1, rows, gdn.numVHeads, gdn.headVDim]) * 0.1)
+                .asType(.bfloat16)
+            let z = gdn.inProjZ(x).reshaped(1, rows, gdn.numVHeads, gdn.headVDim)
+            MLX.eval(q, k, v, g, y, z)
+            var parts: [(String, Double)] = []
+            parts.append(("gdn_inproj4", time {
+                [gdn.inProjQKV(x), gdn.inProjZ(x), gdn.inProjB(x), gdn.inProjA(x)]
+            }))
+            parts.append(("gdn_conv", time {
+                [silu(gdn.conv1d(
+                    take(concatenated([convState, mixed], axis: 1)[0], windows.reshaped(-1), axis: 0)
+                        .reshaped(rows, nKeep + 1, gdn.convDim)))]
+            }))
+            parts.append(("gdn_qknorm_g", time {
+                [MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6),
+                 MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6),
+                 computeGatedDeltaG(gdn.aLog, a, gdn.dtBias)]
+            }))
+            parts.append(("gdn_rec_chain", time {
+                [vlmGatedDeltaKernel(q: q, k: k, v: v, g: g, b: b, state: state).0]
+            }))
+            parts.append(("gdn_rec_tree", time {
+                [vlmGatedDeltaTree(q: q, k: k, v: v, g: g, b: b, state: state,
+                                   parents: plan.parents)]
+            }))
+            parts.append(("gdn_normgate_out", time {
+                let normed = gdn.norm(y, gate: z)
+                return [gdn.outProj(normed.reshaped(1, rows, -1))]
+            }))
+            parts.append(("mlp", time { [(gdnLayer.mlp as! UnaryLayer)(x)] }))
+            parts.append(("attn_proj", time {
+                [attn.qProj(x), attn.kProj(x), attn.vProj(x)]
+            }))
+            parts.append(("attn_oproj", time {
+                [attn.oProj(MLXRandom.normal([1, rows, attn.numAttentionHeads * attn.headDim])
+                    .asType(.bfloat16))]
+            }))
+            parts.append(("layernorms2", time {
+                [gdnLayer.inputLayerNorm(x), gdnLayer.postAttentionLayerNorm(x)]
+            }))
+            parts.append(("lm_head", time { [m.projectToLogits(x)] }))
+            // Achieved bandwidth per projection bit width (every MLP projection of every layer).
+            var byBits: [Int: (bytes: Double, ms: Double)] = [:]
+            for layer in layers {
+                guard let mlp = layer.mlp as? Qwen35Language.MLP else { continue }
+                for module in [mlp.gateProj, mlp.upProj, mlp.downProj] {
+                    guard let q = module as? QuantizedLinear else { continue }
+                    let input = q === (mlp.downProj as AnyObject)
+                        ? (MLXRandom.normal([1, rows, q.weight.dim(1) * 32 / q.bits]) * 0.05)
+                            .asType(.bfloat16)
+                        : x
+                    MLX.eval(input)
+                    let ms = time { [module(input)] }
+                    let bytes = Double(q.weight.nbytes + q.scales.nbytes + (q.biases?.nbytes ?? 0))
+                    let previous = byBits[q.bits] ?? (0, 0)
+                    byBits[q.bits] = (previous.bytes + bytes, previous.ms + ms)
+                }
+            }
+            lines.append("[PARTS] rows=\(rows) mlp by bits: " + byBits.sorted { $0.key < $1.key }.map {
+                String(format: "%dbit %.0fMB %.2fms %.0fGB/s", $0.key, $0.value.bytes / 1e6,
+                       $0.value.ms, $0.value.bytes / 1e6 / $0.value.ms)
+            }.joined(separator: " | "))
+            let gdnCount = layers.filter(\.isLinear).count
+            let attnCount = layers.count - gdnCount
+            lines.append(
+                "[PARTS] rows=\(rows) per-layer ms: "
+                    + parts.map { String(format: "%@=%.3f", $0.0, $0.1) }.joined(separator: " "))
+            let total = parts.reduce(0.0) { sum, part in
+                switch part.0 {
+                case let n where n.hasPrefix("gdn_rec_tree"): return sum
+                case let n where n.hasPrefix("gdn_"): return sum + part.1 * Double(gdnCount)
+                case "mlp", "layernorms2": return sum + part.1 * Double(layers.count)
+                case let n where n.hasPrefix("attn_"): return sum + part.1 * Double(attnCount)
+                default: return sum + part.1
+                }
+            }
+            lines.append(String(format: "[PARTS] rows=%d model-scaled serial total=%.1f ms", rows, total))
+        }
+        return lines
+    }
+}
+
+extension Qwen35: DFlash2MediaPrefillModel {
+    public func dflash2MediaPrefill(
+        _ input: LMInput, cache: [KVCache], captureLayerIDs: Set<Int>, stepSize: Int,
+        restoredPrefix: Int, boundary: Int?, onBoundary: () -> Void,
+        onChunk: ([Int: MLXArray]) -> Void
+    ) throws -> MLXArray {
+        let inputIds = input.text.tokens
+        guard let visionModel else {
+            throw VLMError.processing("media prefill needs the vision tower")
+        }
+        let visionDType = visionModel.patchEmbed.proj.weight.dtype
+        var pixelParts: [MLXArray] = []
+        var imageFrames: [THW]?
+        var videoFrames: [THW]?
+        if let image = input.image {
+            pixelParts.append(image.pixels.asType(visionDType))
+            imageFrames = image.frames
+        }
+        if let video = input.video {
+            pixelParts.append(video.pixels.asType(visionDType))
+            videoFrames = video.frames
+        }
+        guard !pixelParts.isEmpty,
+            let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
+                .nilIfEmpty
+        else { throw VLMError.processing("media prefill without image or video pixels") }
+        let total = inputIds.dim(1)
+        let start = Swift.max(0, Swift.min(restoredPrefix, total - 1))
+        let textEmbeds = languageModel.model.embedTokens(inputIds)
+        let embeddings: MLXArray
+        if start > 0 {
+            // Restored prefix holds every media span: the suffix is text only.
+            embeddings = textEmbeds
+        } else {
+            // Exactly `prepare`'s embedding: vision features scattered onto their placeholders.
+            let (visionHidden, _) = visionModel(concatenated(pixelParts), gridTHW: frames)
+            embeddings = try mergeInputIdsWithImageFeatures(
+                imageFeatures: visionHidden.asType(textEmbeds.dtype),
+                imageRowCount: mergedRowCount(for: imageFrames),
+                inputEmbeds: textEmbeds,
+                inputIds: inputIds,
+                imageTokenIndex: config.imageTokenIndex,
+                videoTokenIndex: config.videoTokenIndex
+            ).0
+        }
+        // Full-prompt M-RoPE positions from token ids + media grids (no pixels), resolved ONCE:
+        // this sets the request's decode delta, and a restored prefix's suffix continues at
+        // exactly the positions a full prefill would have used. `cache: nil` — the table is
+        // for the WHOLE prompt from position 0, independent of what the cache already holds.
+        guard let positions = languageModel.resolvedPositionIds(
+            inputs: inputIds, cache: nil, mask: nil, providedPositionIds: nil,
+            imageGridTHW: imageFrames, videoGridTHW: videoFrames, resetForMedia: true)
+        else { throw VLMError.processing("media prefill could not resolve M-RoPE positions") }
+        let typedCache = castCache(cache)
+        MLX.eval(embeddings, positions)
+        let step = Swift.max(1, stepSize)
+        var offset = start
+        var lastLogits: MLXArray?
+        while offset < total {
+            try Task.checkCancellation()
+            var end = Swift.min(total, offset + step)
+            if let boundary, offset < boundary, end > boundary { end = boundary }
+            let (hidden, captured) = languageModel.model.callAsFunctionCapturing(
+                inputIds[0..., offset ..< end],
+                inputsEmbeds: embeddings[0..., offset ..< end, 0...],
+                cache: typedCache,
+                positionIds: positions[0..., 0..., offset ..< end],
+                captureLayerIDs: captureLayerIDs)
+            onChunk(captured)
+            if end == boundary {
+                MLX.eval(cache)
+                onBoundary()
+            }
+            if end == total {
+                lastLogits = languageModel.headLogits(hidden[0..., (end - offset - 1)..., 0...])
+            } else {
+                MLX.eval(cache)
+                MLX.Memory.clearCache()
+            }
+            offset = end
+        }
+        guard let lastLogits else { throw VLMError.processing("empty media prompt") }
+        return lastLogits
+    }
+
+    public var dflash2PositionDelta: Int {
+        guard let deltas = languageModel.ropeDeltas else { return 0 }
+        return deltas.reshaped(-1)[0].item(Int.self)
+    }
+
+    public func dflash2ResetPositionState() {
+        languageModel.resetPositionState()
+    }
+}

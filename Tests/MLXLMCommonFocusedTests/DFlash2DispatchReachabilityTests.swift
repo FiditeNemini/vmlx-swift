@@ -90,7 +90,7 @@ final class DFlash2DispatchReachabilityTests: XCTestCase {
     /// there too, or the ordering in `Evaluate` never gets a chance.
     func testSettingsResolutionPrefersDFlash2OverNativeMTP() throws {
         let text = try source("Libraries/MLXLMCommon/ServerRuntimeSettings.swift")
-        guard let selectionIndex = text.range(of: "resolvedDFlash2Selection(configData:")?.lowerBound,
+        guard let selectionIndex = text.range(of: "let selection = resolvedDFlash2Selection(")?.lowerBound,
             let mtpIndex = text.range(of: "return .nativeMTP(depth: depth")?.lowerBound
         else {
             return XCTFail("could not locate the strategy resolution branches")

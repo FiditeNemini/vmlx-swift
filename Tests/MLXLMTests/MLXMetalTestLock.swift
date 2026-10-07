@@ -76,6 +76,10 @@ enum MLXMetalTestLock {
     /// the first MLX-backed assertion runs so tests exercise kernels instead
     /// of failing on a runner packaging detail.
     private static let metallibAliasPrepared: Void = {
+        prepareMLXTestMetalLibrary()
+        if ProcessInfo.processInfo.environment["VMLX_TEST_METALLIB_PATH"] != nil {
+            return
+        }
         let sourceDirectories = [
             repoRoot.appendingPathComponent(".build/arm64-apple-macosx/debug"),
             repoRoot.appendingPathComponent(".build/debug"),

@@ -564,8 +564,14 @@ public struct GenerateParameters: Sendable {
     /// safety policy supplies a large finite window even for a 1K-token run;
     /// treating the mere presence of that cap as ineligible silently turned
     /// every such MTP request into plain AR.
-    public func nativeMTPEffectiveParameters(for input: LMInput) -> GenerateParameters? {
-        guard isNativeMTPPenaltyFree, !input.hasMediaContent else { return nil }
+    public func nativeMTPEffectiveParameters(for input: LMInput, model: Any? = nil)
+        -> GenerateParameters?
+    {
+        // Media is speculated only by models whose native forwards continue at the media-shifted
+        // (M-RoPE) positions after a VLM prefill (`NativeMTPMediaCapable`).
+        guard isNativeMTPPenaltyFree,
+            !input.hasMediaContent || NativeMTPMediaPolicy.allows(model: model)
+        else { return nil }
         // NativeMTPTokenIterator needs at least one draft/verify cycle. Treat
         // one-token probes as ordinary AR here so callers do not select the
         // exclusive MTP lane only for iterator construction to throw.
@@ -585,8 +591,8 @@ public struct GenerateParameters: Sendable {
         return resolved
     }
 
-    public func canUseNativeMTP(for input: LMInput) -> Bool {
-        nativeMTPEffectiveParameters(for: input) != nil
+    public func canUseNativeMTP(for input: LMInput, model: Any? = nil) -> Bool {
+        nativeMTPEffectiveParameters(for: input, model: model) != nil
     }
 }
 
@@ -771,6 +777,13 @@ public struct SpeculativeSamplingController {
             logits = logits.asType(.float32)
         }
 
+        let vocabularySize = logits.dim(-1)
+        if topK > 0, topK <= 256, topK < vocabularySize, logits.dim(0) == 1,
+            Self.topKFastPathEnabled
+        {
+            return topKProbabilities(logits, vocabularySize: vocabularySize)
+        }
+
         var logprobs = logSoftmax(logits * (1 / MLXArray(temperature)))
         if topP > 0 && topP < 1 {
             logprobs = applyTopP(logprobs, topP: MLXArray(topP))
@@ -783,6 +796,36 @@ public struct SpeculativeSamplingController {
         }
 
         return softmax(logprobs, axis: -1, precise: true)
+    }
+
+    static let topKFastPathEnabled =
+        ProcessInfo.processInfo.environment["VMLX_SPEC_TOPK_PROBS"] != "0"
+
+    /// Same distribution as the full-vocabulary path above when a top-k filter is set — the kept
+    /// set is `topK ∩ nucleus ∩ minP`, and every member of the nucleus test can be decided from
+    /// the K largest log-probabilities (token i survives top-p iff the mass of strictly larger
+    /// tokens is < topP, and all of those are inside the top K) — but without the 248k-wide
+    /// argSort the top-p filter needs. Runs once per native-MTP draft step and fallback sample.
+    private func topKProbabilities(_ logits: MLXArray, vocabularySize: Int) -> MLXArray {
+        let x = logits.asType(.float32) * (1 / MLXArray(temperature))
+        let lse = logSumExp(x, axis: -1, keepDims: true)
+        let ids = argPartition(-x, kth: topK - 1, axis: -1)[0..., ..<topK]
+        let unsorted = takeAlong(x, ids, axis: -1) - lse
+        let order = argSort(-unsorted, axis: -1)
+        let sortedIDs = takeAlong(ids, order, axis: -1)
+        let logprobs = takeAlong(unsorted, order, axis: -1)
+        var keep = MLXArray.ones(logprobs.shape, type: Bool.self)
+        if topP > 0 && topP < 1 {
+            let p = exp(logprobs)
+            keep = keep .&& ((cumsum(p, axis: -1) - p) .< MLXArray(topP))
+        }
+        if minP > 0 {
+            keep = keep .&& (logprobs .>= (logprobs[0..., 0 ..< 1] + MLXArray(log(minP))))
+        }
+        let kept = softmax(MLX.where(keep, logprobs, negInf), axis: -1, precise: true)
+        return putAlong(
+            MLXArray.zeros([1, vocabularySize], type: Float.self), sortedIDs, values: kept,
+            axis: -1)
     }
 
     public func sample(logits: MLXArray) -> Sample {
@@ -4334,7 +4377,7 @@ public func generate(
     // model's own MTP head does not also run. Ordering here is the
     // backstop; hosts are expected to send only one strategy.
     if let strategy = parameters.draftStrategy, let drafterPath = strategy.dflash2DrafterPath,
-        DFlash2TokenIterator.unservableReason(parameters) == nil
+        DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
     {
         guard let dflashTarget = context.model as? any DFlash2Target else {
             throw DFlash2RuntimeError.drafterTargetMismatch(
@@ -4344,7 +4387,14 @@ public func generate(
         // Vocabulary agreement is checked inside the iterator against the
         // first real logits row rather than here: `vocabularySize` lives on
         // the per-family model protocols, which this module cannot see.
-        let drafter = try DFlash2DrafterResolver.shared.drafter(at: drafterPath)
+        guard let drafter = try DFlash2DrafterResolver.shared.optionalDrafter(at: drafterPath)
+        else {
+            var arParameters = parameters
+            arParameters.draftStrategy = nil
+            return try generate(
+                input: input, cache: cache, parameters: arParameters, context: context,
+                wiredMemoryTicket: wiredMemoryTicket, cacheCoordinator: cacheCoordinator)
+        }
         let iterator = try DFlash2TokenIterator(
             input: input,
             target: dflashTarget,
@@ -4366,7 +4416,7 @@ public func generate(
     }
     if let strategy = parameters.draftStrategy,
         case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
-        parameters.canUseNativeMTP(for: input)
+        parameters.canUseNativeMTP(for: input, model: context.model)
     {
         guard let nativeModel = context.model as? any NativeMTPModel else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
@@ -4814,14 +4864,22 @@ public func generateTokensTask(
     // Same ordering rule as `generate`: a selected DFlash 2 drafter
     // replaces native MTP rather than stacking with it.
     if let strategy = parameters.draftStrategy, let drafterPath = strategy.dflash2DrafterPath,
-        DFlash2TokenIterator.unservableReason(parameters) == nil
+        DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
     {
         guard let dflashTarget = context.model as? any DFlash2Target else {
             throw DFlash2RuntimeError.drafterTargetMismatch(
                 "\(type(of: context.model)) does not expose per-layer hidden states and a shared LM head"
             )
         }
-        let drafter = try DFlash2DrafterResolver.shared.drafter(at: drafterPath)
+        guard let drafter = try DFlash2DrafterResolver.shared.optionalDrafter(at: drafterPath)
+        else {
+            var arParameters = parameters
+            arParameters.draftStrategy = nil
+            return try generateTokensTask(
+                input: input, cache: cache, parameters: arParameters, context: context,
+                includeStopToken: includeStopToken, wiredMemoryTicket: wiredMemoryTicket,
+                cacheCoordinator: cacheCoordinator)
+        }
         let iterator = try DFlash2TokenIterator(
             input: input,
             target: dflashTarget,
@@ -4840,7 +4898,7 @@ public func generateTokensTask(
     }
     if let strategy = parameters.draftStrategy,
         case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
-        parameters.canUseNativeMTP(for: input)
+        parameters.canUseNativeMTP(for: input, model: context.model)
     {
         guard let nativeModel = context.model as? any NativeMTPModel else {
             throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP
@@ -5986,4 +6044,16 @@ internal func _decodePromptTail(
     guard !tokenIds.isEmpty else { return nil }
     let tail = Array(tokenIds.suffix(max(1, tokens)))
     return tokenizer.decode(tokenIds: tail, skipSpecialTokens: false)
+}
+
+/// A native-MTP model whose prefill runs the VLM path and whose native forwards (bridge, AR,
+/// verify, draft seed) continue at the media-shifted M-RoPE positions — so a request carrying
+/// images/video can speculate after its media prefill instead of decoding plain AR.
+public protocol NativeMTPMediaCapable {}
+
+public enum NativeMTPMediaPolicy {
+    public static func allows(model: Any?) -> Bool {
+        model is NativeMTPMediaCapable
+            && ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_MEDIA"] != "0"
+    }
 }

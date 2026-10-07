@@ -56,9 +56,23 @@ final class JANGHDenseNamedMmapTests: XCTestCase {
                 XCTAssertEqual(mlx_safetensors_mmap_advise_layer(1, layer), 0)
             }
             let shape: [Int32] = [1, Int32(page / 4), 1]
+            // Dense Qwen3.5-family JANGH (27B JANGH2) maps gate/up/down banks, with or without the VLM
+            // `language_model.` prefix.
             for name in [
                 "model.layers.0.mlp.gate_proj.tq2_packed",
                 "model.layers.0.mlp.up_proj.tq2_packed",
+                "language_model.model.layers.0.mlp.down_proj.tq2_packed",
+                "language_model.model.layers.63.mlp.gate_proj.tq2_packed",
+            ] {
+                var bank: MLXArray? = try map(name, shape, .uint32, page)
+                XCTAssertEqual(bank?.shape, shape.map(Int.init))
+                bank = nil
+                XCTAssertEqual(mlx_safetensors_mmap_tracked_buffer_bytes(), baseline)
+            }
+            for name in [
+                "model.layers.0.mlp.experts.gate_proj.tq2_packed",
+                "vision_tower.model.layers.0.mlp.up_proj.tq2_packed",
+                "language_model.layers.0.mlp.up_proj.tq2_packed",
                 "model.layers.00.mlp.down_proj.tq2_packed",
                 "model.layers.2147483648.mlp.down_proj.tq2_packed",
             ] {

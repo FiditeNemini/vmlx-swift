@@ -668,6 +668,66 @@ final class DFlash2CandidateSelector: Module {
     }
 }
 
+extension DFlash2CandidateSelector {
+    /// Draft-tree lattice: per position the top-K candidates and their logits, plus EVERY
+    /// selector edge a tree can use — anchor → depth-0 candidates and depth-d candidate i →
+    /// depth-(d+1) candidate j — as one batched matmul, so the host tree search reads a few KB
+    /// instead of tracing one path on the GPU. Same edge formula as `select`:
+    /// `edge(prev, cand) = Σ_r predecessor[prev]_r · hidden_r · successor[cand]_r` (float32 here).
+    func lattice(hidden: MLXArray, logits: MLXArray, anchorIds: MLXArray) -> DFlash2LatticeArrays {
+        let vocab = logits.dim(-1)
+        let length = hidden.dim(1)
+        let candidates = argPartition(logits, kth: vocab - topK, axis: -1)[
+            .ellipsis, (vocab - topK)...]  // [1, L, K]
+        let unary = takeAlong(logits, candidates, axis: -1).asType(.float32)
+        let projected = hiddenProjection(hidden).asType(.float32)  // [1, L, R]
+        let successor = successorCodebook(candidates).asType(.float32)  // [1, L, K, R]
+        let anchor = predecessorCodebook(anchorIds).asType(.float32)  // [1, R]
+        let rootEdges = (anchor.expandedDimensions(axis: 1)
+            * projected[0..., 0, 0...].expandedDimensions(axis: 1)
+            * successor[0..., 0, 0..., 0...]).sum(axis: -1)  // [1, K]
+        var edges: MLXArray? = nil
+        if length > 1 {
+            let predecessor = predecessorCodebook(candidates[0..., ..<(length - 1), 0...])
+                .asType(.float32)  // [1, L-1, K, R]
+            let left = predecessor * projected[0..., 1..., 0...].expandedDimensions(axis: 2)
+            let right = successor[0..., 1..., 0..., 0...].swappedAxes(-1, -2)  // [1, L-1, R, K]
+            edges = matmul(left, right)  // [1, L-1, K, K]
+        }
+        return DFlash2LatticeArrays(
+            candidates: candidates[0].asType(.int32), unary: unary[0], rootEdges: rootEdges[0],
+            edges: edges?[0])
+    }
+}
+
+/// Device arrays of a lattice (evaluate together, then `host()`).
+public struct DFlash2LatticeArrays {
+    public let candidates: MLXArray  // [L, K] int32
+    public let unary: MLXArray  // [L, K] f32
+    public let rootEdges: MLXArray  // [K] f32
+    public let edges: MLXArray?  // [L-1, K, K] f32
+
+    public var arrays: [MLXArray] { [candidates, unary, rootEdges] + (edges.map { [$0] } ?? []) }
+
+    public func host() -> DFlash2Lattice {
+        let L = candidates.dim(0)
+        let K = candidates.dim(1)
+        let c = candidates.asArray(Int32.self)
+        let u = unary.asArray(Float.self)
+        let e = edges?.asArray(Float.self) ?? []
+        return DFlash2Lattice(
+            candidates: (0 ..< L).map { d in (0 ..< K).map { Int(c[d * K + $0]) } },
+            unary: (0 ..< L).map { d in Array(u[(d * K) ..< (d * K + K)]) },
+            rootEdges: rootEdges.asArray(Float.self),
+            edges: (0 ..< max(0, L - 1)).map { d in
+                (0 ..< K).map { i in
+                    let base = (d * K + i) * K
+                    return Array(e[base ..< (base + K)])
+                }
+            })
+    }
+}
+
 // MARK: - Draft model
 
 /// DFlash 2 block-diffusion drafter.
@@ -828,6 +888,22 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             layer0MLPInput: l0MLPInput,
             perLayer: perLayer,
             final: norm(h))
+    }
+
+    /// One drafting round for a TREE: backbone forward, LM head, lattice (no path trace).
+    public func proposeLattice(
+        inputs: MLXArray,
+        targetHidden: MLXArray,
+        cache: [KVCache],
+        embedder: any TokenEmbedderModel
+    ) -> DFlash2LatticeArrays? {
+        let hidden = hiddenStates(
+            inputs: inputs, targetHidden: targetHidden, cache: cache,
+            embedder: embedder, logitsStart: 1)
+        guard hidden.ndim == 3 else { return nil }
+        let logits = computeLogits(hidden, embedder: embedder)
+        return candidateSelector.lattice(
+            hidden: hidden, logits: logits, anchorIds: inputs[0..., 0])
     }
 
     /// One drafting round: backbone forward, LM head, candidate-path trace.

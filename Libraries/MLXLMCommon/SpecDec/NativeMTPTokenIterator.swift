@@ -242,6 +242,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let originalInput: LMInput
     let cacheInitParameters: GenerateParameters
     var promptCacheSnapshot: [KVCache]?
+    // Owned exact checkpoints captured during text prefill, not reconstructed after decode.
+    var prefillBoundarySnapshots: [Int: [KVCache]] = [:]
     let mediaSalt: String?
 
     var tokenCount = 0
@@ -257,9 +259,19 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
     private var pendingTokens: [Int] = []
     private var pendingIndex = 0
+    /// Copy drafts (NativeMTPCopyProposer.swift): the request's suffix-match proposer, fed every confirmed
+    /// token; `copyFed` = how much of the current `pendingTokens` buffer it has seen.
+    private var copyProposer: NativeMTPCopyProposer?
+    private var copyFed = 0
+    /// The drafts now in `drafts` are a copy window (kept out of the head/depth controller's statistics).
+    private var draftsAreCopy = false
     private var nextMain: MLXArray?
     private var drafts: [MLXArray] = []
     private var draftProbabilities: [MLXArray] = []
+    /// Sampled requests with a top-k filter: batched lossless acceptance on the host from one
+    /// readback per cycle (SpeculativeTopKAcceptance.swift). `nil` = greedy or no top-k.
+    private let topKAcceptance: SpeculativeTopKAcceptance.Filter?
+    private var hostRNG: SpeculativeHostRNG
 
     // MARK: - Verify prefetch
     //
@@ -405,6 +417,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     /// Resolved promotion ceiling: fixed requests never exceed their chosen
     /// depth; explicitly adaptive requests may explore to their bounded cap.
     private let adaptiveDepthCeiling: Int
+    /// Cost-model depth owner for explicitly adaptive requests (NativeMTPDepthChooser.swift).
+    private var depthChooser: NativeMTPDepthChooser?
+    private var depthChooserLastStamp: (cycle: Int, time: TimeInterval)?
+    /// After an AR-safety demotion the chooser stays at or below that depth until the safety
+    /// window has refilled, so the next cycle cannot simply undo the demotion.
+    private var depthChooserHold: (depth: Int, untilCycle: Int)?
     private(set) var seedMainForwardTime: TimeInterval = 0
     private(set) var verifyMainForwardTime: TimeInterval = 0
     private(set) var replayMainForwardTime: TimeInterval = 0
@@ -585,7 +603,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             effectiveParameters.maxKVSize = policy.maxKVSize
         }
         guard let nativeMTPParameters = effectiveParameters.nativeMTPEffectiveParameters(
-            for: input)
+            for: input, model: model)
         else {
             throw NativeMTPRuntimeError.unsupportedSampling(
                 "native MTP is enabled only for text-only requests with no active penalties or suppress/reasoning-budget processors, and requires either an unbounded KV window or a prompt plus declared output ceiling that fits wholly inside the configured window; sampled requests run the exact-pq accept path")
@@ -600,6 +618,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.processor = effectiveParameters.processor()
         self.sampler = effectiveParameters.sampler()
         self.speculativeSampler = SpeculativeSamplingController(parameters: effectiveParameters)
+        self.topKAcceptance = SpeculativeTopKAcceptance.Filter(
+            temperature: effectiveParameters.temperature, topP: effectiveParameters.topP,
+            topK: effectiveParameters.topK, minP: effectiveParameters.minP)
+        self.hostRNG = SpeculativeHostRNG(seed: effectiveParameters.randomSeed)
         self.maxTokens = effectiveParameters.maxTokens
         // One resolved policy governs initialization, recovery and promotion.
         // The environment bounds exploration but cannot raise a fixed request.
@@ -611,6 +633,13 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         self.adaptiveDepthCeiling = resolvedDepth.maximumDepth
         self.depth = resolvedDepth.initialDepth
         self.currentDepth = resolvedDepth.initialDepth
+        if case .adaptive = effectiveParameters.nativeMTPDepthPolicy, NativeMTPDepthChooser.enabled,
+            resolvedDepth.maximumDepth > 1
+        {
+            self.depthChooser = NativeMTPDepthChooser(
+                initialDepth: resolvedDepth.initialDepth, maximumDepth: resolvedDepth.maximumDepth,
+                costs: NativeMTPDepthCostTable.shared(for: model as AnyObject))
+        }
         self.verifierModeSetting = effectiveParameters.draftStrategy?.nativeMTPVerifierMode
         let promptTokenStart = NativeMTPClock.now()
         let promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -798,7 +827,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             matchedTokenCount: matchedTokens,
                             preferredDiskBoundaries: originalInput
                                 .cacheStablePrefixTokenCounts,
-                            skipExactDiskBoundary: false,
+                            skipExactDiskBoundary: coordinator.requiresRecurrentSSMCompanion,
                             mediaSalt: mediaSalt)
                     }
                 }
@@ -817,10 +846,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         let start = NativeMTPClock.now()
         try Task.checkCancellation()
-        let prepared = try model.prepare(
-            inputForPrepare,
-            cache: self.cache,
-            windowSize: effectiveParameters.prefillStepSize)
+        let prepared = try prepareCapturingCacheBoundaries(
+            inputForPrepare, windowSize: effectiveParameters.prefillStepSize)
         self.promptPrefillTime = NativeMTPClock.now() - start
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
 
@@ -908,6 +935,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             speculativeSampler: speculativeSampler,
             processor: processor)
         drafts = draftBatch.tokens
+        draftsAreCopy = false
         draftProbabilities = draftBatch.probabilities
         // Keep the confirmed bridge; deeper head rows are speculative.
         headChainPairs = canAlignHeadCache
@@ -950,8 +978,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
 
         if pendingIndex >= pendingTokens.count {
+            feedCopyProposer()
             pendingTokens.removeAll(keepingCapacity: true)
             pendingIndex = 0
+            copyFed = 0
             do {
                 if forceAutoregressiveFallback || arSafetyPaused
                     || (!Self.arSafetyDisabled && arSafetySeedStepSec == nil)
@@ -980,6 +1010,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // in the attention lanes; roll it back before any boundary snapshot
         // can capture them.
         abandonPendingVerify()
+        defer { prefillBoundarySnapshots.removeAll() }
         // Compiled traces capture the cache array; they must not outlive
         // the generation they were built for.
         releaseCompiledVerify()
@@ -1131,9 +1162,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         : boundary
                     let boundaryTokens = Array(promptTokenIds.prefix(storeBoundary))
                     if isStableBoundary,
-                       coordinator.hasValidatedDiskEntry(
-                        tokens: boundaryTokens,
-                        mediaSalt: mediaSalt)
+                       validateStableDiskBoundary(tokens: boundaryTokens, coordinator: coordinator)
                     {
                         continue
                     }
@@ -1416,6 +1445,139 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         return result
     }
 
+    /// Retain exact recurrent checkpoints while the original text prefill
+    /// crosses them. Replaying the whole prefix after generation delayed each
+    /// tool call even when writing the resulting SSD record took milliseconds.
+    /// Media and opaque post-prepare token layouts retain their existing path.
+    private mutating func prepareCapturingCacheBoundaries(
+        _ input: LMInput, windowSize: Int
+    ) throws -> PrepareResult {
+        guard let coordinator = cacheCoordinator,
+            coordinator.canPersistBoundaries,
+            originalInput.cachePromptIntent != .auxiliary,
+            !originalInput.hasMediaContent,
+            !originalInput.requiresPostPrepareCacheKey,
+            !input.hasMediaContent,
+            !input.requiresPostPrepareCacheKey,
+            usesHybridMambaCache,
+            !cache.contains(where: { $0 is HybridPoolCache })
+        else {
+            return try model.prepare(input, cache: cache, windowSize: windowSize)
+        }
+
+        let size = input.text.tokens.size
+        let restored = promptTokenIds.count - size
+        guard size > 0, restored >= 0,
+            cache.allSatisfy({ $0.offset == restored }),
+            input.text.tokenIds.map({ $0.count == size }) ?? true,
+            input.text.mask.map({ $0.size == size }) ?? true
+        else {
+            return try model.prepare(input, cache: cache, windowSize: windowSize)
+        }
+
+        // Match TokenIterator.prepare's segmentation: the canonical chat
+        // boundary comes first. Capturing an earlier stable N-1 first would
+        // introduce an extra single-row forward and change floating-point
+        // results relative to AR. Earlier stable snapshots keep their existing
+        // reconstruction path until both iterators share a capture policy.
+        let stripAt = TokenIterator.hybridStripBoundaryIndex(
+            coordinator: coordinator, promptTokenIds: promptTokenIds,
+            input: originalInput, cache: cache)
+        let canonical = stripAt.flatMap { $0 >= restored ? $0 : nil }
+        let stableStart = canonical ?? restored
+        var wanted = Set(
+            originalInput.cacheStablePrefixTokenCounts
+                .filter { $0 > stableStart && $0 < promptTokenIds.count }
+                .flatMap { [$0 - 1, $0] }
+        ).filter { $0 > stableStart }
+        // Keep segmentation independent of whether an SSD entry already
+        // exists, just as the AR iterator does.
+        if let canonical { wanted.insert(canonical) }
+        guard !wanted.isEmpty else {
+            return try model.prepare(input, cache: cache, windowSize: windowSize)
+        }
+
+        let flat = input.text.tokens.reshaped([-1])
+        let mask = input.text.mask?.reshaped([-1])
+        let batchedMask = (input.text.mask?.ndim ?? 1) >= 2
+        func segment(_ start: Int, _ end: Int) -> LMInput {
+            let segmentMask = mask.map { values in
+                let sliced = values[start..<end]
+                return batchedMask ? sliced[.newAxis, 0...] : sliced
+            }
+            return LMInput(
+                tokens: flat[start..<end][.newAxis, 0...],
+                mask: segmentMask,
+                tokenIds: input.text.tokenIds.map { Array($0[start..<end]) },
+                cacheScopeSalt: input.cacheScopeSalt,
+                cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+                cacheStablePrefixTokenCounts: input.cacheStablePrefixTokenCounts,
+                cachePromptIntent: input.cachePromptIntent,
+                cacheRestorePolicy: input.cacheRestorePolicy,
+                toolSchemas: input.toolSchemas,
+                canonicalRequiredToolContext: input.canonicalRequiredToolContext)
+        }
+
+        var consumed = 0
+        for boundary in wanted.sorted() {
+            try Task.checkCancellation()
+            let end = boundary - restored
+            if end > consumed {
+                let head = segment(consumed, end)
+                try withError { error in
+                    let result = try model.prepare(head, cache: cache, windowSize: windowSize)
+                    try error.check()
+                    if case .tokens(let remaining) = result, remaining.tokens.size > 0 {
+                        _ = model.nativeBackboneForward(
+                            Self.sequenceInput(remaining.tokens), cache: cache)
+                        try error.check()
+                    }
+                    MLX.eval(cache)
+                    try error.check()
+                }
+                consumed = end
+            }
+            if cache.allSatisfy({ $0.offset == boundary }) {
+                // Materialize OWNED copies before subsequent prefill/decode
+                // mutates recurrent state or needs unique buffer ownership.
+                prefillBoundarySnapshots[boundary] = makePromptBoundaryCacheSnapshot(from: cache)
+            }
+        }
+        try Task.checkCancellation()
+        return try model.prepare(segment(consumed, size), cache: cache, windowSize: windowSize)
+    }
+
+    /// Reloading a model drops the disk cache's in-process validation records.
+    /// Validate the exact older checkpoint before replaying its entire prefix.
+    /// Scratch restoration never changes the live target or drafter state.
+    private func validateStableDiskBoundary(
+        tokens: [Int], coordinator: CacheCoordinator
+    ) -> Bool {
+        if coordinator.hasValidatedDiskEntry(tokens: tokens, mediaSalt: mediaSalt) {
+            return true
+        }
+        // Only native in-file recurrent state is covered here. Separate
+        // companions keep their existing production/validation path.
+        guard !Task.isCancelled,
+            coordinator.requiresRecurrentSSMCompanion,
+            !coordinator.requiresSeparateRecurrentPayload,
+            let disk = coordinator.diskCache,
+            case .arrays(let arrays) = disk.fetchCandidate(tokens: tokens, mediaSalt: mediaSalt)
+        else { return false }
+        var scratch = model.newCache(parameters: cacheInitParameters)
+        let restored = restoreFromDiskArrays(arrays, into: &scratch)
+        guard restored == tokens.count,
+            validateRestoredCacheBoundary(
+                scratch, matchedTokens: tokens.count, restoredTokens: restored,
+                detail: "native-mtp-stable-validation")
+        else {
+            // Candidate validation never counted an accepted cache hit.
+            _ = disk.markRestoreRejected(tokens: tokens, mediaSalt: mediaSalt, countedHit: false)
+            return false
+        }
+        return coordinator.hasValidatedDiskEntry(tokens: tokens, mediaSalt: mediaSalt)
+    }
+
     private func cacheSnapshotForBoundary(
         tokens: [Int],
         promptSnapshot: [KVCache],
@@ -1423,6 +1585,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     ) -> [KVCache]? {
         guard !tokens.isEmpty, tokens.count < promptTokenIds.count else {
             return nil
+        }
+        if let captured = prefillBoundarySnapshots[tokens.count],
+            !captured.isEmpty,
+            captured.allSatisfy({ $0.offset == tokens.count })
+        {
+            return captured
         }
         guard let boundaryInput = originalInput.inputForCacheBoundary(
             tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
@@ -1490,8 +1658,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // The mode string is passed task-locally around the verify forward
         // ONLY; it must never leak into prefill/seed/sequential forwards.
         let explicitHybridMode = Self.nativeMTPHybridVerifySetting(verifierModeSetting)
+        // Sampled requests take the staged verify too: the staged commit only needs the
+        // accepted row count, which the sampled acceptance produces exactly like greedy does.
+        // Before 2026-10-07 every sampled hybrid request (= every default app request, the
+        // bundle sampler is T=1.0) went through serial verifier repair.
         let stagedCapable = usesHybridMambaCache
-            && speculativeSampler.isGreedy
+            && (speculativeSampler.isGreedy || Self.sampledStagedVerifyEnabled)
             && processor == nil
             && model is DFlash2StagedVerifyRollbackModel
         let stagedVerify = stagedCapable
@@ -1573,11 +1745,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 cache,
                 verifierMode: verifierModeSetting)
         let canCommitVerifierCache = Self.canCommitVerifierCache(cache)
-        let requiresSequentialRepair = Self.requiresSequentialVerifierRepair(
+        let requiresSequentialRepair = !stagedVerify && Self.requiresSequentialVerifierRepair(
             cache,
             speculativeSampler: speculativeSampler,
             verifierMode: verifierModeSetting)
-        let needsBatchedVerifierRecovery = speculativeSampler.isGreedy && processor == nil
+        let needsBatchedVerifierRecovery = (speculativeSampler.isGreedy || stagedVerify)
+            && processor == nil
         let checkpoint: NativeMTPCacheCheckpoint?
         if let consumedPrefetch {
             // The forward already ran at submit time; a checkpoint taken now
@@ -1643,7 +1816,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         chunkVerifierCount += 1
 
         let sampleStart = NativeMTPClock.now()
-        guard let verifyDecision = Self.verifyDrafts(
+        let fastSampled = sampledTopKDecision(logits: verifier.logits, draftTokenIds:
+            requestedInputIds.dropFirst().map(Int.init))
+        guard let verifyDecision = fastSampled ?? Self.verifyDrafts(
             logits: verifier.logits,
             drafts: drafts,
             draftTokenIds: requestedInputIds.dropFirst().map(Int.init),
@@ -1963,8 +2138,25 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 requiresRepair: repairedHiddenForNextMTP != nil))
         if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
+            draftsAreCopy = false
             draftProbabilities.removeAll(keepingCapacity: true)
             return
+        }
+        if draftsAreCopy {
+            copyProposer?.observe(drafted: drafts.count, accepted: accepted)
+        }
+        // Copy window for the next cycle (greedy staged verify only). With a proposal the head still drafts
+        // ONE level: that forward commits this cycle's confirmed pairs to the aligned head cache (later head
+        // drafts need that context); its single draft is then superseded by the copies.
+        var copyWindow: [Int] = []
+        if stagedVerify, speculativeSampler.isGreedy || topKAcceptance != nil, processor == nil,
+            NativeMTPCopyProposer.enabled
+        {
+            if copyProposer == nil { copyProposer = NativeMTPCopyProposer(prompt: promptTokenIds) }
+            feedCopyProposer()
+            let queued = pendingTokens.count - pendingIndex
+            let room = (maxTokens ?? Int.max / 2) - tokenCount - queued - 1
+            copyWindow = copyProposer?.propose(room: room) ?? []
         }
         let draftStart = NativeMTPClock.now()
         let draftBatch = Self.makeDrafts(
@@ -1972,12 +2164,20 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             hidden: alignedCommitHidden ?? hiddenForNextMTP,
             nextToken: alignedCommitTokens ?? nextToken,
             mtpCache: mtpCache,
-            depth: currentDepth,
+            depth: copyWindow.isEmpty ? currentDepth : 1,
             sampler: sampler,
             speculativeSampler: speculativeSampler,
             processor: processor)
-        drafts = draftBatch.tokens
-        draftProbabilities = draftBatch.probabilities
+        if copyWindow.isEmpty {
+            drafts = draftBatch.tokens
+            draftProbabilities = draftBatch.probabilities
+            draftsAreCopy = false
+        } else {
+            let dtype = nextToken.dtype
+            drafts = copyWindow.map { MLXArray([Int32($0)]).asType(dtype) }
+            draftProbabilities = []
+            draftsAreCopy = true
+        }
         // Levels beyond the first append speculative rows to the head
         // cache; record how many so the next cycle trims them before
         // committing confirmed pairs over the top.
@@ -2316,6 +2516,10 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let previous = currentDepth
         recordDepthLoss()
         currentDepth -= 1
+        if depthChooser != nil {
+            depthChooserHold = (currentDepth, verifyCalls + Self.arSafetyWindow + 1)
+            depthChooserLastStamp = nil
+        }
         adaptiveDepthDownshiftCount += 1
         adaptiveWallClockDemotes += 1
         arSafetyRing.removeAll(keepingCapacity: true)
@@ -2351,6 +2555,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         lastAdaptiveCycleTimestamp = nil
         adaptiveFallbackReason = reason
         drafts.removeAll(keepingCapacity: true)
+        draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
         FileHandle.standardError.write(Data("[NativeMTP] ar_safety paused: \(reason)\n".utf8))
     }
@@ -2419,6 +2624,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             speculativeSampler: speculativeSampler,
             processor: processor)
         drafts = draftBatch.tokens
+        draftsAreCopy = false
         draftProbabilities = draftBatch.probabilities
         headChainPairs = canAlignHeadCache
             ? Swift.max(0, draftBatch.tokens.count - 1) : 0
@@ -2443,9 +2649,23 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             && speculativeRows == 0 && !requiresRepair
     }
 
+    private mutating func feedCopyProposer() {
+        guard copyProposer != nil, copyFed < pendingTokens.count else { return }
+        copyProposer!.append(pendingTokens[copyFed...])
+        copyFed = pendingTokens.count
+    }
+
     private mutating func updateDepthAfterCommittedCycle(
         accepted: Int, preserveConfirmedHead: Bool
     ) {
+        if draftsAreCopy {
+            // A copy window says nothing about the head's per-depth acceptance; it still counts
+            // toward measured MTP-vs-AR throughput. Its wall time must not be billed to a head depth.
+            arSafetyAfterVerifyCycle(accepted: accepted)
+            lastAdaptiveCycleTimestamp = nil
+            depthChooserLastStamp = nil
+            return
+        }
         let previousDepth = currentDepth
         let previousTrips = arSafetyTrips
         arSafetyAfterVerifyCycle(accepted: accepted)
@@ -2468,6 +2688,42 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             // steady-state cost, so complete warmup by cycle count alone.
             if !hybridSafetyWarmupComplete, verifyCalls >= Self.hybridWarmupCycleCount {
                 hybridSafetyWarmupComplete = true
+            }
+            return
+        }
+        if var chooser = depthChooser, stagedVerifierCommitCount > 0, speculativeSampler.isGreedy,
+            !forceAutoregressiveFallback
+        {
+            let now = NativeMTPClock.now()
+            let period = depthChooserLastStamp.flatMap { last in
+                last.cycle == verifyCalls - 1 ? now - last.time : nil
+            }
+            depthChooserLastStamp = (verifyCalls, now)
+            var ceiling = adaptiveDepthCeiling
+            if let hold = depthChooserHold {
+                if verifyCalls < hold.untilCycle {
+                    ceiling = Swift.min(ceiling, hold.depth)
+                } else {
+                    depthChooserHold = nil
+                }
+            }
+            let cycleDepth = currentDepth
+            chooser.observe(
+                cycleDepth: cycleDepth, accepted: accepted, seconds: period, ceiling: ceiling)
+            depthChooser = chooser
+            let next = chooser.depth
+            if next != currentDepth {
+                if next < currentDepth {
+                    adaptiveDepthDownshiftCount += 1
+                    adaptiveWallClockDemotes += 1
+                    if !preserveConfirmedHead {
+                        mtpCache = model.makeNativeMTPCache()
+                        mtpCacheRefreshCount += 1
+                    }
+                } else {
+                    adaptiveDepthPromotionCount += 1
+                }
+                currentDepth = next
             }
             return
         }
@@ -2726,6 +2982,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         forceAutoregressiveFallback = true
         adaptiveFallbackReason = reason
         drafts.removeAll(keepingCapacity: true)
+        draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
         mtpCache = model.makeNativeMTPCache()
         mtpCacheRefreshCount += 1
@@ -2774,6 +3031,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // Any drafts made before this AR step were built for the previous
         // position; they are stale now.
         drafts.removeAll(keepingCapacity: true)
+        draftsAreCopy = false
         draftProbabilities.removeAll(keepingCapacity: true)
         arSafetyAfterARStep(
             stepSec: NativeMTPClock.now() - verifyStart,
@@ -2970,6 +3228,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                 requiresRepair: false))
         if forceAutoregressiveFallback || arSafetyPaused {
             drafts.removeAll(keepingCapacity: true)
+            draftsAreCopy = false
             draftProbabilities.removeAll(keepingCapacity: true)
             return
         }
@@ -2984,6 +3243,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             speculativeSampler: speculativeSampler,
             processor: processor)
         drafts = draftBatch.tokens
+        draftsAreCopy = false
         draftProbabilities = draftBatch.probabilities
         headChainPairs = alignHeadHistory
             ? Swift.max(0, draftBatch.tokens.count - 1) : 0
@@ -3006,6 +3266,73 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         let probabilities: [MLXArray]
         let forwardCount: Int
         let materializeSyncTime: TimeInterval
+    }
+
+    static var sampledStagedVerifyEnabled: Bool {
+        ProcessInfo.processInfo.environment["VMLX_NATIVE_MTP_SAMPLED_STAGED"] != "0"
+    }
+
+    /// Sampled acceptance for the whole verify slab from ONE readback (top-k requests only).
+    /// Copy windows have no draft distribution: they are deterministic proposals, q = one-hot.
+    private mutating func sampledTopKDecision(logits: MLXArray, draftTokenIds: [Int])
+        -> VerifyDecision?
+    {
+        guard !speculativeSampler.isGreedy, processor == nil, let filter = topKAcceptance,
+            draftsAreCopy || draftProbabilities.count == drafts.count
+        else { return nil }
+        let rows = drafts.count + 1
+        let (ids, logprobs) = SpeculativeTopKAcceptance.topK(
+            logits: logits[0..., 0 ..< rows, 0...], filter: filter)
+        var qKept: MLXArray? = nil
+        var qDraft: MLXArray? = nil
+        if !draftsAreCopy, !drafts.isEmpty {
+            let q = concatenated(
+                draftProbabilities.map { $0.reshaped(1, -1) }, axis: 0)  // [D, V]
+            qKept = takeAlong(q, ids[0 ..< drafts.count, 0...], axis: -1)
+            let d = MLXArray(draftTokenIds.map(Int32.init)).reshaped(-1, 1)
+            qDraft = takeAlong(q, d, axis: -1)
+        }
+        let syncStart = NativeMTPClock.now()
+        MLX.eval([ids, logprobs] + [qKept, qDraft].compactMap { $0 })
+        let idRows = ids.asArray(Int32.self)
+        let lpRows = logprobs.asArray(Float.self)
+        let qKeptHost = qKept?.asType(.float32).asArray(Float.self)
+        let qDraftHost = qDraft?.asType(.float32).asArray(Float.self)
+        let syncTime = NativeMTPClock.now() - syncStart
+        let k = ids.dim(1)
+        var p: [[(id: Int, p: Double)]] = []
+        var qAtKept: [[Double]] = []
+        var qAtDraft: [Double] = []
+        for r in 0 ..< rows {
+            let lo = r * k
+            let dist = SpeculativeTopKAcceptance.distribution(
+                ids: idRows[lo ..< lo + k], logprobs: lpRows[lo ..< lo + k], filter: filter)
+            p.append(dist)
+            guard r < drafts.count else { continue }
+            if let qKeptHost, let qDraftHost {
+                // qKept is aligned with the UNSORTED top-k ids; map by id.
+                var byID: [Int: Double] = [:]
+                for j in 0 ..< k { byID[Int(idRows[lo + j])] = Double(qKeptHost[lo + j]) }
+                qAtKept.append(dist.map { byID[$0.id] ?? 0 })
+                qAtDraft.append(Double(qDraftHost[r]))
+            } else {
+                let draft = draftTokenIds[r]
+                qAtKept.append(dist.map { $0.id == draft ? 1 : 0 })
+                qAtDraft.append(1)
+            }
+        }
+        let decision = SpeculativeTopKAcceptance.acceptChain(
+            drafts: Array(draftTokenIds.prefix(drafts.count)), p: p, qAtKept: qAtKept,
+            qAtDraft: qAtDraft, rng: &hostRNG)
+        let next = decision.tokenIds[decision.accepted]
+        let dtype = drafts.first?.dtype ?? .int32
+        return VerifyDecision(
+            accepted: decision.accepted,
+            nextToken: MLXArray([Int32(next)]).asType(dtype),
+            targetTokenIds: decision.tokenIds,
+            acceptanceProbabilitySum: decision.acceptanceProbabilitySum,
+            acceptanceProbabilityCount: decision.acceptanceProbabilityCount,
+            materializeSyncTime: syncTime)
     }
 
     private static func verifyDrafts(

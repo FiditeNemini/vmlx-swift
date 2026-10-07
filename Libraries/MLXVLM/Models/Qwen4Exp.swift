@@ -8,10 +8,23 @@ import MLXNN
 
 
 
+/// Diagnostic only (RunBench BENCH_ROWEXACT): when `enabled`, every layer's output of the next forward is
+/// appended to `layers` so a verify row can be compared with the AR step layer by layer.
+public enum Qwen4ExpRowExactCapture {
+    nonisolated(unsafe) public static var enabled = false
+    nonisolated(unsafe) public static var layers: [MLXArray] = []
+    nonisolated(unsafe) public static var parts: [(String, MLXArray)] = []
+    nonisolated(unsafe) public static var partLayer = 0
+    static func part(_ layer: Int, _ name: String, _ value: MLXArray?) {
+        guard enabled, layer == partLayer, let value else { return }
+        parts.append((name, value))
+    }
+}
+
 enum Qwen4ExpRowExactProjection {
     /// Preserve qualified q8 single-row addressing for actual Flash verification.
     static func q8Projection(_ module: Linear, _ x: MLXArray) -> MLXArray? {
-        guard FlashVerificationScope.usesRowExactVerification(inputShape: x.shape),
+        guard FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "q8"),
             !CompiledDecodeTrace.isActive, x.ndim == 3, x.dim(0) == 1,
             (2...8).contains(x.dim(1)), x.dtype == .bfloat16,
             jangAllowsRawQuantizedProjection(module),
@@ -21,14 +34,25 @@ enum Qwen4ExpRowExactProjection {
             let biases = q.biases, biases.dtype == .float16
         else { return nil }
         let rows = x.dim(1)
-        // Leading singleton bank dimension broadcasts without physical copies.
-        // MLX currently promotes metadata/activations to F32 here; retain the
-        // existing QuantizedLinear BF16 output contract. Cost is unmeasured.
-        return quantizedMM(
-            x.reshaped(rows, 1, x.dim(-1)), q.weight[.newAxis, 0..., 0...],
-            scales: q.scales[.newAxis, 0..., 0...], biases: biases[.newAxis, 0..., 0...],
-            groupSize: 64, bits: 8, mode: .affine)
-            .reshaped(1, rows, q.weight.dim(0)).asType(x.dtype)
+        // Leading singleton bank dimension broadcasts without physical copies:
+        // M=1 per batch element keeps MLX's single-row qmv arithmetic, but
+        // streams the weight once PER ROW (lm_head 636 MB/row at q8).
+        func batched(_ input: MLXArray) -> MLXArray {
+            quantizedMM(
+                input.reshaped(input.dim(0), 1, input.dim(-1)), q.weight[.newAxis, 0..., 0...],
+                scales: q.scales[.newAxis, 0..., 0...], biases: biases[.newAxis, 0..., 0...],
+                groupSize: 64, bits: 8, mode: .affine
+            )
+            .reshaped(input.dim(0), q.weight.dim(0)).asType(input.dtype)
+        }
+        // Same per-row arithmetic, weights streamed once for all rows (bitwise-admitted per shape).
+        let flat = x.reshaped(rows, x.dim(-1))
+        if let fused = Qwen4ExpBF16Affine.mlxQ8Rows(
+            flat, weight: q.weight, scales: q.scales, biases: biases, reference: batched)
+        {
+            return fused.reshaped(1, rows, q.weight.dim(0))
+        }
+        return batched(flat).reshaped(1, rows, q.weight.dim(0))
     }
 
 
@@ -477,7 +501,8 @@ private final class Qwen4ExpGatedResidual: Module {
     }
 
     func mix(_ hyper: MLXArray, normalizedInput: MLXArray? = nil) -> (MLXArray, MLXArray?) {
-        let joinedVerifyProjection = FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape)
+        let joinedVerifyProjection =
+            FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape, site: "hcjoin")
             && combines && hcCount == 4 && hiddenSize == 2560
             && hyper.dim(2) == 10240
             && (normalizedInput.map { $0.shape == hyper.shape && $0.dtype == hyper.dtype } ?? true)
@@ -564,7 +589,8 @@ private final class Qwen4ExpGatedResidual: Module {
             mixedDown = parts[0]
             injected = parts[1]
         } else {
-            if FlashVerificationScope.usesRowExactVerification(inputShape: normalized.shape),
+            if FlashVerificationScope.usesRowExactVerification(
+                inputShape: normalized.shape, site: "hcdown"),
                 !CompiledDecodeTrace.isActive, normalized.ndim == 3,
                 normalized.dim(0) == 1, (2...8).contains(normalized.dim(1)),
                 normalized.dtype == .bfloat16, mixDown.weight.dtype == .bfloat16,
@@ -584,8 +610,12 @@ private final class Qwen4ExpGatedResidual: Module {
         let scaled = mixedDown / Float(hcCount)
         var weights = silu(scaled)
         let projected: MLXArray
-        if FlashVerificationScope.usesRowExactVerification(inputShape: weights.shape),
-            combines, hcCount == 4, hiddenSize == 2560,
+        // Not gated on `combines`: the FINAL hyper-connection mixer (combines == false) has the same
+        // [10240, 320] up-projection, and leaving it on the multi-row matmul made verify row != AR row in the
+        // last mixer (found 2026-10-06 by BENCH_ROWEXACT_LAYERS_AT on 2L pos 52 / 6S pos 1: every decoder layer
+        // bitwise equal, logits off by 0.0625, first differing "layer" = the final mixer).
+        if FlashVerificationScope.usesRowExactVerification(inputShape: weights.shape, site: "hcup"),
+            hcCount == 4, hiddenSize == 2560,
             !(mixUp is QuantizedLinear), mixUp.bias == nil,
             let rowInvariant = Qwen4ExpHCUpProjection.project(weights, weight: mixUp.weight)
         {
@@ -1218,7 +1248,7 @@ private final class Qwen4ExpAttention: Module {
             mask = .array(causal)
         }
         let attended: MLXArray
-        if FlashVerificationScope.usesRowExactVerification(inputShape: x.shape),
+        if FlashVerificationScope.usesRowExactVerification(inputShape: x.shape, site: "attn"),
             (3...8).contains(S), B == 1, let cache,
             case .array(let causal) = mask
         {
@@ -1393,8 +1423,11 @@ private final class Qwen4ExpDecoderLayer: Module {
         }
         // PLE changes the residual before attention; a norm prepared before PLE
         // would be stale. The caller also avoids preparing it for these layers.
+        Qwen4ExpRowExactCapture.part(layerIndex, "after_ple", hyper)
         let (attentionInput, inject) = attentionResidual.mix(
             hyper, normalizedInput: ple == nil ? normalizedInput : nil)
+        Qwen4ExpRowExactCapture.part(layerIndex, "attn_mix_input", attentionInput)
+        Qwen4ExpRowExactCapture.part(layerIndex, "attn_mix_inject", inject)
         let attentionOutput = isLinear
             ? linearAttention!(
                 attentionInput, cache: cache as? MambaCache,
@@ -1407,10 +1440,14 @@ private final class Qwen4ExpDecoderLayer: Module {
         let preparedMLP = fuseHCCombineNorm
             ? mlpResidual.combineAndNormalize(hyper, block: attentionOutput, injection: inject!)
             : nil
+        Qwen4ExpRowExactCapture.part(layerIndex, "attn_out", attentionOutput)
         hyper = preparedMLP?.residual
             ?? attentionResidual.combine(hyper, block: attentionOutput, injection: inject!)
+        Qwen4ExpRowExactCapture.part(layerIndex, "attn_combined", hyper)
         let (mlpInput, mlpInject) = mlpResidual.mix(hyper, normalizedInput: preparedMLP?.normalized)
+        Qwen4ExpRowExactCapture.part(layerIndex, "mlp_mix_input", mlpInput)
         let block = mlp(mlpInput)
+        Qwen4ExpRowExactCapture.part(layerIndex, "moe_out", block)
         if fuseHCCombineNorm,
             let prepared = nextMixer?.combineAndNormalize(hyper, block: block, injection: mlpInject!)
         {
@@ -1625,7 +1662,8 @@ private final class Qwen4ExpTextModel: Module {
         let verifyEarlySubmit = inputIds.ndim == 2 && inputIds.dim(0) == 1
             && (2...8).contains(inputIds.dim(1))
             && FlashVerificationScope.usesRowExactVerification(
-                inputShape: inputIds.shape + [config.base.textConfiguration.hiddenSize])
+                inputShape: inputIds.shape + [config.base.textConfiguration.hiddenSize],
+                site: "early")
             && recordPrefixCommitStates && pleEmbeddings == nil
             && !CompiledDecodeTrace.isActive
         let earlySubmit = verifyEarlySubmit || Qwen4ExpEarlySubmission.allows(
@@ -1677,6 +1715,7 @@ private final class Qwen4ExpTextModel: Module {
                 nextMixer: fuseHCCombineNorm ? nextMixer : nil)
             hidden = result.hidden
             normalizedNext = result.normalizedNext
+            if Qwen4ExpRowExactCapture.enabled { Qwen4ExpRowExactCapture.layers.append(hidden) }
             if earlySubmit {
                 if let normalizedNext { asyncEval(hidden, normalizedNext) }
                 else { asyncEval(hidden) }
@@ -1691,6 +1730,7 @@ private final class Qwen4ExpTextModel: Module {
             if auditDTypes { layerDTypes.append(hidden.dtype) }
         }
         let result = mixer.mix(hidden, normalizedInput: normalizedNext).0
+        if Qwen4ExpRowExactCapture.enabled { Qwen4ExpRowExactCapture.layers.append(result) }
         if let rotaryContext {
             let shape = "\(rotaryContext.factorCount)|\(rotaryContext.reuseCount)"
             if reportedRotaryReuseShapes.insert(shape).inserted {
@@ -2596,3 +2636,7 @@ final class Qwen4ExpMHCSubstageBridge {
     }
 }
 #endif
+
+/// Qwen4Exp keeps the media M-RoPE offset IN the cache (`mediaPositionOffset`) and every native
+/// forward applies it (`ropeDelta(for:)`), so copies and disk restores carry it too.
+extension Qwen4Exp: NativeMTPMediaCapable {}

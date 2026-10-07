@@ -729,7 +729,7 @@ public actor BatchEngine {
         // any speculation, which is the worst kind of failure because it
         // looks exactly like success.
         if parameters.draftStrategy?.usesDFlash2 == true,
-            DFlash2TokenIterator.unservableReason(parameters) == nil
+            DFlash2TokenIterator.unservableReason(parameters, input: input, model: context.model) == nil
         {
             guard canStartExclusiveSoloPath else {
                 Self.logger.error(
@@ -1296,7 +1296,7 @@ public actor BatchEngine {
                     structuredOutput: soloParameters.jsonSchema != nil)
             } else if let strategy = soloParameters.draftStrategy,
                 let drafterPath = strategy.dflash2DrafterPath,
-                DFlash2TokenIterator.unservableReason(soloParameters) == nil
+                DFlash2TokenIterator.unservableReason(soloParameters, input: input, model: context.model) == nil
             {
                 guard let dflashTarget = context.model as? any DFlash2Target else {
                     throw DFlash2RuntimeError.drafterTargetMismatch(
@@ -1311,14 +1311,32 @@ public actor BatchEngine {
                 let deferredParameters = soloParameters
                 let deferredBlockSize = strategy.dflash2BlockSize
                 let deferredDrafterPath = drafterPath
+                let deferredDisableRestore = requiresFreshToolSelection
+                let deferredSkipSeedBoundary = skipDiskBackedToolPromptSeedBoundary
+                let deferredContinuation = continuation
                 let deferredInputs = SendableBox(
                     (input, dflashTarget, cacheCoordinator))
                 let makeIterator: @Sendable () throws -> any TokenIteratorProtocol = {
                     try Task.checkCancellation()
                     let (deferredInput, deferredTarget, deferredCoordinator) =
                         deferredInputs.consume()
-                    let deferredDrafter = try DFlash2DrafterResolver.shared.drafter(
-                        at: deferredDrafterPath)
+                    guard
+                        let deferredDrafter = try DFlash2DrafterResolver.shared.optionalDrafter(
+                            at: deferredDrafterPath)
+                    else {
+                        var arParameters = deferredParameters
+                        arParameters.draftStrategy = nil
+                        return try TokenIterator(
+                            input: deferredInput, model: deferredTarget,
+                            cache: nil, parameters: arParameters,
+                            cacheCoordinator: deferredCoordinator,
+                            disableDiskBackedRequiredToolRestore: deferredDisableRestore,
+                            skipDiskBackedToolPromptSeedBoundary: deferredSkipSeedBoundary,
+                            prefillProgressHandler: { progress in
+                                deferredContinuation.yield(
+                                    .prefillProgress(prefillGate.clamp(progress)))
+                            })
+                    }
                     try Task.checkCancellation()
                     return try DFlash2TokenIterator(
                         input: deferredInput,
@@ -1341,7 +1359,7 @@ public actor BatchEngine {
                     structuredOutput: soloParameters.jsonSchema != nil)
             } else if let strategy = soloParameters.draftStrategy,
                 case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
-                soloParameters.canUseNativeMTP(for: input)
+                soloParameters.canUseNativeMTP(for: input, model: context.model)
             {
                 guard let nativeModel = context.model as? any NativeMTPModel else {
                     throw NativeMTPRuntimeError.modelDoesNotExposeNativeMTP

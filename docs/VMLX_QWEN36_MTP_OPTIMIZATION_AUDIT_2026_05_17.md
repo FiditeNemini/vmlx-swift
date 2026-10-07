@@ -1,5 +1,8 @@
 # Qwen3.6 Native MTP Optimization Audit - 2026-05-17
 
+> Historical measurement/implementation record. For current product defaults and controls, see [Speculative decoding defaults](SPECULATIVE_DECODING_DEFAULTS.md). Fixed-depth probes here are diagnostics, not current user settings.
+
+
 This is the working audit for `goalnew.md`. It records the current Swift MTP
 speed/correctness state after the chunk verifier investigation. It is not a
 global production claim, and it does not enable MTP automatically.

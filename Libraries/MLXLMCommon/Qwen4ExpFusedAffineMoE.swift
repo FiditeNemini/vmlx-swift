@@ -394,8 +394,10 @@ public enum Qwen4ExpFusedAffineMoE {
             let leadingShape = Array(input.shape.dropLast())
             // Extra verifier rows must retain the single-row expert arithmetic.
             // Keep ordinary prefill and other model geometries on their existing routes.
-            let rowLimit = shape == qwen4ExpShape
-                && FlashVerificationScope.usesRowExactVerification(inputShape: input.shape)
+            let rowLimit =
+                shape == qwen4ExpShape
+                    && FlashVerificationScope.usesRowExactVerification(
+                        inputShape: input.shape, site: "moe")
                 ? 8 : maximumRows
             guard input.dtype == .bfloat16,
                 scores.dtype == .bfloat16 || scores.dtype == .float32,

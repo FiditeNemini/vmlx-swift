@@ -843,3 +843,86 @@ private func withEnvironmentValue<R>(
         #expect(opts.compressPct == 70)
     }
 }
+
+/// The Qwen4Exp n-gram table is read from SSD on demand; residency, materialization and the JANGH scheduling
+/// allowance must size against the GPU-resident weights only (Allosaurus: 32.5 GB of an 88 GB bundle).
+@Suite("Load facts separate SSD-resident n-gram tables")
+struct LoadBundleFactsNGramTests {
+    @Test("n-gram embedding shards are excluded from GPU-resident weight bytes")
+    func ngramBytesExcluded() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("facts-ngram-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(#"{"model_type":"qwen4_exp"}"#.utf8).write(to: root.appendingPathComponent("config.json"))
+        let header: [String: Any] = [
+            "language_model.layers.0.ple.ngram_embedding.shards.0.weight":
+                ["dtype": "U32", "shape": [1000], "data_offsets": [0, 4000]],
+            "language_model.layers.0.ple.key_proj.weight": ["dtype": "F16", "shape": [500], "data_offsets": [4000, 5000]],
+            "language_model.layers.0.mlp.gate.weight": ["dtype": "F16", "shape": [1000], "data_offsets": [5000, 7000]],
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(bytes)
+        file.append(Data(count: 7000))
+        try file.write(to: root.appendingPathComponent("model.safetensors"))
+
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.ssdResidentTableBytes == 4000)
+        #expect(facts.totalSafetensorsBytes == UInt64(file.count))
+        #expect(facts.gpuResidentWeightBytes == UInt64(file.count) - 4000)
+    }
+
+    @Test("invalid n-gram offsets cannot trap or subtract absent payload bytes",
+        arguments: [[-1, 4], [Int.min, Int.max], [0, Int.max], [4, 3], [0, 17]])
+    func invalidNGramOffsetsAreNotSubtracted(offsets: [Int]) throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("facts-ngram-invalid-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        // A second valid table shares the shard. Rejecting one malformed
+        // descriptor must not change valid packed-shard accounting.
+        let header: [String: Any] = [
+            "language_model.layers.0.ple.ngram_embedding.shards.0.weight":
+                ["dtype": "U32", "shape": [1], "data_offsets": offsets],
+            "language_model.layers.0.ple.ngram_embedding.shards.1.weight":
+                ["dtype": "U32", "shape": [1], "data_offsets": [12, 16]],
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(bytes)
+        file.append(Data(count: 16))
+        try file.write(to: root.appendingPathComponent("model.safetensors"))
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.ssdResidentTableBytes == 4)
+        #expect(facts.gpuResidentWeightBytes == UInt64(file.count) - 4)
+    }
+
+    @Test("truncated n-gram payload remains in the conservative resident estimate")
+    func truncatedNGramPayloadIsNotSubtracted() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("facts-ngram-short-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let header: [String: Any] = [
+            "language_model.layers.0.ple.ngram_embedding.shards.0.weight":
+                ["dtype": "U32", "shape": [4], "data_offsets": [0, 16]],
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(bytes)
+        file.append(Data(count: 15))
+        try file.write(to: root.appendingPathComponent("model.safetensors"))
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.ssdResidentTableBytes == 0)
+        #expect(facts.gpuResidentWeightBytes == UInt64(file.count))
+    }
+
+    @Test("bundles without an n-gram table keep every byte as weights")
+    func noNGramTable() {
+        var facts = LoadBundleFacts(totalSafetensorsBytes: 10, isRouted: false, physicalMemory: 100)
+        #expect(facts.gpuResidentWeightBytes == 10)
+        facts.ssdResidentTableBytes = 20
+        #expect(facts.gpuResidentWeightBytes == 0)
+    }
+}

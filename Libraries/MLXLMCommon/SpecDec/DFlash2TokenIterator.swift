@@ -67,6 +67,10 @@ public enum DFlash2RuntimeError: Error, LocalizedError {
 /// can show acceptance without a debug build.
 public struct DFlash2GenerationStats: Sendable, Equatable {
     public var blockSize: Int = 0
+    /// Cycles run at each verify width (DFlash2WidthChooser).
+    public var widthCycles: [Int: Int] = [:]
+    /// Cycles verified as a draft TREE (DFlash2Tree.swift) instead of a chain.
+    public var treeCycles: Int = 0
     public var verifyCalls: Int = 0
     public var draftedTokens: Int = 0
     public var acceptedTokens: Int = 0
@@ -93,6 +97,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
 
     private var cache: [KVCache]
     private var draftCache: [KVCache]
+    /// Absolute position of the drafter cache's first row (see init). Rows in the drafter cache = committed
+    /// context rows after that base.
+    private var draftPositionBase = 0
+    /// All-sliding drafters see at most `window - 1` context rows; nil otherwise.
+    private var drafterContextLimit: Int?
+    private var committedDraftRows: Int { promptTokenIds.count + stats.emittedTokens - 1 - draftPositionBase }
     private let cacheCoordinator: CacheCoordinator?
 
     private let sampler: LogitSampler
@@ -197,6 +207,19 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// Whether full-size blocks run the staged verify (attention caches
     /// promoted to Compilable buffers; GDN commits from staging slots).
     private var useStagedVerify = false
+    /// Per-cycle verify width chooser (nil = fixed `blockSize`).
+    private var widthChooser: DFlash2WidthChooser?
+
+    // MARK: draft trees (DFlash2Tree.swift)
+    /// nil = not resolved yet (needs the post-prefill cache); then fixed for the request.
+    private var treeMode: Bool?
+    private var treeFilter: SpeculativeTopKAcceptance.Filter?
+    private var treeRNG: SpeculativeHostRNG
+    /// The next cycle's lattice, dispatched right after a commit so the drafter runs on the GPU
+    /// while the host streams the committed tokens.
+    private var pendingLattice: DFlash2LatticeArrays?
+    private static let treePrefetchEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DFLASH2_TREE_PREFETCH"] != "0"
     /// The first staged cycle runs EAGERLY to allocate the staging slots;
     /// `compile()` needs those objects to exist before the trace.
     private var stagedVerifyWarm = false
@@ -258,12 +281,25 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// per step. A block is drafted before any of those could have seen
     /// the tokens inside it, so accepting under them would emit a
     /// distribution the caller did not ask for.
+    static func mediaServable(model: Any?) -> Bool {
+        model is DFlash2MediaPrefillModel
+            && ProcessInfo.processInfo.environment["VMLX_DFLASH2_MEDIA"] != "0"
+    }
+
     /// Fewest positions a drafted block can carry. One position is the
     /// anchor, so a block of 2 drafts a single speculative token; below that
     /// there is nothing to draft.
     static let minimumBlockSize = 2
 
-    static func unservableReason(_ parameters: GenerateParameters) -> String? {
+    static func unservableReason(
+        _ parameters: GenerateParameters, input: LMInput? = nil, model: Any? = nil
+    ) -> String? {
+        // Media is prefilled through the target's own vision path
+        // (`DFlash2MediaPrefillModel`) and then drafted/verified as text at the media-shifted
+        // positions. A target without that path cannot consume the merged embeddings.
+        if input?.hasMediaContent == true, !Self.mediaServable(model: model) {
+            return "media input requires ordinary model preparation"
+        }
         // A penalty of exactly 1.0 (repetition) or 0 (presence/frequency)
         // is the identity. Bundles ship those as explicit defaults —
         // Qwen3.8 stamps `repetition_penalty: 1.0` — so treating "set" as
@@ -326,7 +362,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         if let maxTokens = parameters.maxTokens, maxTokens <= 1 {
             throw DFlash2RuntimeError.maxTokensTooSmall
         }
-        if let reason = Self.unservableReason(parameters) {
+        if let reason = Self.unservableReason(parameters, input: input, model: target) {
             throw DFlash2RuntimeError.unsupportedSampling(reason)
         }
 
@@ -351,6 +387,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             effectiveParameters.kvMode = policy.kvMode
             effectiveParameters.maxKVSize = policy.maxKVSize
         }
+
+        // DFlash2 decodes only through multi-row verify forwards. MLX's quantized matmul switches
+        // kernels with the row count; the lane matmul (LaneQMM.swift, Metal 4 matrix units) costs about
+        // the same for 1...16 rows. Installed once per target model, target only (the drafter keeps MLX).
+        LaneQMM.installForDFlash2Target(target)
 
         self.target = target
         self.drafter = drafter
@@ -379,6 +420,21 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             && ProcessInfo.processInfo.environment["VMLX_DFLASH2_ADAPTIVE_BLOCK"] == "1"
         self.adaptiveBlockSize =
             self.adaptiveBlockSizeEnabled ? Self.recallLearnedBlockSize() : nil
+        // Per-cycle verify width (DFlash2WidthChooser): (8, 16) on lane-flat targets, else (5, 8, 16).
+        // The configured `blockSize` stays the trained width so the staged verify keeps its shape;
+        // other widths take the eager input-capture path. Off when the caller pinned a size, when the
+        // legacy probe ladder is on, or with VMLX_DFLASH2_WIDTHS=0.
+        if requestedBlockSize == nil, !self.adaptiveBlockSizeEnabled,
+            ProcessInfo.processInfo.environment["VMLX_DFLASH2_WIDTHS"] != "0"
+        {
+            let widths = DFlash2WidthChooser.plan(
+                trained: config.blockSize, laneFlat: LaneQMM.isLaneFlat(target))
+            if widths != [effectiveBlockSize] {
+                self.widthChooser = DFlash2WidthChooser(
+                    widths: widths,
+                    costs: DFlash2WidthCostTable.shared(for: target as AnyObject, widths: widths))
+            }
+        }
         self.maskTokenID = config.maskTokenId
         self.maxTokens = effectiveParameters.maxTokens
         self.promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
@@ -386,6 +442,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.originalInput = input
         self.cacheInitParameters = effectiveParameters
         self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
+        self.treeRNG = SpeculativeHostRNG(seed: effectiveParameters.randomSeed)
+        var treeFilter = SpeculativeTopKAcceptance.Filter(
+            temperature: effectiveParameters.temperature, topP: effectiveParameters.topP,
+            topK: effectiveParameters.topK, minP: 0)
+        treeFilter?.nucleusWithinTopK = true
+        self.treeFilter = treeFilter
         self.contextHidden = MLXArray.zeros([1, 0, 1])
         self.lastToken = 0
 
@@ -406,6 +468,16 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // MARK: prefix reuse
 
         var tokensToPrefill = self.promptTokenIds
+        // Media: prefilled through the target's vision path. A restored (media-salted) entry is
+        // continued at positions recomputed from the full prompt's token ids + media grids, so
+        // the entry itself never needs to carry the M-RoPE delta. A suffix that carries a media
+        // placeholder (a new image this turn) resets to a full prefill below.
+        let mediaPrefill = input.hasMediaContent
+        let mediaTarget = target as? DFlash2MediaPrefillModel
+        if !mediaPrefill {
+            // Text-only: never inherit an EARLIER request's media position delta.
+            mediaTarget?.dflash2ResetPositionState()
+        }
         if let coordinator = cacheCoordinator, !tokensToPrefill.isEmpty,
             !input.requiresPostPrepareCacheKey
         {
@@ -424,22 +496,37 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     coordinator.setPagedIncompatible(true)
                 }
             }
+            // Always leave one token to produce the drafter's hidden seed.
+            // For path-dependent caches, request N-1 itself so BOTH paged
+            // and disk tiers can choose a safe prefix. Merely skipping the
+            // exact disk probe still lets a paged N hit hide an N-1 snapshot.
+            let needsReplayBoundary =
+                cacheRequiresDiskBackedCoordinatorRestore(self.cache)
+                || self.cache.contains { !$0.isTrimmable }
+            let lookupTokens =
+                needsReplayBoundary
+                ? Array(tokensToPrefill.dropLast()) : tokensToPrefill
             let result = coordinator.fetch(
-                tokens: tokensToPrefill,
+                tokens: lookupTokens,
                 mediaSalt: mediaSalt,
                 preferredDiskBoundaries: input.cacheStablePrefixTokenCounts,
                 chainId: parameters.cacheChainId)
             if case .hit(
-                let matchedTokens, let remainingTokens, let detail, let blocks, let ssmStates,
+                let matchedTokens, _, let detail, let blocks, let ssmStates,
                 let diskArrays) = result
             {
+                // Lookup may stop at N-1; restore suffix belongs to the full
+                // logical prompt, including its final token.
+                let remainingTokens = Array(tokensToPrefill.dropFirst(matchedTokens))
                 var restored = false
+                var restoredTokenCount = 0
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(
                         from: blocks, into: self.cache,
                         preserveStandardKVStorageDType: coordinator.config.preserveStandardKVStorageDType)
                     coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
+                        restoredTokenCount = restoredTokens
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: self.cache, boundary: matchedTokens)
                         }
@@ -451,8 +538,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 // drafter's cache is separate), so an entry that does not
                 // fit it fits neither, and is reported the same way.
                 if let diskArrays, !restored {
-                    if restoreFromDiskArrays(
-                                diskArrays, into: &self.cache, requirePromptBoundary: true) > 0 {
+                    let diskRestoredTokens = restoreFromDiskArrays(
+                        diskArrays, into: &self.cache, requirePromptBoundary: true)
+                    if diskRestoredTokens > 0 {
+                        restoredTokenCount = diskRestoredTokens
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: self.cache, boundary: matchedTokens)
                         }
@@ -465,6 +554,23 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                             reason: "payload does not fit the runtime cache")
                     }
                 }
+                if restored,
+                    !validateRestoredCacheBoundary(
+                        self.cache, matchedTokens: matchedTokens,
+                        restoredTokens: restoredTokenCount, detail: "dflash2")
+                {
+                    if detail == .disk {
+                        coordinator.reportDiskRestoreRejected(
+                            tokens: tokensToPrefill, boundary: matchedTokens,
+                            mediaSalt: mediaSalt,
+                            reason: "restored offsets do not match the boundary")
+                    }
+                    restored = false
+                }
+                if !restored {
+                    // A rejected payload may already have mutated some layers.
+                    self.cache = target.newCache(parameters: effectiveParameters)
+                }
                 if restored, Self.traceEnabled {
                     let offsets = Set(self.cache.map(\.offset)).sorted()
                     let kvLens = self.cache.compactMap { ($0 as? KVCacheSimple)?.state.first?.dim(2) }
@@ -473,7 +579,16 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                             .utf8))
                 }
                 if restored {
-                    if input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens) {
+                    // A full hit needs one token replayed for drafter hidden state.
+                    // Recurrent/ring companions cannot be rewound by trimming KV.
+                    // Keep this defense even if a future lookup returns a full hit.
+                    let unsafeFullHit =
+                        remainingTokens.isEmpty
+                        && (cacheRequiresDiskBackedCoordinatorRestore(self.cache)
+                            || self.cache.contains { !$0.isTrimmable })
+                    if unsafeFullHit
+                        || input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
+                    {
                         self.cache = target.newCache(parameters: effectiveParameters)
                     } else if remainingTokens.isEmpty, let last = tokensToPrefill.last {
                         // A full hit still has to re-run the final token so
@@ -510,6 +625,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             config.layerTypes.allSatisfy { $0 == "sliding_attention" }
             ? (config.slidingWindow.map { $0 - 1 })
             : nil
+        self.drafterContextLimit = hiddenLimit
         // Same boundary rule as TokenIterator, so both iterators agree on
         // what the canonical cross-turn checkpoint is (hybrid SSM and
         // standalone rotating/SWA topologies).
@@ -536,15 +652,44 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             FileHandle.standardError.write(Data(line.utf8))
         }
         try Task.checkCancellation()
-        let prefill = try Self.prefill(
-            tokens: tokensToPrefill,
-            target: target,
-            cache: &self.cache,
-            captureLayerIDs: self.captureLayerIDs,
-            orderedLayerIDs: self.orderedLayerIDs,
-            hiddenLimit: hiddenLimit,
-            stepSize: effectiveParameters.prefillStepSize,
-            captureBoundaryAt: captureAt)
+        let prefill: PrefillResult
+        if mediaPrefill, let mediaTarget {
+            var retained: MLXArray?
+            var boundarySnapshot: [KVCache]?
+            let ordered = self.orderedLayerIDs
+            let restored = self.promptTokenIds.count - tokensToPrefill.count
+            let cacheRef = self.cache
+            let lastLogits = try mediaTarget.dflash2MediaPrefill(
+                input, cache: self.cache, captureLayerIDs: self.captureLayerIDs,
+                stepSize: effectiveParameters.prefillStepSize,
+                restoredPrefix: restored,
+                boundary: captureAt.map { $0 + restored },
+                onBoundary: { boundarySnapshot = cacheRef.map { $0.copy() } }
+            ) { captured in
+                let chunkHidden = extractContextFeature(captured: captured, targetLayerIDs: ordered)
+                let combined = retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
+                if let limit = hiddenLimit, combined.dim(1) > limit {
+                    retained = combined[0..., (combined.dim(1) - limit)..., 0...]
+                } else {
+                    retained = combined
+                }
+                if let retained { MLX.eval(retained) }
+            }
+            guard let retained else { throw DFlash2RuntimeError.emptyPrompt }
+            MLX.eval(lastLogits, retained)
+            prefill = PrefillResult(
+                lastLogits: lastLogits, hidden: retained, boundarySnapshot: boundarySnapshot)
+        } else {
+            prefill = try Self.prefill(
+                tokens: tokensToPrefill,
+                target: target,
+                cache: &self.cache,
+                captureLayerIDs: self.captureLayerIDs,
+                orderedLayerIDs: self.orderedLayerIDs,
+                hiddenLimit: hiddenLimit,
+                stepSize: effectiveParameters.prefillStepSize,
+                captureBoundaryAt: captureAt)
+        }
         if Self.traceEnabled {
             let logitsShape = prefill.lastLogits.shape
             let hiddenShape = prefill.hidden.shape
@@ -564,12 +709,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.contextHidden = prefill.hidden
         self.stats.seededContextRows = prefill.hidden.dim(1)
 
-        // The drafter's cache starts counting where the retained hidden
-        // window starts, so its RoPE positions line up with the target's.
-        let hiddenOffset = self.cache.first.map { $0.offset - prefill.hidden.dim(1) } ?? 0
-        for c in self.draftCache {
-            c.offsetForDFlash2 = Swift.max(0, hiddenOffset)
-        }
+        // The drafter cache counts PHYSICAL rows from 0; the absolute position of its first row (the retained hidden
+        // window's start) is kept apart in `draftPositionBase`. Shifting an empty cache's offset instead left the
+        // drafter's RotatingKVCache with offset ahead of its fill: the next update returned `keys[..<offset]` with
+        // zero rows and `temporalOrder` treated the unwrapped ring as wrapped, so after ANY prefix restore (or a
+        // prompt longer than the drafter window) the drafter attended to zero rows and acceptance collapsed (27B
+        // JANGH2 prose follow-up 1.41 -> 0.22 accepted per cycle). Drafter RoPE is relative, so the base only
+        // matters for the committed-row accounting below.
+        self.draftPositionBase = Swift.max(0, self.cache.first.map { $0.offset - prefill.hidden.dim(1) } ?? 0)
 
         self.promptCacheSnapshot = self.cache.map { $0.copy() }
 
@@ -725,10 +872,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         if let maxTokens, tokenCount >= maxTokens {
             if Self.traceEnabled, stats.verifyCalls > 0 {
                 let line = String(
-                    format: "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs arFallback=%d\n",
+                    format:
+                        "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs arFallback=%d widths=%@\n",
                     stats.verifyCalls, stats.acceptanceLength, stats.draftSeconds,
                     stats.verifySeconds, stats.commitSeconds,
-                    stats.autoregressiveFallbackTokens)
+                    stats.autoregressiveFallbackTokens,
+                    stats.widthCycles.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }
+                        .joined(separator: ","))
                 FileHandle.standardError.write(Data(line.utf8))
             }
             // Release the compiled traces at end of generation. They
@@ -771,13 +921,30 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
         // Anything else in flight was speculated against a budget or block
         // size we can no longer use; roll its rows back before proceeding.
-        abandonInFlightVerify()
+        // A prefetched tree lattice stays: it serves any width.
+        abandonInFlightVerify(keepLattice: treeMode == true && !drafterDisabled)
 
         // The block spends one position on the anchor, so a block of size
         // `bs` yields at most `bs` new tokens (bs-1 drafts + 1 bonus).
-        let bs = Swift.min(adaptiveBlockSize ?? blockSize, budget + 1)
+        let bs = Swift.min(widthChooser?.width ?? adaptiveBlockSize ?? blockSize, budget + 1)
+        if bs <= 1, !drafterDisabled, widthChooser?.width == 1 {
+            // The chooser measured AR as the faster option: time the step as width 1.
+            let start = Date.timeIntervalSinceReferenceDate
+            let ok = runAutoregressiveStep()
+            if ok {
+                widthChooser!.observe(
+                    verifyWidth: 1, tokens: 1, seconds: Date.timeIntervalSinceReferenceDate - start)
+                stats.widthCycles[1, default: 0] += 1
+            }
+            return ok
+        }
         if bs <= 1 || drafterDisabled {
             return runAutoregressiveStep()
+        }
+        let cycleStart = Date.timeIntervalSinceReferenceDate
+        if treeMode == nil { treeMode = resolveTreeMode() }
+        if treeMode == true, let ok = runTreeCycle(rows: bs, cycleStart: cycleStart) {
+            return ok
         }
         guard let flight = issueVerify(bs: bs) else {
             // The drafter forward produced a degenerate result — an MLX
@@ -796,7 +963,15 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     + "continuing autoregressively.\n").utf8))
             return runAutoregressiveStep()
         }
-        return completeVerify(flight)
+        let ok = completeVerify(flight)
+        if ok, widthChooser != nil {
+            // Wall time of the whole cycle (draft + verify + accept + commit) is the width's real cost.
+            widthChooser!.observe(
+                verifyWidth: bs, tokens: pendingTokens.count,
+                seconds: Date.timeIntervalSinceReferenceDate - cycleStart)
+            stats.widthCycles[bs, default: 0] += 1
+        }
+        return ok
     }
 
     /// Build one cycle's draft + verify graphs and DISPATCH them, without
@@ -819,6 +994,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // the drafter's sliding window) must surface as a caught error and
         // an AR fallback, never as a degraded husk that dies on the next
         // host-side shape read.
+        clipDrafterContext()
         let proposal: DFlash2Proposal
         do {
             proposal = try withError {
@@ -853,7 +1029,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // The sliding clip inside drafter attention can advance the cache
         // offset past the committed token count. Pull it back so the next
         // round's RoPE offsets stay absolute.
-        let expectedDraftOffset = promptTokenIds.count + stats.emittedTokens - 1
+        let expectedDraftOffset = committedDraftRows
         if let head = draftCache.first, head.offset > expectedDraftOffset {
             let excess = head.offset - expectedDraftOffset
             for c in draftCache {
@@ -1093,9 +1269,174 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         return true
     }
 
+    /// Trees need a target that can verify one, a cache it can commit, and a request whose
+    /// acceptance we can do losslessly on the host (greedy, or sampled with a top-k filter).
+    private func resolveTreeMode() -> Bool {
+        if ProcessInfo.processInfo.environment["VMLX_DFLASH2_TREE"] == "0" { return false }
+        guard let treeTarget = target as? DFlash2TreeVerifyModel,
+            treeTarget.dflash2SupportsTree(cache: cache),
+            isGreedy || treeFilter != nil
+        else { return false }
+        return true
+    }
+
+    private mutating func dispatchLattice(rows: Int) -> DFlash2LatticeArrays? {
+        var blockIds = [Int32(lastToken)]
+        blockIds.append(contentsOf: Array(repeating: Int32(maskTokenID), count: rows - 1))
+        let block = MLXArray(blockIds).reshaped(1, rows)
+        clipDrafterContext()
+        let arrays: DFlash2LatticeArrays?
+        do {
+            arrays = try withError {
+                drafter.proposeLattice(
+                    inputs: block, targetHidden: contextHidden, cache: draftCache,
+                    embedder: target)
+            }
+        } catch {
+            return nil
+        }
+        if let arrays {
+            asyncEval(arrays.arrays)
+            // The drafter has now read these rows into its cache (kept even if this lattice is
+            // abandoned: they are committed context), so they must not be fed again.
+            contextHidden = contextHidden[0..., ..<0, 0...]
+        }
+        return arrays
+    }
+
+    /// A context chunk longer than an all-sliding drafter's window makes every row already in its cache fall out
+    /// of the window. Start the drafter cache over at the first kept row instead of letting the drafter's
+    /// in-attention clip advance the cache offset past its physical fill (the same offset/fill desync as the old
+    /// init shift).
+    private mutating func clipDrafterContext() {
+        guard let limit = drafterContextLimit, contextHidden.dim(1) > limit else { return }
+        let skip = contextHidden.dim(1) - limit
+        draftPositionBase += (draftCache.first?.offset ?? 0) + skip
+        draftCache = drafter.makeCache()
+        contextHidden = contextHidden[0..., skip..., 0...]
+    }
+
+    /// Pull the drafter cache back to the committed context (it advanced by a lattice block).
+    private mutating func trimDraftCacheToCommitted() {
+        let expectedDraftOffset = committedDraftRows
+        for c in draftCache where c.offset > expectedDraftOffset {
+            let excess = c.offset - expectedDraftOffset
+            if c.isTrimmable {
+                _ = c.trim(excess)
+            } else {
+                c.offsetForDFlash2 = Swift.max(0, c.offset - excess)
+            }
+        }
+    }
+
+    /// One tree cycle. `nil` = could not draft a tree this cycle (caller runs the chain path).
+    private mutating func runTreeCycle(rows: Int, cycleStart: TimeInterval) -> Bool? {
+        guard rows >= 2, let treeTarget = target as? DFlash2TreeVerifyModel else { return nil }
+        abandonInFlightVerify(keepLattice: true)
+
+        // MARK: draft — one drafter forward, one small readback, host best-first search
+        let draftStart = Date.timeIntervalSinceReferenceDate
+        let prefetched = pendingLattice
+        pendingLattice = nil
+        // A prefetched lattice was drafted at the width the chooser held after the previous
+        // cycle; if the chooser moved since, it is still valid (nodes are capped by `rows`).
+        guard let latticeArrays = prefetched ?? dispatchLattice(rows: rows) else { return nil }
+        MLX.eval(latticeArrays.arrays)
+        trimDraftCacheToCommitted()
+        let lattice = latticeArrays.host()
+        let tree = DFlash2TreeSearch.bestFirst(
+            lattice: lattice, maxNodes: rows - 1, temperature: isGreedy ? 0 : temperature)
+        guard !tree.tokens.isEmpty else { return nil }
+        let plan = DFlash2TreePlan(
+            tokens: [lastToken] + tree.tokens, parents: [-1] + tree.parents.map { $0 + 1 })
+        stats.draftSeconds += Date.timeIntervalSinceReferenceDate - draftStart
+        stats.draftedTokens += tree.tokens.count
+
+        // MARK: verify — every row along its own root path
+        let verifyStart = Date.timeIntervalSinceReferenceDate
+        let scope = DFlash2TreeScope(plan: plan)
+        let input = MLXArray(plan.tokens.map(Int32.init)).reshaped(1, plan.rows)
+        let (logits, captured) = treeTarget.dflash2TreeForward(
+            input, cache: cache, captureLayerIDs: captureLayerIDs, scope: scope)
+        let newHidden = extractContextFeature(captured: captured, targetLayerIDs: orderedLayerIDs)
+
+        // MARK: accept — the cycle's one readback of the target
+        let keptRows: [Int]
+        let bonus: Int
+        if isGreedy {
+            let ids = argMax(logits, axis: -1)
+            MLX.eval(ids, newHidden)
+            let argmax = ids.reshaped(-1).asArray(Int32.self).map(Int.init)
+            (keptRows, bonus) = DFlash2TreeAcceptance.greedyPath(plan: plan, argmax: argmax)
+        } else {
+            let filter = treeFilter!
+            let (ids, logprobs) = SpeculativeTopKAcceptance.topK(logits: logits, filter: filter)
+            MLX.eval(ids, logprobs, newHidden)
+            let k = ids.dim(1)
+            let idRows = ids.asArray(Int32.self)
+            let lpRows = logprobs.asArray(Float.self)
+            let distributions = (0 ..< plan.rows).map { r in
+                SpeculativeTopKAcceptance.distribution(
+                    ids: idRows[(r * k) ..< (r * k + k)], logprobs: lpRows[(r * k) ..< (r * k + k)],
+                    filter: filter)
+            }
+            let path = DFlash2TreeAcceptance.sampledPath(
+                plan: plan, distributions: distributions, rng: &treeRNG)
+            (keptRows, bonus) = (path.rows, path.bonus)
+        }
+        let cycleVerifySeconds = Date.timeIntervalSinceReferenceDate - verifyStart
+        stats.verifySeconds += cycleVerifySeconds
+        stats.verifyCalls += 1
+        let accepted = keptRows.count - 1
+        stats.acceptedTokens += accepted
+
+        // MARK: commit — KV rows compacted to the kept path, recurrent state replayed along it
+        let commitStart = Date.timeIntervalSinceReferenceDate
+        guard treeTarget.dflash2CommitTree(cache: cache, scope: scope, keptRows: keptRows) else {
+            stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
+            FileHandle.standardError.write(Data(
+                ("[DFlash2] ABORTED at cycle \(stats.verifyCalls): tree commit failed for "
+                    + "\(keptRows.count) of \(plan.rows) rows. The turn is TRUNCATED at "
+                    + "\(stats.emittedTokens) tokens.\n").utf8))
+            return false
+        }
+        stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
+        contextHidden = take(newHidden, MLXArray(keptRows.map(Int32.init)), axis: 1)
+
+        let budget = maxTokens.map { $0 - tokenCount } ?? Int.max
+        var emitted = keptRows.dropFirst().map { plan.tokens[$0] }
+        emitted.append(bonus)
+        if emitted.count > budget { emitted = Array(emitted.prefix(budget)) }
+        guard let last = emitted.last else { return false }
+        lastToken = last
+        pendingTokens = emitted
+        stats.emittedTokens += emitted.count
+        stats.treeCycles += 1
+        if widthChooser != nil {
+            widthChooser!.observe(
+                verifyWidth: rows, tokens: emitted.count,
+                seconds: Date.timeIntervalSinceReferenceDate - cycleStart)
+            stats.widthCycles[rows, default: 0] += 1
+        }
+        // Draft the NEXT lattice at the width the chooser now picks: the block-diffusion drafter
+        // attends across its whole block, so drafting wider than needed changes (worsens) the
+        // early positions' candidates.
+        if Self.treePrefetchEnabled, emitted.count < budget {
+            let nextRows = Swift.min(widthChooser?.width ?? rows, budget - emitted.count + 1)
+            if nextRows >= 2 { pendingLattice = dispatchLattice(rows: nextRows) }
+        }
+        if Self.traceEnabled {
+            FileHandle.standardError.write(Data(
+                ("[DFlash2] tree cycle=\(stats.verifyCalls) rows=\(plan.rows) "
+                    + "depthMax=\(plan.depths.max() ?? 0) accepted=\(accepted) "
+                    + "emitted=\(emitted.count) path=\(keptRows)\n").utf8))
+        }
+        return true
+    }
+
     /// Dispatch the next cycle's forwards, if one is worth having.
     private mutating func prefetchNextVerify() {
-        guard prefetchEnabled, inFlight == nil else { return }
+        guard prefetchEnabled, inFlight == nil, treeMode != true else { return }
         // Budget left AFTER the tokens queued by the cycle that just
         // completed — they have not been consumed by `next()` yet.
         let remaining = maxTokens.map { $0 - tokenCount - pendingTokens.count } ?? Int.max
@@ -1111,7 +1452,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// offset were never touched. Must run before ANY path that persists
     /// or reuses the cache, or unverified draft positions leak into a
     /// stored prefix.
-    private mutating func abandonInFlightVerify() {
+    private mutating func abandonInFlightVerify(keepLattice: Bool = false) {
+        if pendingLattice != nil, !keepLattice {
+            pendingLattice = nil
+            trimDraftCacheToCommitted()
+        }
         guard let flight = inFlight else { return }
         inFlight = nil
         for layer in cache where layer.isTrimmable {
@@ -1120,7 +1465,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
         stagedWarmedSizes.removeAll(keepingCapacity: true)
         // The drafter cache also advanced for the abandoned block.
-        let expectedDraftOffset = promptTokenIds.count + stats.emittedTokens - 1
+        let expectedDraftOffset = committedDraftRows
         for c in draftCache where c.offset > expectedDraftOffset {
             let excess = c.offset - expectedDraftOffset
             if c.isTrimmable {
@@ -1276,7 +1621,9 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let sampled = sampler.sample(logits: logits[0..., -1, 0...])
         MLX.eval(sampled, hidden)
         let token = sampled.reshaped(-1)[0].item(Int.self)
-        contextHidden = hidden
+        // Rows the drafter has not read yet accumulate across consecutive AR steps.
+        contextHidden = contextHidden.dim(1) > 0 && contextHidden.dim(-1) == hidden.dim(-1)
+            ? concatenated([contextHidden, hidden], axis: 1) : hidden
         lastToken = token
         pendingTokens = [token]
         pendingIndex = 0

@@ -13,6 +13,10 @@
 import Foundation
 import MLX
 
+#if canImport(os)
+    import os
+#endif
+
 public final class DFlash2DrafterResolver: @unchecked Sendable {
 
     public static let shared = DFlash2DrafterResolver()
@@ -39,6 +43,29 @@ public final class DFlash2DrafterResolver: @unchecked Sendable {
         cache[key] = model
         lock.unlock()
         return model
+    }
+
+    /// An optional acceleration artifact must not prevent ordinary generation.
+    /// Only classified artifact failures fall back, and only before target prefill.
+    public func optionalDrafter(at path: URL) throws -> DFlash2DraftModel? {
+        try Task.checkCancellation()
+        do {
+            guard DFlash2ArtifactMetadata.rejectionReason(at: path) == nil else {
+                try Task.checkCancellation()
+                Logger(subsystem: "vmlx", category: "DFlash2").warning(
+                    "Optional drafter metadata invalid; using AR")
+                return nil
+            }
+            let model = try drafter(at: path)
+            try Task.checkCancellation()
+            return model
+        } catch let error as DFlash2LoadError {
+            try Task.checkCancellation()
+            Logger(subsystem: "vmlx", category: "DFlash2").warning(
+                "Optional drafter unavailable; using AR: \(error.localizedDescription, privacy: .public)"
+            )
+            return nil
+        }
     }
 
     /// Load a drafter and check it against the model that will verify its

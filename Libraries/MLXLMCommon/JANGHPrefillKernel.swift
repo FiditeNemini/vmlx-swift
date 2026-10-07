@@ -8,6 +8,7 @@ import MLXFast
 /// the same packed representation on older devices.
 final class JANGHPrefillKernel {
     enum Backend: String { case nax, steel }
+    let enableDenseSmallTile: Bool
     private let bits: Int
     private let upBits: Int
     private let codebookHeader: String
@@ -15,7 +16,11 @@ final class JANGHPrefillKernel {
     private let lock = NSLock()
     private let rotation = JANGHRowRotation()
 
-    init(contract: JANGHFormatContract, module: String, upModule: String? = nil) throws {
+    init(
+        contract: JANGHFormatContract, module: String, upModule: String? = nil,
+        enableDenseSmallTile: Bool = false
+    ) throws {
+        self.enableDenseSmallTile = enableDenseSmallTile
         guard let projection = contract.projections[module],
             upModule == nil || contract.projections[upModule!] != nil
         else { throw JANGHFormatContract.ValidationError.invalid("missing prefill projection") }
@@ -38,6 +43,20 @@ final class JANGHPrefillKernel {
         }
         codebookHeader = header
     }
+
+    /// Largest row count routed to the 16-row NAX tile. `VMLX_JANGH_NAX_SMALL_TILE_MAX=0` keeps the 64-row tile.
+    static let smallTileMaxRows: Int = {
+        if let raw = RuntimeEnvironment.value("VMLX_JANGH_NAX_SMALL_TILE_MAX"), let v = Int(raw) {
+            return v
+        }
+        return 16
+    }()
+
+    /// Dense verify-window split-K (`projectDenseSplitK`). `VMLX_JANGH_SPLITK=0` restores the 16-row tile.
+    static let denseSplitKEnabled: Bool = RuntimeEnvironment.value("VMLX_JANGH_SPLITK") != "0"
+
+    // Only immutable dense-bank owners opt in; routed/K2 callers retain their old tile.
+    private let smallTileAdmission = JANGHDenseFastAdmission(enabled: true)
 
     static var nativeBackend: Backend {
         #if os(macOS)
@@ -62,9 +81,15 @@ final class JANGHPrefillKernel {
         dtype == .float32 ? .steel : requested
     }
 
-    private func kernel(dtype: DType, backend: Backend, fused: Bool, rotate: Bool, width: Int) -> MLXFast.MLXFastKernel {
+    private func kernel(
+        dtype: DType, backend: Backend, fused: Bool, rotate: Bool, width: Int, tileRows: Int = 64
+    )
+        -> MLXFast.MLXFastKernel
+    {
         let type = dtype == .bfloat16 ? "bfloat16_t" : dtype == .float16 ? "half" : "float"
-        let key = "\(backend.rawValue)_\(type)_\(width)_\(upBits)_\(fused)_\(rotate)"
+        let key =
+            "\(backend.rawValue)_\(type)_\(width)_\(upBits)_\(fused)_\(rotate)"
+            + (tileRows == 64 ? "" : "_m\(tileRows)")
         lock.lock()
         defer { lock.unlock() }
         if let value = kernels[key] { return value }
@@ -74,7 +99,7 @@ final class JANGHPrefillKernel {
                 constexpr int PAD = 64 + 16 / sizeof(\(type));
                 threadgroup \(type) Wg[64 * PAD];
                 threadgroup \(type) Wu[\(fused ? 64 : 1) * PAD];
-                tq_gather_qmm_nax<\(type), \(width), \(upBits), \(fused), \(rotate)>(
+                tq_gather_qmm_nax<\(type), \(width), \(upBits), \(fused), \(rotate), \(tileRows)>(
                     x,wg,sg,wu,su,indices,y,meta[0],meta[1],meta[2],meta[3],lim[0],Wg,Wu,
                     threadgroup_position_in_grid,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
                 """
@@ -100,6 +125,49 @@ final class JANGHPrefillKernel {
         }
         kernels[key] = value
         return value
+    }
+
+    /// Dense verify windows (<= 16 rows, one bank, plain linear): split-K NAX tile (`JANGHPrefillSource.naxSplitK`).
+    /// Returns nil when the shape is not eligible. Output dtype = input dtype.
+    func projectDenseSplitK(_ input: MLXArray, packed: MLXArray, scales: MLXArray) -> MLXArray? {
+        guard input.ndim == 2, input.dim(0) >= 1, input.dim(0) <= 16, packed.ndim == 3, packed.dim(0) == 1,
+            [.float16, .bfloat16].contains(input.dtype), Self.resolvedBackend(dtype: input.dtype, requested: Self.nativeBackend) == .nax
+        else { return nil }
+        let m = input.dim(0), k = input.dim(1), n = packed.dim(1)
+        guard k.isMultiple(of: 64), n.isMultiple(of: 64) else { return nil }
+        let tiles = n / 64
+        let steps = k / 64
+        var split = 1
+        while split < 16 && tiles * split < 1024 && steps / (split * 2) >= 8 { split *= 2 }
+        let type = input.dtype == .bfloat16 ? "bfloat16_t" : "half"
+        let key = "splitk_\(type)_\(bits)"
+        lock.lock()
+        let kernel: MLXFast.MLXFastKernel
+        if let cached = kernels[key] {
+            kernel = cached
+        } else {
+            let source = """
+                constexpr int PAD = 64 + 16 / sizeof(\(type));
+                threadgroup \(type) Wg[64 * PAD];
+                tq_dense_qmm_nax_splitk<\(type), \(bits), 16>(
+                    x, wg, sg, yp, meta[0], meta[1], meta[2], meta[3], Wg,
+                    threadgroup_position_in_grid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+                """
+            kernel = MLXFast.metalKernel(
+                name: "jangh_dense_" + key, inputNames: ["x", "wg", "sg", "meta"], outputNames: ["yp"],
+                source: source,
+                header: JANGHPrefillHeaders.nax + codebookHeader + JANGHPrefillSource.loader
+                    + JANGHPrefillSource.naxSplitK,
+                ensureRowContiguous: false)
+            kernels[key] = kernel
+        }
+        lock.unlock()
+        let metadata = MLXArray([Int32(m), Int32(n), Int32(k), Int32(split)])
+        let partial = kernel(
+            [contiguous(input), packed, scales, metadata],
+            grid: (tiles * 64, (m + 15) / 16, split), threadGroup: (64, 1, 1),
+            outputShapes: [[split, m, n]], outputDTypes: [.float32])[0]
+        return (split == 1 ? partial[0] : partial.sum(axis: 0)).asType(input.dtype)
     }
 
     func projectSorted(
@@ -138,10 +206,30 @@ final class JANGHPrefillKernel {
             array.size < 8 ? concatenated([array.flattened(), MLXArray.zeros([8 - array.size], dtype: array.dtype)]) : array
         }
         if selected == .nax {
-            return kernel(dtype: input.dtype, backend: .nax, fused: upPacked != nil, rotate: rotateOutput, width: bits)(
-                [x, deviceArray(packed), deviceArray(scales), deviceArray(upPacked ?? packed), deviceArray(upScales ?? scales), idx, metadata, MLXArray([limit ?? 0])],
-                grid: (((n + 63) / 64) * 128, (m + 63) / 64, 1), threadGroup: (128, 1, 1),
-                outputShapes: [[m, n]], outputDTypes: [input.dtype])[0]
+            let inputs = [
+                x, deviceArray(packed), deviceArray(scales), deviceArray(upPacked ?? packed),
+                deviceArray(upScales ?? scales), idx, metadata, MLXArray([limit ?? 0]),
+            ]
+            func run(_ tileRows: Int) -> MLXArray {
+                let threads = tileRows == 16 ? 64 : 128
+                return kernel(
+                    dtype: input.dtype, backend: .nax, fused: upPacked != nil, rotate: rotateOutput,
+                    width: bits, tileRows: tileRows)(
+                        inputs, grid: (((n + 63) / 64) * threads, (m + tileRows - 1) / tileRows, 1),
+                        threadGroup: (threads, 1, 1), outputShapes: [[m, n]],
+                        outputDTypes: [input.dtype])[0]
+            }
+            // Verify windows (<= 16 rows) use the 16-row tile (2 simdgroups = 64 threads): same per-element MMA
+            // sequence as the 64-row tile, so it is admitted per dense owner/input variant only if bitwise equal to it.
+            if enableDenseSmallTile, experts == 1, m <= Self.smallTileMaxRows,
+                smallTileAdmission.admits(
+                    key:
+                        "\(input.dtype)_\(m)_\(k)_\(n)_\(bits)_\(upBits)_\(upPacked != nil)_\(rotateOutput)_\(limit?.bitPattern ?? 0)",
+                    compare: { (run(16), run(64)) })
+            {
+                return run(16)
+            }
+            return run(64)
         }
         func single(_ w: MLXArray, _ s: MLXArray, _ width: Int) -> MLXArray {
             return kernel(dtype: input.dtype, backend: .steel, fused: false, rotate: false, width: width)(

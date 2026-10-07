@@ -5,6 +5,16 @@ import XCTest
 
 /// Packed prefill primitives only; no model installation or performance claim.
 final class JANGHPrefillKernelTests: XCTestCase {
+    func testSmallTileRequiresExplicitDenseOwnerOptIn() throws {
+        let config = try contract(2, 4)
+        let legacy = try JANGHPrefillKernel(
+            contract: config, module: module + ".gate_proj", upModule: module + ".up_proj")
+        XCTAssertFalse(legacy.enableDenseSmallTile)
+        let dense = try JANGHPrefillKernel(
+            contract: config, module: module + ".gate_proj", enableDenseSmallTile: true)
+        XCTAssertTrue(dense.enableDenseSmallTile)
+    }
+
     private let module = "model.layers.0.mlp.switch_mlp"
     private let beta = Float(0.0000001)
     private struct Bank {
@@ -178,6 +188,36 @@ final class JANGHPrefillKernelTests: XCTestCase {
                                 XCTAssertEqual(got[i], expected[i], accuracy: tolerance * max(1, abs(expected[i])),
                                     "H32 \(inputDType) -> \(outputDType), \(rows)x\(width) element\(i)")
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dense verify split-K (rows 1...16, one bank): agrees with the independent reference, including a K-step
+    /// count that does not divide by the split (17 steps -> slices 9 + 8) and a ragged row count.
+    func testDenseSplitKMatchesReference() throws {
+        guard JANGHPrefillKernel.nativeBackend == .nax else { throw XCTSkip("split-K is NAX-only") }
+        try MLXMetalTestLock.withLock {
+            for (bits, k) in [(2, 1088), (4, 2048), (8, 1088)] {
+                let gate = bank(bits: bits, experts: 1, n: 192, k: k, seed: 7)
+                let kernel = try JANGHPrefillKernel(
+                    contract: contract(bits, bits), module: module + ".gate_proj", enableDenseSmallTile: true)
+                for tokens in [1, 3, 8, 16] {
+                    for dtype in [DType.float16, .bfloat16] {
+                        let values = rounded((0 ..< tokens * k).map { Float(($0 * 11 + $0 / k) % 29 - 14) / 32 }, dtype)
+                        guard let actual = kernel.projectDenseSplitK(
+                            MLXArray(values, [tokens, k]).asType(dtype), packed: gate.packed, scales: gate.scaleArray)
+                        else { return XCTFail("split-K declined \(tokens)x\(k)") }
+                        let expected = reference(input: values, ids: [UInt32](repeating: 0, count: tokens), gate: gate,
+                                                 up: nil, dtype: dtype, backend: .nax, rotate: false, limit: nil)
+                        XCTAssertEqual(actual.shape, [tokens, 192]); XCTAssertEqual(actual.dtype, dtype)
+                        let got = actual.asType(.float32).asArray(Float.self)
+                        let tolerance: Float = dtype == .bfloat16 ? 0.012 : 0.004
+                        for i in got.indices {
+                            XCTAssertEqual(got[i], expected[i], accuracy: tolerance * max(1, abs(expected[i])),
+                                           "split-K bits\(bits) T\(tokens) \(dtype) element\(i)")
                         }
                     }
                 }

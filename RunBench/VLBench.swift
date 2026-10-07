@@ -1714,6 +1714,20 @@ enum VLBench {
         if let nativeMTPDepth {
             params.draftStrategy = .nativeMTP(depth: nativeMTPDepth)
         }
+        // `BENCH_VL_DFLASH2=1` runs the same shapes with the bundle's DFlash 2 drafter (27B), so restored
+        // follow-ups, media turns and tool turns all cross the speculative lane. `BENCH_VL_SAMPLED=1` uses the
+        // bundle sampler the app sends (T 1.0, top_p 0.95, top_k 20).
+        let env = ProcessInfo.processInfo.environment
+        if env["BENCH_VL_DFLASH2"] == "1" {
+            params.draftStrategy = .dflash2(drafterPath: modelDir.appendingPathComponent("dflash2"), blockSize: nil)
+        }
+        if env["BENCH_VL_SAMPLED"] == "1" {
+            params.temperature = 1.0
+            params.topP = 0.95
+            params.topK = 20
+            params.randomSeed = 1234
+        }
+        print("DFlash 2: \(env["BENCH_VL_DFLASH2"] == "1" ? "on" : "off") sampled: \(env["BENCH_VL_SAMPLED"] == "1")")
         // `BENCH_REQUESTED_REASONING_BUDGET` runs the SAME variating shapes
         // with the per-request reasoning ceiling armed on every turn — the
         // crossed axis for the answer-reserve feature: a think close forced

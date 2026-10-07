@@ -33,6 +33,9 @@ public enum DFlash2Loader {
             throw DFlash2LoadError.notDFlash2(dir)
         }
 
+        if let reason = DFlash2ArtifactMetadata.rejectionReason(at: dir) {
+            throw DFlash2LoadError.targetMismatch(reason)
+        }
         var weights = [String: MLXArray]()
         if let enumerator = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil)
         {
@@ -71,7 +74,8 @@ public enum DFlash2Loader {
 
         do {
             try model.update(
-                parameters: ModuleParameters.unflattened(weights), verify: [.noUnusedKeys])
+                parameters: ModuleParameters.unflattened(weights),
+                verify: [.noUnusedKeys, .allModelKeysSet, .shapeMismatch])
         } catch {
             throw DFlash2LoadError.weightUpdateFailed(error)
         }
