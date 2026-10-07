@@ -944,6 +944,38 @@ public struct TokenizerLoaderMacro: ExpressionMacro {
         return
             """
             { () -> MLXLMCommon.TokenizerLoader in
+                struct MetadataTokenizer: MLXLMCommon.GenerationPromptControllableTokenizer {
+                    let base: any MLXLMCommon.GenerationPromptControllableTokenizer
+                    let grammarTokenVocabulary: MLXLMCommon.GrammarTokenVocabulary?
+                    var incrementalByteLevelDecoder: (@Sendable (Int) -> MLXLMCommon.ByteLevelDecodingPiece)? {
+                        base.incrementalByteLevelDecoder
+                    }
+                    var bosToken: String? { base.bosToken }
+                    var eosToken: String? { base.eosToken }
+                    var unknownToken: String? { base.unknownToken }
+                    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+                        base.encode(text: text, addSpecialTokens: addSpecialTokens)
+                    }
+                    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+                        base.decode(tokenIds: tokenIds, skipSpecialTokens: skipSpecialTokens)
+                    }
+                    func convertTokenToId(_ token: String) -> Int? { base.convertTokenToId(token) }
+                    func convertIdToToken(_ id: Int) -> String? { base.convertIdToToken(id) }
+                    func applyChatTemplate(
+                        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+                        additionalContext: [String: any Sendable]?
+                    ) throws -> [Int] {
+                        try base.applyChatTemplate(messages: messages, tools: tools, additionalContext: additionalContext)
+                    }
+                    func applyChatTemplate(
+                        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+                        additionalContext: [String: any Sendable]?, addGenerationPrompt: Bool
+                    ) throws -> [Int] {
+                        try base.applyChatTemplate(
+                            messages: messages, tools: tools, additionalContext: additionalContext,
+                            addGenerationPrompt: addGenerationPrompt)
+                    }
+                }
                 struct TransformersLoader: MLXLMCommon.TokenizerLoader {
                     public init() {}
 
@@ -953,7 +985,17 @@ public struct TokenizerLoaderMacro: ExpressionMacro {
                         // import VMLXTokenizers
                         //
                         let upstream = try await VMLXTokenizers.AutoTokenizer.from(modelFolder: directory)
-                        return #adaptHuggingFaceTokenizer(upstream)
+                        let adapted = #adaptHuggingFaceTokenizer(upstream)
+                        // Only file-backed metadata plus the upstream lossless decoder
+                        // can qualify a vocabulary. The standalone adaptor stays nil.
+                        guard upstream.incrementalByteLevelDecoder != nil,
+                            let data = try? Data(contentsOf: directory.appendingPathComponent("tokenizer.json")),
+                            let config = try? Data(contentsOf: directory.appendingPathComponent("tokenizer_config.json")),
+                            let vocabulary = MLXLMCommon.GrammarTokenVocabulary.fromTokenizerJSON(
+                                data, tokenizerConfig: config),
+                            let controllable = adapted as? any MLXLMCommon.GenerationPromptControllableTokenizer
+                        else { return adapted }
+                        return MetadataTokenizer(base: controllable, grammarTokenVocabulary: vocabulary)
                     }
                 }
 
