@@ -1,34 +1,48 @@
 import Foundation
 import XCTest
+
 @testable import MLXLMCommon
 
 /// CPU-only compiler/matcher tests. No model, MLX array or Metal execution.
 final class JSONSchemaGrammarTests: XCTestCase {
-    private let pieces = ["<eos>", "{", "}", "\"", "answer", ":", "true", "false", " ", "[", "]", ",", "1", "2", "null", "extra", "<end>"]
-    private let schema = ##"{"type":"object","properties":{"answer":{"type":"boolean"}},"required":["answer"],"additionalProperties":false}"##
+    private let pieces = [
+        "<eos>", "{", "}", "\"", "answer", ":", "true", "false", " ", "[", "]", ",", "1", "2",
+        "null", "extra", "<end>",
+    ]
+    private let schema =
+        ##"{"type":"object","properties":{"answer":{"type":"boolean"}},"required":["answer"],"additionalProperties":false}"##
 
     private func tokenizer() throws -> JSONSchemaGrammarTokenizer {
-        try JSONSchemaGrammarTokenizer(vocabulary: pieces, vocabularyType: .raw, stopTokenIDs: [0, 16])
+        try JSONSchemaGrammarTokenizer(
+            vocabulary: pieces, vocabularyType: .raw, stopTokenIDs: [0, 16])
     }
     private func allows(_ mask: JSONSchemaTokenMask, _ token: Int) -> Bool {
         (mask.words[token / 32] & (UInt32(1) << UInt32(token % 32))) != 0
     }
     private func feed(_ grammar: JSONSchemaGrammar, _ tokens: [Int]) throws {
         for token in tokens {
-            XCTAssertTrue(allows(try grammar.nextTokenMask(), token), "Expected token \(token) admitted")
+            XCTAssertTrue(
+                allows(try grammar.nextTokenMask(), token), "Expected token \(token) admitted")
             try grammar.accept(tokenID: token)
         }
     }
 
     func testPropertyNamesPreserveJSONEscapingAndUnicode() throws {
-        for name in ["quote\"key", "back\\slash", "literal\\n", "line\nfeed", "tab\tkey", "nul\0key", "café😀"] {
+        for name in [
+            "quote\"key", "back\\slash", "literal\\n", "line\nfeed", "tab\tkey", "nul\0key",
+            "café😀",
+        ] {
             let schemaObject: [String: Any] = [
                 "type": "object", "properties": [name: ["type": "boolean"]],
                 "required": [name], "additionalProperties": false,
             ]
-            let schema = String(decoding: try JSONSerialization.data(withJSONObject: schemaObject), as: UTF8.self)
-            let output = String(decoding: try JSONSerialization.data(withJSONObject: [name: true]), as: UTF8.self)
-            let wrong = String(decoding: try JSONSerialization.data(withJSONObject: ["different": true]), as: UTF8.self)
+            let schema = String(
+                decoding: try JSONSerialization.data(withJSONObject: schemaObject), as: UTF8.self)
+            let output = String(
+                decoding: try JSONSerialization.data(withJSONObject: [name: true]), as: UTF8.self)
+            let wrong = String(
+                decoding: try JSONSerialization.data(withJSONObject: ["different": true]),
+                as: UTF8.self)
             let tokenizer = try JSONSchemaGrammarTokenizer(
                 vocabulary: ["<eos>", output, wrong], vocabularyType: .raw, stopTokenIDs: [0])
             let grammar = try JSONSchemaGrammar(tokenizer: tokenizer, schema: schema)
@@ -42,10 +56,15 @@ final class JSONSchemaGrammarTests: XCTestCase {
     }
 
     func testNumericConstantsRejectLossySourceSpellingsRecursively() throws {
-        for value in ["0.1", "9007199254740990.1", "9007199254740992", "18446744073709551615", "1e0", "[1,0.5]", "{\"x\":0.5}"] {
+        for value in [
+            "0.1", "9007199254740990.1", "9007199254740992", "18446744073709551615", "1e0",
+            "[1,0.5]", "{\"x\":0.5}",
+        ] {
             for keyword in ["const", "enum"] {
                 let body = keyword == "enum" ? "[\(value)]" : value
-                XCTAssertThrowsError(try JSONSchemaGrammar.validateSupportedSchema("{\"\(keyword)\":\(body)}")) { error in
+                XCTAssertThrowsError(
+                    try JSONSchemaGrammar.validateSupportedSchema("{\"\(keyword)\":\(body)}")
+                ) { error in
                     guard case JSONSchemaGrammarError.unsupportedSchema = error else {
                         return XCTFail("Expected typed unsupported number, got \(error)")
                     }
@@ -56,14 +75,18 @@ final class JSONSchemaGrammarTests: XCTestCase {
             try JSONSchemaGrammar.validateSupportedSchema("{\"const\":\(value)}")
         }
         try JSONSchemaGrammar.validateSupportedSchema(##"{"type":"number","default":0.1}"##)
-        try JSONSchemaGrammar.validateSupportedSchema(##"{"type":"object","properties":{"const":{"type":"number"}},"additionalProperties":false}"##)
+        try JSONSchemaGrammar.validateSupportedSchema(
+            ##"{"type":"object","properties":{"const":{"type":"number"}},"additionalProperties":false}"##
+        )
     }
 
     func testArrayBoundsRequirePlainIntegerSourceSpellings() throws {
         for keyword in ["minItems", "maxItems"] {
             for value in ["1.0000000000000001", "1.0", "1e0"] {
-                XCTAssertThrowsError(try JSONSchemaGrammar.validateSupportedSchema(
-                    "{\"type\":\"array\",\"\(keyword)\":\(value)}")) { error in
+                XCTAssertThrowsError(
+                    try JSONSchemaGrammar.validateSupportedSchema(
+                        "{\"type\":\"array\",\"\(keyword)\":\(value)}")
+                ) { error in
                     guard case JSONSchemaGrammarError.unsupportedSchema = error else {
                         return XCTFail("Expected typed unsupported bound, got \(error)")
                     }
@@ -112,7 +135,8 @@ final class JSONSchemaGrammarTests: XCTestCase {
         ]
         for schema in schemas {
             XCTAssertThrowsError(try JSONSchemaGrammar.validateSupportedSchema(schema)) { error in
-                guard case JSONSchemaGrammarError.unsupportedSchema(let path, let keyword) = error else {
+                guard case JSONSchemaGrammarError.unsupportedSchema(let path, let keyword) = error
+                else {
                     return XCTFail("Expected typed unsupported schema, got \(error)")
                 }
                 XCTAssertEqual(path, "#")
@@ -176,7 +200,8 @@ final class JSONSchemaGrammarTests: XCTestCase {
         for keyword in ["minLength", "maxLength"] {
             let schema = "{\"type\":\"string\",\"\(keyword)\":1}"
             XCTAssertThrowsError(try JSONSchemaGrammar.validateSupportedSchema(schema)) { error in
-                guard case JSONSchemaGrammarError.unsupportedSchema(let path, let rejected) = error else {
+                guard case JSONSchemaGrammarError.unsupportedSchema(let path, let rejected) = error
+                else {
                     return XCTFail("Expected typed unsupported schema error, got \(error)")
                 }
                 XCTAssertEqual(path, "#")
@@ -208,14 +233,22 @@ final class JSONSchemaGrammarTests: XCTestCase {
     }
 
     func testMalformedSchemasAndTokenizerFailClosed() {
-        for schema in ["{", "[]", "42", "false", ##"{"type":42}"##,
+        for schema in [
+            "{", "[]", "42", "false", ##"{"type":42}"##,
             ##"{"type":"mystery"}"##, ##"{"type":"array","minItems":true}"##,
             ##"{"type":"array","minItems":3,"maxItems":2}"##,
-            ##"{"type":"string","enum":[true]}"##, ##"{"$ref":"#/$defs/missing"}"##] {
+            ##"{"type":"string","enum":[true]}"##, ##"{"$ref":"#/$defs/missing"}"##,
+        ] {
             XCTAssertThrowsError(try JSONSchemaGrammar.validateSupportedSchema(schema), schema)
         }
-        XCTAssertThrowsError(try JSONSchemaGrammarTokenizer(vocabulary: pieces, vocabularyType: .raw, stopTokenIDs: []))
-        XCTAssertThrowsError(try JSONSchemaGrammarTokenizer(vocabulary: pieces, vocabularyType: .raw, stopTokenIDs: [-1]))
-        XCTAssertThrowsError(try JSONSchemaGrammarTokenizer(vocabulary: ["\u{0}"], vocabularyType: .raw, stopTokenIDs: [0]))
+        XCTAssertThrowsError(
+            try JSONSchemaGrammarTokenizer(
+                vocabulary: pieces, vocabularyType: .raw, stopTokenIDs: []))
+        XCTAssertThrowsError(
+            try JSONSchemaGrammarTokenizer(
+                vocabulary: pieces, vocabularyType: .raw, stopTokenIDs: [-1]))
+        XCTAssertThrowsError(
+            try JSONSchemaGrammarTokenizer(
+                vocabulary: ["\u{0}"], vocabularyType: .raw, stopTokenIDs: [0]))
     }
 }

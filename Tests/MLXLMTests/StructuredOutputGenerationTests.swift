@@ -2,12 +2,15 @@ import Foundation
 import MLX
 import MLXNN
 import XCTest
+
 @testable import MLXLMCommon
 
 /// Exercises real common generation with a deterministic tiny target, not a
 /// second implementation of the grammar or decode loop. No real model loading.
 final class StructuredOutputGenerationTests: XCTestCase {
-    private static func parameters(schema: String = #"{"type":"boolean"}"#, max: Int = 16) -> GenerateParameters {
+    private static func parameters(schema: String = #"{"type":"boolean"}"#, max: Int = 16)
+        -> GenerateParameters
+    {
         var p = GenerateParameters(maxTokens: max, temperature: 0)
         p.jsonSchema = schema
         return p
@@ -16,11 +19,14 @@ final class StructuredOutputGenerationTests: XCTestCase {
     func testActualIteratorStopsBeforeForwardingEOSAgain() throws {
         try MLXMetalTestLock.withLock {
             let model = SchemaGenerationTarget(plan: [1, 0])
-            var iterator = try TokenIterator(input: LMInput(tokens: MLXArray([Int32(3)])),
-                model: model, parameters: Self.parameters(), tokenizer: SchemaGenerationTokenizer(), stopTokenIDs: [0])
+            var iterator = try TokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(3)])),
+                model: model, parameters: Self.parameters(), tokenizer: SchemaGenerationTokenizer(),
+                stopTokenIDs: [0])
             XCTAssertEqual(iterator.next(), 1)
             XCTAssertEqual(iterator.next(), 0)
-            XCTAssertEqual(model.forwarded, [[3], [1]], "EOS must not trigger another model forward")
+            XCTAssertEqual(
+                model.forwarded, [[3], [1]], "EOS must not trigger another model forward")
             XCTAssertNil(iterator.generationFailure)
             XCTAssertEqual(iterator.structuredOutputComplete, true)
         }
@@ -30,10 +36,13 @@ final class StructuredOutputGenerationTests: XCTestCase {
         try await MLXMetalTestLock.withLock { () async throws -> Void in
             let tokenizer = SchemaGenerationTokenizer()
             let model = SchemaGenerationTarget(plan: [1, 0])
-            let base = try TokenIterator(input: LMInput(tokens: MLXArray([Int32(3)])),
-                model: model, parameters: Self.parameters(), tokenizer: tokenizer, stopTokenIDs: [0])
+            let base = try TokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(3)])),
+                model: model, parameters: Self.parameters(), tokenizer: tokenizer, stopTokenIDs: [0]
+            )
             let audit = SchemaPublicationAudit()
-            let (stream, task) = generateTokenTask(promptTokenCount: 1,
+            let (stream, task) = generateTokenTask(
+                promptTokenCount: 1,
                 modelConfiguration: ModelConfiguration(id: "fixture/schema"), tokenizer: tokenizer,
                 iterator: SchemaPublicationIterator(base: base, audit: audit))
             var ids: [Int] = []
@@ -58,11 +67,15 @@ final class StructuredOutputGenerationTests: XCTestCase {
         try await MLXMetalTestLock.withLock { () async throws -> Void in
             let tokenizer = SchemaGenerationTokenizer()
             let model = SchemaGenerationTarget(plan: [6, 1, 7, 2, 8, 0])
-            let params = Self.parameters(schema: #"{"type":"array","items":{"type":"boolean"},"minItems":2,"maxItems":2}"#, max: 1)
-            let base = try TokenIterator(input: LMInput(tokens: MLXArray([Int32(3)])),
+            let params = Self.parameters(
+                schema: #"{"type":"array","items":{"type":"boolean"},"minItems":2,"maxItems":2}"#,
+                max: 1)
+            let base = try TokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(3)])),
                 model: model, parameters: params, tokenizer: tokenizer, stopTokenIDs: [0])
             let audit = SchemaPublicationAudit()
-            let (stream, task) = generateTokenTask(promptTokenCount: 1,
+            let (stream, task) = generateTokenTask(
+                promptTokenCount: 1,
                 modelConfiguration: ModelConfiguration(id: "fixture/schema"), tokenizer: tokenizer,
                 iterator: SchemaPublicationIterator(base: base, audit: audit))
             var ids: [Int] = []
@@ -78,7 +91,8 @@ final class StructuredOutputGenerationTests: XCTestCase {
             XCTAssertEqual(ids, [6])
             XCTAssertEqual(terminal?.stopReason, .length)
             XCTAssertEqual(terminal?.generationFailure?.stage, .decoding)
-            XCTAssertEqual(audit.calls, [false], "Truncation must not publish a successful generated boundary")
+            XCTAssertEqual(
+                audit.calls, [false], "Truncation must not publish a successful generated boundary")
         }
     }
 
@@ -87,13 +101,16 @@ final class StructuredOutputGenerationTests: XCTestCase {
             let tokenizer = SchemaGenerationTokenizer()
             let model = SchemaGenerationTarget(plan: [1, 0])
             var params = Self.parameters()
-            params.suppressTokens = Array(0..<9)
-            let base = try TokenIterator(input: LMInput(tokens: MLXArray([Int32(3)])),
+            params.suppressTokens = Array(0 ..< 9)
+            let base = try TokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(3)])),
                 model: model, parameters: params, tokenizer: tokenizer, stopTokenIDs: [0])
             let audit = SchemaPublicationAudit()
-            let (stream, task) = generateTokenTask(promptTokenCount: 1,
+            let (stream, task) = generateTokenTask(
+                promptTokenCount: 1,
                 modelConfiguration: ModelConfiguration(id: "fixture/schema"), tokenizer: tokenizer,
-                iterator: SchemaPublicationIterator(base: base, audit: audit), includeStopToken: true)
+                iterator: SchemaPublicationIterator(base: base, audit: audit),
+                includeStopToken: true)
             var ids: [Int] = []
             var terminal: GenerateCompletionInfo?
             for await event in stream {
@@ -115,10 +132,13 @@ final class StructuredOutputGenerationTests: XCTestCase {
         try await MLXMetalTestLock.withLock { () async throws -> Void in
             let tokenizer = SchemaGenerationTokenizer()
             let target = SchemaGenerationTarget(plan: [1, 0])
-            let iterator = try TokenIterator(input: LMInput(tokens: MLXArray([Int32(3)])),
-                model: target, parameters: Self.parameters(max: 1), tokenizer: tokenizer, stopTokenIDs: [0])
+            let iterator = try TokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(3)])),
+                model: target, parameters: Self.parameters(max: 1), tokenizer: tokenizer,
+                stopTokenIDs: [0])
             let audit = SchemaPublicationAudit()
-            let (stream, task) = generateTokenTask(promptTokenCount: 1,
+            let (stream, task) = generateTokenTask(
+                promptTokenCount: 1,
                 modelConfiguration: ModelConfiguration(id: "fixture/schema"), tokenizer: tokenizer,
                 iterator: SchemaPublicationIterator(base: iterator, audit: audit))
             var ids: [Int] = []
@@ -140,12 +160,16 @@ final class StructuredOutputGenerationTests: XCTestCase {
         try await MLXMetalTestLock.withLock { () async throws -> Void in
             let tokenizer = SchemaGenerationTokenizer()
             let target = SchemaGenerationTarget(plan: [1, 0])
-            let iterator = try TokenIterator(input: LMInput(tokens: MLXArray([Int32(3)])),
-                model: target, parameters: Self.parameters(), tokenizer: tokenizer, stopTokenIDs: [0])
+            let iterator = try TokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(3)])),
+                model: target, parameters: Self.parameters(), tokenizer: tokenizer,
+                stopTokenIDs: [0])
             let audit = SchemaPublicationAudit()
-            let (stream, task) = generateTokenTask(promptTokenCount: 1,
+            let (stream, task) = generateTokenTask(
+                promptTokenCount: 1,
                 modelConfiguration: ModelConfiguration(id: "fixture/schema"), tokenizer: tokenizer,
-                iterator: SchemaPublicationIterator(base: iterator, audit: audit, cancelOnNext: true))
+                iterator: SchemaPublicationIterator(
+                    base: iterator, audit: audit, cancelOnNext: true))
             var ids: [Int] = []
             var terminal: GenerateCompletionInfo?
             for await event in stream {
@@ -165,12 +189,16 @@ final class StructuredOutputGenerationTests: XCTestCase {
         try MLXMetalTestLock.withLock {
             let target = SchemaGenerationTarget(plan: [1, 0])
             let tokenizer = SchemaGenerationTokenizer()
-            let context = ModelContext(configuration: ModelConfiguration(id: "fixture/schema"),
+            let context = ModelContext(
+                configuration: ModelConfiguration(id: "fixture/schema"),
                 model: target, processor: StandInUserInputProcessor(), tokenizer: tokenizer)
             var parameters = Self.parameters()
             parameters.extraStopStrings = ["true"]
-            XCTAssertThrowsError(try generateTokensTask(input: LMInput(tokens: MLXArray([Int32(3)])),
-                parameters: parameters, context: context)) { error in
+            XCTAssertThrowsError(
+                try generateTokensTask(
+                    input: LMInput(tokens: MLXArray([Int32(3)])),
+                    parameters: parameters, context: context)
+            ) { error in
                 XCTAssertEqual((error as? GenerationFailure)?.stage, .preparation)
             }
             XCTAssertTrue(target.forwarded.isEmpty)
@@ -180,16 +208,22 @@ final class StructuredOutputGenerationTests: XCTestCase {
     func testBatchEngineSchemaIsolationAndFailedSlotDoNotChangeOrdinaryRequest() async throws {
         try await MLXMetalTestLock.withLock { () async throws -> Void in
             let tokenizer = SchemaGenerationTokenizer()
-            let context = ModelContext(configuration: ModelConfiguration(id: "fixture/schema-batch"),
-                model: SchemaBatchTarget(), processor: StandInUserInputProcessor(), tokenizer: tokenizer)
+            let context = ModelContext(
+                configuration: ModelConfiguration(id: "fixture/schema-batch"),
+                model: SchemaBatchTarget(), processor: StandInUserInputProcessor(),
+                tokenizer: tokenizer)
             let engine = BatchEngine(context: context, maxBatchSize: 4)
-            let (_, booleanStream) = await engine.submit(input: LMInput(tokens: MLXArray([Int32(3)])), parameters: Self.parameters())
-            let (_, falseStream) = await engine.submit(input: LMInput(tokens: MLXArray([Int32(3)])),
+            let (_, booleanStream) = await engine.submit(
+                input: LMInput(tokens: MLXArray([Int32(3)])), parameters: Self.parameters())
+            let (_, falseStream) = await engine.submit(
+                input: LMInput(tokens: MLXArray([Int32(3)])),
                 parameters: Self.parameters(schema: #"{"type":"boolean","enum":[false]}"#))
             var conflict = Self.parameters()
-            conflict.suppressTokens = Array(0..<9)
-            let (_, failedStream) = await engine.submit(input: LMInput(tokens: MLXArray([Int32(3)])), parameters: conflict)
-            let (_, ordinaryStream) = await engine.submit(input: LMInput(tokens: MLXArray([Int32(3)])),
+            conflict.suppressTokens = Array(0 ..< 9)
+            let (_, failedStream) = await engine.submit(
+                input: LMInput(tokens: MLXArray([Int32(3)])), parameters: conflict)
+            let (_, ordinaryStream) = await engine.submit(
+                input: LMInput(tokens: MLXArray([Int32(3)])),
                 parameters: GenerateParameters(maxTokens: 16, temperature: 0))
             let streams = [booleanStream, falseStream, failedStream, ordinaryStream]
             let expected = [[1], [2], [], [1]]
@@ -216,8 +250,11 @@ final class StructuredOutputGenerationTests: XCTestCase {
         try MLXMetalTestLock.withLock {
             let target = SchemaGenerationTarget(plan: [1, 0])
             let draft = SchemaGenerationTarget(plan: [1, 0])
-            XCTAssertThrowsError(try SpeculativeTokenIterator(input: LMInput(tokens: MLXArray([Int32(3)])),
-                mainModel: target, draftModel: draft, parameters: Self.parameters(), numDraftTokens: 2))
+            XCTAssertThrowsError(
+                try SpeculativeTokenIterator(
+                    input: LMInput(tokens: MLXArray([Int32(3)])),
+                    mainModel: target, draftModel: draft, parameters: Self.parameters(),
+                    numDraftTokens: 2))
             XCTAssertTrue(target.forwarded.isEmpty)
             XCTAssertTrue(draft.forwarded.isEmpty)
         }
@@ -227,10 +264,13 @@ final class StructuredOutputGenerationTests: XCTestCase {
         try await MLXMetalTestLock.withLock { () async throws -> Void in
             let tokenizer = SchemaMarkerTokenizer()
             let target = SchemaGenerationTarget(plan: [1, 0], vocabularySize: 3)
-            let context = ModelContext(configuration: ModelConfiguration(id: "fixture/schema",
-                toolCallFormat: .json, reasoningParserName: "qwen3"),
+            let context = ModelContext(
+                configuration: ModelConfiguration(
+                    id: "fixture/schema",
+                    toolCallFormat: .json, reasoningParserName: "qwen3"),
                 model: target, processor: StandInUserInputProcessor(), tokenizer: tokenizer)
-            let stream = try generate(input: LMInput(tokens: MLXArray([Int32(2)])),
+            let stream = try generate(
+                input: LMInput(tokens: MLXArray([Int32(2)])),
                 parameters: Self.parameters(schema: #"{"type":"string"}"#), context: context)
             var text = ""
             var terminal: GenerateCompletionInfo?
@@ -253,10 +293,15 @@ final class StructuredOutputGenerationTests: XCTestCase {
         try MLXMetalTestLock.withLock {
             let target = SchemaGenerationTarget(plan: [1, 0])
             let tokenizer = SchemaGenerationTokenizer(reasoningPrompt: true)
-            let context = ModelContext(configuration: ModelConfiguration(id: "fixture/schema", reasoningParserName: "qwen3"),
+            let context = ModelContext(
+                configuration: ModelConfiguration(
+                    id: "fixture/schema", reasoningParserName: "qwen3"),
                 model: target, processor: StandInUserInputProcessor(), tokenizer: tokenizer)
-            XCTAssertThrowsError(try generateTokensTask(input: LMInput(tokens: MLXArray([Int32(3)])),
-                parameters: Self.parameters(), context: context)) { error in
+            XCTAssertThrowsError(
+                try generateTokensTask(
+                    input: LMInput(tokens: MLXArray([Int32(3)])),
+                    parameters: Self.parameters(), context: context)
+            ) { error in
                 XCTAssertEqual((error as? GenerationFailure)?.stage, .preparation)
             }
             XCTAssertTrue(target.forwarded.isEmpty)
@@ -275,7 +320,9 @@ private final class SchemaGenerationTarget: Module, LanguageModel {
     }
     var kvHeads: [Int] { [] }
     func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult { .tokens(input.text) }
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
     func callAsFunction(_ input: MLXArray, cache: [KVCache]?) -> MLXArray {
         let next = plan[min(forwarded.count, plan.count - 1)]
         forwarded.append(input.asArray(Int.self))
@@ -301,8 +348,10 @@ private struct SchemaGenerationTokenizer: MLXLMCommon.Tokenizer {
     }
     func convertTokenToId(_ token: String) -> Int? { pieces.firstIndex(of: token) }
     func convertIdToToken(_ id: Int) -> String? { pieces.indices.contains(id) ? pieces[id] : nil }
-    func applyChatTemplate(messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
-                           additionalContext: [String: any Sendable]?) throws -> [Int] { [3] }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [3] }
 }
 
 /// Observes the real generation loop's publication flag and delegates to the
@@ -323,9 +372,13 @@ private struct SchemaPublicationIterator: TokenIteratorProtocol {
         if cancelOnNext { withUnsafeCurrentTask { $0?.cancel() } }
         return token
     }
-    mutating func storeCacheAfterGeneration(generatedTokenIds: [Int], includeGeneratedBoundary: Bool) {
+    mutating func storeCacheAfterGeneration(
+        generatedTokenIds: [Int], includeGeneratedBoundary: Bool
+    ) {
         audit.calls.append(includeGeneratedBoundary)
-        base.storeCacheAfterGeneration(generatedTokenIds: generatedTokenIds, includeGeneratedBoundary: includeGeneratedBoundary)
+        base.storeCacheAfterGeneration(
+            generatedTokenIds: generatedTokenIds, includeGeneratedBoundary: includeGeneratedBoundary
+        )
     }
 }
 
@@ -345,8 +398,10 @@ private struct SchemaMarkerTokenizer: MLXLMCommon.Tokenizer {
     }
     func convertTokenToId(_ token: String) -> Int? { pieces.firstIndex(of: token) }
     func convertIdToToken(_ id: Int) -> String? { pieces.indices.contains(id) ? pieces[id] : nil }
-    func applyChatTemplate(messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
-                           additionalContext: [String: any Sendable]?) throws -> [Int] { [2] }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [2] }
 }
 
 /// Input-local deterministic logits support the scheduler's genuine B-wide
@@ -355,14 +410,16 @@ private final class SchemaBatchTarget: Module, LanguageModel {
     var vocabularySize: Int { 9 }
     var kvHeads: [Int] { [] }
     func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult { .tokens(input.text) }
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
     func callAsFunction(_ input: MLXArray, cache: [KVCache]?) -> MLXArray {
         let batch = input.ndim == 1 ? 1 : input.dim(0)
         let sequence = input.ndim == 1 ? input.size : input.dim(1)
         let tokens = input.asArray(Int.self)
         var values: [Float] = []
-        for row in 0..<batch {
-            for position in 0..<sequence {
+        for row in 0 ..< batch {
+            for position in 0 ..< sequence {
                 let token = tokens[row * sequence + position]
                 var logits = Array(repeating: Float(-10), count: vocabularySize)
                 if token == 3 {

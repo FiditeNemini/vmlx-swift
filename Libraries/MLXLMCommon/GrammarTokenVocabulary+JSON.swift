@@ -38,11 +38,11 @@ extension GrammarTokenVocabulary {
         // The byte-to-Unicode alphabet specified by the ByteLevel decoder.
         // Added tokens bypass that decoder, so encode their literal UTF-8 bytes
         // into this same alphabet before handing the vocabulary to XGrammar.
-        let initial = Array(33...126) + Array(161...172) + Array(174...255)
+        let initial = Array(33 ... 126) + Array(161 ... 172) + Array(174 ... 255)
         var byteScalars: [Int: Unicode.Scalar] = [:]
         for value in initial { byteScalars[value] = Unicode.Scalar(value)! }
         var extra = 0
-        for value in 0...255 where byteScalars[value] == nil {
+        for value in 0 ... 255 where byteScalars[value] == nil {
             byteScalars[value] = Unicode.Scalar(256 + extra)!
             extra += 1
         }
@@ -73,7 +73,10 @@ extension GrammarTokenVocabulary {
             if let text = value as? String { return text }
             return (value as? [String: Any])?["content"] as? String
         }
-        for key in ["bos_token", "eos_token", "unk_token", "pad_token", "sep_token", "cls_token", "mask_token"] {
+        for key in [
+            "bos_token", "eos_token", "unk_token", "pad_token", "sep_token", "cls_token",
+            "mask_token",
+        ] {
             if let content = specialContent(config[key]) {
                 for (id, piece) in originalPieces where piece == content { special.insert(id) }
             }
@@ -84,17 +87,19 @@ extension GrammarTokenVocabulary {
             }
         }
         for (id, piece) in pieces where !special.contains(id) {
-            guard !piece.isEmpty, piece.unicodeScalars.allSatisfy({ alphabet.contains($0) }) else { return nil }
+            guard !piece.isEmpty, piece.unicodeScalars.allSatisfy({ alphabet.contains($0) }) else {
+                return nil
+            }
         }
         // Bound sparse, untrusted IDs before allocating an ID-indexed array.
         // This is a supported vocabulary limit, not a model/token remapping.
         guard let maximum = pieces.keys.max(), maximum < (1 << 22) else { return nil }
         var vocabulary = Array(repeating: "", count: maximum + 1)
         for id in vocabulary.indices {
-            if let piece = pieces[id] { vocabulary[id] = piece }
-            else { special.insert(id) } // ID holes must never become admissible empty tokens.
+            if let piece = pieces[id] { vocabulary[id] = piece } else { special.insert(id) }  // ID holes must never become admissible empty tokens.
         }
-        return GrammarTokenVocabulary(vocabulary: vocabulary, vocabularyType: .byteLevel,
+        return GrammarTokenVocabulary(
+            vocabulary: vocabulary, vocabularyType: .byteLevel,
             specialTokenIDs: special)
     }
 }

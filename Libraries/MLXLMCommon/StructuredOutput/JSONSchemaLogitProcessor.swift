@@ -37,16 +37,20 @@ public struct JSONSchemaLogitProcessor: LogitProcessor, ConstraintFailureReporti
         base: (any LogitProcessor)? = nil
     ) throws {
         guard let metadata = tokenizer.grammarTokenVocabulary else {
-            throw JSONSchemaGrammarError.invalidTokenizer("Tokenizer does not expose exact grammar vocabulary metadata")
+            throw JSONSchemaGrammarError.invalidTokenizer(
+                "Tokenizer does not expose exact grammar vocabulary metadata")
         }
-        guard metadata.specialTokenIDs.allSatisfy({ metadata.vocabulary.indices.contains($0) }) else {
-            throw JSONSchemaGrammarError.invalidTokenizer("Special token ID is outside the vocabulary")
+        guard metadata.specialTokenIDs.allSatisfy({ metadata.vocabulary.indices.contains($0) })
+        else {
+            throw JSONSchemaGrammarError.invalidTokenizer(
+                "Special token ID is outside the vocabulary")
         }
         let grammarTokenizer = try JSONSchemaGrammarTokenizer(
             vocabulary: metadata.vocabulary, vocabularyType: metadata.vocabularyType,
             stopTokenIDs: stopTokenIDs.sorted())
         self.base = base
-        self.state = State(grammar: try JSONSchemaGrammar(tokenizer: grammarTokenizer, schema: schema))
+        self.state = State(
+            grammar: try JSONSchemaGrammar(tokenizer: grammarTokenizer, schema: schema))
         self.vocabularySize = grammarTokenizer.vocabularySize
         self.stopTokenIDs = stopTokenIDs
         self.excludedTokenIDs = metadata.specialTokenIDs.subtracting(stopTokenIDs)
@@ -71,9 +75,10 @@ public struct JSONSchemaLogitProcessor: LogitProcessor, ConstraintFailureReporti
             copied = State(grammar: nil, failure: Self.constraintError(error))
         }
         copied.terminated = state.terminated
-        return Self(base: base?.independentCopy(), state: copied,
-                    vocabularySize: vocabularySize, stopTokenIDs: stopTokenIDs,
-                    excludedTokenIDs: excludedTokenIDs)
+        return Self(
+            base: base?.independentCopy(), state: copied,
+            vocabularySize: vocabularySize, stopTokenIDs: stopTokenIDs,
+            excludedTokenIDs: excludedTokenIDs)
     }
 
     public mutating func prompt(_ prompt: MLXArray) {
@@ -93,7 +98,8 @@ public struct JSONSchemaLogitProcessor: LogitProcessor, ConstraintFailureReporti
                 throw JSONSchemaGrammarError.runtime("Missing request-local grammar matcher")
             }
             guard logits.ndim >= 1, let count = logits.shape.last, count >= vocabularySize,
-                  logits.size == count else {
+                logits.size == count
+            else {
                 throw JSONSchemaGrammarError.runtime("Schema processor requires one vocabulary row")
             }
             var allowed = Array(repeating: false, count: count)
@@ -104,11 +110,14 @@ public struct JSONSchemaLogitProcessor: LogitProcessor, ConstraintFailureReporti
             } else {
                 let mask = try grammar.nextTokenMask()
                 guard mask.vocabularySize == vocabularySize,
-                      !mask.needsApply || mask.words.count >= (vocabularySize + 31) / 32 else {
-                    throw JSONSchemaGrammarError.runtime("Grammar mask does not match tokenizer vocabulary")
+                    !mask.needsApply || mask.words.count >= (vocabularySize + 31) / 32
+                else {
+                    throw JSONSchemaGrammarError.runtime(
+                        "Grammar mask does not match tokenizer vocabulary")
                 }
-                for id in 0..<vocabularySize {
-                    allowed[id] = !mask.needsApply
+                for id in 0 ..< vocabularySize {
+                    allowed[id] =
+                        !mask.needsApply
                         || (mask.words[id / 32] & (UInt32(1) << UInt32(id % 32))) != 0
                 }
                 for id in excludedTokenIDs { allowed[id] = false }
@@ -116,17 +125,19 @@ public struct JSONSchemaLogitProcessor: LogitProcessor, ConstraintFailureReporti
             guard allowed.contains(true) else {
                 throw JSONSchemaGrammarError.runtime("JSON schema has no valid next token")
             }
-            let masked = MLX.where(MLXArray(allowed), processed,
-                                   MLXArray(-Float.infinity, dtype: processed.dtype))
+            let masked = MLX.where(
+                MLXArray(allowed), processed,
+                MLXArray(-Float.infinity, dtype: processed.dtype))
             // Existing suppression/reasoning processors can eliminate every
             // grammar-allowed token. Report that conflict, never sample NaNs.
             guard MLX.any(MLX.isFinite(masked)).item(Bool.self) else {
-                throw JSONSchemaGrammarError.runtime("No finite token remains after schema and generation constraints")
+                throw JSONSchemaGrammarError.runtime(
+                    "No finite token remains after schema and generation constraints")
             }
             return masked
         } catch {
             state.failure = Self.constraintError(error)
-            return logits // Caller must check constraintFailure before sampling.
+            return logits  // Caller must check constraintFailure before sampling.
         }
     }
 
@@ -137,12 +148,14 @@ public struct JSONSchemaLogitProcessor: LogitProcessor, ConstraintFailureReporti
                 throw JSONSchemaGrammarError.runtime("Schema processor requires one sampled token")
             }
             let id = token.item(Int.self)
-            guard (0..<vocabularySize).contains(id), !excludedTokenIDs.contains(id) else {
-                throw JSONSchemaGrammarError.runtime("Sampled token is outside the allowed grammar vocabulary")
+            guard (0 ..< vocabularySize).contains(id), !excludedTokenIDs.contains(id) else {
+                throw JSONSchemaGrammarError.runtime(
+                    "Sampled token is outside the allowed grammar vocabulary")
             }
             if state.terminated {
                 guard stopTokenIDs.contains(id) else {
-                    throw JSONSchemaGrammarError.runtime("Non-stop token sampled after schema completion")
+                    throw JSONSchemaGrammarError.runtime(
+                        "Non-stop token sampled after schema completion")
                 }
                 return
             }
