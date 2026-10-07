@@ -33,6 +33,14 @@ func runRowCostBench(modelPath: String) async throws {
         // The DFlash2 target lane install (VMLX_LANE_QMM_TILED=1 selects the tiled layout).
         LaneQMM.installForDFlash2Target(model)
     }
+    if env["BENCH_PARTS"] == "1" {
+        for line in Qwen35DFlash2PartsProbe.run(
+            model: model, rowsList: rowsList, reps: Int(env["BENCH_PARTS_REPS"] ?? "15") ?? 15)
+        {
+            print(line)
+        }
+        return
+    }
     let text = String(
         repeating: "The history of printing presses in Europe changed literacy and trade. ",
         count: 40)
