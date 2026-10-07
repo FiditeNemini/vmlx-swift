@@ -9,7 +9,11 @@ import Testing
 @Suite("Native MTP manual depth contract")
 struct NativeMTPManualDepthTests {
 
-    private static func config(modelType: String = "qwen4_exp") -> Data {
+    /// A tuning-gated family. NOT `qwen4_exp`: Qwen3.8 Flash-Next has a measured family cold-start depth
+    /// (it launches Adaptive D3 without a tuning file, by design), so an "untuned qwen4_exp" fixture can never
+    /// exercise the tuning gate this suite is about — and real inspected Flash bundles always carry
+    /// `measuredFamilyAutoDepth` (2026-10-06 fix of these pre-existing failures).
+    private static func config(modelType: String = "qwen3_5") -> Data {
         Data("{\"model_type\": \"\(modelType)\"}".utf8)
     }
 
@@ -143,7 +147,7 @@ struct NativeMTPManualDepthTests {
             try NativeMTPActivation.$manualDepthOverride.withValue(2) {
                 let allowed = try NativeMTPActivation.shouldLoadNativeMTPWeights(
                     configData: Self.config(),
-                    baseModelType: "qwen4_exp",
+                    baseModelType: "qwen3_5",
                     status: Self.completeUntunedStatus)
                 #expect(allowed)
             }
@@ -153,7 +157,7 @@ struct NativeMTPManualDepthTests {
             #expect(throws: (any Error).self) {
                 _ = try NativeMTPActivation.shouldLoadNativeMTPWeights(
                     configData: Self.config(),
-                    baseModelType: "qwen4_exp",
+                    baseModelType: "qwen3_5",
                     status: Self.completeUntunedStatus)
             }
         }
@@ -179,13 +183,13 @@ struct NativeMTPManualDepthTests {
                 #expect(throws: NativeMTPActivationError.self) {
                     _ = try NativeMTPActivation.shouldLoadNativeMTPWeights(
                         configData: Self.config(),
-                        baseModelType: "qwen4_exp",
+                        baseModelType: "qwen3_5",
                         status: Self.blockedStatus)
                 }
                 do {
                     _ = try NativeMTPActivation.shouldLoadNativeMTPWeights(
                         configData: Self.config(),
-                        baseModelType: "qwen4_exp",
+                        baseModelType: "qwen3_5",
                         status: Self.blockedStatus)
                     Issue.record("blocked tuning unexpectedly loaded")
                 } catch let error as NativeMTPActivationError {
@@ -213,7 +217,7 @@ struct NativeMTPManualDepthTests {
             try NativeMTPActivation.$manualDepthOverride.withValue(2) {
                 let allowed = try NativeMTPActivation.shouldLoadNativeMTPWeights(
                     configData: Self.config(),
-                    baseModelType: "qwen4_exp",
+                    baseModelType: "qwen3_5",
                     status: Self.autoOnlyBlockedStatus)
                 #expect(allowed)
             }

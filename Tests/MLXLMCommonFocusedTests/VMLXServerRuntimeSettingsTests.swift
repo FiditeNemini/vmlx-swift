@@ -125,14 +125,16 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
-    @Test("default Off prevents native MTP launch without changing capability")
-    func defaultOffPreventsNativeMTPLaunch() {
+    @Test("explicit Off prevents native MTP launch without changing capability")
+    func explicitOffPreventsNativeMTPLaunch() {
         for type in ["qwen4_exp", "qwen3_5"] {
             let config = Data("{\"model_type\":\"\(type)\",\"mtp_num_hidden_layers\":1}".utf8)
             let status = MTPBundleStatus(
                 bundleHasMTP: true, configuredLayers: 1, tensorCount: 57,
                 mode: .preservedEnabled, measuredFamilyAutoDepth: 3)
-            let settings = VMLXServerRuntimeSettings()
+            // The shipped default is `.familyDefault` (on for Flash-Next); Off must still switch it off.
+            var settings = VMLXServerRuntimeSettings()
+            settings.mtp.mode = .off
             var base = LoadConfiguration.default
             base.nativeMTP = true
             #expect(settings.resolvedMTPLaunch(
