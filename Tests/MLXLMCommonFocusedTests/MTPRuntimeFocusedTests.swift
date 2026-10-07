@@ -1909,7 +1909,9 @@ struct MTPRuntimeFocusedTests {
             let model = FocusedNativeMTPProbeTarget()
             let context = Self.nativeMTPDispatchContext(model: model)
             let engine = BatchEngine(context: context, maxBatchSize: 2)
-            var params = GenerateParameters(maxTokens: 4, temperature: 0)
+            // Allow seed and AR timing-calibration tokens before requiring an
+            // actual verify cycle. Four tokens stop before verification starts.
+            var params = GenerateParameters(maxTokens: 12, temperature: 0)
             params.draftStrategy = .nativeMTP(depth: 3)
 
             let stream = await engine.generate(
