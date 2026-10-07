@@ -24,7 +24,7 @@ public enum BatchEngineConfigurationError: Error, LocalizedError, Sendable {
 }
 
 private func cancelledBatchStream(
-    promptTokenCount: Int
+    promptTokenCount: Int, generationFailure: GenerationFailure? = nil
 ) -> (id: BatchRequestID, stream: AsyncStream<BatchGeneration>) {
     let id = BatchRequestID()
     let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
@@ -33,14 +33,14 @@ private func cancelledBatchStream(
         generationTokenCount: 0,
         promptTime: 0,
         generationTime: 0,
-        stopReason: .cancelled
+        stopReason: .cancelled, generationFailure: generationFailure
     )))
     continuation.finish()
     return (id, stream)
 }
 
 private func cancelledGenerationStream(
-    promptTokenCount: Int
+    promptTokenCount: Int, generationFailure: GenerationFailure? = nil
 ) -> AsyncStream<Generation> {
     let (stream, continuation) = AsyncStream<Generation>.makeStream()
     continuation.yield(.info(GenerateCompletionInfo(
@@ -48,7 +48,7 @@ private func cancelledGenerationStream(
         generationTokenCount: 0,
         promptTime: 0,
         generationTime: 0,
-        stopReason: .cancelled
+        stopReason: .cancelled, generationFailure: generationFailure
     )))
     continuation.finish()
     return stream
@@ -493,6 +493,16 @@ public actor BatchEngine {
             return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
         }
 
+        var parameters = parameters
+        if parameters.jsonSchema != nil {
+            do {
+                try validateStructuredOutputRequest(input: input, parameters: parameters, context: context)
+                parameters.draftStrategy = nil
+            } catch {
+                return cancelledBatchStream(promptTokenCount: input.text.tokens.size,
+                    generationFailure: GenerationFailure(stage: .preparation, cause: error.localizedDescription))
+            }
+        }
         do {
             _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
         } catch {
@@ -527,7 +537,6 @@ public actor BatchEngine {
             tokenizer: context.tokenizer,
             modelName: context.configuration.name,
             path: "BatchEngine.submit")
-        var parameters = parameters
         if let floor = MinimumReasoningFloor.armIfNeeded(
             input: input, tokenizer: context.tokenizer, promptTail: promptTail)
         {
@@ -595,6 +604,16 @@ public actor BatchEngine {
             return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
         }
 
+        var parameters = parameters
+        if parameters.jsonSchema != nil {
+            do {
+                try validateStructuredOutputRequest(input: input, parameters: parameters, context: context)
+                parameters.draftStrategy = nil
+            } catch {
+                return cancelledGenerationStream(promptTokenCount: input.text.tokens.size,
+                    generationFailure: GenerationFailure(stage: .preparation, cause: error.localizedDescription))
+            }
+        }
         do {
             _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
         } catch {
@@ -656,7 +675,6 @@ public actor BatchEngine {
             tokenizer: tokenizer,
             modelName: context.configuration.name,
             path: "BatchEngine.generate")
-        var parameters = parameters
         if let floor = MinimumReasoningFloor.armIfNeeded(
             input: input, tokenizer: tokenizer, promptTail: promptTail)
         {
@@ -798,10 +816,13 @@ public actor BatchEngine {
         // info remain buffered and the cache-store time is incorrectly added to
         // user-visible TTFT. Keep the store serialized on the actor, but consume
         // and detokenize its stream on an independent executor.
+        let structuredOutput = parameters.jsonSchema != nil
         Task.detached {
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
             let activeToolSchemas = toolSchemas?.isEmpty == false ? toolSchemas : nil
             let toolCallProcessor: ToolCallProcessor? = {
+                // Protocol-looking strings inside JSON are literal user data.
+                guard !structuredOutput else { return nil }
                 if let activeToolSchemas {
                     return ToolCallProcessor(format: toolCallFormat, tools: activeToolSchemas)
                 }
@@ -816,10 +837,10 @@ public actor BatchEngine {
                 }
                 return nil
             }()
-            var reasoningParser = ReasoningParser.forPrompt(
+            var reasoningParser = structuredOutput ? nil : ReasoningParser.forPrompt(
                 stampName: reasoningParserName,
                 promptTail: promptTail)
-            var stopMatcher = StopStringMatcher(stopStrings: extraStopStrings)
+            var stopMatcher = StopStringMatcher(stopStrings: structuredOutput ? [] : extraStopStrings)
             var stopMatched = false
             func emitChunkThroughStop(_ text: String) {
                 guard stopMatcher.isEnabled else {
@@ -1257,7 +1278,8 @@ public actor BatchEngine {
                     makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
-                    toolSchemas: toolSchemas)
+                    toolSchemas: toolSchemas,
+                    structuredOutput: soloParameters.jsonSchema != nil)
             } else if let strategy = soloParameters.draftStrategy,
                 let drafterPath = strategy.dflash2DrafterPath,
                 DFlash2TokenIterator.unservableReason(soloParameters) == nil
@@ -1301,7 +1323,8 @@ public actor BatchEngine {
                     makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
-                    toolSchemas: toolSchemas)
+                    toolSchemas: toolSchemas,
+                    structuredOutput: soloParameters.jsonSchema != nil)
             } else if let strategy = soloParameters.draftStrategy,
                 case .nativeMTP(depth: let depth, verifierMode: _) = strategy,
                 soloParameters.canUseNativeMTP(for: input)
@@ -1342,7 +1365,8 @@ public actor BatchEngine {
                     makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
-                    toolSchemas: toolSchemas)
+                    toolSchemas: toolSchemas,
+                    structuredOutput: soloParameters.jsonSchema != nil)
             } else {
                 // Defer TokenIterator construction (and therefore the prompt
                 // prefill) into the streaming task so the consumer can observe
@@ -1359,6 +1383,8 @@ public actor BatchEngine {
                 let deferredInputs = SendableBox(
                     (input, context.model, cacheCoordinator))
                 let deferredContinuation = continuation
+                let schemaTokenizer = context.tokenizer
+                let schemaStopIDs = stopTokenIDs
                 let makeIterator: @Sendable () throws -> any TokenIteratorProtocol = {
                     let (deferredInput, deferredModel, deferredCoordinator) =
                         deferredInputs.consume()
@@ -1372,7 +1398,7 @@ public actor BatchEngine {
                         skipDiskBackedToolPromptSeedBoundary: deferredSkipSeedBoundary,
                         prefillProgressHandler: { progress in
                             deferredContinuation.yield(.prefillProgress(prefillGate.clamp(progress)))
-                        })
+                        }, tokenizer: schemaTokenizer, stopTokenIDs: schemaStopIDs)
                 }
                 (sourceStream, generationTask) = generateTaskDeferred(
                     promptTokenCount: promptTokenCount,
@@ -1382,7 +1408,8 @@ public actor BatchEngine {
                     makeIterator: makeIterator,
                     extraStopStrings: soloParameters.extraStopStrings,
                     promptTail: promptTail,
-                    toolSchemas: toolSchemas)
+                    toolSchemas: toolSchemas,
+                    structuredOutput: soloParameters.jsonSchema != nil)
             }
         } catch {
             Self.logger.error(
@@ -1894,6 +1921,17 @@ public actor BatchEngine {
             }
 
             var slot = BatchSlot(from: request, cache: cache, stopTokenIDs: stopTokenIDs)
+            if let schema = request.parameters.jsonSchema {
+                do {
+                    slot.processor = try JSONSchemaLogitProcessor(
+                        schema: schema, tokenizer: context.tokenizer, stopTokenIDs: stopTokenIDs,
+                        base: slot.processor)
+                } catch {
+                    finishSlot(&slot, reason: .cancelled, generationFailure:
+                        GenerationFailure(stage: .preparation, cause: error.localizedDescription))
+                    continue
+                }
+            }
             if NaNLogitsTrace.isEnabled {
                 slot.nanTrace = NaNLogitsTrace(
                     slot: request.id.description,
@@ -2685,7 +2723,7 @@ public actor BatchEngine {
                     return output
                 }
                 let logits = result.logits[0 ..< 1, -1, 0...]
-                firstToken = slot.sampleToken(from: logits)
+                firstToken = try slot.sampleToken(from: logits)
 
             case .logits(let result):
                 if let effectivePromptTokens = result.effectivePromptTokens,
@@ -2709,7 +2747,7 @@ public actor BatchEngine {
                 }
                 // VLM path: prepare() already ran the full prompt and returned logits directly.
                 let logits = result.logits[0 ..< 1, -1, 0...]
-                firstToken = slot.sampleToken(from: logits)
+                firstToken = try slot.sampleToken(from: logits)
             }
 
         } catch {
@@ -2720,7 +2758,8 @@ public actor BatchEngine {
                 generationFailure: error is CancellationError
                     ? nil
                     : GenerationFailure(
-                        stage: .preparation, cause: error.localizedDescription))
+                        stage: error is JSONSchemaGrammarError ? .decoding : .preparation,
+                        cause: error.localizedDescription))
             slot.isFinished = true
             activeSlots[slotIndex] = slot
             return
@@ -2851,7 +2890,10 @@ public actor BatchEngine {
 
         // Extract as [1, V] for the processor/sampler contract.
         let logits = result[0][0 ..< 1, 0, 0...]
-        let token = slot.sampleToken(from: logits)
+        guard let token = sampleSchemaAwareToken(slot: &slot, logits: logits) else {
+            activeSlots[slotIndex] = slot
+            return
+        }
         let tokenID = token.item(Int.self)
 
         // Stage 0: per-step KV-quant hook. For compile+TQ this is a no-op
@@ -3216,21 +3258,22 @@ public actor BatchEngine {
         // Mirrors `TokenIterator.next()`'s `asyncEval(token)` idiom
         // which is what gave the non-batch path its +15% edge on
         // 35B-A3B models.
-        var sampledTokens: [MLXArray] = []
+        var sampledTokens: [MLXArray?] = []
         sampledTokens.reserveCapacity(slotIndices.count)
         for (batchIdx, slotIdx) in slotIndices.enumerated() {
             let logits = result.logits[batchIdx ..< batchIdx + 1, 0, 0...]
             var slot = activeSlots[slotIdx]
-            let token = slot.sampleToken(from: logits)
+            let token = sampleSchemaAwareToken(slot: &slot, logits: logits)
             sampledTokens.append(token)
             activeSlots[slotIdx] = slot
         }
-        asyncEval(sampledTokens)
+        let validSampledTokens = sampledTokens.compactMap { $0 }
+        if !validSampledTokens.isEmpty { asyncEval(validSampledTokens) }
 
         // Sample per sequence and route results
         for (batchIdx, slotIdx) in slotIndices.enumerated() {
             var slot = activeSlots[slotIdx]
-            let token = sampledTokens[batchIdx]
+            guard let token = sampledTokens[batchIdx] else { continue }
             // `.item(Int.self)` forces eval of the sampled-token op.
             // GPU is already running (kicked off by asyncEval above
             // of both the logits and the sampled tokens) — this wait
@@ -3334,6 +3377,17 @@ public actor BatchEngine {
 
     /// Finish a slot by yielding completion info and closing its stream.
     ///
+    private func sampleSchemaAwareToken(slot: inout BatchSlot, logits: MLXArray) -> MLXArray? {
+        do {
+            return try slot.sampleToken(from: logits)
+        } catch {
+            finishSlot(&slot, reason: .cancelled, generationFailure:
+                GenerationFailure(stage: .decoding, cause: error.localizedDescription))
+            slot.isFinished = true
+            return nil
+        }
+    }
+
     /// When a cache coordinator is present and the slot completed normally
     /// (not cancelled), stores prompt and safe post-answer boundaries for
     /// future cache reuse.
@@ -3342,6 +3396,13 @@ public actor BatchEngine {
         generationFailure: GenerationFailure? = nil
     ) {
         var slot = liveSlot
+        var generationFailure = generationFailure
+        if slot.parameters.jsonSchema != nil, generationFailure == nil,
+           reason != .stop || (slot.processor as? any ConstraintFailureReporting)?.constraintIsComplete != true {
+            generationFailure = GenerationFailure(stage: .decoding,
+                cause: (slot.processor as? any ConstraintFailureReporting)?.constraintFailure?.localizedDescription
+                    ?? "Generation ended before the JSON schema matcher accepted a stop token")
+        }
         slot.nanTrace?.finish(totalSteps: slot.generatedTokenCount)
         defer {
             // Cache stores are synchronous. Drop the sole retained prompt/seed
@@ -3378,7 +3439,7 @@ public actor BatchEngine {
         // ring buffer + 5-tuple metaState via `.rotating` LayerKind. The
         // `mediaSalt` is passed through so the stored key matches the key
         // the next fetch will look for (VL multi-turn cache hits).
-        if reason != .cancelled,
+        if reason != .cancelled, generationFailure == nil,
             // Auxiliary (title/suggestion/summary) prompts never store a
             // boundary — see `CachePromptIntent.auxiliary`.
             slot.originalInput.cachePromptIntent != .auxiliary,

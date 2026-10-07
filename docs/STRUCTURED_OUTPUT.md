@@ -1,0 +1,63 @@
+# JSON Schema constrained output
+
+This proposed runtime feature applies a compiled JSON grammar to each next-token distribution when a request explicitly supplies `GenerateParameters.jsonSchema`. It does not add closing-token bias, whitespace bias, prompt instructions, thinking tags, or sampler defaults. The existing request/bundle sampler selects among the allowed tokens.
+
+## Request contract
+
+```swift
+var parameters = GenerateParameters()
+parameters.jsonSchema = #"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#
+// Pass parameters to the ordinary prepared-input generation API.
+```
+
+Schema requests use autoregressive decoding only. Speculative/native-MTP draft strategies are disabled for that request; ordinary requests keep their existing behavior. Model KV/prefix/SSD caching, including full-precision disk state, remains independent of grammar state. Each request owns a fresh matcher. Processor copies replay accepted token IDs into an independent matcher; matcher history is not restored from the model's SSD prefix cache.
+
+The request must have an exact supported tokenizer vocabulary contract. The current bundle adapter accepts BPE with a plain ByteLevel decoder, empty continuation/end-of-word suffixes, and explicitly disabled tokenization-space cleanup. It maps added tokens using their literal bytes and excludes non-stop special IDs and vocabulary gaps. Decoder sequences, byte fallback, Metaspace and unknown tokenizer metadata are not qualified by this adapter. The lower-level grammar vocabulary enum is broader than the bundle adapter's admitted coverage.
+
+Active reasoning envelopes and tool-call envelopes are not qualified and are explicitly rejected at request preparation. The implementation does not silently change a model's reasoning mode. A caller may explicitly choose the model's native non-reasoning mode, where available. Block-diffusion generation is also rejected. A completed object is not sufficient for success: the matcher must admit and consume a configured stop token. Length limits, cancellation, processor failures and incomplete schemas are not schema-success receipts. Consumers must inspect completion/failure status and must not treat partial streamed text as a validated result.
+
+## Schema subset
+
+`JSONSchemaGrammar.validateSupportedSchema(_:)` rejects unsupported keywords and combinations before compilation, using `JSONSchemaGrammarError`. This is a deliberately limited contract, not general JSON Schema support.
+
+Admitted structures:
+
+- Primitive `type`, or a nonempty distinct array of primitive type names; `true`/empty schemas.
+- Object `properties`, `required` and boolean/schema `additionalProperties`. Required names must be declared properties. Object constraints require an explicit object type.
+- Array schema `items`, `minItems` and `maxItems` (integer bounds 0...1024). Array constraints require an explicit array type.
+- `enum` or `const`, optionally with a consistent type, without other constraint siblings. Enums contain 1...1024 values.
+- `anyOf` with 1...128 branches and no other constraint siblings.
+- `$defs`/`definitions` and acyclic local `$ref` (simple `#/...` schema paths), without constraint siblings. Escaped/percent-encoded pointers, external references, cycles, and targets inside annotations or instance data are rejected. All reference chains are resolved against validated schema locations.
+- Annotation fields `title`, `description`, `$comment`, `default`, `examples`; these do not constrain output. Explicit `$schema` dialect declarations are rejected until a dialect is qualified.
+
+Omitted `additionalProperties` follows JSON Schema's permissive default. The bridge explicitly compiles with `strict_mode=false`; it does not silently insert `additionalProperties:false`.
+
+Rejected features include `oneOf`, `allOf`, `not`, conditionals, dependencies, numeric bounds/`multipleOf`, `uniqueItems`, `contains`, `pattern`, `format`, `minLength`, `maxLength`, and unknown keywords. `false` schemas are rejected rather than compiling an empty language. Schema input is limited to 1 MiB, nesting depth 64 and 10,000 visited nodes.
+
+String-length constraints are rejected: the pinned compiler's constrained-string branch does not implement the full JSON escaped-character language. Ordinary strings use the separate JSON string grammar. Recursive references and explicit dialect declarations are rejected pending qualification.
+
+Low-level use with an exact vocabulary:
+
+```swift
+let vocabulary = try JSONSchemaGrammarTokenizer(
+    vocabulary: rawPieces, vocabularyType: .byteLevel,
+    stopTokenIDs: explicitStopIDs)
+let grammar = try JSONSchemaGrammar(tokenizer: vocabulary, schema: schemaJSON)
+let mask = try grammar.nextTokenMask() // packed UInt32 bits indexed by token ID
+// Apply the actual mask, then sample using the existing sampler.
+try grammar.accept(tokenID: sampledID)
+let complete = try grammar.isTerminated()
+let independent = try grammar.independentCopy()
+```
+
+The engine processor handles mask application and fail-closed errors. Application code should normally use the request parameter instead of implementing a second decode loop.
+
+## Architect integration boundary
+
+An Architect `generate` or `decide` node can supply a schema to this same generation request seam and consume the completed typed result. This change does not implement a workflow graph, input validation nodes, cloud provider nodes, agent planning, tool execution or a separate agentic runtime. Schema validation of arbitrary incoming user/workflow data remains separate from constrained model generation.
+
+## Provenance and proof limits
+
+The C shim and XGrammar sources are derived from `ml-explore/mlx-swift-lm` commit `22157fc397b59acfb03e91c370bcbf2cfb10970e`. Embedded XGrammar is v0.1.30, commit `d476a48dcd8fa3b5afeddbe850e73bb3b1dcf505`. Licenses/notices and local compatibility changes are recorded in `Libraries/MLXCXGrammar/PROVENANCE.md`. No upstream guided loop, completion reserve, closing/whitespace biases or heuristic tokenizer extractor is imported.
+
+CPU grammar tests exercise masks, explicit stop IDs, independent copies, defaults and fail-closed schema admission. Those tests do not establish real-model multi-turn, cancellation, SSD restoration, reasoning, tool or application UI qualification. Report live proof separately from source and CPU tests.

@@ -185,16 +185,23 @@ struct BatchSlot {
     /// Sample a token from logits, applying processor and sampler.
     ///
     /// Returns the sampled token as an `MLXArray` scalar.
-    mutating func sampleToken(from logits: MLXArray) -> MLXArray {
+    mutating func sampleToken(from logits: MLXArray) throws -> MLXArray {
         // Diagnostic only: the raw `[1, V]` row before any processor rewrite.
         let rawRow = nanTrace != nil ? logits : nil
         var logits = logits
         let token: MLXArray
         if var proc = processor {
             logits = proc.process(logits: logits)
+            if let failure = (proc as? any ConstraintFailureReporting)?.constraintFailure {
+                self.processor = proc
+                throw failure
+            }
             token = sampler.sample(logits: logits)
             proc.didSample(token: token)
             self.processor = proc
+            if let failure = (proc as? any ConstraintFailureReporting)?.constraintFailure {
+                throw failure
+            }
         } else {
             token = sampler.sample(logits: logits)
         }
