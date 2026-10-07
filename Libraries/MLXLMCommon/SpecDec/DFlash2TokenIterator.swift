@@ -209,8 +209,6 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private var treeMode: Bool?
     private var treeFilter: SpeculativeTopKAcceptance.Filter?
     private var treeRNG: SpeculativeHostRNG
-    /// This request was prefilled through the vision path: it never stores a prefix entry.
-    private var servedMediaPrefill = false
     /// The next cycle's lattice, dispatched right after a commit so the drafter runs on the GPU
     /// while the host streams the committed tokens.
     private var pendingLattice: DFlash2LatticeArrays?
@@ -464,9 +462,10 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // MARK: prefix reuse
 
         var tokensToPrefill = self.promptTokenIds
-        // Media: always a fresh full prefill through the vision path. A restored entry does not
-        // carry the request's M-RoPE delta, so continuing text after it would sit at the wrong
-        // positions; and media requests do not store (see storeCacheAfterGeneration).
+        // Media: prefilled through the target's vision path. A restored (media-salted) entry is
+        // continued at positions recomputed from the full prompt's token ids + media grids, so
+        // the entry itself never needs to carry the M-RoPE delta. A suffix that carries a media
+        // placeholder (a new image this turn) resets to a full prefill below.
         let mediaPrefill = input.hasMediaContent
         let mediaTarget = target as? DFlash2MediaPrefillModel
         if !mediaPrefill {
@@ -474,7 +473,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             mediaTarget?.dflash2ResetPositionState()
         }
         if let coordinator = cacheCoordinator, !tokensToPrefill.isEmpty,
-            !input.requiresPostPrepareCacheKey, !mediaPrefill
+            !input.requiresPostPrepareCacheKey
         {
             if !coordinator.isHybrid, cacheContainsPathDependentState(self.cache) {
                 let topology = ModelCacheTopologySnapshot(cache: self.cache)
@@ -633,7 +632,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // no capture — a stored boundary at least that long already exists
         // and is the one the next turn will match.
         let restoredCount = self.promptTokenIds.count - tokensToPrefill.count
-        let captureAt: Int? = mediaPrefill ? nil : self.hybridStripBoundary.flatMap { stripAt in
+        let captureAt: Int? = self.hybridStripBoundary.flatMap { stripAt in
             stripAt > restoredCount ? stripAt - restoredCount : nil
         }
 
@@ -649,10 +648,16 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         let prefill: PrefillResult
         if mediaPrefill, let mediaTarget {
             var retained: MLXArray?
+            var boundarySnapshot: [KVCache]?
             let ordered = self.orderedLayerIDs
+            let restored = self.promptTokenIds.count - tokensToPrefill.count
+            let cacheRef = self.cache
             let lastLogits = try mediaTarget.dflash2MediaPrefill(
                 input, cache: self.cache, captureLayerIDs: self.captureLayerIDs,
-                stepSize: effectiveParameters.prefillStepSize
+                stepSize: effectiveParameters.prefillStepSize,
+                restoredPrefix: restored,
+                boundary: captureAt.map { $0 + restored },
+                onBoundary: { boundarySnapshot = cacheRef.map { $0.copy() } }
             ) { captured in
                 let chunkHidden = extractContextFeature(captured: captured, targetLayerIDs: ordered)
                 let combined = retained.map { concatenated([$0, chunkHidden], axis: 1) } ?? chunkHidden
@@ -665,8 +670,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             }
             guard let retained else { throw DFlash2RuntimeError.emptyPrompt }
             MLX.eval(lastLogits, retained)
-            prefill = PrefillResult(lastLogits: lastLogits, hidden: retained, boundarySnapshot: nil)
-            self.servedMediaPrefill = true
+            prefill = PrefillResult(
+                lastLogits: lastLogits, hidden: retained, boundarySnapshot: boundarySnapshot)
         } else {
             prefill = try Self.prefill(
                 tokens: tokensToPrefill,
@@ -1643,10 +1648,6 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // Never persist a cache that still carries unverified draft rows.
         abandonInFlightVerify()
         guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else { return }
-        // A media-prefilled cache is only valid with this request's M-RoPE delta, which an
-        // entry cannot carry: storing it would let a later text continuation restore it at the
-        // wrong positions.
-        guard !servedMediaPrefill else { return }
         // Auxiliary (title/suggestion/summary) prompts never store a
         // boundary — see `CachePromptIntent.auxiliary`.
         guard originalInput.cachePromptIntent != .auxiliary else { return }

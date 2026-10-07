@@ -94,7 +94,19 @@ func runSpeedProbe(modelPath: String) async throws {
             modelDir.lastPathComponent,
             CFAbsoluteTimeGetCurrent() - loadStart, String(describing: type(of: context.model))))
     nonisolated(unsafe) let ctx = context
-    let engine = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: nil)
+    // BENCH_SPEED_CACHE_DIR=<dir>: a disk-backed prefix cache (what the app runs), so multi-turn
+    // smokes exercise restore.
+    let coordinator: CacheCoordinator? = env["BENCH_SPEED_CACHE_DIR"].map { dir in
+        var cfg = CacheCoordinatorConfig()
+        cfg.usePagedCache = false
+        cfg.enableDiskCache = true
+        cfg.diskCacheDir = URL(fileURLWithPath: dir)
+        cfg.modelKey = modelDir.lastPathComponent
+        let c = CacheCoordinator(config: cfg)
+        c.setPagedIncompatible(true)
+        return c
+    }
+    let engine = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: coordinator)
 
     func params(_ budget: Int) -> GenerateParameters {
         var p = GenerateParameters(
@@ -136,8 +148,15 @@ func runSpeedProbe(modelPath: String) async throws {
         var text: String
         var chunkRate: Double
     }
+    // BENCH_SPEED_FILLER=<n>: prepend ~n tokens of unrelated context (in-app prompts carry a
+    // ~2.5k-token agent system prompt + history; decode cost depends on context length).
+    let filler: String = {
+        guard let n = Int(env["BENCH_SPEED_FILLER"] ?? ""), n > 0 else { return "" }
+        let sentence = "The archive records list shipping manifests, tide tables and lighthouse logs. "
+        return "Background notes (ignore):\n" + String(repeating: sentence, count: max(1, n / 14)) + "\n\n"
+    }()
     func run(_ prompt: String, _ budget: Int, cat: String) async throws -> Row {
-        var input = UserInput(prompt: prompt)
+        var input = UserInput(prompt: filler + prompt)
         input.additionalContext = ["enable_thinking": false]
         let t0 = CFAbsoluteTimeGetCurrent()
         let prepared = try await ctx.processor.prepare(input: input)
@@ -221,6 +240,45 @@ func runSpeedProbe(modelPath: String) async throws {
                 URL(fileURLWithPath: path).lastPathComponent, tokens,
                 genTime > 0 ? Double(tokens) / genTime : 0, (first ?? t0) - t0,
                 String(reflecting: String(text.prefix(160)))))
+        }
+        // Two-turn conversation: image turn, then a text follow-up with the image in history.
+        if let first = images.split(separator: ",").first,
+            let image = CIImage(contentsOf: URL(fileURLWithPath: String(first)))
+        {
+            let q1 = "What background color and which digit are in this image? One sentence."
+            var answer = ""
+            for turn in 0 ..< 2 {
+                var chat: [Chat.Message] = [.user(q1, images: [.ciImage(image)])]
+                if turn == 1 {
+                    chat += [.assistant(answer), .user("Translate your sentence into French and German.")]
+                }
+                var input = UserInput(chat: chat)
+                input.additionalContext = ["enable_thinking": false]
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let prepared = try await ctx.processor.prepare(input: input)
+                nonisolated(unsafe) let send = prepared
+                let stream = await engine.generate(input: send, parameters: params(120))
+                var text = ""
+                var first: Double?
+                var tokens = 0
+                var genTime = 0.0
+                for await ev in stream {
+                    switch ev {
+                    case .chunk(let c):
+                        if first == nil { first = CFAbsoluteTimeGetCurrent() }
+                        text += c
+                    case .info(let info):
+                        tokens = info.generationTokenCount
+                        genTime = info.generateTime
+                    default: break
+                    }
+                }
+                if turn == 0 { answer = text }
+                print(String(
+                    format: "[BENCH_SPEED_CONV] turn=%d tokens=%d decode_tok_s=%.2f ttft=%.2f text=%@",
+                    turn + 1, tokens, genTime > 0 ? Double(tokens) / genTime : 0,
+                    (first ?? t0) - t0, String(reflecting: String(text.prefix(200)))))
+            }
         }
         return
     }

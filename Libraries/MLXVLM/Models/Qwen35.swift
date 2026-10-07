@@ -4526,6 +4526,7 @@ public enum Qwen35DFlash2PartsProbe {
 extension Qwen35: DFlash2MediaPrefillModel {
     public func dflash2MediaPrefill(
         _ input: LMInput, cache: [KVCache], captureLayerIDs: Set<Int>, stepSize: Int,
+        restoredPrefix: Int, boundary: Int?, onBoundary: () -> Void,
         onChunk: ([Int: MLXArray]) -> Void
     ) throws -> MLXArray {
         let inputIds = input.text.tokens
@@ -4548,31 +4549,42 @@ extension Qwen35: DFlash2MediaPrefillModel {
             let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
                 .nilIfEmpty
         else { throw VLMError.processing("media prefill without image or video pixels") }
-        // Exactly `prepare`'s embedding: vision features scattered onto their placeholders.
+        let total = inputIds.dim(1)
+        let start = Swift.max(0, Swift.min(restoredPrefix, total - 1))
         let textEmbeds = languageModel.model.embedTokens(inputIds)
-        let (visionHidden, _) = visionModel(concatenated(pixelParts), gridTHW: frames)
-        let (embeddings, _) = try mergeInputIdsWithImageFeatures(
-            imageFeatures: visionHidden.asType(textEmbeds.dtype),
-            imageRowCount: mergedRowCount(for: imageFrames),
-            inputEmbeds: textEmbeds,
-            inputIds: inputIds,
-            imageTokenIndex: config.imageTokenIndex,
-            videoTokenIndex: config.videoTokenIndex)
-        let typedCache = castCache(cache)
-        // Full-prompt M-RoPE positions, resolved ONCE (sets this request's decode delta);
-        // chunks slice them together with the embeddings, as `prepare` does.
+        let embeddings: MLXArray
+        if start > 0 {
+            // Restored prefix holds every media span: the suffix is text only.
+            embeddings = textEmbeds
+        } else {
+            // Exactly `prepare`'s embedding: vision features scattered onto their placeholders.
+            let (visionHidden, _) = visionModel(concatenated(pixelParts), gridTHW: frames)
+            embeddings = try mergeInputIdsWithImageFeatures(
+                imageFeatures: visionHidden.asType(textEmbeds.dtype),
+                imageRowCount: mergedRowCount(for: imageFrames),
+                inputEmbeds: textEmbeds,
+                inputIds: inputIds,
+                imageTokenIndex: config.imageTokenIndex,
+                videoTokenIndex: config.videoTokenIndex
+            ).0
+        }
+        // Full-prompt M-RoPE positions from token ids + media grids (no pixels), resolved ONCE:
+        // this sets the request's decode delta, and a restored prefix's suffix continues at
+        // exactly the positions a full prefill would have used. `cache: nil` — the table is
+        // for the WHOLE prompt from position 0, independent of what the cache already holds.
         guard let positions = languageModel.resolvedPositionIds(
-            inputs: inputIds, cache: typedCache, mask: nil, providedPositionIds: nil,
+            inputs: inputIds, cache: nil, mask: nil, providedPositionIds: nil,
             imageGridTHW: imageFrames, videoGridTHW: videoFrames, resetForMedia: true)
         else { throw VLMError.processing("media prefill could not resolve M-RoPE positions") }
+        let typedCache = castCache(cache)
         MLX.eval(embeddings, positions)
-        let total = inputIds.dim(1)
         let step = Swift.max(1, stepSize)
-        var offset = 0
+        var offset = start
         var lastLogits: MLXArray?
         while offset < total {
             try Task.checkCancellation()
-            let end = Swift.min(total, offset + step)
+            var end = Swift.min(total, offset + step)
+            if let boundary, offset < boundary, end > boundary { end = boundary }
             let (hidden, captured) = languageModel.model.callAsFunctionCapturing(
                 inputIds[0..., offset ..< end],
                 inputsEmbeds: embeddings[0..., offset ..< end, 0...],
@@ -4580,6 +4592,10 @@ extension Qwen35: DFlash2MediaPrefillModel {
                 positionIds: positions[0..., 0..., offset ..< end],
                 captureLayerIDs: captureLayerIDs)
             onChunk(captured)
+            if end == boundary {
+                MLX.eval(cache)
+                onBoundary()
+            }
             if end == total {
                 lastLogits = languageModel.headLogits(hidden[0..., (end - offset - 1)..., 0...])
             } else {

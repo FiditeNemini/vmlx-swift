@@ -300,8 +300,14 @@ public protocol DFlash2MediaPrefillModel {
     /// Full-prompt prefill of `input` (vision tower → merged embeddings → full-prompt M-RoPE
     /// positions) in chunks of `stepSize`; `onChunk` receives each chunk's captured hiddens.
     /// Returns the last row's logits `[1, 1, V]`.
+    /// `boundary`: absolute prompt index where a chunk must end so the caller can snapshot the
+    /// cache (`onBoundary`, after that chunk is evaluated) — the cross-turn checkpoint.
+    /// `restoredPrefix` > 0: the cache already holds that many prompt tokens (a restored entry)
+    /// and the remaining suffix carries no media placeholder; only the suffix is prefilled, at
+    /// the full prompt's M-RoPE positions (recomputed from token ids + media grids, no vision).
     func dflash2MediaPrefill(
         _ input: LMInput, cache: [KVCache], captureLayerIDs: Set<Int>, stepSize: Int,
+        restoredPrefix: Int, boundary: Int?, onBoundary: () -> Void,
         onChunk: ([Int: MLXArray]) -> Void
     ) throws -> MLXArray
 
