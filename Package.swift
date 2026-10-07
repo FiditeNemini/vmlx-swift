@@ -490,8 +490,31 @@ let package = Package(
         ),
 
         .target(
+            name: "MLXCXGrammar",
+            path: "Libraries/MLXCXGrammar",
+            exclude: ["PROVENANCE.md", "xgrammar/cpp/grammar_functor.cc"],
+            publicHeadersPath: "include",
+            cxxSettings: [
+                .headerSearchPath("xgrammar/include"),
+                .headerSearchPath("xgrammar/cpp"),
+                .headerSearchPath("xgrammar/3rdparty/picojson"),
+                .headerSearchPath("xgrammar/3rdparty/dlpack/include"),
+                .define("XGRAMMAR_ENABLE_CPPTRACE", to: "0"),
+                .define("XGRAMMAR_ENABLE_INTERNAL_CHECK", to: "0"),
+                .define("xgrammar", to: "vmlx_xgrammar"),
+                .define("picojson", to: "vmlx_picojson"),
+            ],
+            linkerSettings: [
+                .linkedLibrary("c++", .when(platforms: [.macOS, .iOS, .visionOS, .tvOS]))
+            ]
+        ),
+
+        .target(
             name: "MLXLMCommon",
-            dependencies: ["MLX", "MLXFast", "MLXNN", "MLXOptimizers", "MLXRandom", "CmlxGraphShim"],
+            dependencies: [
+                "MLX", "MLXFast", "MLXNN", "MLXOptimizers", "MLXRandom", "CmlxGraphShim",
+                "MLXCXGrammar",
+            ],
             path: "Libraries/MLXLMCommon",
             exclude: mlxLMCommonExcludedFiles,
             // Compile this target in the Swift 5 language mode. The package is

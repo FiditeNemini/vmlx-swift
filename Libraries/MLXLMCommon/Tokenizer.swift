@@ -9,8 +9,31 @@ public enum ByteLevelDecodingPiece: Sendable {
     case ignored
 }
 
+/// Exact, ID-indexed vocabulary metadata for grammar compilation. These are
+/// tokenizer model pieces, not strings produced by decoding individual tokens.
+/// Providers must identify the decoder encoding from tokenizer configuration and
+/// include added tokens at their real IDs. Unsupported decoders return nil.
+public struct GrammarTokenVocabulary: Sendable {
+    public let vocabulary: [String]
+    public let vocabularyType: JSONSchemaVocabularyType
+    public let specialTokenIDs: Set<Int>
+
+    public init(
+        vocabulary: [String], vocabularyType: JSONSchemaVocabularyType,
+        specialTokenIDs: Set<Int>
+    ) {
+        self.vocabulary = vocabulary
+        self.vocabularyType = vocabularyType
+        self.specialTokenIDs = specialTokenIDs
+    }
+}
+
 /// A protocol for tokenizing text into token IDs and decoding token IDs into text.
 public protocol Tokenizer: Sendable {
+    /// Optional exact grammar vocabulary. Nil means constrained generation is
+    /// unsupported; callers must not infer bytes using decode([tokenID]).
+    var grammarTokenVocabulary: GrammarTokenVocabulary? { get }
+
     /// Optional lossless ByteLevel decoding with cleanup disabled. Other
     /// tokenizers retain the generic streaming decoder.
     var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? { get }
@@ -409,6 +432,7 @@ public func canonicalChatCacheBoundaries(
 }
 
 extension Tokenizer {
+    public var grammarTokenVocabulary: GrammarTokenVocabulary? { nil }
     public var incrementalByteLevelDecoder: (@Sendable (Int) -> ByteLevelDecodingPiece)? { nil }
 
     public func encode(text: String) -> [Int] {
