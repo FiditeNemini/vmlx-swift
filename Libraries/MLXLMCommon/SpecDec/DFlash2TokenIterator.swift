@@ -453,16 +453,26 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     coordinator.setPagedIncompatible(true)
                 }
             }
+            // Always leave one token to produce the drafter's hidden seed.
+            // For path-dependent caches, request N-1 itself so BOTH paged
+            // and disk tiers can choose a safe prefix. Merely skipping the
+            // exact disk probe still lets a paged N hit hide an N-1 snapshot.
+            let needsReplayBoundary = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
+                || self.cache.contains { !$0.isTrimmable }
+            let lookupTokens = needsReplayBoundary
+                ? Array(tokensToPrefill.dropLast()) : tokensToPrefill
             let result = coordinator.fetch(
-                tokens: tokensToPrefill,
+                tokens: lookupTokens,
                 mediaSalt: mediaSalt,
-                skipExactDiskBoundary: cacheRequiresDiskBackedCoordinatorRestore(self.cache),
                 preferredDiskBoundaries: input.cacheStablePrefixTokenCounts,
                 chainId: parameters.cacheChainId)
             if case .hit(
-                let matchedTokens, let remainingTokens, let detail, let blocks, let ssmStates,
+                let matchedTokens, _, let detail, let blocks, let ssmStates,
                 let diskArrays) = result
             {
+                // Lookup may stop at N-1; restore suffix belongs to the full
+                // logical prompt, including its final token.
+                let remainingTokens = Array(tokensToPrefill.dropFirst(matchedTokens))
                 var restored = false
                 var restoredTokenCount = 0
                 if !blocks.isEmpty {
@@ -526,7 +536,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                 if restored {
                     // A full hit needs one token replayed for drafter hidden state.
                     // Recurrent/ring companions cannot be rewound by trimming KV.
-                    // fetch skips exact disk hits, but other tiers still need this guard.
+                    // Keep this defense even if a future lookup returns a full hit.
                     let unsafeFullHit = remainingTokens.isEmpty
                         && (cacheRequiresDiskBackedCoordinatorRestore(self.cache)
                             || self.cache.contains { !$0.isTrimmable })
