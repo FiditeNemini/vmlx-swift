@@ -1303,7 +1303,7 @@ public final class CacheCoordinator: @unchecked Sendable {
         defer { CombinedDiskCacheQuotaLock.shared.unlock() }
 
         let stableBoundaries = Set(preferredDiskBoundaries.compactMap { boundary in
-            let storedBoundary = skipExactDiskBoundary ? boundary - 1 : boundary
+            let storedBoundary = skipExactDiskBoundary && boundary > 1 ? boundary - 1 : boundary
             return storedBoundary > 0 && storedBoundary <= matchedTokenCount
                 ? storedBoundary
                 : nil

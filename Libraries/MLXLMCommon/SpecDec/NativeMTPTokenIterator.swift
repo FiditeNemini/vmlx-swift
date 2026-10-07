@@ -827,7 +827,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                             matchedTokenCount: matchedTokens,
                             preferredDiskBoundaries: originalInput
                                 .cacheStablePrefixTokenCounts,
-                            skipExactDiskBoundary: false,
+                            skipExactDiskBoundary: coordinator.requiresRecurrentSSMCompanion,
                             mediaSalt: mediaSalt)
                     }
                 }
@@ -1162,9 +1162,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
                         : boundary
                     let boundaryTokens = Array(promptTokenIds.prefix(storeBoundary))
                     if isStableBoundary,
-                       coordinator.hasValidatedDiskEntry(
-                        tokens: boundaryTokens,
-                        mediaSalt: mediaSalt)
+                       validateStableDiskBoundary(tokens: boundaryTokens, coordinator: coordinator)
                     {
                         continue
                     }
@@ -1547,6 +1545,37 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         }
         try Task.checkCancellation()
         return try model.prepare(segment(consumed, size), cache: cache, windowSize: windowSize)
+    }
+
+    /// Reloading a model drops the disk cache's in-process validation records.
+    /// Validate the exact older checkpoint before replaying its entire prefix.
+    /// Scratch restoration never changes the live target or drafter state.
+    private func validateStableDiskBoundary(
+        tokens: [Int], coordinator: CacheCoordinator
+    ) -> Bool {
+        if coordinator.hasValidatedDiskEntry(tokens: tokens, mediaSalt: mediaSalt) {
+            return true
+        }
+        // Only native in-file recurrent state is covered here. Separate
+        // companions keep their existing production/validation path.
+        guard !Task.isCancelled,
+            coordinator.requiresRecurrentSSMCompanion,
+            !coordinator.requiresSeparateRecurrentPayload,
+            let disk = coordinator.diskCache,
+            case .arrays(let arrays) = disk.fetchCandidate(tokens: tokens, mediaSalt: mediaSalt)
+        else { return false }
+        var scratch = model.newCache(parameters: cacheInitParameters)
+        let restored = restoreFromDiskArrays(arrays, into: &scratch)
+        guard restored == tokens.count,
+            validateRestoredCacheBoundary(
+                scratch, matchedTokens: tokens.count, restoredTokens: restored,
+                detail: "native-mtp-stable-validation")
+        else {
+            // Candidate validation never counted an accepted cache hit.
+            _ = disk.markRestoreRejected(tokens: tokens, mediaSalt: mediaSalt, countedHit: false)
+            return false
+        }
+        return coordinator.hasValidatedDiskEntry(tokens: tokens, mediaSalt: mediaSalt)
     }
 
     private func cacheSnapshotForBoundary(

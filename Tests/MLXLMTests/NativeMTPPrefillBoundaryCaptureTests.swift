@@ -218,6 +218,85 @@ final class NativeMTPPrefillBoundaryCaptureTests: XCTestCase {
         XCTAssertEqual(warm.cache[0].state[0].asArray(Float.self), cold.cache[0].state[0].asArray(Float.self))
     }
 
+    func testReloadValidatesExactStableCheckpointWithoutBackboneReplay() throws {
+        let lock = lockSerializedMLXTest(); defer { lock.unlock() }
+        for scenario in 0..<3 {
+            let rejected = scenario != 0
+            let writer = coordinator()
+            writer.setHybrid(true, requiresRecurrentSSMCompanion: true,
+                requiresSeparateRecurrentPayload: false)
+            let root = try XCTUnwrap(roots.last)
+            var first = try NativeMTPTokenIterator(input: input(stable + user + suffix),
+                model: NativeBoundaryRecordingModel(), parameters: parameters(), depth: 1,
+                cacheCoordinator: writer)
+            first.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+
+            let reader = coordinator(root: root)
+            reader.setHybrid(true, requiresRecurrentSSMCompanion: true,
+                requiresSeparateRecurrentPayload: false)
+            let next = stable + user + [23, 24, 25] + suffix
+            let salt = computeCacheSalt(for: input(next), parameters: parameters())
+            let stableTokens = Array(stable.dropLast())
+            XCTAssertFalse(reader.hasValidatedDiskEntry(tokens: stableTokens, mediaSalt: salt))
+            let model = NativeBoundaryRecordingModel()
+            let priorRecency = try XCTUnwrap(reader.diskCache!.quotaEntries()
+                .first { $0.tokenCount == stableTokens.count }?.createdAt)
+            var warm = try NativeMTPTokenIterator(input: input(next), model: model,
+                parameters: parameters(), depth: 1, cacheCoordinator: reader)
+            let retainedRecency = try XCTUnwrap(reader.diskCache!.quotaEntries()
+                .first { $0.tokenCount == stableTokens.count }?.createdAt)
+            XCTAssertGreaterThan(retainedRecency, priorRecency,
+                "retaining the longer checkpoint must touch the stable N-1 seed")
+            if scenario == 1 {
+                guard case .arrays = reader.diskCache!.fetchCandidate(tokens: stableTokens, mediaSalt: salt)
+                else { return XCTFail("stable checkpoint missing") }
+                _ = reader.diskCache!.markRestoreRejected(tokens: stableTokens, mediaSalt: salt,
+                    countedHit: false)
+            } else if scenario == 2 {
+                let row = try XCTUnwrap(reader.diskCache!.quotaEntries()
+                    .first { $0.tokenCount == stableTokens.count })
+                let badModel = NativeBoundaryRecordingModel()
+                let badCache = badModel.newCache(parameters: parameters())
+                _ = badModel.nativeBackboneForward(
+                    MLXArray(stableTokens.map(Int32.init)).reshaped(1, stableTokens.count), cache: badCache)
+                let badRecurrent = try XCTUnwrap(badCache.first as? MambaCache)
+                badRecurrent.offset = stableTokens.count - 1
+                MLX.eval(badCache)
+                try MLX.save(arrays: TQDiskSerializer.serialize(cache: badCache),
+                    url: reader.diskCache!.cacheDir.appendingPathComponent(row.hash + ".safetensors"))
+            }
+            let before = model.forwarded.count
+            let hitsBefore = reader.diskCache!.snapshotStats().hits
+            let offsetBefore = warm.cache[0].offset
+            let stateBefore = warm.cache[0].state[0].asArray(Float.self)
+            warm.storeCacheAfterGeneration(generatedTokenIds: [], includeGeneratedBoundary: false)
+            XCTAssertEqual(Array(model.forwarded.dropFirst(before)), rejected ? stableTokens : [])
+            XCTAssertEqual(warm.cache[0].offset, offsetBefore)
+            XCTAssertEqual(warm.cache[0].state[0].asArray(Float.self), stateBefore)
+            XCTAssertEqual(reader.diskCache!.snapshotStats().hits, hitsBefore,
+                "validation-only fetch/rejection must not change accepted-hit telemetry")
+            XCTAssertTrue(reader.hasValidatedDiskEntry(tokens: stableTokens, mediaSalt: salt))
+        }
+    }
+
+    func testSingleTokenStableCheckpointRecencyMatchesStorageOffset() throws {
+        let lock = lockSerializedMLXTest(); defer { lock.unlock() }
+        let disk = coordinator()
+        disk.setHybrid(true, requiresRecurrentSSMCompanion: true,
+            requiresSeparateRecurrentPayload: false)
+        let model = NativeBoundaryRecordingModel()
+        let cache = model.newCache(parameters: parameters())
+        _ = model.nativeBackboneForward(MLXArray([Int32(1)]).reshaped(1, 1), cache: cache)
+        disk.storeAfterGeneration(promptTokens: [1], perLayerData: [nil],
+            ssmStates: nil, cache: cache, isStableRoot: true)
+        let before = try XCTUnwrap(disk.diskCache!.quotaEntries().first?.createdAt)
+        disk.touchStableDiskCheckpointsAfterRetainedRestore(requestTokens: [1, 2],
+            matchedTokenCount: 1, preferredDiskBoundaries: [1],
+            skipExactDiskBoundary: true, mediaSalt: nil)
+        let after = try XCTUnwrap(disk.diskCache!.quotaEntries().first?.createdAt)
+        XCTAssertGreaterThan(after, before)
+    }
+
     func testMediaDoesNotAcquireTextOnlyBoundarySplits() throws {
         let lock = lockSerializedMLXTest(); defer { lock.unlock() }
         let model = NativeBoundaryRecordingModel()
