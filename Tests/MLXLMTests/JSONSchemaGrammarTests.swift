@@ -97,6 +97,48 @@ final class JSONSchemaGrammarTests: XCTestCase {
         }
     }
 
+    func testDeterministicStructuralFormattingPreservesStringWhitespace() throws {
+        let schema =
+            ##"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"##
+        let vocabulary = [
+            "<eos>", "{", "\"answer\"", ":", "\" a  b\\n\\t \"", "}", " ", "\n", "\t",
+        ]
+        let tokenizer = try JSONSchemaGrammarTokenizer(
+            vocabulary: vocabulary, vocabularyType: .raw, stopTokenIDs: [0])
+        let grammar = try JSONSchemaGrammar(tokenizer: tokenizer, schema: schema)
+        for token in [1, 2, 3, 4, 5] {
+            let mask = try grammar.nextTokenMask()
+            for space in [6, 7, 8] { XCTAssertFalse(allows(mask, space)) }
+            XCTAssertTrue(allows(mask, token))
+            try grammar.accept(tokenID: token)
+        }
+        let completed = try grammar.nextTokenMask()
+        for space in [6, 7, 8] { XCTAssertFalse(allows(completed, space)) }
+        XCTAssertTrue(allows(completed, 0))
+        try grammar.accept(tokenID: 0)
+        XCTAssertTrue(try grammar.isTerminated())
+    }
+
+    func testDeterministicFormattingPreservesEnumAndConstValues() throws {
+        for keyword in ["enum", "const"] {
+            let value: [String: Any] = [" spaced key ": " a  b\n\t "]
+            let schemaValue: Any = keyword == "enum" ? [value] : value
+            let schemaData = try JSONSerialization.data(withJSONObject: [keyword: schemaValue])
+            let outputData = try JSONSerialization.data(withJSONObject: value)
+            let output = String(decoding: outputData, as: UTF8.self)
+            let tokenizer = try JSONSchemaGrammarTokenizer(
+                vocabulary: ["<eos>", output, "\n"], vocabularyType: .raw, stopTokenIDs: [0])
+            let grammar = try JSONSchemaGrammar(
+                tokenizer: tokenizer,
+                schema: String(decoding: schemaData, as: UTF8.self))
+            XCTAssertTrue(allows(try grammar.nextTokenMask(), 1))
+            try grammar.accept(tokenID: 1)
+            XCTAssertFalse(allows(try grammar.nextTokenMask(), 2))
+            try grammar.accept(tokenID: 0)
+            XCTAssertTrue(try grammar.isTerminated())
+        }
+    }
+
     func testObjectMaskAndExplicitStopIDs() throws {
         let grammar = try JSONSchemaGrammar(tokenizer: tokenizer(), schema: schema)
         let initial = try grammar.nextTokenMask()

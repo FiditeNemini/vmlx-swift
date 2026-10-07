@@ -318,7 +318,8 @@ XGStatus xg_compile_json_schema(
         schema_json,
         out_compiled,
         XG_ERR_INVALID_JSON_SCHEMA,
-        [&](const std::string &s) { return compiler->inner.CompileJSONSchema(s, true, std::nullopt, std::nullopt, false); }
+        [&](const std::string &s) { return compiler->inner.CompileJSONSchema(
+            s, false, std::nullopt, std::make_pair(std::string(","), std::string(":")), false); }
     );
 }
 

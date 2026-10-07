@@ -10,3 +10,5 @@ The namespace macros isolate C++ xgrammar and picojson symbols. The existing pac
 Local C++20 compatibility: moved the SequenceFormat and OrFormat constructor bodies after all recursive variant alternatives in structural_tag.h. No grammar behavior change.
 
 Local JSON key correctness fix: GetPropertyPattern first serializes the property name as a JSON string and then applies the existing JSONStrToPrintableStr EBNF quoting helper, matching VisitConst. This preserves quote, backslash, control and Unicode key semantics instead of inserting raw property names into EBNF literals. CPU regression: testPropertyNamesPreserveJSONEscapingAndUnicode.
+
+Serialization policy: compile JSON schemas with any_whitespace=false, no indent, and explicit comma/colon separators. This restricts structural formatting at grammar compilation, without modifying string values, logits, sampling, or EOS. Donor generic basic collection rules retain their fixed comma-space separator; they have no unbounded structural whitespace loop.

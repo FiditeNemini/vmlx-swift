@@ -66,3 +66,7 @@ CPU grammar tests exercise masks, explicit stop IDs, independent copies, default
 
 ### Exact numeric constants
 Numeric values inside `const` or `enum`, including nested instance objects/arrays, currently require plain integer literals in the inclusive range -9007199254740991 through 9007199254740991. Fractional and exponent spellings are rejected before parsing can round them. Ordinary `type:number` generation remains supported. This restriction prevents the donor compiler from compiling a different numeric constant than requested. JSON property names are serialized as JSON strings before EBNF escaping, including controls, quotes, backslashes and Unicode.
+
+## Deterministic JSON formatting
+
+Schema grammar compilation uses deterministic structural formatting: no indentation and explicit comma/colon separators, with `any_whitespace=false`. This removes unbounded structural whitespace choices that can otherwise consume the token budget. String spaces, escaped newlines/tabs, Unicode, enum/const values and property names retain their data semantics. This is a serialization grammar policy, not a whitespace logit bias or forced EOS. Generic unconstrained collection rules in the pinned donor retain a fixed comma-space separator; that bounded formatting does not introduce a whitespace loop. Natural grammar-authorized completion is still required; formatting alone is not a successful-generation proof.
