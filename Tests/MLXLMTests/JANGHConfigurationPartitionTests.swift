@@ -36,7 +36,8 @@ final class JANGHConfigurationPartitionTests: XCTestCase {
         config["model_type"] = "qwen3_5"
         var plan = config["quantization"] as! [String: Any]
         for role in ["gate_proj", "up_proj", "down_proj"] {
-            plan["language_model.model.layers.3.mlp." + role] = plan.removeValue(forKey: prefix + role)
+            plan["language_model.model.layers.3.mlp." + role] = plan.removeValue(
+                forKey: prefix + role)
         }
         config["quantization"] = plan
         config["quantization_config"] = plan
@@ -46,46 +47,59 @@ final class JANGHConfigurationPartitionTests: XCTestCase {
     private func denseQwenSummary() -> [String: Any] {
         // Actual local 27B JANGH2 sidecar shape: format_version is a string,
         // quantization is a scalar summary, and the authoritative header is in config.
-        ["format": "jangtq2", "format_version": "2.0",
-         "quantization": ["bits": 4, "group_size": 64, "bit_widths_used": [2, 8]],
-         "chat": ["sampling_defaults": ["temperature": 1.0]],
-         "runtime": ["bundle_has_mtp": false]]
+        [
+            "format": "jangtq2", "format_version": "2.0",
+            "quantization": ["bits": 4, "group_size": 64, "bit_widths_used": [2, 8]],
+            "chat": ["sampling_defaults": ["temperature": 1.0]],
+            "runtime": ["bundle_has_mtp": false],
+        ]
     }
 
     func testDenseQwenSummaryPreservesAuthoritativePlanAndChecksHeaders() throws {
         let config = denseQwenConfiguration()
         var summary = denseQwenSummary()
         let plain = try JANGHConfigurationPartition(configuration: data(config))
-        let withSummary = try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary))
+        let withSummary = try JANGHConfigurationPartition(
+            configuration: data(config), sidecar: data(summary))
         XCTAssertEqual(plain.customConfiguration, withSummary.customConfiguration)
         XCTAssertEqual(plain.ordinaryConfiguration, withSummary.ordinaryConfiguration)
         summary["jangtq"] = config["jangtq"]
-        XCTAssertNoThrow(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary)))
+        XCTAssertNoThrow(
+            try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary)))
         var conflicting = config["jangtq"] as! [String: Any]
         conflicting["rotation"] = "none"
         summary["jangtq"] = conflicting
-        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary)))
+        XCTAssertThrowsError(
+            try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary)))
         summary["jangtq"] = NSNull()
-        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary)))
+        XCTAssertThrowsError(
+            try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary)))
     }
 
     func testDenseQwenSummaryCannotIntroduceASecondPlan() throws {
         let config = denseQwenConfiguration()
         for replacement: [String: Any] in [
             ["quantization_config": config["quantization"]!],
-            ["quantization": ["bits": 4, "group_size": 64, "bit_widths_used": [2, 8],
-                              "language_model.model.layers.3.mlp.gate_proj": ["bits": 4]]],
+            [
+                "quantization": [
+                    "bits": 4, "group_size": 64, "bit_widths_used": [2, 8],
+                    "language_model.model.layers.3.mlp.gate_proj": ["bits": 4],
+                ]
+            ],
             ["quantization": ["mode": "affine", "bits": 4, "group_size": 64]],
             ["format_version": "3.0"], ["format": "affine"],
         ] {
             var summary = denseQwenSummary()
             for (key, value) in replacement { summary[key] = value }
-            XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary)))
+            XCTAssertThrowsError(
+                try JANGHConfigurationPartition(configuration: data(config), sidecar: data(summary))
+            )
         }
         var missingHeader = config
         missingHeader.removeValue(forKey: "jangtq")
-        XCTAssertThrowsError(try JANGHConfigurationPartition(
-            configuration: data(missingHeader), sidecar: data(denseQwenSummary())))
+        XCTAssertThrowsError(
+            try JANGHConfigurationPartition(
+                configuration: data(missingHeader), sidecar: data(denseQwenSummary())))
     }
 
     func testDenseK2RetainsStrictSidecarOwnership() throws {
@@ -93,21 +107,32 @@ final class JANGHConfigurationPartitionTests: XCTestCase {
         config["model_type"] = "k2_horizon"
         config["mlp_layout"] = "dense_jangh_down"
         let projection = (config["quantization"] as! [String: Any])[prefix + "down_proj"]!
-        let plan: [String: Any] = ["mode": "affine", "bits": 8, "group_size": 64,
-                                  "model.layers.3.mlp.down_proj": projection]
+        let plan: [String: Any] = [
+            "mode": "affine", "bits": 8, "group_size": 64,
+            "model.layers.3.mlp.down_proj": projection,
+        ]
         config["quantization"] = plan
         config["quantization_config"] = plan
-        XCTAssertNoThrow(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(sidecar(config))))
-        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(denseQwenSummary())))
+        XCTAssertNoThrow(
+            try JANGHConfigurationPartition(
+                configuration: data(config), sidecar: data(sidecar(config))))
+        XCTAssertThrowsError(
+            try JANGHConfigurationPartition(
+                configuration: data(config), sidecar: data(denseQwenSummary())))
         var conflicting = sidecar(config)
         var header = config["jangtq"] as! [String: Any]
         header["rotation"] = "none"
         conflicting["jangtq"] = header
-        XCTAssertThrowsError(try JANGHConfigurationPartition(configuration: data(config), sidecar: data(conflicting)))
+        XCTAssertThrowsError(
+            try JANGHConfigurationPartition(configuration: data(config), sidecar: data(conflicting))
+        )
     }
 
     func testActualDenseQwenMetadataWhenProvided() throws {
-        guard let path = ProcessInfo.processInfo.environment["VMLX_DENSE_QWEN_JANGH_METADATA_DIRECTORY"] else {
+        guard
+            let path = ProcessInfo.processInfo.environment[
+                "VMLX_DENSE_QWEN_JANGH_METADATA_DIRECTORY"]
+        else {
             throw XCTSkip("Optional read-only local metadata fixture")
         }
         let directory = URL(fileURLWithPath: path)

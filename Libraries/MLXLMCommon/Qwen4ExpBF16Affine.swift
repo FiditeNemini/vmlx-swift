@@ -27,18 +27,24 @@ public enum Qwen4ExpBF16Affine {
         ) -> Bool {
             let key = "\(kind):\(k):\(n):\(rows)"
             lock.lock()
-            if let verdict = verdicts[key] { lock.unlock(); return verdict }
+            if let verdict = verdicts[key] {
+                lock.unlock()
+                return verdict
+            }
             lock.unlock()
             let probe = (MLXRandom.normal([rows, k]) * 0.5).asType(.bfloat16)
             let got = candidate(probe)
             let want = reference(probe)
-            let equal = got.shape == want.shape
+            let equal =
+                got.shape == want.shape
                 && all(got.asType(.float32) .== want.asType(.float32)).item(Bool.self)
             lock.lock()
             verdicts[key] = equal
             lock.unlock()
-            FileHandle.standardError.write(Data(
-                "[Qwen4Exp] bf16_affine_rows kind=\(kind) K=\(k) N=\(n) rows=\(rows) admitted=\(equal)\n".utf8))
+            FileHandle.standardError.write(
+                Data(
+                    "[Qwen4Exp] bf16_affine_rows kind=\(kind) K=\(k) N=\(n) rows=\(rows) admitted=\(equal)\n"
+                        .utf8))
             return equal
         }
     }
@@ -426,9 +432,10 @@ public enum Qwen4ExpBF16Affine {
         scales: MLXArray, biases: MLXArray?,
         groupSize: Int, bits: Int, mode: QuantizationMode
     ) -> MLXArray {
-        guard usesFullBlockQ4(
-            input: input, weight: weight, scales: scales, biases: biases,
-            groupSize: groupSize, bits: bits, mode: mode),
+        guard
+            usesFullBlockQ4(
+                input: input, weight: weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits, mode: mode),
             let biases
         else {
             return denseLegacy(
@@ -443,17 +450,20 @@ public enum Qwen4ExpBF16Affine {
         let rows = input.size / inputDimensions
         var outputShape = input.shape
         outputShape[outputShape.count - 1] = outputDimensions
-        if rows >= 2, let fast = rowsFull(
-            input, weight, scales: scales, biases: biases, groupSize: groupSize, bits: bits,
-            packsPerThread: 2, rows: rows, outputShape: outputShape,
-            reference: { x in
-                fullBlockQ4Kernel(
-                    [x, weight, scales, biases],
-                    template: [("K", inputDimensions), ("N", outputDimensions), ("ROWS", rows)],
-                    grid: (rows * 32, (outputDimensions / 8) * 2, 1), threadGroup: (32, 2, 1),
-                    outputShapes: [[rows, inputDimensions == 0 ? 0 : outputDimensions]],
-                    outputDTypes: [.bfloat16])[0]
-            })
+        if rows >= 2,
+            let fast = rowsFull(
+                input, weight, scales: scales, biases: biases, groupSize: groupSize, bits: bits,
+                packsPerThread: 2, rows: rows, outputShape: outputShape,
+                reference: { x in
+                    fullBlockQ4Kernel(
+                        [x, weight, scales, biases],
+                        template: [
+                            ("K", inputDimensions), ("N", outputDimensions), ("ROWS", rows),
+                        ],
+                        grid: (rows * 32, (outputDimensions / 8) * 2, 1), threadGroup: (32, 2, 1),
+                        outputShapes: [[rows, inputDimensions == 0 ? 0 : outputDimensions]],
+                        outputDTypes: [.bfloat16])[0]
+                })
         {
             return fast
         }
@@ -471,16 +481,17 @@ public enum Qwen4ExpBF16Affine {
         input: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray?,
         groupSize: Int, bits: Int, mode: QuantizationMode
     ) -> Bool {
-        guard supports(
-            input: input, weight: weight, scales: scales, biases: biases,
-            groupSize: groupSize, bits: bits, mode: mode),
+        guard
+            supports(
+                input: input, weight: weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits, mode: mode),
             bits == 4, groupSize == 64, input.ndim >= 2, weight.ndim == 2
         else { return false }
         let k = weight.dim(1) * 8
         let n = weight.dim(0)
         guard k > 0, k % 512 == 0, n > 0, n % 8 == 0, input.dim(-1) == k
         else { return false }
-        return (1...8).contains(input.size / k)
+        return (1 ... 8).contains(input.size / k)
     }
 
     /// Original dense dispatch retained as the unsupported-shape fallback and
@@ -516,7 +527,7 @@ public enum Qwen4ExpBF16Affine {
         let k = input.dim(-1)
         let n = weight.dim(0)
         let blockSize = (32 / bits) * packsPerThread * 32
-        guard RowsAdmission.enabled, (1...8).contains(rows), bits == 4 || bits == 8,
+        guard RowsAdmission.enabled, (1 ... 8).contains(rows), bits == 4 || bits == 8,
             k % blockSize == 0, n % 8 == 0, !CompiledDecodeTrace.isActive
         else { return nil }
         let perGroup = (bits == 4 && rows > 4 && rows % 2 == 0) ? 2 : rows
@@ -530,9 +541,10 @@ public enum Qwen4ExpBF16Affine {
                 grid: ((rows / perGroup) * 32, (n / 8) * 2, 1), threadGroup: (32, 2, 1),
                 outputShapes: [shape], outputDTypes: [.bfloat16])[0]
         }
-        guard RowsAdmission.admits(
-            kind: "\(kindPrefix)\(bits)p\(packsPerThread)g\(perGroup)", k: k, n: n, rows: rows,
-            candidate: { launch($0, [rows, n]) }, reference: reference)
+        guard
+            RowsAdmission.admits(
+                kind: "\(kindPrefix)\(bits)p\(packsPerThread)g\(perGroup)", k: k, n: n, rows: rows,
+                candidate: { launch($0, [rows, n]) }, reference: reference)
         else { return nil }
         return launch(input, outputShape)
     }

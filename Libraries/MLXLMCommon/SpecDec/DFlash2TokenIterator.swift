@@ -267,7 +267,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// there is nothing to draft.
     static let minimumBlockSize = 2
 
-    static func unservableReason(_ parameters: GenerateParameters, input: LMInput? = nil) -> String? {
+    static func unservableReason(_ parameters: GenerateParameters, input: LMInput? = nil) -> String?
+    {
         // This iterator forwards token IDs directly; it cannot consume the
         // embeddings produced by the model-specific media prepare path.
         if input?.hasMediaContent == true {
@@ -457,9 +458,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             // For path-dependent caches, request N-1 itself so BOTH paged
             // and disk tiers can choose a safe prefix. Merely skipping the
             // exact disk probe still lets a paged N hit hide an N-1 snapshot.
-            let needsReplayBoundary = cacheRequiresDiskBackedCoordinatorRestore(self.cache)
+            let needsReplayBoundary =
+                cacheRequiresDiskBackedCoordinatorRestore(self.cache)
                 || self.cache.contains { !$0.isTrimmable }
-            let lookupTokens = needsReplayBoundary
+            let lookupTokens =
+                needsReplayBoundary
                 ? Array(tokensToPrefill.dropLast()) : tokensToPrefill
             let result = coordinator.fetch(
                 tokens: lookupTokens,
@@ -537,10 +540,13 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
                     // A full hit needs one token replayed for drafter hidden state.
                     // Recurrent/ring companions cannot be rewound by trimming KV.
                     // Keep this defense even if a future lookup returns a full hit.
-                    let unsafeFullHit = remainingTokens.isEmpty
+                    let unsafeFullHit =
+                        remainingTokens.isEmpty
                         && (cacheRequiresDiskBackedCoordinatorRestore(self.cache)
                             || self.cache.contains { !$0.isTrimmable })
-                    if unsafeFullHit || input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens) {
+                    if unsafeFullHit
+                        || input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
+                    {
                         self.cache = target.newCache(parameters: effectiveParameters)
                     } else if remainingTokens.isEmpty, let last = tokensToPrefill.last {
                         // A full hit still has to re-run the final token so
@@ -792,7 +798,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         if let maxTokens, tokenCount >= maxTokens {
             if Self.traceEnabled, stats.verifyCalls > 0 {
                 let line = String(
-                    format: "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs arFallback=%d widths=%@\n",
+                    format:
+                        "[DFlash2 stats] cycles=%d accLen=%.2f draft=%.2fs verify=%.2fs commit=%.2fs arFallback=%d widths=%@\n",
                     stats.verifyCalls, stats.acceptanceLength, stats.draftSeconds,
                     stats.verifySeconds, stats.commitSeconds,
                     stats.autoregressiveFallbackTokens,

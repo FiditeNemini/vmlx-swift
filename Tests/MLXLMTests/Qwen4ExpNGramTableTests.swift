@@ -129,13 +129,15 @@ struct Qwen4ExpNGramTableTests {
         #expect(throws: Qwen4ExpNGramTableError.self) {
             _ = try table.gather([table.rowCount], parallelRows: true)
         }
-        #expect(table.ioStats() == .init(
-            gatherCalls: 3,
-            rowsRead: 7,
-            payloadBytesRead: 60,
-            backingFileCount: 1,
-            backingFileBytes: UInt64(bytes.count),
-            noCacheFileCount: Qwen4ExpNGramTable.uncachedReads ? 1 : 0))
+        #expect(
+            table.ioStats()
+                == .init(
+                    gatherCalls: 3,
+                    rowsRead: 7,
+                    payloadBytesRead: 60,
+                    backingFileCount: 1,
+                    backingFileBytes: UInt64(bytes.count),
+                    noCacheFileCount: Qwen4ExpNGramTable.uncachedReads ? 1 : 0))
 
         for parallel in [false, true] {
             let before = table.ioStats()
@@ -246,8 +248,9 @@ struct Qwen4ExpNGramTableTests {
             #expect(stats.gatherCalls == 1)
             #expect(stats.rowsRead == 3)
             #expect(stats.payloadBytesRead > 0)
-            #expect(stats.noCacheFileCount
-                == (Qwen4ExpNGramTable.uncachedReads ? stats.backingFileCount : 0))
+            #expect(
+                stats.noCacheFileCount
+                    == (Qwen4ExpNGramTable.uncachedReads ? stats.backingFileCount : 0))
         }
     }
 }

@@ -46,7 +46,9 @@ final class JANGHPrefillKernel {
 
     /// Largest row count routed to the 16-row NAX tile. `VMLX_JANGH_NAX_SMALL_TILE_MAX=0` keeps the 64-row tile.
     static let smallTileMaxRows: Int = {
-        if let raw = RuntimeEnvironment.value("VMLX_JANGH_NAX_SMALL_TILE_MAX"), let v = Int(raw) { return v }
+        if let raw = RuntimeEnvironment.value("VMLX_JANGH_NAX_SMALL_TILE_MAX"), let v = Int(raw) {
+            return v
+        }
         return 16
     }()
 
@@ -76,11 +78,15 @@ final class JANGHPrefillKernel {
         dtype == .float32 ? .steel : requested
     }
 
-    private func kernel(dtype: DType, backend: Backend, fused: Bool, rotate: Bool, width: Int, tileRows: Int = 64)
+    private func kernel(
+        dtype: DType, backend: Backend, fused: Bool, rotate: Bool, width: Int, tileRows: Int = 64
+    )
         -> MLXFast.MLXFastKernel
     {
         let type = dtype == .bfloat16 ? "bfloat16_t" : dtype == .float16 ? "half" : "float"
-        let key = "\(backend.rawValue)_\(type)_\(width)_\(upBits)_\(fused)_\(rotate)" + (tileRows == 64 ? "" : "_m\(tileRows)")
+        let key =
+            "\(backend.rawValue)_\(type)_\(width)_\(upBits)_\(fused)_\(rotate)"
+            + (tileRows == 64 ? "" : "_m\(tileRows)")
         lock.lock()
         defer { lock.unlock() }
         if let value = kernels[key] { return value }
@@ -154,20 +160,26 @@ final class JANGHPrefillKernel {
             array.size < 8 ? concatenated([array.flattened(), MLXArray.zeros([8 - array.size], dtype: array.dtype)]) : array
         }
         if selected == .nax {
-            let inputs = [x, deviceArray(packed), deviceArray(scales), deviceArray(upPacked ?? packed),
-                          deviceArray(upScales ?? scales), idx, metadata, MLXArray([limit ?? 0])]
+            let inputs = [
+                x, deviceArray(packed), deviceArray(scales), deviceArray(upPacked ?? packed),
+                deviceArray(upScales ?? scales), idx, metadata, MLXArray([limit ?? 0]),
+            ]
             func run(_ tileRows: Int) -> MLXArray {
                 let threads = tileRows == 16 ? 64 : 128
-                return kernel(dtype: input.dtype, backend: .nax, fused: upPacked != nil, rotate: rotateOutput,
-                              width: bits, tileRows: tileRows)(
-                    inputs, grid: (((n + 63) / 64) * threads, (m + tileRows - 1) / tileRows, 1),
-                    threadGroup: (threads, 1, 1), outputShapes: [[m, n]], outputDTypes: [input.dtype])[0]
+                return kernel(
+                    dtype: input.dtype, backend: .nax, fused: upPacked != nil, rotate: rotateOutput,
+                    width: bits, tileRows: tileRows)(
+                        inputs, grid: (((n + 63) / 64) * threads, (m + tileRows - 1) / tileRows, 1),
+                        threadGroup: (threads, 1, 1), outputShapes: [[m, n]],
+                        outputDTypes: [input.dtype])[0]
             }
             // Verify windows (<= 16 rows) use the 16-row tile (2 simdgroups = 64 threads): same per-element MMA
             // sequence as the 64-row tile, so it is admitted per dense owner/input variant only if bitwise equal to it.
-            if enableDenseSmallTile, experts == 1, m <= Self.smallTileMaxRows, smallTileAdmission.admits(
-                key: "\(input.dtype)_\(m)_\(k)_\(n)_\(bits)_\(upBits)_\(upPacked != nil)_\(rotateOutput)_\(limit?.bitPattern ?? 0)",
-                compare: { (run(16), run(64)) })
+            if enableDenseSmallTile, experts == 1, m <= Self.smallTileMaxRows,
+                smallTileAdmission.admits(
+                    key:
+                        "\(input.dtype)_\(m)_\(k)_\(n)_\(bits)_\(upBits)_\(upPacked != nil)_\(rotateOutput)_\(limit?.bitPattern ?? 0)",
+                    compare: { (run(16), run(64)) })
             {
                 return run(16)
             }

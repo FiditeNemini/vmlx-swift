@@ -62,10 +62,14 @@ struct JANGHConfigurationPartition: Sendable {
                     throw Failure.invalid("sidecar quantization ownership is not supported")
                 }
                 if let summary = try Self.optionalObject(other, "quantization") {
-                    guard Set(summary.keys).isSubset(of: ["bits", "group_size", "bit_widths_used"]),
+                    guard
+                        Set(summary.keys).isSubset(of: ["bits", "group_size", "bit_widths_used"]),
                         summary["bits"] is Int, summary["group_size"] is Int,
                         summary["bit_widths_used"] is [Int]
-                    else { throw Failure.invalid("dense Qwen sidecar quantization must be summary metadata") }
+                    else {
+                        throw Failure.invalid(
+                            "dense Qwen sidecar quantization must be summary metadata")
+                    }
                 }
             } else {
                 // Do not identify the format using the legacy label alone.
@@ -109,7 +113,9 @@ struct JANGHConfigurationPartition: Sendable {
                     parts[2] == "layers", let layer = Int(parts[3]), layer >= 0,
                     String(layer) == String(parts[3]), parts[4] == "mlp",
                     ["gate_proj", "up_proj", "down_proj"].contains(String(parts[5]))
-                else { throw Failure.invalid("unsupported dense qwen3_5 JANGH module path \(name)") }
+                else {
+                    throw Failure.invalid("unsupported dense qwen3_5 JANGH module path \(name)")
+                }
                 continue
             }
             let components = name.split(separator: ".", omittingEmptySubsequences: false)

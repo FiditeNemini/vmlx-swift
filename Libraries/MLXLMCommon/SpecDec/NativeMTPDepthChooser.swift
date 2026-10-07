@@ -32,13 +32,22 @@ final class NativeMTPDepthCostTable: @unchecked Sendable {
     private var warm: Set<Int> = []
 
     func observe(depth: Int, seconds: Double) {
-        lock.lock(); defer { lock.unlock() }
-        if !warm.contains(depth) { warm.insert(depth); return }
-        if let c = cost[depth] { cost[depth] = c + 0.25 * (seconds - c) } else { cost[depth] = seconds }
+        lock.lock()
+        defer { lock.unlock() }
+        if !warm.contains(depth) {
+            warm.insert(depth)
+            return
+        }
+        if let c = cost[depth] {
+            cost[depth] = c + 0.25 * (seconds - c)
+        } else {
+            cost[depth] = seconds
+        }
     }
 
     func cost(of depth: Int) -> Double? {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
         return cost[depth]
     }
 
@@ -46,7 +55,8 @@ final class NativeMTPDepthCostTable: @unchecked Sendable {
     private static let tablesLock = NSLock()
 
     static func shared(for model: AnyObject) -> NativeMTPDepthCostTable {
-        tablesLock.lock(); defer { tablesLock.unlock() }
+        tablesLock.lock()
+        defer { tablesLock.unlock() }
         let key = ObjectIdentifier(model)
         if let t = tables[key] { return t }
         let t = NativeMTPDepthCostTable()
@@ -56,7 +66,8 @@ final class NativeMTPDepthCostTable: @unchecked Sendable {
 }
 
 struct NativeMTPDepthChooser {
-    static let decay = Double(ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CHOOSER_DECAY"] ?? "") ?? 0.95
+    static let decay =
+        Double(ProcessInfo.processInfo.environment["VMLX_MTP_DEPTH_CHOOSER_DECAY"] ?? "") ?? 0.95
     static let probeEvery = 64
     static let priorP = 0.7
     /// OPT-IN (VMLX_MTP_DEPTH_CHOOSER=1). Measured 2026-10-06 on 4S, interleaved at matched GPU clock:
@@ -81,9 +92,11 @@ struct NativeMTPDepthChooser {
     }
 
     func expectedTokens(_ d: Int) -> Double {
-        var e = 1.0, run = 1.0, prev = Self.priorP
+        var e = 1.0
+        var run = 1.0
+        var prev = Self.priorP
         if d >= 1 {
-            for k in 1...d {
+            for k in 1 ... d {
                 prev = (hits[k] + prev) / (trials[k] + 1.0)
                 run *= prev
                 e += run
@@ -96,13 +109,13 @@ struct NativeMTPDepthChooser {
     /// (nil when the previous cycle was not adjacent, e.g. across an AR pause or a skipped cycle).
     /// `ceiling` bounds the next depth (an AR-safety demotion holds it down for a window).
     mutating func observe(cycleDepth: Int, accepted: Int, seconds: Double?, ceiling: Int) {
-        for k in 1..<trials.count {
+        for k in 1 ..< trials.count {
             trials[k] *= Self.decay
             hits[k] *= Self.decay
         }
         let lastDrafted = Swift.min(accepted + 1, cycleDepth)
         if lastDrafted >= 1 {
-            for k in 1...lastDrafted where k < trials.count {
+            for k in 1 ... lastDrafted where k < trials.count {
                 trials[k] += 1
                 if k <= accepted { hits[k] += 1 }
             }
@@ -113,14 +126,15 @@ struct NativeMTPDepthChooser {
             lastTimed[cycleDepth] = cycles
         }
         let top = Swift.max(1, Swift.min(maximumDepth, ceiling))
-        let candidates = Array(1...top)
+        let candidates = Array(1 ... top)
         if let unseen = candidates.first(where: { costs.cost(of: $0) == nil }) {
             depth = unseen
             return
         }
-        let best = candidates.max {
-            expectedTokens($0) / costs.cost(of: $0)! < expectedTokens($1) / costs.cost(of: $1)!
-        } ?? depth
+        let best =
+            candidates.max {
+                expectedTokens($0) / costs.cost(of: $0)! < expectedTokens($1) / costs.cost(of: $1)!
+            } ?? depth
         if cycles % Self.probeEvery == 0 {
             let neighbours = [best - 1, best + 1].filter { $0 >= 1 && $0 <= top }
             if let stale = neighbours.min(by: { (lastTimed[$0] ?? -1) < (lastTimed[$1] ?? -1) }) {
@@ -132,9 +146,10 @@ struct NativeMTPDepthChooser {
     }
 
     var summary: String {
-        (1...maximumDepth).map { d in
-            String(format: "d%d:E=%.2f,c=%@", d, expectedTokens(d),
-                   costs.cost(of: d).map { String(format: "%.1fms", $0 * 1000) } ?? "-")
+        (1 ... maximumDepth).map { d in
+            String(
+                format: "d%d:E=%.2f,c=%@", d, expectedTokens(d),
+                costs.cost(of: d).map { String(format: "%.1fms", $0 * 1000) } ?? "-")
         }.joined(separator: " ")
     }
 }

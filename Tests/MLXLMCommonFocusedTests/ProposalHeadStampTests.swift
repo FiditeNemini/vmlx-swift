@@ -215,7 +215,8 @@ extension ProposalHeadStampTests {
         XCTAssertEqual(model.installedBits, [4], "re-derived verdict must be used in-process")
         // The runtime never writes into a model folder (2026-10-06): the stale file is left as it was.
         let untouched = ProposalHeadStamp.load(fromBundleAt: dir)
-        XCTAssertEqual(untouched?.source, configLie, "the runtime must not rewrite a bundle's stamp")
+        XCTAssertEqual(
+            untouched?.source, configLie, "the runtime must not rewrite a bundle's stamp")
     }
 
     /// The inverse authority rule: when the source MATCHES the loaded head,
@@ -264,7 +265,9 @@ extension ProposalHeadStampTests {
                 }
             }
         }
-        XCTAssertNil(ProposalHeadStamp.load(fromBundleAt: dir), "the runtime must not write into a model folder")
+        XCTAssertNil(
+            ProposalHeadStamp.load(fromBundleAt: dir),
+            "the runtime must not write into a model folder")
         _ = layout
     }
 }

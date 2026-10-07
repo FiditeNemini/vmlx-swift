@@ -1899,7 +1899,9 @@ enum Qwen35Language {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
             // Exact-row target verification only; AR and ordinary prefill retain their paths.
-            let exactRowVerifier = FlashVerificationScope.usesRowExactVerification(inputShape: inputs.shape, site: "gdn")
+            let exactRowVerifier =
+                FlashVerificationScope.usesRowExactVerification(
+                    inputShape: inputs.shape, site: "gdn")
                 && verifyTileFamily == Qwen4ExpVerifyTile.Family.qwen4Exp
                 && recordPrefixCommitStates && B == 1 && (2...8).contains(S)
                 && NativeMTPVerifierStatePolicy.mode == .inputCaptureStaged
@@ -3287,7 +3289,8 @@ enum Qwen35Language {
 // MARK: - Model
 
 public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel,
-    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping, SafetensorsLoadKeyExcluding
+    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping,
+    SafetensorsLoadKeyExcluding
 {
     /// Dense JANGH bank tensors (`*.tq2_packed` / `*.tq2_scales`) owned by installed `JANGHDenseLinear`
     /// modules; the generic safetensors loader must not try to bind them. Empty for ordinary bundles.

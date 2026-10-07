@@ -186,7 +186,8 @@ final class JANGHDenseFastQMV {
     init?(bits: Int, alpha: Double, beta: Double) {
         guard bits == 2 || bits == 4 else { return nil }
         self.bits = bits
-        let a = Float(alpha), b = Float(beta)
+        let a = Float(alpha)
+        let b = Float(beta)
         let center = Float((1 << bits) - 1) / 2
         // Same float operations as the reference kernel: u = float(code) - center; level = u * fma(beta, u*u, alpha).
         let levels = (0 ..< (1 << bits)).map { code -> UInt32 in
@@ -194,7 +195,8 @@ final class JANGHDenseFastQMV {
             let level = u * a.addingProduct(b, u * u)
             return level.bitPattern
         }
-        let table = levels.map { "as_type<float>(0x\(String($0, radix: 16))u)" }.joined(separator: ", ")
+        let table = levels.map { "as_type<float>(0x\(String($0, radix: 16))u)" }.joined(
+            separator: ", ")
         let laneWords = 16 * bits / 32
         let source = """
             const float LV[\(1 << bits)] = {\(table)};
@@ -231,7 +233,8 @@ final class JANGHDenseFastQMV {
     }
 
     func project(_ x: MLXArray, packed: MLXArray, scales: MLXArray) -> MLXArray {
-        let k = x.dim(1), n = packed.dim(1)
+        let k = x.dim(1)
+        let n = packed.dim(1)
         return kernel(
             [x, packed, scales],
             template: [("K", k), ("N", n), ("WORDS", k * bits / 32), ("BITS", bits)],
@@ -273,9 +276,12 @@ final class JANGHDenseFastAdmission {
         let equal: Bool
         if let (got, want) = try? compare() {
             equal = Self.bitwiseEqual(got, want)
-        } else { equal = false }
+        } else {
+            equal = false
+        }
         verdicts[key] = equal
-        FileHandle.standardError.write(Data("[JANGH] projection admission \(key) admitted=\(equal)\n".utf8))
+        FileHandle.standardError.write(
+            Data("[JANGH] projection admission \(key) admitted=\(equal)\n".utf8))
         return equal
     }
 }

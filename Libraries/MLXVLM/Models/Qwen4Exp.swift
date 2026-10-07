@@ -41,8 +41,9 @@ enum Qwen4ExpRowExactProjection {
             quantizedMM(
                 input.reshaped(input.dim(0), 1, input.dim(-1)), q.weight[.newAxis, 0..., 0...],
                 scales: q.scales[.newAxis, 0..., 0...], biases: biases[.newAxis, 0..., 0...],
-                groupSize: 64, bits: 8, mode: .affine)
-                .reshaped(input.dim(0), q.weight.dim(0)).asType(input.dtype)
+                groupSize: 64, bits: 8, mode: .affine
+            )
+            .reshaped(input.dim(0), q.weight.dim(0)).asType(input.dtype)
         }
         // Same per-row arithmetic, weights streamed once for all rows (bitwise-admitted per shape).
         let flat = x.reshaped(rows, x.dim(-1))
@@ -500,7 +501,8 @@ private final class Qwen4ExpGatedResidual: Module {
     }
 
     func mix(_ hyper: MLXArray, normalizedInput: MLXArray? = nil) -> (MLXArray, MLXArray?) {
-        let joinedVerifyProjection = FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape, site: "hcjoin")
+        let joinedVerifyProjection =
+            FlashVerificationScope.usesRowExactVerification(inputShape: hyper.shape, site: "hcjoin")
             && combines && hcCount == 4 && hiddenSize == 2560
             && hyper.dim(2) == 10240
             && (normalizedInput.map { $0.shape == hyper.shape && $0.dtype == hyper.dtype } ?? true)
@@ -587,7 +589,8 @@ private final class Qwen4ExpGatedResidual: Module {
             mixedDown = parts[0]
             injected = parts[1]
         } else {
-            if FlashVerificationScope.usesRowExactVerification(inputShape: normalized.shape, site: "hcdown"),
+            if FlashVerificationScope.usesRowExactVerification(
+                inputShape: normalized.shape, site: "hcdown"),
                 !CompiledDecodeTrace.isActive, normalized.ndim == 3,
                 normalized.dim(0) == 1, (2...8).contains(normalized.dim(1)),
                 normalized.dtype == .bfloat16, mixDown.weight.dtype == .bfloat16,
@@ -1659,7 +1662,8 @@ private final class Qwen4ExpTextModel: Module {
         let verifyEarlySubmit = inputIds.ndim == 2 && inputIds.dim(0) == 1
             && (2...8).contains(inputIds.dim(1))
             && FlashVerificationScope.usesRowExactVerification(
-                inputShape: inputIds.shape + [config.base.textConfiguration.hiddenSize], site: "early")
+                inputShape: inputIds.shape + [config.base.textConfiguration.hiddenSize],
+                site: "early")
             && recordPrefixCommitStates && pleEmbeddings == nil
             && !CompiledDecodeTrace.isActive
         let earlySubmit = verifyEarlySubmit || Qwen4ExpEarlySubmission.allows(

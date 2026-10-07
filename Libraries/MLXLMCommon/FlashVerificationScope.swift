@@ -17,8 +17,11 @@ public enum FlashVerificationScope {
     ) rethrows -> Result {
         // Diagnostic only (measurement of the exact-verify machinery's cost): VMLX_FLASH_ROW_EXACT=0 runs
         // verification without the row-exact routes. Greedy output may then differ from AR.
-        let admittedRows = diagnosticDisabled ? 0 : (inputShape.count == 2 && inputShape[0] == 1
-            && (2...8).contains(inputShape[1]) ? inputShape[1] : 0)
+        let admittedRows =
+            diagnosticDisabled
+            ? 0
+            : (inputShape.count == 2 && inputShape[0] == 1
+                && (2 ... 8).contains(inputShape[1]) ? inputShape[1] : 0)
         return try $rows.withValue(admittedRows, operation: operation)
     }
 

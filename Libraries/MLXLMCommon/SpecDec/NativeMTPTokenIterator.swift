@@ -1996,7 +1996,9 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // ONE level: that forward commits this cycle's confirmed pairs to the aligned head cache (later head
         // drafts need that context); its single draft is then superseded by the copies.
         var copyWindow: [Int] = []
-        if stagedVerify, speculativeSampler.isGreedy, processor == nil, NativeMTPCopyProposer.enabled {
+        if stagedVerify, speculativeSampler.isGreedy, processor == nil,
+            NativeMTPCopyProposer.enabled
+        {
             if copyProposer == nil { copyProposer = NativeMTPCopyProposer(prompt: promptTokenIds) }
             feedCopyProposer()
             let queued = pendingTokens.count - pendingIndex
@@ -2546,11 +2548,15 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
             depthChooserLastStamp = (verifyCalls, now)
             var ceiling = adaptiveDepthCeiling
             if let hold = depthChooserHold {
-                if verifyCalls < hold.untilCycle { ceiling = Swift.min(ceiling, hold.depth) }
-                else { depthChooserHold = nil }
+                if verifyCalls < hold.untilCycle {
+                    ceiling = Swift.min(ceiling, hold.depth)
+                } else {
+                    depthChooserHold = nil
+                }
             }
             let cycleDepth = currentDepth
-            chooser.observe(cycleDepth: cycleDepth, accepted: accepted, seconds: period, ceiling: ceiling)
+            chooser.observe(
+                cycleDepth: cycleDepth, accepted: accepted, seconds: period, ceiling: ceiling)
             depthChooser = chooser
             let next = chooser.depth
             if next != currentDepth {

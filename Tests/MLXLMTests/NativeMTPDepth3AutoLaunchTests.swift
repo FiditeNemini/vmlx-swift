@@ -32,8 +32,10 @@ struct NativeMTPDepth3AutoLaunchTests {
     private static func publishedTuning(workloadGeneral: Bool = true) throws -> NativeMTPTuning {
         // Synthetic general-workload control; the unchanged historical artifact
         // is retained below as a rejection regression, not represented as proof.
-        let json = workloadGeneral ? publishedTuningJSON.replacingOccurrences(
-            of: "deterministic_count_96_tokens", with: "general_mixed") : publishedTuningJSON
+        let json =
+            workloadGeneral
+            ? publishedTuningJSON.replacingOccurrences(
+                of: "deterministic_count_96_tokens", with: "general_mixed") : publishedTuningJSON
         let data = Data(json.utf8)
         let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         let native = try #require(root?["native_mtp"] as? [String: Any])
@@ -101,7 +103,10 @@ struct NativeMTPDepth3AutoLaunchTests {
     func resolvedDraftStrategyIsNativeMTPDepth3(modelType: String) throws {
         let status = Self.shippedStatus(tuning: try Self.publishedTuning())
         var settings = VMLXServerRuntimeSettings()
-        #expect(settings.resolvedMTPDraftStrategy(configData: Self.config(modelType: modelType), jangConfig: nil, status: status) == nil)
+        #expect(
+            settings.resolvedMTPDraftStrategy(
+                configData: Self.config(modelType: modelType), jangConfig: nil, status: status)
+                == nil)
         settings.mtp.mode = .auto
 
         let strategy = try #require(
@@ -127,8 +132,10 @@ struct NativeMTPDepth3AutoLaunchTests {
         #expect(tuning.usableBestDepth == nil)
         var settings = VMLXServerRuntimeSettings()
         settings.mtp.mode = .auto
-        #expect(settings.resolvedMTPDraftStrategy(configData: Self.config(modelType: "qwen3_5"),
-            jangConfig: nil, status: Self.shippedStatus(tuning: tuning)) == nil)
+        #expect(
+            settings.resolvedMTPDraftStrategy(
+                configData: Self.config(modelType: "qwen3_5"),
+                jangConfig: nil, status: Self.shippedStatus(tuning: tuning)) == nil)
     }
 
     // MARK: - Why the artifact is load-bearing (the silent-off traps)

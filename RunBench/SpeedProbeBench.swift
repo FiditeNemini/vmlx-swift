@@ -23,24 +23,36 @@ import MLXVLM
 import VMLXTokenizers
 
 private let speedPrompts: [(String, [String])] = [
-    ("prose", [
-        "Write a detailed essay of about 400 words on the history of the printing press and its effect on literacy in Europe.",
-        "Write a detailed essay of about 400 words on how coral reefs form, why they bleach, and what restoration projects have learned.",
-        "Write a detailed essay of about 400 words on the economics of medieval Venetian trade with the eastern Mediterranean.",
-    ]),
-    ("code", [
-        "Write a Python class implementing an LRU cache with get(key) and put(key, value) in O(1) using an OrderedDict, then a small unittest covering eviction order. Code only, no prose.",
-        "Write a Rust function that parses an ISO-8601 date string into (year, month, day) with error handling, plus three unit tests. Code only, no prose.",
-        "Write a TypeScript debounce(fn, ms) utility with leading/trailing options and cancel(), plus Jest tests for both modes. Code only, no prose.",
-    ]),
-    ("easy_code", [
-        "Write Python code that prints the numbers 1 to 100, one print statement per line, no loops. Code only.",
-        "Write a JavaScript array literal containing the integers 1 through 150 in order. Code only.",
-    ]),
-    ("easy_prose", [
-        "Write the sentence: The quick brown fox jumps over the lazy dog. Write it 25 times, one per line.",
-        "List the days of the week in order, Monday to Sunday, ten times, separated by commas.",
-    ]),
+    (
+        "prose",
+        [
+            "Write a detailed essay of about 400 words on the history of the printing press and its effect on literacy in Europe.",
+            "Write a detailed essay of about 400 words on how coral reefs form, why they bleach, and what restoration projects have learned.",
+            "Write a detailed essay of about 400 words on the economics of medieval Venetian trade with the eastern Mediterranean.",
+        ]
+    ),
+    (
+        "code",
+        [
+            "Write a Python class implementing an LRU cache with get(key) and put(key, value) in O(1) using an OrderedDict, then a small unittest covering eviction order. Code only, no prose.",
+            "Write a Rust function that parses an ISO-8601 date string into (year, month, day) with error handling, plus three unit tests. Code only, no prose.",
+            "Write a TypeScript debounce(fn, ms) utility with leading/trailing options and cancel(), plus Jest tests for both modes. Code only, no prose.",
+        ]
+    ),
+    (
+        "easy_code",
+        [
+            "Write Python code that prints the numbers 1 to 100, one print statement per line, no loops. Code only.",
+            "Write a JavaScript array literal containing the integers 1 through 150 in order. Code only.",
+        ]
+    ),
+    (
+        "easy_prose",
+        [
+            "Write the sentence: The quick brown fox jumps over the lazy dog. Write it 25 times, one per line.",
+            "List the days of the week in order, Monday to Sunday, ten times, separated by commas.",
+        ]
+    ),
 ]
 
 func runSpeedProbe(modelPath: String) async throws {
@@ -61,23 +73,32 @@ func runSpeedProbe(modelPath: String) async throws {
     if arm == "default" {
         context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader(),
-            loadConfiguration: defaultLoad).0
+            loadConfiguration: defaultLoad
+        ).0
     } else if arm == "adaptive" {
         context = try await MLXLMCommon.loadModel(
             from: modelDir, using: #huggingFaceTokenizerLoader(),
-            loadConfiguration: LoadConfiguration(nativeMTP: true)).0
+            loadConfiguration: LoadConfiguration(nativeMTP: true)
+        ).0
     } else {
-        context = try await MLXLMCommon.loadModel(from: modelDir, using: #huggingFaceTokenizerLoader())
+        context = try await MLXLMCommon.loadModel(
+            from: modelDir, using: #huggingFaceTokenizerLoader())
     }
-    print("[BENCH_SPEED_RESOLUTION] requested=\(arm) bundleDefault=\(String(describing: defaultStrategy))")
-    print(String(format: "[BENCH_SPEED] arm=%@ model=%@ load=%.1fs type=%@", arm, modelDir.lastPathComponent,
-                 CFAbsoluteTimeGetCurrent() - loadStart, String(describing: type(of: context.model))))
+    print(
+        "[BENCH_SPEED_RESOLUTION] requested=\(arm) bundleDefault=\(String(describing: defaultStrategy))"
+    )
+    print(
+        String(
+            format: "[BENCH_SPEED] arm=%@ model=%@ load=%.1fs type=%@", arm,
+            modelDir.lastPathComponent,
+            CFAbsoluteTimeGetCurrent() - loadStart, String(describing: type(of: context.model))))
     nonisolated(unsafe) let ctx = context
     let engine = BatchEngine(context: ctx, maxBatchSize: 1, cacheCoordinator: nil)
 
     func params(_ budget: Int) -> GenerateParameters {
-        var p = GenerateParameters(maxTokens: budget, temperature: 0, topP: 1, topK: 0, minP: 0,
-                                   repetitionPenalty: nil)
+        var p = GenerateParameters(
+            maxTokens: budget, temperature: 0, topP: 1, topK: 0, minP: 0,
+            repetitionPenalty: nil)
         switch arm {
         case "default":
             p.draftStrategy = defaultStrategy
@@ -91,14 +112,22 @@ func runSpeedProbe(modelPath: String) async throws {
             p.nativeMTPDepthPolicy = .adaptive(maximumDepth: maxDepth)
         case "dflash2":
             let block = env["BENCH_SPEED_DFLASH2_BLOCK"].flatMap(Int.init)
-            p.draftStrategy = .dflash2(drafterPath: modelDir.appendingPathComponent("dflash2"), blockSize: block)
+            p.draftStrategy = .dflash2(
+                drafterPath: modelDir.appendingPathComponent("dflash2"), blockSize: block)
         default:
             break
         }
         return p
     }
 
-    struct Row { var cat: String; var tokens: Int; var decode: Double; var ttft: Double; var text: String; var chunkRate: Double }
+    struct Row {
+        var cat: String
+        var tokens: Int
+        var decode: Double
+        var ttft: Double
+        var text: String
+        var chunkRate: Double
+    }
     func run(_ prompt: String, _ budget: Int, cat: String) async throws -> Row {
         var input = UserInput(prompt: prompt)
         input.additionalContext = ["enable_thinking": false]
@@ -115,17 +144,25 @@ func runSpeedProbe(modelPath: String) async throws {
         for await ev in stream {
             switch ev {
             case .chunk(let c):
-                let now = CFAbsoluteTimeGetCurrent(); if first == nil { first = now }; last = now; text += c
+                let now = CFAbsoluteTimeGetCurrent()
+                if first == nil { first = now }
+                last = now
+                text += c
             case .reasoning(let r):
-                let now = CFAbsoluteTimeGetCurrent(); if first == nil { first = now }; last = now; text += r
+                let now = CFAbsoluteTimeGetCurrent()
+                if first == nil { first = now }
+                last = now
+                text += r
             case .info(let info):
                 tokens = info.generationTokenCount
                 genTime = info.generateTime
                 if let m = info.nativeMTPStats {
-                    mtp = String(format: "verify=%d commit/verify=%.2f arFallback=%d accByDepth=%@ depth=%d->%d downshifts=%d arTrips=%d/%d mode=%@",
-                                 m.verifyCalls, m.avgCommittedPerVerify, m.arFallbackTokens,
-                                 m.acceptedByDepth.description, m.depth, m.activeDepth, m.adaptiveDownshifts,
-                                 m.arSafetyTrips, m.arSafetyResumes, m.verifierMode)
+                    mtp = String(
+                        format:
+                            "verify=%d commit/verify=%.2f arFallback=%d accByDepth=%@ depth=%d->%d downshifts=%d arTrips=%d/%d mode=%@",
+                        m.verifyCalls, m.avgCommittedPerVerify, m.arFallbackTokens,
+                        m.acceptedByDepth.description, m.depth, m.activeDepth, m.adaptiveDownshifts,
+                        m.arSafetyTrips, m.arSafetyResumes, m.verifierMode)
                 }
             default:
                 break
@@ -137,7 +174,9 @@ func runSpeedProbe(modelPath: String) async throws {
         let span = (first.map { last - $0 }) ?? 0
         let chunkRate = span > 0.2 && tokens > 1 ? Double(tokens - 1) / span : 0
         if !mtp.isEmpty { print("[BENCH_SPEED_MTP] \(cat) \(mtp)") }
-        return Row(cat: cat, tokens: tokens, decode: decode, ttft: (first ?? t0) - t0, text: text, chunkRate: chunkRate)
+        return Row(
+            cat: cat, tokens: tokens, decode: decode, ttft: (first ?? t0) - t0, text: text,
+            chunkRate: chunkRate)
     }
 
     _ = try await run("Say hi.", 16, cat: "warmup")
@@ -151,18 +190,24 @@ func runSpeedProbe(modelPath: String) async throws {
             let r = try await run(prompt, maxTokens, cat: cat)
             summary[cat, default: []].append(r.decode)
             let preview = String(r.text.prefix(80)).replacingOccurrences(of: "\n", with: "\\n")
-            let line = String(format: "{\"cat\":\"%@\",\"tokens\":%d,\"decode_tok_s\":%.2f,\"chunk_tok_s\":%.2f,\"ttft\":%.3f,\"preview\":%@}",
-                              cat, r.tokens, r.decode, r.chunkRate, r.ttft, String(reflecting: preview))
+            let line = String(
+                format:
+                    "{\"cat\":\"%@\",\"tokens\":%d,\"decode_tok_s\":%.2f,\"chunk_tok_s\":%.2f,\"ttft\":%.3f,\"preview\":%@}",
+                cat, r.tokens, r.decode, r.chunkRate, r.ttft, String(reflecting: preview))
             print("[BENCH_SPEED_ROW] " + line)
             lines.append(line)
             texts.append(r.text)
         }
     }
     func median(_ v: [Double]) -> Double {
-        let s = v.sorted(); return s.isEmpty ? 0 : (s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2)
+        let s = v.sorted()
+        return s.isEmpty
+            ? 0 : (s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2)
     }
-    let med = speedPrompts.filter { selected?.contains($0.0) ?? true }.map { cat, _ in String(format: "\"%@\": %.2f", cat, median(summary[cat] ?? [])) }
-        .joined(separator: ", ")
+    let med = speedPrompts.filter { selected?.contains($0.0) ?? true }.map { cat, _ in
+        String(format: "\"%@\": %.2f", cat, median(summary[cat] ?? []))
+    }
+    .joined(separator: ", ")
     print("[BENCH_SPEED_SUMMARY] arm=\(arm) {\(med)}")
     if let textOut = env["BENCH_SPEED_TEXT_OUT"] {
         // Full generated texts in prompt order (greedy identity check across arms).
@@ -170,6 +215,7 @@ func runSpeedProbe(modelPath: String) async throws {
         try data.write(to: URL(fileURLWithPath: textOut))
     }
     if let out = env["BENCH_SPEED_OUT"] {
-        try (lines + ["{\"summary\": {\(med)}}"]).joined(separator: "\n").write(toFile: out, atomically: true, encoding: .utf8)
+        try (lines + ["{\"summary\": {\(med)}}"]).joined(separator: "\n").write(
+            toFile: out, atomically: true, encoding: .utf8)
     }
 }

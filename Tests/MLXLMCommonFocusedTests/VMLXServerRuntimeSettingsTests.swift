@@ -78,21 +78,26 @@ struct VMLXServerRuntimeSettingsTests {
         let flash = MTPBundleStatus(
             bundleHasMTP: true, configuredLayers: 1, tensorCount: 57, mode: .preservedEnabled,
             nativeMTPTuning: nil, measuredFamilyAutoDepth: 3)
-        let flashConfig = Data(#"{"model_type": "qwen4_exp", "text_config": {"model_type": "qwen4_exp_text"}}"#.utf8)
+        let flashConfig = Data(
+            #"{"model_type": "qwen4_exp", "text_config": {"model_type": "qwen4_exp_text"}}"#.utf8)
         let defaults = VMLXServerRuntimeSettings()
-        let flashLaunch = defaults.resolvedMTPLaunch(configData: flashConfig, jangConfig: nil, status: flash)
+        let flashLaunch = defaults.resolvedMTPLaunch(
+            configData: flashConfig, jangConfig: nil, status: flash)
         #expect(flashLaunch.launchMode == .speculative)
         #expect(flashLaunch.recommendation?.depth == 3)
 
         let other = MTPBundleStatus(
             bundleHasMTP: true, configuredLayers: 1, tensorCount: 15, mode: .preservedEnabled)
         let otherConfig = Data(#"{"model_type": "qwen3_5"}"#.utf8)
-        #expect(defaults.resolvedMTPLaunch(configData: otherConfig, jangConfig: nil, status: other)
-            .launchMode == .off)
+        #expect(
+            defaults.resolvedMTPLaunch(configData: otherConfig, jangConfig: nil, status: other)
+                .launchMode == .off)
 
         var off = VMLXServerRuntimeSettings()
         off.mtp.mode = .off
-        #expect(off.resolvedMTPLaunch(configData: flashConfig, jangConfig: nil, status: flash).launchMode == .off)
+        #expect(
+            off.resolvedMTPLaunch(configData: flashConfig, jangConfig: nil, status: flash)
+                .launchMode == .off)
     }
 
     @Test("a bundled dflash2 drafter is used unless speculation is switched off")
@@ -108,12 +113,13 @@ struct VMLXServerRuntimeSettingsTests {
              "mask_token_id": 248070, "selector_rank": 256, "selector_top_k": 16, "conv_kernel_size": 2, "conv_group_size":16}}
             """#
         try Data(drafterConfig.utf8).write(to: drafter.appendingPathComponent("config.json"))
-        let shapes = try DFlash2ArtifactMetadata.requiredShapes(configData: Data(drafterConfig.utf8))
+        let shapes = try DFlash2ArtifactMetadata.requiredShapes(
+            configData: Data(drafterConfig.utf8))
         var offset = 0
         var header: [String: Any] = [:]
         for (name, shape) in shapes {
             let end = offset + shape.reduce(2, *)
-            header[name] = ["dtype":"BF16", "shape":shape, "data_offsets":[offset,end]]
+            header[name] = ["dtype": "BF16", "shape": shape, "data_offsets": [offset, end]]
             offset = end
         }
         let bytes = try JSONSerialization.data(withJSONObject: header)
@@ -125,17 +131,26 @@ struct VMLXServerRuntimeSettingsTests {
         let handle = try FileHandle(forWritingTo: url)
         try handle.truncate(atOffset: UInt64(file.count + offset))
         try handle.close()
-        let targetConfig = Data(#"{"model_type": "qwen3_5", "text_config": {"vocab_size": 248320, "hidden_size":5120, "num_hidden_layers": 64}}"#.utf8)
+        let targetConfig = Data(
+            #"{"model_type": "qwen3_5", "text_config": {"vocab_size": 248320, "hidden_size":5120, "num_hidden_layers": 64}}"#
+                .utf8)
         guard VMLXDFlash2DrafterInfo.read(at: drafter) != nil else {
-            Issue.record("fixture is not recognised as a DFlash 2 drafter; update it to the reader's discriminator")
+            Issue.record(
+                "fixture is not recognised as a DFlash 2 drafter; update it to the reader's discriminator"
+            )
             return
         }
         let defaults = VMLXServerRuntimeSettings()
-        #expect(defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root) != nil)
+        #expect(
+            defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root)
+                != nil)
         var off = defaults
         off.mtp.mode = .off
-        #expect(off.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root) == nil)
-        #expect(defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: nil) == nil)
+        #expect(
+            off.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root) == nil)
+        #expect(
+            defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: nil) == nil
+        )
     }
 
     @Test("selection capability shares the launch policy across architecture aliases")

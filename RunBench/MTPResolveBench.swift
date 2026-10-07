@@ -18,12 +18,19 @@ func runMTPResolveBench() throws {
         let configData = try? Data(contentsOf: url.appendingPathComponent("config.json"))
         let jang = try? JangLoader.loadConfig(at: url)
         let status = try? MTPBundleInspector.inspect(modelDirectory: url, jangConfig: jang)
-        let launch = settings.resolvedMTPLaunch(configData: configData, jangConfig: jang, status: status)
-        let load = settings.resolvedLoadConfiguration(configData: configData, jangConfig: jang, status: status)
-        let strategy = settings.resolvedMTPDraftStrategy(configData: configData, jangConfig: jang, status: status, bundleDirectory: url)
+        let launch = settings.resolvedMTPLaunch(
+            configData: configData, jangConfig: jang, status: status)
+        let load = settings.resolvedLoadConfiguration(
+            configData: configData, jangConfig: jang, status: status)
+        let strategy = settings.resolvedMTPDraftStrategy(
+            configData: configData, jangConfig: jang, status: status, bundleDirectory: url)
         print("[MTPRESOLVE] \(url.lastPathComponent)")
-        print("  status: complete=\(status?.hasCompleteMTPArtifact ?? false) layers=\(status?.configuredLayers ?? -1) tensors=\(status?.tensorCount ?? -1) mode=\(status.map { String(describing: $0.mode) } ?? "nil") tuning=\(status?.nativeMTPTuning != nil) usableTuning=\(status?.hasUsableNativeMTPTuning ?? false) familyAuto=\(String(describing: status?.measuredFamilyAutoDepth)) blocked=\(status?.isExplicitlyBlocked ?? false) canAuto=\(status?.canAutoLaunchMTP ?? false)")
-        print("  nativeLaunch=\(launch.launchMode) depth=\(launch.recommendation.map { String($0.depth) } ?? "-") loadNativeMTP=\(load.nativeMTP) strategy=\(strategy.map { String(describing: $0) } ?? "nil")")
+        print(
+            "  status: complete=\(status?.hasCompleteMTPArtifact ?? false) layers=\(status?.configuredLayers ?? -1) tensors=\(status?.tensorCount ?? -1) mode=\(status.map { String(describing: $0.mode) } ?? "nil") tuning=\(status?.nativeMTPTuning != nil) usableTuning=\(status?.hasUsableNativeMTPTuning ?? false) familyAuto=\(String(describing: status?.measuredFamilyAutoDepth)) blocked=\(status?.isExplicitlyBlocked ?? false) canAuto=\(status?.canAutoLaunchMTP ?? false)"
+        )
+        print(
+            "  nativeLaunch=\(launch.launchMode) depth=\(launch.recommendation.map { String($0.depth) } ?? "-") loadNativeMTP=\(load.nativeMTP) strategy=\(strategy.map { String(describing: $0) } ?? "nil")"
+        )
         print("  nativeReason: \(launch.reason)")
     }
 }

@@ -432,7 +432,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         if mtp.mode == .familyDefault, status?.measuredFamilyAutoDepth == nil {
             return .init(
                 launchMode: .off, recommendation: nil,
-                reason: "Native MTP is on by default only for Qwen3.8 Flash-Next; choose On (Adaptive) to enable it for this bundle.")
+                reason:
+                    "Native MTP is on by default only for Qwen3.8 Flash-Next; choose On (Adaptive) to enable it for this bundle."
+            )
         }
         if let limit = mtp.draftTokenLimit, limit <= 0 {
             return .init(
@@ -452,7 +454,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
                     recommendation: nil,
                     reason: "MTP explicit depth must be 1, 2, or 3 (got \(depth)).")
             }
-            if status?.isExplicitlyBlocked == true || status?.nativeMTPTuning?.manualBlocked == true {
+            if status?.isExplicitlyBlocked == true || status?.nativeMTPTuning?.manualBlocked == true
+            {
                 return .init(
                     launchMode: .blocked,
                     recommendation: nil,
@@ -535,7 +538,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         // drafter means "draft with this", not "draft with this as well".
         // Off (AR) disables every speculative strategy, including a previously
         // selected external drafter. Selection is retained for re-enabling.
-        if let selection = resolvedDFlash2Selection(configData: configData, bundleDirectory: bundleDirectory) {
+        if let selection = resolvedDFlash2Selection(
+            configData: configData, bundleDirectory: bundleDirectory)
+        {
             return .dflash2(
                 drafterPath: URL(fileURLWithPath: selection.path),
                 blockSize: mtp.dflash2BlockSize)

@@ -24,13 +24,22 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
     private var warm: Set<Int> = []
 
     func observe(width: Int, seconds: Double) {
-        lock.lock(); defer { lock.unlock() }
-        if !warm.contains(width) { warm.insert(width); return }
-        if let c = cost[width] { cost[width] = c + 0.25 * (seconds - c) } else { cost[width] = seconds }
+        lock.lock()
+        defer { lock.unlock() }
+        if !warm.contains(width) {
+            warm.insert(width)
+            return
+        }
+        if let c = cost[width] {
+            cost[width] = c + 0.25 * (seconds - c)
+        } else {
+            cost[width] = seconds
+        }
     }
 
     func cost(of width: Int) -> Double? {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
         return cost[width]
     }
 
@@ -38,7 +47,8 @@ final class DFlash2WidthCostTable: @unchecked Sendable {
     private static let tablesLock = NSLock()
 
     static func shared(for target: AnyObject, widths: [Int]) -> DFlash2WidthCostTable {
-        tablesLock.lock(); defer { tablesLock.unlock() }
+        tablesLock.lock()
+        defer { tablesLock.unlock() }
         let key = ObjectIdentifier(target)
         if let t = tables[key] { return t }
         let t = DFlash2WidthCostTable()
@@ -81,9 +91,11 @@ struct DFlash2WidthChooser {
     }
 
     func expectedTokens(_ w: Int) -> Double {
-        var e = 1.0, run = 1.0, prev = Self.priorP
+        var e = 1.0
+        var run = 1.0
+        var prev = Self.priorP
         if w > 1 {
-            for k in 1..<w {
+            for k in 1 ..< w {
                 prev = (hits[k] + prev) / (trials[k] + 1.0)
                 run *= prev
                 e += run
@@ -94,15 +106,15 @@ struct DFlash2WidthChooser {
 
     /// One finished cycle: `tokens` emitted (accepted + 1) in `seconds` wall time at `verifyWidth` rows.
     mutating func observe(verifyWidth: Int, tokens: Int, seconds: Double) {
-        guard seconds > 0, widths.contains(verifyWidth) else { return }   // clipped final block
+        guard seconds > 0, widths.contains(verifyWidth) else { return }  // clipped final block
         let accepted = tokens - 1
-        for k in 1..<trials.count {
+        for k in 1 ..< trials.count {
             trials[k] *= Self.decay
             hits[k] *= Self.decay
         }
         let lastVerified = min(accepted + 1, verifyWidth - 1)
         if lastVerified >= 1 {
-            for k in 1...lastVerified where k < trials.count {
+            for k in 1 ... lastVerified where k < trials.count {
                 trials[k] += 1
                 if k <= accepted { hits[k] += 1 }
             }
@@ -117,7 +129,11 @@ struct DFlash2WidthChooser {
             let others = widths.filter { $0 != verifyWidth }
             width = others.min { (lastTimed[$0] ?? -1) < (lastTimed[$1] ?? -1) } ?? verifyWidth
         } else {
-            width = widths.max { expectedTokens($0) / costs.cost(of: $0)! < expectedTokens($1) / costs.cost(of: $1)! }
+            width =
+                widths.max {
+                    expectedTokens($0) / costs.cost(of: $0)! < expectedTokens($1) / costs.cost(
+                        of: $1)!
+                }
                 ?? width
         }
     }

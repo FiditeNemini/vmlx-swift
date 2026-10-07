@@ -213,13 +213,15 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
     /// hits. Page-cache pages are clean and reclaimable: under memory pressure macOS evicts them and
     /// lookups fall back to drive reads — never an error, never a refusal.
     static let uncachedReads: Bool = {
-        let raw = (ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_NOCACHE"] ?? "0").lowercased()
+        let raw = (ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_NOCACHE"] ?? "0")
+            .lowercased()
         return ["1", "true", "yes", "on"].contains(raw)
     }()
 
     /// Warm policy. `VMLX_QWEN4_PLE_WARM=1` forces the warm, `=0` disables it; unset = automatic (below).
     static let warmOverride: Bool? = {
-        guard let raw = ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_WARM"]?.lowercased() else { return nil }
+        guard let raw = ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_WARM"]?.lowercased()
+        else { return nil }
         if ["0", "false", "no", "off"].contains(raw) { return false }
         if ["1", "true", "yes", "on"].contains(raw) { return true }
         return nil
@@ -242,15 +244,18 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         var bundleBytes: UInt64 = 0
         if let names = try? fm.contentsOfDirectory(atPath: modelDirectory.path) {
             for name in names where name.hasSuffix(".safetensors") {
-                let attrs = try? fm.attributesOfItem(atPath: modelDirectory.appendingPathComponent(name).path)
+                let attrs = try? fm.attributesOfItem(
+                    atPath: modelDirectory.appendingPathComponent(name).path)
                 bundleBytes += (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
             }
         }
         let physical = ProcessInfo.processInfo.physicalMemory
         let fits = Double(bundleBytes) <= 0.60 * Double(physical)
-        log(String(format: "page-cache warm %@: bundle %.1f GB vs 60%% of %.0f GB physical",
-                   fits ? "on" : "off (rows are cached on demand only)",
-                   Double(bundleBytes) / 1e9, Double(physical) / 1e9))
+        log(
+            String(
+                format: "page-cache warm %@: bundle %.1f GB vs 60%% of %.0f GB physical",
+                fits ? "on" : "off (rows are cached on demand only)",
+                Double(bundleBytes) / 1e9, Double(physical) / 1e9))
         return fits
     }
 
@@ -284,8 +289,11 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
                 Darwin.close(fd)
             }
             let seconds = Date().timeIntervalSince(started)
-            log(String(format: "page-cache warm done: %.2f GB in %.1f s (%.2f GB/s, %d files)",
-                       Double(done) / 1e9, seconds, Double(done) / 1e9 / Swift.max(seconds, 1e-6), fresh.count))
+            log(
+                String(
+                    format: "page-cache warm done: %.2f GB in %.1f s (%.2f GB/s, %d files)",
+                    Double(done) / 1e9, seconds, Double(done) / 1e9 / Swift.max(seconds, 1e-6),
+                    fresh.count))
         }
         thread.name = "vmlx-qwen4-ple-page-warm"
         thread.qualityOfService = .utility
@@ -457,15 +465,18 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         if Self.shouldWarm(modelDirectory: modelDirectory) {
             Self.warmPageCache(openedFiles.keys.sorted { $0.path < $1.path })
         }
-        Self.log(String(format:
-            "ssd-row-reader ready backend=%@ row_schedule=%@ files=%d backing_file_bytes=%.3f_GiB rows=%lld dimensions=%d source=%@",
-            Self.uncachedReads ? "pread-fnocache cache=F_NOCACHE" : "pread-pagecache warm=\(Self.warmEnabled)",
-            Self.parallelRows ? "parallel" : "sequential-opt-out",
-            backingFileCount,
-            Double(backingFileBytes) / 1_073_741_824.0,
-            rowCount,
-            dimensions,
-            modelDirectory.path))
+        Self.log(
+            String(
+                format:
+                    "ssd-row-reader ready backend=%@ row_schedule=%@ files=%d backing_file_bytes=%.3f_GiB rows=%lld dimensions=%d source=%@",
+                Self.uncachedReads
+                    ? "pread-fnocache cache=F_NOCACHE" : "pread-pagecache warm=\(Self.warmEnabled)",
+                Self.parallelRows ? "parallel" : "sequential-opt-out",
+                backingFileCount,
+                Double(backingFileBytes) / 1_073_741_824.0,
+                rowCount,
+                dimensions,
+                modelDirectory.path))
     }
 
     /// Returns row-major Float32 values. Only bytes belonging to selected rows

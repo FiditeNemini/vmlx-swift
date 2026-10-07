@@ -9,16 +9,19 @@ final class JANGHProjectionKernelTests: XCTestCase {
         try MLXMetalTestLock.withLock {
             let firstBank = JANGHDenseFastAdmission(enabled: true)
             let otherBank = JANGHDenseFastAdmission(enabled: true)
-            let one = MLXArray([Float(1)]), two = MLXArray([Float(2)])
+            let one = MLXArray([Float(1)])
+            let two = MLXArray([Float(2)])
             var comparisons = 0
-            XCTAssertTrue(firstBank.admits(key: "float32_rows1") {
-                comparisons += 1
-                return (one, one)
-            })
-            XCTAssertTrue(firstBank.admits(key: "float32_rows1") {
-                XCTFail("Same immutable bank/variant should use its cached verdict")
-                return (one, two)
-            })
+            XCTAssertTrue(
+                firstBank.admits(key: "float32_rows1") {
+                    comparisons += 1
+                    return (one, one)
+                })
+            XCTAssertTrue(
+                firstBank.admits(key: "float32_rows1") {
+                    XCTFail("Same immutable bank/variant should use its cached verdict")
+                    return (one, two)
+                })
             XCTAssertFalse(otherBank.admits(key: "float32_rows1") { (one, two) })
             XCTAssertFalse(firstBank.admits(key: "float16_rows1") { (one, two) })
             XCTAssertFalse(firstBank.admits(key: "float32_rows2") { (one, two) })
@@ -28,10 +31,12 @@ final class JANGHProjectionKernelTests: XCTestCase {
 
     func testDenseAdmissionComparesBitsAndDoesNotConsumeRequestRandomState() throws {
         try MLXMetalTestLock.withLock {
-            XCTAssertFalse(JANGHDenseFastAdmission.bitwiseEqual(
-                MLXArray([Float.zero]), MLXArray([-Float.zero])))
-            XCTAssertFalse(JANGHDenseFastAdmission.bitwiseEqual(
-                MLXArray([Float(1)]), MLXArray([Float16(1)])))
+            XCTAssertFalse(
+                JANGHDenseFastAdmission.bitwiseEqual(
+                    MLXArray([Float.zero]), MLXArray([-Float.zero])))
+            XCTAssertFalse(
+                JANGHDenseFastAdmission.bitwiseEqual(
+                    MLXArray([Float(1)]), MLXArray([Float16(1)])))
             let baseline = withRandomState(MLXRandom.RandomState(seed: 914)) {
                 MLXRandom.normal([8]).asArray(Float.self)
             }
@@ -51,7 +56,8 @@ final class JANGHProjectionKernelTests: XCTestCase {
                 let (alpha, beta) = coefficients(bits)
                 let fast = try XCTUnwrap(JANGHDenseFastQMV(bits: bits, alpha: alpha, beta: beta))
                 let reference = try kernel(bits: bits, rotation: "none")
-                let k = 512, n = 8
+                let k = 512
+                let n = 8
                 let codes = (0 ..< n * k).map { UInt32(($0 * 13 + $0 / k) % (1 << bits)) }
                 let weights = MLXArray(pack(codes, bits: bits), [1, n, k * bits / 32])
                 let scales = MLXArray((0 ..< n).map { Float16(Float($0 + 1) / 11) }, [1, n])
@@ -60,9 +66,11 @@ final class JANGHProjectionKernelTests: XCTestCase {
                         let values = (0 ..< rows * k).map { Float(($0 * 17) % 127 - 63) / 37 }
                         let input = MLXArray(values, [rows, k]).asType(dtype)
                         let got = fast.project(input, packed: weights, scales: scales)
-                        let want = try reference.project(input, packed: weights, scales: scales,
+                        let want = try reference.project(
+                            input, packed: weights, scales: scales,
                             indices: MLXArray.zeros([rows], type: UInt32.self))
-                        XCTAssertTrue(JANGHDenseFastAdmission.bitwiseEqual(got, want),
+                        XCTAssertTrue(
+                            JANGHDenseFastAdmission.bitwiseEqual(got, want),
                             "bits=\(bits) dtype=\(dtype) rows=\(rows)")
                     }
                 }
@@ -72,10 +80,11 @@ final class JANGHProjectionKernelTests: XCTestCase {
 
     func testDenseAdmissionDisabledNeverEvaluatesCandidate() {
         let admission = JANGHDenseFastAdmission(enabled: false)
-        XCTAssertFalse(admission.admits(key: "legacy") {
-            XCTFail("Disabled admission must not evaluate a diagnostic")
-            return (MLXArray(Float(0)), MLXArray(Float(0)))
-        })
+        XCTAssertFalse(
+            admission.admits(key: "legacy") {
+                XCTFail("Disabled admission must not evaluate a diagnostic")
+                return (MLXArray(Float(0)), MLXArray(Float(0)))
+            })
     }
 
     private func coefficients(_ bits: Int) -> (Double, Double) {

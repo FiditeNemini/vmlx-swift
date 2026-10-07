@@ -23,46 +23,60 @@ public final class JANGHDenseModelPreparation {
         hiddenSize: Int, intermediateSize: Int, layerCount: Int
     ) throws {
         for name in ["jangtq_runtime.safetensors", "jangtq_stacked.safetensors"] {
-            guard !FileManager.default.fileExists(atPath: directory.appendingPathComponent(name).path)
+            guard
+                !FileManager.default.fileExists(atPath: directory.appendingPathComponent(name).path)
             else {
-                throw JANGHFormatContract.ValidationError.invalid("dense JANGH cannot coexist with legacy overlays")
+                throw JANGHFormatContract.ValidationError.invalid(
+                    "dense JANGH cannot coexist with legacy overlays")
             }
         }
-        let partition = try JANGHConfigurationPartition(configuration: configuration, sidecar: sidecar)
-        guard partition.modelType == "qwen3_5", hiddenSize > 0, intermediateSize > 0, layerCount > 0,
+        let partition = try JANGHConfigurationPartition(
+            configuration: configuration, sidecar: sidecar)
+        guard partition.modelType == "qwen3_5", hiddenSize > 0, intermediateSize > 0,
+            layerCount > 0,
             hiddenSize.isMultiple(of: 32), intermediateSize.isMultiple(of: 32)
-        else { throw JANGHFormatContract.ValidationError.invalid("unsupported dense qwen3_5 JANGH architecture") }
+        else {
+            throw JANGHFormatContract.ValidationError.invalid(
+                "unsupported dense qwen3_5 JANGH architecture")
+        }
         var dims: [String: JANGHTensorIndexPlan.Dimensions] = [:]
         var inputs: [String: Int] = [:]
         for name in partition.customModules {
             let parts = name.split(separator: ".")
             guard let layer = Int(parts[3]), layer < layerCount else {
-                throw JANGHFormatContract.ValidationError.invalid("dense JANGH layer out of range \(name)")
+                throw JANGHFormatContract.ValidationError.invalid(
+                    "dense JANGH layer out of range \(name)")
             }
             let isDown = name.hasSuffix(".down_proj")
             let input = isDown ? intermediateSize : hiddenSize
-            dims[name] = .init(experts: 1, input: input, output: isDown ? hiddenSize : intermediateSize)
+            dims[name] = .init(
+                experts: 1, input: input, output: isDown ? hiddenSize : intermediateSize)
             inputs[name] = input
         }
-        let metadata = try JANGHHeaderAdapter.read(directory: directory, indexName: "model.safetensors.index.json")
+        let metadata = try JANGHHeaderAdapter.read(
+            directory: directory, indexName: "model.safetensors.index.json")
         source = try JANGHMappedBanks.SourceLease(
-            directory: directory, metadata: metadata, contract: partition.contract, dimensions: dims)
+            directory: directory, metadata: metadata, contract: partition.contract, dimensions: dims
+        )
         modules = [:]
         inputDimensions = intermediateSize
         pathInputs = inputs
         ordinaryConfiguration = partition.ordinaryConfiguration
-        excludedTensorNames = Set(partition.customModules.flatMap { [$0 + ".tq2_packed", $0 + ".tq2_scales"] })
+        excludedTensorNames = Set(
+            partition.customModules.flatMap { [$0 + ".tq2_packed", $0 + ".tq2_scales"] })
     }
 
     /// Path-keyed projections (Qwen3.5-family). `sortedThreshold` = rows from which the one-pass sorted QMM
     /// (NAX, 16-row tile for verify windows) replaces the per-row QMV. Measured 27B JANGH2 target forward
     /// (2026-10-06, lane on): per-row QMV +12 ms per extra row; sorted NAX 54-59 ms flat for 4-16 rows.
-    public func makeProjectionsByPath(sortedThreshold: Int = 2) throws -> [String: JANGHDenseLinear] {
+    public func makeProjectionsByPath(sortedThreshold: Int = 2) throws -> [String: JANGHDenseLinear]
+    {
         let banks = try JANGHMappedBanks(source: source)
         var out: [String: JANGHDenseLinear] = [:]
         for (path, input) in pathInputs {
             out[path] = try JANGHDenseLinear(
-                banks: banks, module: path, inputDimensions: input, sortedThreshold: sortedThreshold,
+                banks: banks, module: path, inputDimensions: input,
+                sortedThreshold: sortedThreshold,
                 qwen35Optimizations: true)
         }
         return out
@@ -181,9 +195,12 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
         rotation = banks.contract.projections[module]!.rotation
         let bits = banks.contract.projections[module]!.bits
         let book = banks.contract.codebooks[bits]
-        fast = (qwen35Optimizations && book != nil && JANGHDenseFastQMV.eligible(k: inputDimensions, n: bank.scales.dim(1), bits: bits))
+        fast =
+            (qwen35Optimizations && book != nil
+                && JANGHDenseFastQMV.eligible(k: inputDimensions, n: bank.scales.dim(1), bits: bits))
             ? JANGHDenseFastQMV(bits: bits, alpha: book!.alpha, beta: book!.beta) : nil
-        fastKey = "K=\(inputDimensions) N=\(bank.scales.dim(1)) bits=\(bits) rot=\(rotation.rawValue) book=\(book.map { "\($0.alpha.bitPattern)/\($0.beta.bitPattern)" } ?? "-")"
+        fastKey =
+            "K=\(inputDimensions) N=\(bank.scales.dim(1)) bits=\(bits) rot=\(rotation.rawValue) book=\(book.map { "\($0.alpha.bitPattern)/\($0.beta.bitPattern)" } ?? "-")"
         self.inputDimensions = inputDimensions
         supplementalWeightBytes = bank.packed.nbytes + bank.scales.nbytes
         supplementalParameterCount = inputDimensions * bank.scales.size
@@ -210,19 +227,29 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
                 // FP32 preserves the dense decode contract while avoiding its
                 // repetition in every output-row group of the fused kernel.
                 let decodeInput = rotation == .hadamard32 ? x.asType(.float32) : x
-                let packed = storage.bank.packed, scales = storage.bank.scales
+                let packed = storage.bank.packed
+                let scales = storage.bank.scales
                 if let fast, !CompiledDecodeTrace.isActive,
-                    fastAdmission.admits(key: "\(fastKey) dtype=\(decodeInput.dtype) rows=\(count)", compare: {
-                        // Use actual operands; admission must never consume request RNG.
-                        let rotated = rotation == .hadamard32 ? try decode.hadamard32(decodeInput) : decodeInput
-                        return (fast.project(rotated, packed: packed, scales: scales),
-                                try decode.project(decodeInput, packed: packed, scales: scales, indices: indices))
-                    })
+                    fastAdmission.admits(
+                        key: "\(fastKey) dtype=\(decodeInput.dtype) rows=\(count)",
+                        compare: {
+                            // Use actual operands; admission must never consume request RNG.
+                            let rotated =
+                                rotation == .hadamard32
+                                ? try decode.hadamard32(decodeInput) : decodeInput
+                            return (
+                                fast.project(rotated, packed: packed, scales: scales),
+                                try decode.project(
+                                    decodeInput, packed: packed, scales: scales, indices: indices)
+                            )
+                        })
                 {
-                    let rotated = rotation == .hadamard32 ? try decode.hadamard32(decodeInput) : decodeInput
+                    let rotated =
+                        rotation == .hadamard32 ? try decode.hadamard32(decodeInput) : decodeInput
                     y = fast.project(rotated, packed: packed, scales: scales)
                 } else {
-                    y = try decode.project(decodeInput, packed: packed, scales: scales, indices: indices)
+                    y = try decode.project(
+                        decodeInput, packed: packed, scales: scales, indices: indices)
                 }
             }
             return y.asType(input.dtype).reshaped(shape)

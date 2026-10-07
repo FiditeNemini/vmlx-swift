@@ -306,7 +306,8 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
             let coordinator = makeCoordinator()
             let prompt = turn1User + genPromptSuffix
             let mediaSalt = computeCacheSalt(for: input(prompt), parameters: parameters())
-            let lengths = includePreviousBoundary ? [prompt.count - 1, prompt.count] : [prompt.count]
+            let lengths =
+                includePreviousBoundary ? [prompt.count - 1, prompt.count] : [prompt.count]
             for length in lengths {
                 let prefix = Array(prompt.prefix(length))
                 let cache = target.newCache(parameters: parameters())
@@ -341,19 +342,23 @@ final class DFlash2PrefixCacheReuseTests: XCTestCase {
         defer { lock.unlock() }
         let target = RecordingDFlash2Target(hidden: hiddenSize, vocab: vocabSize)
         let mediaInputs = [
-            LMInput(text: input(turn1User).text,
-                    image: .init(pixels: MLXArray.zeros([1, 3, 2, 2]))),
-            LMInput(text: input(turn1User).text,
-                    video: .init(pixels: MLXArray.zeros([1, 3, 2, 2]))),
-            LMInput(text: input(turn1User).text,
-                    audio: .init(waveform: MLXArray.zeros([16]))),
+            LMInput(
+                text: input(turn1User).text,
+                image: .init(pixels: MLXArray.zeros([1, 3, 2, 2]))),
+            LMInput(
+                text: input(turn1User).text,
+                video: .init(pixels: MLXArray.zeros([1, 3, 2, 2]))),
+            LMInput(
+                text: input(turn1User).text,
+                audio: .init(waveform: MLXArray.zeros([16]))),
         ]
         XCTAssertNil(DFlash2TokenIterator.unservableReason(parameters(), input: input(turn1User)))
         for media in mediaInputs {
             XCTAssertNotNil(DFlash2TokenIterator.unservableReason(parameters(), input: media))
-            XCTAssertThrowsError(try DFlash2TokenIterator(
-                input: media, target: target, drafter: makeDrafter(), blockSize: nil,
-                parameters: parameters()))
+            XCTAssertThrowsError(
+                try DFlash2TokenIterator(
+                    input: media, target: target, drafter: makeDrafter(), blockSize: nil,
+                    parameters: parameters()))
         }
         XCTAssertTrue(target.forwarded.isEmpty)
     }

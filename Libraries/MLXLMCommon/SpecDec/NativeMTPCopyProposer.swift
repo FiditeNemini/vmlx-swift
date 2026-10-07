@@ -34,7 +34,9 @@ struct NativeMTPCopyProposer {
     }
 
     private static func envInt(_ name: String, _ fallback: Int, minimum: Int, maximum: Int) -> Int {
-        guard let raw = ProcessInfo.processInfo.environment[name], let v = Int(raw) else { return fallback }
+        guard let raw = ProcessInfo.processInfo.environment[name], let v = Int(raw) else {
+            return fallback
+        }
         return Swift.min(maximum, Swift.max(minimum, v))
     }
 
@@ -57,7 +59,8 @@ struct NativeMTPCopyProposer {
     private(set) var stats = Stats()
 
     init(prompt: [Int]) {
-        minMatch = Self.envInt("VMLX_NATIVE_MTP_COPY_MIN_MATCH", 8, minimum: Self.ngram, maximum: 4096)
+        minMatch = Self.envInt(
+            "VMLX_NATIVE_MTP_COPY_MIN_MATCH", 8, minimum: Self.ngram, maximum: 4096)
         maxWidth = Self.envInt("VMLX_NATIVE_MTP_COPY_MAX", 7, minimum: 1, maximum: 7)
         tokens.reserveCapacity(prompt.count + 1024)
         append(prompt)
@@ -68,7 +71,7 @@ struct NativeMTPCopyProposer {
             tokens.append(t)
             let i = tokens.count - 1
             guard i >= Self.ngram - 1 else { continue }
-            let key = Array(tokens[(i - Self.ngram + 1)...i])
+            let key = Array(tokens[(i - Self.ngram + 1) ... i])
             if var slot = index[key] {
                 slot.append(i)
                 if slot.count > Self.positionsKept { slot.removeFirst() }
@@ -84,21 +87,28 @@ struct NativeMTPCopyProposer {
         let w = Swift.min(width, maxWidth, room)
         let n = tokens.count
         guard w > 0, n >= Swift.max(Self.ngram, minMatch) + 1 else { return [] }
-        if silentFor > 0 { silentFor -= 1; return [] }
+        if silentFor > 0 {
+            silentFor -= 1
+            return []
+        }
         guard let candidates = index[Array(tokens[(n - Self.ngram)...])] else { return [] }
-        var bestPos = -1, bestLen = 0
+        var bestPos = -1
+        var bestLen = 0
         for p in candidates.reversed() where p < n - 1 {
             var length = Self.ngram
             let limit = Swift.min(Self.maxExtend, p + 1)
             while length < limit, tokens[p - length] == tokens[n - 1 - length] { length += 1 }
-            if length > bestLen { bestPos = p; bestLen = length }
+            if length > bestLen {
+                bestPos = p
+                bestLen = length
+            }
         }
         guard bestPos >= 0, bestLen >= minMatch else { return [] }
         let start = bestPos + 1
         let end = Swift.min(n, start + w)
         guard start < end else { return [] }
         stats.proposals += 1
-        return Array(tokens[start..<end])
+        return Array(tokens[start ..< end])
     }
 
     /// A verified copy window: `drafted` copied tokens, `accepted` of them confirmed.
