@@ -580,6 +580,10 @@ struct Bench {
             try await runNoGuardSamplingProbe(modelPath: modelPath, maxNew: maxNew)
             return
         }
+        if (env["BENCH_MTPRESOLVE"] ?? "0") == "1" {
+            try runMTPResolveBench()
+            return
+        }
         if (env["BENCH_ROWEXACT"] ?? "0") == "1" {
             try await runRowExactBench(modelPath: modelPath)
             return

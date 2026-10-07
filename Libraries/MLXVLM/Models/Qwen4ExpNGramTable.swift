@@ -217,11 +217,42 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         return ["1", "true", "yes", "on"].contains(raw)
     }()
 
-    /// `VMLX_QWEN4_PLE_WARM=0` disables the one-time background warm.
-    static let warmEnabled: Bool = {
-        let raw = (ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_WARM"] ?? "1").lowercased()
-        return !["0", "false", "no", "off"].contains(raw)
+    /// Warm policy. `VMLX_QWEN4_PLE_WARM=1` forces the warm, `=0` disables it; unset = automatic (below).
+    static let warmOverride: Bool? = {
+        guard let raw = ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_WARM"]?.lowercased() else { return nil }
+        if ["0", "false", "no", "off"].contains(raw) { return false }
+        if ["1", "true", "yes", "on"].contains(raw) { return true }
+        return nil
     }()
+    static var warmEnabled: Bool { warmOverride ?? true }
+
+    /// AUTOMATIC WARM = only when the whole bundle comfortably fits in RAM (bundle bytes <= 60 % of physical).
+    ///
+    /// WHY (measured 2026-10-06, max2 128 GB, Qwen3.8 Flash-Next JANG_6S = 107 GB bundle, 30 GB PLE table):
+    /// warming the full table during load made Adaptive MTP thrash at 0.34 tok/s (footprint 87 GB of Metal
+    /// buffers + 27 GB of warmed table pages: 1.6 GB free, page-ins in the hundreds of millions) while the
+    /// SAME run with page-cached reads and NO warm ran 45.0 prose / 90.3 easy prose (F_NOCACHE: 47.6 / 90.5).
+    /// The memory contract: what every token needs (the model weights) is resident; the n-gram table is a
+    /// sparse SSD lookup table and only the rows actually touched enter the page cache. The full warm only
+    /// buys faster COLD prefill (Python measured 3-6x on 1.8k-6.7k-token prompts), so it is spent only when
+    /// it cannot compete with the weights. This never refuses or delays a load — it only skips a speedup.
+    static func shouldWarm(modelDirectory: URL) -> Bool {
+        if let forced = warmOverride { return forced }
+        let fm = FileManager.default
+        var bundleBytes: UInt64 = 0
+        if let names = try? fm.contentsOfDirectory(atPath: modelDirectory.path) {
+            for name in names where name.hasSuffix(".safetensors") {
+                let attrs = try? fm.attributesOfItem(atPath: modelDirectory.appendingPathComponent(name).path)
+                bundleBytes += (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+            }
+        }
+        let physical = ProcessInfo.processInfo.physicalMemory
+        let fits = Double(bundleBytes) <= 0.60 * Double(physical)
+        log(String(format: "page-cache warm %@: bundle %.1f GB vs 60%% of %.0f GB physical",
+                   fits ? "on" : "off (rows are cached on demand only)",
+                   Double(bundleBytes) / 1e9, Double(physical) / 1e9))
+        return fits
+    }
 
     private static let warmLock = NSLock()
     nonisolated(unsafe) private static var warmedFiles: Set<String> = []
@@ -229,7 +260,7 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
     /// One sequential pass over each backing file (32 MiB preads on a background thread) so later
     /// per-token row lookups are page-cache hits. Port of Python `_start_page_cache_warm`.
     static func warmPageCache(_ urls: [URL]) {
-        guard warmEnabled, !uncachedReads else { return }
+        guard !uncachedReads else { return }
         warmLock.lock()
         let fresh = urls.filter { warmedFiles.insert($0.path).inserted }
         warmLock.unlock()
@@ -423,7 +454,9 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
         self.noCacheFileCount = Self.uncachedReads ? openedFiles.count : 0
         self.dimensions = commonDimensions ?? 0
         self.rowCount = nextStart
-        Self.warmPageCache(openedFiles.keys.sorted { $0.path < $1.path })
+        if Self.shouldWarm(modelDirectory: modelDirectory) {
+            Self.warmPageCache(openedFiles.keys.sorted { $0.path < $1.path })
+        }
         Self.log(String(format:
             "ssd-row-reader ready backend=%@ row_schedule=%@ files=%d backing_file_bytes=%.3f_GiB rows=%lld dimensions=%d source=%@",
             Self.uncachedReads ? "pread-fnocache cache=F_NOCACHE" : "pread-pagecache warm=\(Self.warmEnabled)",

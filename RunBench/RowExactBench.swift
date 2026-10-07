@@ -150,6 +150,11 @@ func runRowExactBench(modelPath: String) async throws {
             }
         }
     }
+    if let dump = env["BENCH_ROWEXACT_DUMP"] {
+        // The reference AR stream as text (compare with BENCH_SPEED_TEXT_OUT dumps of the real iterators).
+        let text = context.tokenizer.decode(tokenIds: Array(stream.dropLast()))
+        try text.write(toFile: dump, atomically: true, encoding: .utf8)
+    }
     print("[ROWEXACT] model=\(modelDir.lastPathComponent) prompt=\(prompt.dim(1)) steps=\(steps) ar=\(env["BENCH_ROWEXACT_AR"] ?? "native-autoregressive")")
 
     // 2. Verify windows over the same stream.
