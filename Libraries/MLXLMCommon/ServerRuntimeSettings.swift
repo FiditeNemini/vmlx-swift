@@ -723,24 +723,24 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
             memorySafety.customPhysicalMemoryFraction == nil,
             let facts = bundleFacts,
             facts.customRoutedFormat == .none,
-            facts.totalSafetensorsBytes > 0,
+            facts.gpuResidentWeightBytes > 0,
             physicalMemory > 0,
-            Double(facts.totalSafetensorsBytes) > 0.55 * Double(physicalMemory),
+            Double(facts.gpuResidentWeightBytes) > 0.55 * Double(physicalMemory),
             // Only when the weights actually fit. A pack larger than ~86%
             // of RAM (e.g. 30 GiB on a 24 GiB host) cannot be made resident
             // at all — mmap streaming is its only viable mode, and
             // materializing it would push the host into swap/jetsam.
-            Double(facts.totalSafetensorsBytes) <= 0.86 * Double(physicalMemory)
+            Double(facts.gpuResidentWeightBytes) <= 0.86 * Double(physicalMemory)
         {
             loadConfiguration.useMmapSafetensors = false
             let needFraction = min(
                 0.92,
-                Double(facts.totalSafetensorsBytes) / Double(physicalMemory) + 0.06)
+                Double(facts.gpuResidentWeightBytes) / Double(physicalMemory) + 0.06)
             if needFraction > requestedFraction {
                 loadConfiguration.memoryLimit = .fraction(needFraction)
             }
             warnings.append(
-                "Weights (\(facts.totalSafetensorsBytes / 1_073_741_824) GiB) approach physical memory; loading materialized instead of mmap so pages stay resident."
+                "Weights (\(facts.gpuResidentWeightBytes / 1_073_741_824) GiB) approach physical memory; loading materialized instead of mmap so pages stay resident."
             )
         }
         // Plain affine DSV4 must advertise the same limits the loader will

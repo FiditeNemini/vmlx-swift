@@ -696,8 +696,11 @@ public func loadModel(
     //     constrained Mac where the model is a large fraction of RAM it leaves
     //     the swappable default instead of wiring the machine into a
     //     memory-pressure panic (osaurus#2612). See `modelResidencyWiredTarget`.
-    if facts.totalSafetensorsBytes > 0 {
-        let modelBytes = Int(clamping: facts.totalSafetensorsBytes)
+    //     Size against the GPU-resident weights: the Qwen4Exp n-gram table (18-54 GB) is read from SSD on
+    //     demand and is never wired. Counting it left Allosaurus (32.5 GB of weights, 88 GB bundle) and
+    //     Flash-Next JANGH4 with NO residency, so their weights were evictable between turns.
+    if facts.gpuResidentWeightBytes > 0 {
+        let modelBytes = Int(clamping: facts.gpuResidentWeightBytes)
         let workingSet = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
         let physical = Int(clamping: facts.physicalMemory)
         if let target = modelResidencyWiredTarget(

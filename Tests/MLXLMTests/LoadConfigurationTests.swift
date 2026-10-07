@@ -843,3 +843,41 @@ private func withEnvironmentValue<R>(
         #expect(opts.compressPct == 70)
     }
 }
+
+/// The Qwen4Exp n-gram table is read from SSD on demand; residency, materialization and the JANGH scheduling
+/// allowance must size against the GPU-resident weights only (Allosaurus: 32.5 GB of an 88 GB bundle).
+@Suite("Load facts separate SSD-resident n-gram tables")
+struct LoadBundleFactsNGramTests {
+    @Test("n-gram embedding shards are excluded from GPU-resident weight bytes")
+    func ngramBytesExcluded() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("facts-ngram-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(#"{"model_type":"qwen4_exp"}"#.utf8).write(to: root.appendingPathComponent("config.json"))
+        let header: [String: Any] = [
+            "language_model.layers.0.ple.ngram_embedding.shards.0.weight":
+                ["dtype": "U32", "shape": [1000], "data_offsets": [0, 4000]],
+            "language_model.layers.0.ple.key_proj.weight": ["dtype": "F16", "shape": [500], "data_offsets": [4000, 5000]],
+            "language_model.layers.0.mlp.gate.weight": ["dtype": "F16", "shape": [1000], "data_offsets": [5000, 7000]],
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
+        var file = withUnsafeBytes(of: &length) { Data($0) }
+        file.append(bytes)
+        file.append(Data(count: 7000))
+        try file.write(to: root.appendingPathComponent("model.safetensors"))
+
+        let facts = LoadBundleFacts.inspect(bundleURL: root)
+        #expect(facts.ssdResidentTableBytes == 4000)
+        #expect(facts.totalSafetensorsBytes == UInt64(file.count))
+        #expect(facts.gpuResidentWeightBytes == UInt64(file.count) - 4000)
+    }
+
+    @Test("bundles without an n-gram table keep every byte as weights")
+    func noNGramTable() {
+        var facts = LoadBundleFacts(totalSafetensorsBytes: 10, isRouted: false, physicalMemory: 100)
+        #expect(facts.gpuResidentWeightBytes == 10)
+        facts.ssdResidentTableBytes = 20
+        #expect(facts.gpuResidentWeightBytes == 0)
+    }
+}

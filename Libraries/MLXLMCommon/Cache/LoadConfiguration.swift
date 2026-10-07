@@ -248,12 +248,12 @@ public struct LoadConfiguration: Sendable, Equatable {
     ) -> ResidentCap {
         let ordinary = facts.resolveMLXMemoryLimit(requested: memoryLimit)
         guard !memoryLimitWasExplicit, facts.customRoutedFormat == .janghV2,
-            facts.isRouted, facts.totalSafetensorsBytes > 0,
+            facts.isRouted, facts.gpuResidentWeightBytes > 0,
             let recommendedWorkingSetBytes, recommendedWorkingSetBytes > 0,
             let base = ordinary.resolve(physicalMemory: facts.physicalMemory)
         else { return ordinary }
         let headroom: UInt64 = 4 << 30
-        let desired = facts.totalSafetensorsBytes.addingReportingOverflow(headroom)
+        let desired = facts.gpuResidentWeightBytes.addingReportingOverflow(headroom)
         // Keep at least 15% of physical RAM outside this scheduling allowance.
         let physical85 = (facts.physicalMemory / 20) * 17
             + ((facts.physicalMemory % 20) * 17) / 20
@@ -338,6 +338,18 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// inspection failed (treat as unknown — `.auto` falls through to
     /// disabled in that case).
     public var totalSafetensorsBytes: UInt64
+
+    /// Bytes of tables that are read from SSD on demand and never become GPU-resident weights: the Qwen4Exp
+    /// (Flash-Next / Allosaurus) per-layer n-gram embedding shards (`*.ple.ngram_embedding.*`, 18-54 GB). They are
+    /// served by `pread` rows through the page cache, not MLX arrays.
+    public var ssdResidentTableBytes: UInt64 = 0
+
+    /// The weights that must be resident for decode: the bundle minus SSD-resident tables. Wiring, the
+    /// materialize-instead-of-mmap rule and the JANGH scheduling allowance size against this, not the whole
+    /// bundle (Allosaurus: 32.5 GB of weights in an 88 GB bundle).
+    public var gpuResidentWeightBytes: UInt64 {
+        totalSafetensorsBytes >= ssdResidentTableBytes ? totalSafetensorsBytes - ssdResidentTableBytes : 0
+    }
 
     /// True iff `config.json` declares any of:
     /// `num_local_experts`, `num_experts`, `moe_intermediate_size`,
@@ -576,7 +588,35 @@ public struct LoadBundleFacts: Sendable, Equatable {
         facts.hasPrestackedAffineRoutedExperts = hasPrestackedAffineRoutedExperts
         facts.isMiMoV26MixedQuantized = isMiMoV26MixedQuantized
         facts.customRoutedFormat = customRoutedFormat
+        facts.ssdResidentTableBytes = Self.ngramTableBytes(bundleURL: url)
         return facts
+    }
+
+    /// Sum of `*.ple.ngram_embedding.*` tensor payloads, read from safetensors headers only (no weights).
+    /// `0` for bundles without an n-gram table or on any read failure.
+    static func ngramTableBytes(bundleURL url: URL) -> UInt64 {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+        else { return 0 }
+        var total: UInt64 = 0
+        for entry in entries where entry.pathExtension == "safetensors" {
+            guard let handle = try? FileHandle(forReadingFrom: entry) else { continue }
+            defer { try? handle.close() }
+            guard let lengthData = try? handle.read(upToCount: 8), lengthData.count == 8 else { continue }
+            let length = lengthData.enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << UInt64(8 * $1.offset) }
+            guard length > 0, length <= 64 << 20, let headerData = try? handle.read(upToCount: Int(length)),
+                headerData.count == Int(length),
+                let header = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any]
+            else { continue }
+            for (name, value) in header where name.contains(".ple.ngram_embedding.") {
+                if let offsets = (value as? [String: Any])?["data_offsets"] as? [Int], offsets.count == 2,
+                    offsets[1] >= offsets[0]
+                {
+                    total &+= UInt64(offsets[1] - offsets[0])
+                }
+            }
+        }
+        return total
     }
 
     private static let deepseekV4AffineLayerCount = 43
