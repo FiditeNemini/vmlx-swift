@@ -50,12 +50,16 @@ METAL_FUNC float tq_act(float g, float u, float lim) {
   return (g / (1.0f + metal::fast::exp(-g))) * u;
 }
 // FUSED=false: y = x W^T for one weight.  FUSED=true: y = act(x Wg^T, x Wu^T).
-template <typename T, int bits, int bits_u, bool FUSED, bool ROT_OUT>
+template <typename T, int bits, int bits_u, bool FUSED, bool ROT_OUT, int BM_ = 64>
 METAL_FUNC void tq_gather_qmm_nax(
     const device T* x, const device uint32_t* wg, const device half* sg, const device uint32_t* wu, const device half* su,
     const device uint32_t* indices, device T* y, const int M, const int N, const int K, const int EXPERTS, const float lim,
     threadgroup T* Wg, threadgroup T* Wu, uint3 tid, uint simd_group_id, uint simd_lane_id) {
-  constexpr int BM = 64, BK = 64, BN = 64, WM = 2, WN = 2;
+  // BM_ = 64: prefill tile (2x2 simdgroups of 32x32, 128 threads). BM_ = 16: verify-window tile (1x2 simdgroups of
+  // 16x32, 64 threads) so an 8-row DFlash2/MTP verify does not pay MMA for 24 padded rows. Each simdgroup keeps
+  // SN = 32: tile_matmad_nax only issues MMAs when TN or TM is even (a 16x16 simdgroup tile computes NOTHING), and
+  // ROT_OUT needs the 32-wide output block.
+  constexpr int BM = BM_, BK = 64, BN = 64, WM = BM_ == 64 ? 2 : 1, WN = 2;
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));

@@ -175,6 +175,9 @@ extension LaneQMM {
         var flat = report.lane > 0
         for (path, m) in module.leafModules().flattened() {
             if path.hasPrefix("vision") || path.contains("vision_tower") || path.contains("visual") { continue }
+            // Dense JANGH codebook projections (Qwen3.8-27B JANGH2 MLPs) do not run on the lane; their bank
+            // tensors live outside module parameters, so the uint32 scan below cannot see them.
+            if m is JANGHDenseLinear { flat = false; break }
             if m is LaneQuantizedLinear || m is Embedding { continue }
             if m.parameters().flattened().contains(where: { $0.1.dtype == .uint32 }) { flat = false; break }
         }

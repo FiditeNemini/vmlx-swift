@@ -1472,9 +1472,16 @@ enum Qwen35Language {
     }
 
     final class MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "gate_proj") var gateProj: Linear
-        @ModuleInfo(key: "down_proj") var downProj: Linear
-        @ModuleInfo(key: "up_proj") var upProj: Linear
+        // UnaryLayer, not Linear: dense JANGH bundles (Qwen3.8-27B JANGH2) install `JANGHDenseLinear` here
+        // (Qwen35JANGHPreparation). Affine/plain paths still take the Linear fast path in `project`.
+        @ModuleInfo(key: "gate_proj") var gateProj: UnaryLayer
+        @ModuleInfo(key: "down_proj") var downProj: UnaryLayer
+        @ModuleInfo(key: "up_proj") var upProj: UnaryLayer
+
+        private func project(_ module: UnaryLayer, _ x: MLXArray) -> MLXArray {
+            if let linear = module as? Linear { return qwen4ExpProjection(linear, x) }
+            return module(x)
+        }
 
         init(dimensions: Int, hiddenDimensions: Int) {
             _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
@@ -1485,10 +1492,10 @@ enum Qwen35Language {
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
             // Fused silu(gate) * up via compiled swiglu (1 Metal dispatch vs 2).
-            let gate = qwen4ExpProjection(gateProj, x)
-            let up = qwen4ExpProjection(upProj, x)
+            let gate = project(gateProj, x)
+            let up = project(upProj, x)
             let activated = _vlmCompiledSwiGLU(gate, up)
-            let result = qwen4ExpProjection(downProj, activated)
+            let result = project(downProj, activated)
             return result
         }
     }
@@ -3280,8 +3287,15 @@ enum Qwen35Language {
 // MARK: - Model
 
 public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel, NativeMTPModel,
-    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping
+    DFlash2StagedVerifyRollbackModel, ModalityBearing, ModelComponentMapping, SafetensorsLoadKeyExcluding
 {
+    /// Dense JANGH bank tensors (`*.tq2_packed` / `*.tq2_scales`) owned by installed `JANGHDenseLinear`
+    /// modules; the generic safetensors loader must not try to bind them. Empty for ordinary bundles.
+    public var customDenseTensorNames: Set<String> = []
+    public func excludeFromGenericSafetensorsLoad(key: String) -> Bool {
+        !customDenseTensorNames.isEmpty && customDenseTensorNames.contains(key)
+    }
+
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel?
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 

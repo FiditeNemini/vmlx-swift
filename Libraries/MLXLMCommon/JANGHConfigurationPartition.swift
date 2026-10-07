@@ -73,8 +73,21 @@ struct JANGHConfigurationPartition: Sendable {
         // are unsupported here (shared-expert and attention aliases in the
         // generic decoder must not broaden custom-bank admission implicitly).
         let denseK2 = modelType == "k2_horizon" && root["mlp_layout"] as? String == "dense_jangh_down"
+        // Dense Qwen3.5-family JANGH (Qwen3.8-27B JANGH2, 2026-10-06): every dense decoder MLP projection is a
+        // one-expert codebook bank at `language_model.model.layers.L.mlp.{gate,up,down}_proj` (complete
+        // triples are enforced by JANGHFormatContract). Nothing else may be custom in such a bundle.
+        let denseQwen35 = modelType == "qwen3_5"
         for name in customModules {
             if denseK2 { continue } // Exact down-only namespace was validated by the format contract.
+            if denseQwen35 {
+                let parts = name.split(separator: ".", omittingEmptySubsequences: false)
+                guard parts.count == 6, parts[0] == "language_model", parts[1] == "model",
+                    parts[2] == "layers", let layer = Int(parts[3]), layer >= 0,
+                    String(layer) == String(parts[3]), parts[4] == "mlp",
+                    ["gate_proj", "up_proj", "down_proj"].contains(String(parts[5]))
+                else { throw Failure.invalid("unsupported dense qwen3_5 JANGH module path \(name)") }
+                continue
+            }
             let components = name.split(separator: ".", omittingEmptySubsequences: false)
             guard components.count == 6, components[0] == "model",
                 components[1] == "layers", let layer = Int(components[2]), layer >= 0,

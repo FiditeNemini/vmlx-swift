@@ -10,6 +10,62 @@ public final class JANGHDenseModelPreparation {
     private let source: JANGHMappedBanks.SourceLease
     private let modules: [Int: String]
     private let inputDimensions: Int
+    /// Path-keyed modules (input width per module) for architectures where several dense projections per
+    /// layer are JANGH (Qwen3.5-family: gate/up/down). Empty for K2.
+    private var pathInputs: [String: Int] = [:]
+
+    /// Dense Qwen3.5-family JANGH (Qwen3.8-27B JANGH2): all 3 MLP projections of every decoder layer are
+    /// one-expert codebook banks (gate/up hidden->intermediate, down intermediate->hidden). Mirrors vMLX
+    /// Python `jangh/dense.py` (`TQLinear`). Fails closed: every custom module must be one of those paths
+    /// and every layer's triple must be present (the format contract enforces complete triples).
+    public init(
+        qwen35Directory directory: URL, configuration: Data, sidecar: Data?,
+        hiddenSize: Int, intermediateSize: Int, layerCount: Int
+    ) throws {
+        for name in ["jangtq_runtime.safetensors", "jangtq_stacked.safetensors"] {
+            guard !FileManager.default.fileExists(atPath: directory.appendingPathComponent(name).path)
+            else {
+                throw JANGHFormatContract.ValidationError.invalid("dense JANGH cannot coexist with legacy overlays")
+            }
+        }
+        let partition = try JANGHConfigurationPartition(configuration: configuration, sidecar: sidecar)
+        guard partition.modelType == "qwen3_5", hiddenSize > 0, intermediateSize > 0, layerCount > 0,
+            hiddenSize.isMultiple(of: 32), intermediateSize.isMultiple(of: 32)
+        else { throw JANGHFormatContract.ValidationError.invalid("unsupported dense qwen3_5 JANGH architecture") }
+        var dims: [String: JANGHTensorIndexPlan.Dimensions] = [:]
+        var inputs: [String: Int] = [:]
+        for name in partition.customModules {
+            let parts = name.split(separator: ".")
+            guard let layer = Int(parts[3]), layer < layerCount else {
+                throw JANGHFormatContract.ValidationError.invalid("dense JANGH layer out of range \(name)")
+            }
+            let isDown = name.hasSuffix(".down_proj")
+            let input = isDown ? intermediateSize : hiddenSize
+            dims[name] = .init(experts: 1, input: input, output: isDown ? hiddenSize : intermediateSize)
+            inputs[name] = input
+        }
+        let metadata = try JANGHHeaderAdapter.read(directory: directory, indexName: "model.safetensors.index.json")
+        source = try JANGHMappedBanks.SourceLease(
+            directory: directory, metadata: metadata, contract: partition.contract, dimensions: dims)
+        modules = [:]
+        inputDimensions = intermediateSize
+        pathInputs = inputs
+        ordinaryConfiguration = partition.ordinaryConfiguration
+        excludedTensorNames = Set(partition.customModules.flatMap { [$0 + ".tq2_packed", $0 + ".tq2_scales"] })
+    }
+
+    /// Path-keyed projections (Qwen3.5-family). `sortedThreshold` = rows from which the one-pass sorted QMM
+    /// (NAX, 16-row tile for verify windows) replaces the per-row QMV. Measured 27B JANGH2 target forward
+    /// (2026-10-06, lane on): per-row QMV +12 ms per extra row; sorted NAX 54-59 ms flat for 4-16 rows.
+    public func makeProjectionsByPath(sortedThreshold: Int = 2) throws -> [String: JANGHDenseLinear] {
+        let banks = try JANGHMappedBanks(source: source)
+        var out: [String: JANGHDenseLinear] = [:]
+        for (path, input) in pathInputs {
+            out[path] = try JANGHDenseLinear(
+                banks: banks, module: path, inputDimensions: input, sortedThreshold: sortedThreshold)
+        }
+        return out
+    }
 
     public init(
         directory: URL, configuration: Data, sidecar: Data?,
@@ -100,10 +156,14 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
     private let rotation: JANGHFormatContract.Rotation
     private let rowRotation = JANGHRowRotation()
     private let inputDimensions: Int
+    private let sortedThreshold: Int
+    private let fast: JANGHDenseFastQMV?
+    private let fastKey: String
     public let supplementalWeightBytes: Int
     public let supplementalParameterCount: Int
 
-    init(banks: JANGHMappedBanks, module: String, inputDimensions: Int) throws {
+    init(banks: JANGHMappedBanks, module: String, inputDimensions: Int, sortedThreshold: Int = 64) throws {
+        self.sortedThreshold = Swift.max(1, sortedThreshold)
         let bank = try banks.projection(module)
         guard bank.packed.dim(0) == 1, bank.scales.dim(0) == 1 else {
             throw JANGHFormatContract.ValidationError.invalid(
@@ -113,6 +173,11 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
         decode = try JANGHProjectionKernel(contract: banks.contract, module: module)
         prefill = try JANGHPrefillKernel(contract: banks.contract, module: module)
         rotation = banks.contract.projections[module]!.rotation
+        let bits = banks.contract.projections[module]!.bits
+        let book = banks.contract.codebooks[bits]
+        fast = (book != nil && JANGHDenseFastQMV.eligible(k: inputDimensions, n: bank.scales.dim(1), bits: bits))
+            ? JANGHDenseFastQMV(bits: bits, alpha: book!.alpha, beta: book!.beta) : nil
+        fastKey = "K=\(inputDimensions) N=\(bank.scales.dim(1)) bits=\(bits) rot=\(rotation.rawValue) book=\(book.map { "\($0.alpha.bitPattern)/\($0.beta.bitPattern)" } ?? "-")"
         self.inputDimensions = inputDimensions
         supplementalWeightBytes = bank.packed.nbytes + bank.scales.nbytes
         supplementalParameterCount = inputDimensions * bank.scales.size
@@ -129,7 +194,7 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
         let indices = MLXArray.zeros([count], type: UInt32.self)
         do {
             let y: MLXArray
-            if count >= 64 && inputDimensions.isMultiple(of: 64) {
+            if count >= sortedThreshold && inputDimensions.isMultiple(of: 64) {
                 let rotated = rotation == .hadamard32 ? try rowRotation(x) : x
                 y = try prefill.projectSorted(
                     rotated, packed: storage.bank.packed,
@@ -139,8 +204,21 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
                 // FP32 preserves the dense decode contract while avoiding its
                 // repetition in every output-row group of the fused kernel.
                 let decodeInput = rotation == .hadamard32 ? x.asType(.float32) : x
-                y = try decode.project(
-                    decodeInput, packed: storage.bank.packed, scales: storage.bank.scales, indices: indices)
+                let packed = storage.bank.packed, scales = storage.bank.scales
+                if let fast, !CompiledDecodeTrace.isActive,
+                    JANGHDenseFastAdmission.admits(key: fastKey, compare: {
+                        let probe = (MLXRandom.normal([1, inputDimensions]) * 0.5).asType(.float32)
+                        let rotated = rotation == .hadamard32 ? try decode.hadamard32(probe) : probe
+                        let zero = MLXArray.zeros([1], type: UInt32.self)
+                        return (fast.project(rotated, packed: packed, scales: scales),
+                                try decode.project(probe, packed: packed, scales: scales, indices: zero))
+                    })
+                {
+                    let rotated = rotation == .hadamard32 ? try decode.hadamard32(decodeInput) : decodeInput
+                    y = fast.project(rotated, packed: packed, scales: scales)
+                } else {
+                    y = try decode.project(decodeInput, packed: packed, scales: scales, indices: indices)
+                }
             }
             return y.asType(input.dtype).reshaped(shape)
         } catch {

@@ -39,6 +39,30 @@ final class JANGHPrefillKernel {
         codebookHeader = header
     }
 
+    /// Largest row count routed to the 16-row NAX tile. `VMLX_JANGH_NAX_SMALL_TILE_MAX=0` keeps the 64-row tile.
+    static let smallTileMaxRows: Int = {
+        if let raw = ProcessInfo.processInfo.environment["VMLX_JANGH_NAX_SMALL_TILE_MAX"], let v = Int(raw) { return v }
+        return 16
+    }()
+
+    // One verdict per shape per process (not per projection instance: 27B has 192 dense projections).
+    private static let verdictLock = NSLock()
+    nonisolated(unsafe) private static var smallTileVerdicts: [String: Bool] = [:]
+
+    private func smallTileAdmitted(key: String, compare: () -> (MLXArray, MLXArray)) -> Bool {
+        let lock = Self.verdictLock
+        lock.lock()
+        if let v = Self.smallTileVerdicts[key] { lock.unlock(); return v }
+        lock.unlock()
+        // Admission needs eager evaluation; inside a compiled trace keep the proven 64-row tile.
+        if CompiledDecodeTrace.isActive { return false }
+        let (got, want) = compare()
+        let equal = all(got .== want).item(Bool.self)
+        lock.lock(); Self.smallTileVerdicts[key] = equal; lock.unlock()
+        FileHandle.standardError.write(Data("[JANGH] NAX 16-row tile \(key) admitted=\(equal)\n".utf8))
+        return equal
+    }
+
     static var nativeBackend: Backend {
         #if os(macOS)
             guard #available(macOS 26.2, *) else { return .steel }
@@ -62,9 +86,11 @@ final class JANGHPrefillKernel {
         dtype == .float32 ? .steel : requested
     }
 
-    private func kernel(dtype: DType, backend: Backend, fused: Bool, rotate: Bool, width: Int) -> MLXFast.MLXFastKernel {
+    private func kernel(dtype: DType, backend: Backend, fused: Bool, rotate: Bool, width: Int, tileRows: Int = 64)
+        -> MLXFast.MLXFastKernel
+    {
         let type = dtype == .bfloat16 ? "bfloat16_t" : dtype == .float16 ? "half" : "float"
-        let key = "\(backend.rawValue)_\(type)_\(width)_\(upBits)_\(fused)_\(rotate)"
+        let key = "\(backend.rawValue)_\(type)_\(width)_\(upBits)_\(fused)_\(rotate)" + (tileRows == 64 ? "" : "_m\(tileRows)")
         lock.lock()
         defer { lock.unlock() }
         if let value = kernels[key] { return value }
@@ -74,7 +100,7 @@ final class JANGHPrefillKernel {
                 constexpr int PAD = 64 + 16 / sizeof(\(type));
                 threadgroup \(type) Wg[64 * PAD];
                 threadgroup \(type) Wu[\(fused ? 64 : 1) * PAD];
-                tq_gather_qmm_nax<\(type), \(width), \(upBits), \(fused), \(rotate)>(
+                tq_gather_qmm_nax<\(type), \(width), \(upBits), \(fused), \(rotate), \(tileRows)>(
                     x,wg,sg,wu,su,indices,y,meta[0],meta[1],meta[2],meta[3],lim[0],Wg,Wu,
                     threadgroup_position_in_grid,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
                 """
@@ -138,10 +164,24 @@ final class JANGHPrefillKernel {
             array.size < 8 ? concatenated([array.flattened(), MLXArray.zeros([8 - array.size], dtype: array.dtype)]) : array
         }
         if selected == .nax {
-            return kernel(dtype: input.dtype, backend: .nax, fused: upPacked != nil, rotate: rotateOutput, width: bits)(
-                [x, deviceArray(packed), deviceArray(scales), deviceArray(upPacked ?? packed), deviceArray(upScales ?? scales), idx, metadata, MLXArray([limit ?? 0])],
-                grid: (((n + 63) / 64) * 128, (m + 63) / 64, 1), threadGroup: (128, 1, 1),
-                outputShapes: [[m, n]], outputDTypes: [input.dtype])[0]
+            let inputs = [x, deviceArray(packed), deviceArray(scales), deviceArray(upPacked ?? packed),
+                          deviceArray(upScales ?? scales), idx, metadata, MLXArray([limit ?? 0])]
+            func run(_ tileRows: Int) -> MLXArray {
+                let threads = tileRows == 16 ? 64 : 128
+                return kernel(dtype: input.dtype, backend: .nax, fused: upPacked != nil, rotate: rotateOutput,
+                              width: bits, tileRows: tileRows)(
+                    inputs, grid: (((n + 63) / 64) * threads, (m + tileRows - 1) / tileRows, 1),
+                    threadGroup: (threads, 1, 1), outputShapes: [[m, n]], outputDTypes: [input.dtype])[0]
+            }
+            // Verify windows (<= 16 rows) use the 16-row tile (2 simdgroups = 64 threads): same per-element MMA
+            // sequence as the 64-row tile, so it is admitted once per shape only if bitwise equal to it.
+            if m <= Self.smallTileMaxRows, smallTileAdmitted(
+                key: "\(input.dtype)_\(k)_\(n)_\(bits)_\(upPacked != nil)_\(rotateOutput)",
+                compare: { (run(16), run(64)) })
+            {
+                return run(16)
+            }
+            return run(64)
         }
         func single(_ w: MLXArray, _ s: MLXArray, _ width: Int) -> MLXArray {
             return kernel(dtype: input.dtype, backend: .steel, fused: false, rotate: false, width: width)(
