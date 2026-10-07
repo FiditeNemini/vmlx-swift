@@ -219,9 +219,16 @@ public final class JANGHDenseLinear: Module, UnaryLayer, SupplementalModelWeight
             let y: MLXArray
             if count >= sortedThreshold && inputDimensions.isMultiple(of: 64) {
                 let rotated = rotation == .hadamard32 ? try rowRotation(x) : x
-                y = try prefill.projectSorted(
-                    rotated, packed: storage.bank.packed,
-                    scales: storage.bank.scales, indices: indices)
+                if prefill.enableDenseSmallTile, JANGHPrefillKernel.denseSplitKEnabled,
+                    let split = prefill.projectDenseSplitK(
+                        rotated, packed: storage.bank.packed, scales: storage.bank.scales)
+                {
+                    y = split
+                } else {
+                    y = try prefill.projectSorted(
+                        rotated, packed: storage.bank.packed,
+                        scales: storage.bank.scales, indices: indices)
+                }
             } else {
                 // Rotate once per input row in FP32. Keeping the rotation in
                 // FP32 preserves the dense decode contract while avoiding its

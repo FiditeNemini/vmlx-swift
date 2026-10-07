@@ -52,6 +52,9 @@ final class JANGHPrefillKernel {
         return 16
     }()
 
+    /// Dense verify-window split-K (`projectDenseSplitK`). `VMLX_JANGH_SPLITK=0` restores the 16-row tile.
+    static let denseSplitKEnabled: Bool = RuntimeEnvironment.value("VMLX_JANGH_SPLITK") != "0"
+
     // Only immutable dense-bank owners opt in; routed/K2 callers retain their old tile.
     private let smallTileAdmission = JANGHDenseFastAdmission(enabled: true)
 
@@ -122,6 +125,49 @@ final class JANGHPrefillKernel {
         }
         kernels[key] = value
         return value
+    }
+
+    /// Dense verify windows (<= 16 rows, one bank, plain linear): split-K NAX tile (`JANGHPrefillSource.naxSplitK`).
+    /// Returns nil when the shape is not eligible. Output dtype = input dtype.
+    func projectDenseSplitK(_ input: MLXArray, packed: MLXArray, scales: MLXArray) -> MLXArray? {
+        guard input.ndim == 2, input.dim(0) >= 1, input.dim(0) <= 16, packed.ndim == 3, packed.dim(0) == 1,
+            [.float16, .bfloat16].contains(input.dtype), Self.resolvedBackend(dtype: input.dtype, requested: Self.nativeBackend) == .nax
+        else { return nil }
+        let m = input.dim(0), k = input.dim(1), n = packed.dim(1)
+        guard k.isMultiple(of: 64), n.isMultiple(of: 64) else { return nil }
+        let tiles = n / 64
+        let steps = k / 64
+        var split = 1
+        while split < 16 && tiles * split < 1024 && steps / (split * 2) >= 8 { split *= 2 }
+        let type = input.dtype == .bfloat16 ? "bfloat16_t" : "half"
+        let key = "splitk_\(type)_\(bits)"
+        lock.lock()
+        let kernel: MLXFast.MLXFastKernel
+        if let cached = kernels[key] {
+            kernel = cached
+        } else {
+            let source = """
+                constexpr int PAD = 64 + 16 / sizeof(\(type));
+                threadgroup \(type) Wg[64 * PAD];
+                tq_dense_qmm_nax_splitk<\(type), \(bits), 16>(
+                    x, wg, sg, yp, meta[0], meta[1], meta[2], meta[3], Wg,
+                    threadgroup_position_in_grid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+                """
+            kernel = MLXFast.metalKernel(
+                name: "jangh_dense_" + key, inputNames: ["x", "wg", "sg", "meta"], outputNames: ["yp"],
+                source: source,
+                header: JANGHPrefillHeaders.nax + codebookHeader + JANGHPrefillSource.loader
+                    + JANGHPrefillSource.naxSplitK,
+                ensureRowContiguous: false)
+            kernels[key] = kernel
+        }
+        lock.unlock()
+        let metadata = MLXArray([Int32(m), Int32(n), Int32(k), Int32(split)])
+        let partial = kernel(
+            [contiguous(input), packed, scales, metadata],
+            grid: (tiles * 64, (m + 15) / 16, split), threadGroup: (64, 1, 1),
+            outputShapes: [[split, m, n]], outputDTypes: [.float32])[0]
+        return (split == 1 ? partial[0] : partial.sum(axis: 0)).asType(input.dtype)
     }
 
     func projectSorted(

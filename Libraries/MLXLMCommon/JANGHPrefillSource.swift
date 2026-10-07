@@ -167,6 +167,70 @@ struct TQBlockLoader {
         }
 
         """#
+    /// Dense (single-bank) verify-window split-K: the 16-row tile launched N/64 threadgroups of 64 threads, each
+    /// walking ALL of K serially (27B down_proj: 80 threadgroups x 272 barrier-separated steps — the GPU mostly idle;
+    /// a 4..16-row JANGH2 MLP cost 3x its 1-row decode). Here grid z slices K: each threadgroup covers a 64-column
+    /// tile x a K-slice with the same codebook tile loader and MMA sequence, and writes FP32 partials [S, M, N] that
+    /// the host sums. Dense 27B DFlash 2 is speed-first (summation order changes; admitted by agreement).
+    static let naxSplitK = #"""
+
+        template <typename T, int bits, int BM_ = 16>
+        METAL_FUNC void tq_dense_qmm_nax_splitk(
+            const device T* x, const device uint32_t* wg, const device half* sg, device float* yp,
+            const int M, const int N, const int K, const int SPLITK,
+            threadgroup T* Wg, uint3 tid, uint simd_group_id, uint simd_lane_id) {
+          constexpr int BM = BM_, BK = 64, BN = 64, WM = BM_ == 64 ? 2 : 1, WN = 2;
+          constexpr int pack_factor = get_pack_factor<bits, 8>();
+          constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+          constexpr int BK_padded = (BK + 16 / sizeof(T));
+          using loader_w_t = TQBlockLoader<T, BN, BK, BK_padded, WM * WN * SIMD_SIZE, bits>;
+          const int K_w = K * bytes_per_pack / pack_factor;
+          const int K_it = K / BK;
+          const int per = (K_it + SPLITK - 1) / SPLITK;
+          const int it0 = min(K_it, int(tid.z) * per);
+          const int it1 = min(K_it, it0 + per);
+          const int y_row = tid.y * BM; const int y_col = tid.x * BN;
+          const short tgp_bn = short(min(BN, N - y_col));
+          auto wgl = (const device uint8_t*)wg;
+          wgl += size_t(y_col) * K_w + size_t(it0) * (BK * bytes_per_pack / pack_factor);
+          device float* y = yp + size_t(tid.z) * size_t(M) * size_t(N) + size_t(y_row) * N + y_col;
+          constexpr short SM = BM / WM, SN = BN / WN, SK = 32;
+          constexpr short TM = SM / 16, TN = SN / 16, TK = SK / 16;
+          const short tm = SM * (simd_group_id / WN); const short tn = SN * (simd_group_id % WN);
+          const short sgp_sm = min(SM, short(max(0, (M - (y_row + tm)))));
+          const short sgp_sn = min(SN, short(max(0, (N - (y_col + tn)))));
+          NAXTile<float, TM, TN> Gt; Gt.clear();
+          const device T* xn = x + size_t(y_row + tm) * K + size_t(it0) * BK;
+          thread loader_w_t lg(wgl, sg + y_col, K, Wg, simd_group_id, simd_lane_id, tgp_bn);
+          const bool full_n = (tgp_bn == BN);
+          const bool sg_active = (sgp_sm > 0) && (sgp_sn > 0);
+          dispatch_bool(sgp_sm == SM, [&](auto kAlignedM) {
+            for (int k = it0; k < it1; k++) {
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (full_n) { lg.load_unsafe(); } else { lg.load_safe(short2(BK, tgp_bn)); }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (sg_active) {
+                STEEL_PRAGMA_NO_UNROLL
+                for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+                  NAXTile<T, TM, TK> Atile; NAXTile<T, TN, TK> Bg;
+                  volatile int compiler_barrier;
+                  if constexpr (kAlignedM.value) Atile.load(xn + kk1, K); else Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+                  Bg.template load<T, BK_padded, 1>(Wg + tn * BK_padded + kk1);
+                  tile_matmad_nax(Gt, Atile, metal::bool_constant<false>{}, Bg, metal::bool_constant<true>{});
+                  (void)compiler_barrier;
+                }
+              }
+              xn += BK; lg.next();
+            }
+          });
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg_active) {
+            if (sgp_sm == SM && sgp_sn == SN) Gt.store(y + tm * N + tn, N);
+            else Gt.store_slice(y + tm * N + tn, N, short2(0, 0), short2(sgp_sn, sgp_sm));
+          }
+        }
+
+        """#
     static let steel = #"""
 
 template <typename T, int bits>
