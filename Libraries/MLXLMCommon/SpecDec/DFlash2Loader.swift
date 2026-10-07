@@ -74,7 +74,8 @@ public enum DFlash2Loader {
 
         do {
             try model.update(
-                parameters: ModuleParameters.unflattened(weights), verify: [.noUnusedKeys, .allModelKeysSet, .shapeMismatch])
+                parameters: ModuleParameters.unflattened(weights),
+                verify: [.noUnusedKeys, .allModelKeysSet, .shapeMismatch])
         } catch {
             throw DFlash2LoadError.weightUpdateFailed(error)
         }

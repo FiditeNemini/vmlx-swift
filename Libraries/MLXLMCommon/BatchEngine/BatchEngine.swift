@@ -1320,16 +1320,21 @@ public actor BatchEngine {
                     try Task.checkCancellation()
                     let (deferredInput, deferredTarget, deferredCoordinator) =
                         deferredInputs.consume()
-                    guard let deferredDrafter = try DFlash2DrafterResolver.shared.optionalDrafter(
-                        at: deferredDrafterPath) else {
+                    guard
+                        let deferredDrafter = try DFlash2DrafterResolver.shared.optionalDrafter(
+                            at: deferredDrafterPath)
+                    else {
                         var arParameters = deferredParameters
                         arParameters.draftStrategy = nil
-                        return try TokenIterator(input: deferredInput, model: deferredTarget,
-                            cache: nil, parameters: arParameters, cacheCoordinator: deferredCoordinator,
+                        return try TokenIterator(
+                            input: deferredInput, model: deferredTarget,
+                            cache: nil, parameters: arParameters,
+                            cacheCoordinator: deferredCoordinator,
                             disableDiskBackedRequiredToolRestore: deferredDisableRestore,
                             skipDiskBackedToolPromptSeedBoundary: deferredSkipSeedBoundary,
                             prefillProgressHandler: { progress in
-                                deferredContinuation.yield(.prefillProgress(prefillGate.clamp(progress)))
+                                deferredContinuation.yield(
+                                    .prefillProgress(prefillGate.clamp(progress)))
                             })
                     }
                     try Task.checkCancellation()
