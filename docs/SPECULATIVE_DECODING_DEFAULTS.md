@@ -12,7 +12,7 @@ Bundle capability discovery must inspect configuration and actual weight invento
 
 Chat, API, included evaluations and benchmarks use the same bundle-aware resolution unless the caller explicitly requests an override. Benchmark reports must record the effective strategy, rather than infer activation from an On setting. Keep model generation parameters and explicit sampling overrides unchanged.
 
-Unsupported speculative media requests use the target's normal AR media path. This applies to images and video and to later requests whose context still contains media. A text-only subsequent request must not inherit incompatible speculative companion state. Schema-constrained requests remain AR until speculative grammar rollback is qualified.
+Media requests (images, video, and every later request whose context still contains media) are prefilled through the target's VLM path and then speculate on lanes that support it; other targets use their normal AR media path. A text-only subsequent request must not inherit incompatible speculative companion or position state. Schema-constrained requests remain AR until speculative grammar rollback is qualified.
 
 SSD remains the prefix-cache tier. Preserve full precision, logical prompt identity, media salts, target cache boundaries and architecture-specific companion state. Store each tool-call prefix before its continuation. A target KV hit alone does not prove a usable MTP or DFlash2 restore. Native head priming and drafter context must be aligned to the restored target boundary; otherwise perform the correct rederivation or cold path.
 
