@@ -30,20 +30,84 @@ struct VMLXServerRuntimeSettingsTests {
         }
     }
 
-    @Test("native MTP is opt-in on initialization and missing-mode decode")
-    func sharedMTPDefaultsOffAndPreservesExplicitChoices() throws {
-        #expect(VMLXServerMTPSettings().mode == .off)
+    @Test("native MTP defaults to the family default on initialization and missing-mode decode")
+    func sharedMTPDefaultsToFamilyDefaultAndPreservesExplicitChoices() throws {
+        #expect(VMLXServerMTPSettings().mode == .familyDefault)
         #expect(
-            try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode == .off
+            try JSONDecoder().decode(VMLXServerMTPSettings.self, from: Data("{}".utf8)).mode
+                == .familyDefault
         )
         for settings in [
-            VMLXServerMTPSettings(mode: .off), .init(mode: .auto),
+            VMLXServerMTPSettings(mode: .off), .init(mode: .auto), .init(mode: .familyDefault),
             .init(mode: .forceOn, explicitDepth: 3),
         ] {
             #expect(
                 try JSONDecoder().decode(
                     VMLXServerMTPSettings.self, from: JSONEncoder().encode(settings)) == settings)
         }
+    }
+
+    @Test("a pre-contract-5 stored off migrates once to the family default; later choices stick")
+    func mtpOffMigratesOnceToFamilyDefault() {
+        var legacy = VMLXServerRuntimeSettings(mtp: .init(mode: .off), schemaVersion: 4)
+        legacy.migrateToCurrentSchema()
+        #expect(legacy.mtp.mode == .familyDefault)
+        #expect(legacy.schemaVersion == VMLXServerRuntimeSettings.contractVersion)
+        var chosen = VMLXServerRuntimeSettings(mtp: .init(mode: .off), schemaVersion: 5)
+        chosen.migrateToCurrentSchema()
+        #expect(chosen.mtp.mode == .off)
+        var explicitOn = VMLXServerRuntimeSettings(mtp: .init(mode: .auto), schemaVersion: 4)
+        explicitOn.migrateToCurrentSchema()
+        #expect(explicitOn.mtp.mode == .auto)
+    }
+
+    @Test("the family default launches Flash-Next only; explicit Adaptive keeps its contract")
+    func familyDefaultLaunchesFlashNextOnly() {
+        let flash = MTPBundleStatus(
+            bundleHasMTP: true, configuredLayers: 1, tensorCount: 57, mode: .preservedEnabled,
+            nativeMTPTuning: nil, measuredFamilyAutoDepth: 3)
+        let flashConfig = Data(#"{"model_type": "qwen4_exp", "text_config": {"model_type": "qwen4_exp_text"}}"#.utf8)
+        let defaults = VMLXServerRuntimeSettings()
+        let flashLaunch = defaults.resolvedMTPLaunch(configData: flashConfig, jangConfig: nil, status: flash)
+        #expect(flashLaunch.launchMode == .speculative)
+        #expect(flashLaunch.recommendation?.depth == 3)
+
+        let other = MTPBundleStatus(
+            bundleHasMTP: true, configuredLayers: 1, tensorCount: 15, mode: .preservedEnabled)
+        let otherConfig = Data(#"{"model_type": "qwen3_5"}"#.utf8)
+        #expect(defaults.resolvedMTPLaunch(configData: otherConfig, jangConfig: nil, status: other)
+            .launchMode == .off)
+
+        var off = VMLXServerRuntimeSettings()
+        off.mtp.mode = .off
+        #expect(off.resolvedMTPLaunch(configData: flashConfig, jangConfig: nil, status: flash).launchMode == .off)
+    }
+
+    @Test("a bundled dflash2 drafter is used unless speculation is switched off")
+    func bundledDFlash2DrafterDiscovery() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bundled-dflash2-\(UUID().uuidString)")
+        let drafter = root.appendingPathComponent("dflash2")
+        try FileManager.default.createDirectory(at: drafter, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let drafterConfig = #"""
+            {"architectures": ["DFlash2DraftModel"], "vocab_size": 248320, "num_target_layers": 64,
+             "dflash_config": {"block_size": 8, "target_layer_ids": [5, 19, 33, 47, 61],
+             "mask_token_id": 248070, "selector_rank": 256, "selector_top_k": 16, "conv_kernel_size": 2}}
+            """#
+        try Data(drafterConfig.utf8).write(to: drafter.appendingPathComponent("config.json"))
+        try Data().write(to: drafter.appendingPathComponent("model.safetensors"))
+        let targetConfig = Data(#"{"model_type": "qwen3_5", "text_config": {"vocab_size": 248320, "num_hidden_layers": 64}}"#.utf8)
+        guard VMLXDFlash2DrafterInfo.read(at: drafter) != nil else {
+            Issue.record("fixture is not recognised as a DFlash 2 drafter; update it to the reader's discriminator")
+            return
+        }
+        let defaults = VMLXServerRuntimeSettings()
+        #expect(defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root) != nil)
+        var off = defaults
+        off.mtp.mode = .off
+        #expect(off.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: root) == nil)
+        #expect(defaults.resolvedDFlash2Selection(configData: targetConfig, bundleDirectory: nil) == nil)
     }
 
     @Test("selection capability shares the launch policy across architecture aliases")
@@ -101,7 +165,7 @@ struct VMLXServerRuntimeSettingsTests {
         #expect(settings.generation.topK == nil)
         #expect(settings.generation.minP == nil)
         #expect(settings.generation.repetitionPenalty == nil)
-        #expect(settings.mtp.mode == .off)
+        #expect(settings.mtp.mode == .familyDefault)
         #expect(settings.mtp.keepDraftCacheSeparate)
         #expect(settings.mtp.acceptedTokensOnlyEnterBaseCache)
         #expect(settings.effectivePerformance.deepseekV4ActivationQAT == false)

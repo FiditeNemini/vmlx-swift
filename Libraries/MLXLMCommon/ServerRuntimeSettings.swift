@@ -14,7 +14,11 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     ///
     /// 4: Automatic uses 30% of available space (free + owned payloads).
     ///    Explicit settings, including historical 10% values, are preserved.
-    public static let contractVersion = 4
+    ///
+    /// 5: MTP mode default moved from `.off` to `.familyDefault` (Eric, 2026-10-06). Every install since
+    ///    2026-09-16 persisted the then-default `.off` without a user choosing it, so a stored `.off` written
+    ///    before contract 5 is migrated ONCE to `.familyDefault`; any choice saved after that sticks.
+    public static let contractVersion = 5
 
     public var network: VMLXServerNetworkSettings
     public var concurrency: VMLXServerConcurrencySettings
@@ -70,6 +74,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// user's saved choice. Earlier migrations could not distinguish a chosen
     /// 10% from the old default, so do not infer intent from the number alone.
     public mutating func migrateToCurrentSchema() {
+        if (schemaVersion ?? 1) < 5, mtp.mode == .off {
+            mtp.mode = .familyDefault
+        }
         schemaVersion = max(schemaVersion ?? 1, Self.contractVersion)
     }
 
@@ -391,6 +398,9 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         switch mtp.mode {
         case .off:
             return .off
+        case .familyDefault:
+            return (status?.canAutoLaunchMTP == true && status?.measuredFamilyAutoDepth != nil)
+                ? .speculative : .off
         case .auto:
             return (status?.canAutoLaunchMTP == true) ? .speculative : .off
         case .forceOn:
@@ -417,6 +427,13 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     ) -> VMLXResolvedMTPLaunch {
         guard mtp.mode != .off else {
             return .init(launchMode: .off, recommendation: nil, reason: "MTP disabled by server settings.")
+        }
+        // Default-on covers only the family measured to win cold (Qwen3.8 Flash-Next: `measuredFamilyAutoDepth`
+        // is set from model_type, never from a path or name). Every other family keeps the opt-in contract.
+        if mtp.mode == .familyDefault, status?.measuredFamilyAutoDepth == nil {
+            return .init(
+                launchMode: .off, recommendation: nil,
+                reason: "Native MTP is on by default only for Qwen3.8 Flash-Next; choose On (Adaptive) to enable it for this bundle.")
         }
         if let limit = mtp.draftTokenLimit, limit <= 0 {
             return .init(
@@ -506,7 +523,8 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     public func resolvedMTPDraftStrategy(
         configData: Data?,
         jangConfig: JangConfig?,
-        status: MTPBundleStatus?
+        status: MTPBundleStatus?,
+        bundleDirectory: URL? = nil
     ) -> DraftStrategy? {
         let launch = resolvedMTPLaunch(
             configData: configData,
@@ -520,7 +538,7 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
         // who downloads a drafter and points the runtime at it has asked
         // for speculation, and making them also flip Mode to Auto would
         // be a second switch for one decision.
-        if let selection = resolvedDFlash2Selection(configData: configData) {
+        if let selection = resolvedDFlash2Selection(configData: configData, bundleDirectory: bundleDirectory) {
             return .dflash2(
                 drafterPath: URL(fileURLWithPath: selection.path),
                 blockSize: mtp.dflash2BlockSize)
@@ -537,12 +555,31 @@ public struct VMLXServerRuntimeSettings: Codable, Sendable, Equatable {
     /// described by `configData`. `nil` otherwise — including when the
     /// folder has gone missing, which must degrade to ordinary decoding
     /// rather than failing the request.
-    public func resolvedDFlash2Selection(configData: Data?) -> VMLXDFlash2DrafterInfo? {
-        guard let path = mtp.dflash2DrafterPath, !path.isEmpty else { return nil }
-        guard let info = VMLXDFlash2DrafterInfo.read(at: URL(fileURLWithPath: path)) else {
-            return nil
+    ///
+    /// Bundled drafter (Eric, 2026-10-06): when no selected drafter fits and the mode is not `.off`, a
+    /// `dflash2/` folder inside the model bundle (`bundleDirectory`) is used if it passes the same fit check.
+    /// That is how a Qwen 27B bundle shipped with its drafter gets DFlash 2 by default.
+    public func resolvedDFlash2Selection(
+        configData: Data?, bundleDirectory: URL? = nil
+    ) -> VMLXDFlash2DrafterInfo? {
+        if let path = mtp.dflash2DrafterPath, !path.isEmpty,
+            let info = VMLXDFlash2DrafterInfo.read(at: URL(fileURLWithPath: path)),
+            info.mismatchReason(configData: configData) == nil
+        {
+            return info
         }
-        guard info.mismatchReason(configData: configData) == nil else { return nil }
+        return bundledDFlash2Drafter(configData: configData, bundleDirectory: bundleDirectory)
+    }
+
+    /// The bundle-local `dflash2/` drafter when it fits and speculation is not switched off.
+    public func bundledDFlash2Drafter(
+        configData: Data?, bundleDirectory: URL?
+    ) -> VMLXDFlash2DrafterInfo? {
+        guard mtp.mode != .off, let bundleDirectory else { return nil }
+        let local = bundleDirectory.appendingPathComponent("dflash2", isDirectory: true)
+        guard let info = VMLXDFlash2DrafterInfo.read(at: local),
+            info.mismatchReason(configData: configData) == nil
+        else { return nil }
         return info
     }
 
@@ -1536,7 +1573,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     public var dflash2BlockSize: Int?
 
     public init(
-        mode: VMLXMTPServerMode = .off,
+        mode: VMLXMTPServerMode = .familyDefault,
         draftTokenLimit: Int? = nil,
         keepDraftCacheSeparate: Bool = true,
         acceptedTokensOnlyEnterBaseCache: Bool = true,
@@ -1567,7 +1604,7 @@ public struct VMLXServerMTPSettings: Codable, Sendable, Equatable {
     /// failing the whole settings load.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.mode = try c.decodeIfPresent(VMLXMTPServerMode.self, forKey: .mode) ?? .off
+        self.mode = try c.decodeIfPresent(VMLXMTPServerMode.self, forKey: .mode) ?? .familyDefault
         self.draftTokenLimit = try c.decodeIfPresent(Int.self, forKey: .draftTokenLimit)
         self.keepDraftCacheSeparate =
             try c.decodeIfPresent(Bool.self, forKey: .keepDraftCacheSeparate) ?? true
@@ -1583,6 +1620,11 @@ public enum VMLXMTPServerMode: String, Codable, Sendable, Equatable, CaseIterabl
     case auto
     case off
     case forceOn = "force_on"
+    /// The shipped default (Eric, 2026-10-06): speculation ON where it is measured to win without any user
+    /// action — Qwen3.8 Flash-Next native MTP (Adaptive, family cold-start D3) and a Qwen 27B bundle that ships
+    /// its own `dflash2/` drafter — and OFF for every other family. `.auto` (On (Adaptive)) and `.off` remain
+    /// explicit user choices and always win. Persisted as "family_default".
+    case familyDefault = "family_default"
 }
 
 public enum VMLXMTPLaunchMode: String, Codable, Sendable, Equatable, CaseIterable {
