@@ -242,6 +242,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     let originalInput: LMInput
     let cacheInitParameters: GenerateParameters
     var promptCacheSnapshot: [KVCache]?
+    // Owned exact checkpoints captured during text prefill, not reconstructed after decode.
+    var prefillBoundarySnapshots: [Int: [KVCache]] = [:]
     let mediaSalt: String?
 
     var tokenCount = 0
@@ -844,10 +846,8 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
 
         let start = NativeMTPClock.now()
         try Task.checkCancellation()
-        let prepared = try model.prepare(
-            inputForPrepare,
-            cache: self.cache,
-            windowSize: effectiveParameters.prefillStepSize)
+        let prepared = try prepareCapturingCacheBoundaries(
+            inputForPrepare, windowSize: effectiveParameters.prefillStepSize)
         self.promptPrefillTime = NativeMTPClock.now() - start
         self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
 
@@ -1010,6 +1010,7 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         // in the attention lanes; roll it back before any boundary snapshot
         // can capture them.
         abandonPendingVerify()
+        defer { prefillBoundarySnapshots.removeAll() }
         // Compiled traces capture the cache array; they must not outlive
         // the generation they were built for.
         releaseCompiledVerify()
@@ -1446,6 +1447,108 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
         return result
     }
 
+    /// Retain exact recurrent checkpoints while the original text prefill
+    /// crosses them. Replaying the whole prefix after generation delayed each
+    /// tool call even when writing the resulting SSD record took milliseconds.
+    /// Media and opaque post-prepare token layouts retain their existing path.
+    private mutating func prepareCapturingCacheBoundaries(
+        _ input: LMInput, windowSize: Int
+    ) throws -> PrepareResult {
+        guard let coordinator = cacheCoordinator,
+            coordinator.canPersistBoundaries,
+            originalInput.cachePromptIntent != .auxiliary,
+            !originalInput.hasMediaContent,
+            !originalInput.requiresPostPrepareCacheKey,
+            !input.hasMediaContent,
+            !input.requiresPostPrepareCacheKey,
+            usesHybridMambaCache,
+            !cache.contains(where: { $0 is HybridPoolCache })
+        else {
+            return try model.prepare(input, cache: cache, windowSize: windowSize)
+        }
+
+        let size = input.text.tokens.size
+        let restored = promptTokenIds.count - size
+        guard size > 0, restored >= 0,
+            cache.allSatisfy({ $0.offset == restored }),
+            input.text.tokenIds.map({ $0.count == size }) ?? true,
+            input.text.mask.map({ $0.size == size }) ?? true
+        else {
+            return try model.prepare(input, cache: cache, windowSize: windowSize)
+        }
+
+        // Match TokenIterator.prepare's segmentation: the canonical chat
+        // boundary comes first. Capturing an earlier stable N-1 first would
+        // introduce an extra single-row forward and change floating-point
+        // results relative to AR. Earlier stable snapshots keep their existing
+        // reconstruction path until both iterators share a capture policy.
+        let stripAt = TokenIterator.hybridStripBoundaryIndex(
+            coordinator: coordinator, promptTokenIds: promptTokenIds,
+            input: originalInput, cache: cache)
+        let canonical = stripAt.flatMap { $0 >= restored ? $0 : nil }
+        let stableStart = canonical ?? restored
+        var wanted = Set(
+            originalInput.cacheStablePrefixTokenCounts
+                .filter { $0 > stableStart && $0 < promptTokenIds.count }
+                .flatMap { [$0 - 1, $0] }
+        ).filter { $0 > stableStart }
+        // Keep segmentation independent of whether an SSD entry already
+        // exists, just as the AR iterator does.
+        if let canonical { wanted.insert(canonical) }
+        guard !wanted.isEmpty else {
+            return try model.prepare(input, cache: cache, windowSize: windowSize)
+        }
+
+        let flat = input.text.tokens.reshaped([-1])
+        let mask = input.text.mask?.reshaped([-1])
+        let batchedMask = (input.text.mask?.ndim ?? 1) >= 2
+        func segment(_ start: Int, _ end: Int) -> LMInput {
+            let segmentMask = mask.map { values in
+                let sliced = values[start..<end]
+                return batchedMask ? sliced[.newAxis, 0...] : sliced
+            }
+            return LMInput(
+                tokens: flat[start..<end][.newAxis, 0...],
+                mask: segmentMask,
+                tokenIds: input.text.tokenIds.map { Array($0[start..<end]) },
+                cacheScopeSalt: input.cacheScopeSalt,
+                cachePrefixTokenCounts: input.cachePrefixTokenCounts,
+                cacheStablePrefixTokenCounts: input.cacheStablePrefixTokenCounts,
+                cachePromptIntent: input.cachePromptIntent,
+                cacheRestorePolicy: input.cacheRestorePolicy,
+                toolSchemas: input.toolSchemas,
+                canonicalRequiredToolContext: input.canonicalRequiredToolContext)
+        }
+
+        var consumed = 0
+        for boundary in wanted.sorted() {
+            try Task.checkCancellation()
+            let end = boundary - restored
+            if end > consumed {
+                let head = segment(consumed, end)
+                try withError { error in
+                    let result = try model.prepare(head, cache: cache, windowSize: windowSize)
+                    try error.check()
+                    if case .tokens(let remaining) = result, remaining.tokens.size > 0 {
+                        _ = model.nativeBackboneForward(
+                            Self.sequenceInput(remaining.tokens), cache: cache)
+                        try error.check()
+                    }
+                    MLX.eval(cache)
+                    try error.check()
+                }
+                consumed = end
+            }
+            if cache.allSatisfy({ $0.offset == boundary }) {
+                // Materialize OWNED copies before subsequent prefill/decode
+                // mutates recurrent state or needs unique buffer ownership.
+                prefillBoundarySnapshots[boundary] = makePromptBoundaryCacheSnapshot(from: cache)
+            }
+        }
+        try Task.checkCancellation()
+        return try model.prepare(segment(consumed, size), cache: cache, windowSize: windowSize)
+    }
+
     private func cacheSnapshotForBoundary(
         tokens: [Int],
         promptSnapshot: [KVCache],
@@ -1453,6 +1556,12 @@ struct NativeMTPTokenIterator: TokenIteratorProtocol {
     ) -> [KVCache]? {
         guard !tokens.isEmpty, tokens.count < promptTokenIds.count else {
             return nil
+        }
+        if let captured = prefillBoundarySnapshots[tokens.count],
+            !captured.isEmpty,
+            captured.allSatisfy({ $0.offset == tokens.count })
+        {
+            return captured
         }
         guard let boundaryInput = originalInput.inputForCacheBoundary(
             tokens: tokens, fullPromptTokenIds: promptTokenIds) else { return nil }
