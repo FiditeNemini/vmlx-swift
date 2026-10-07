@@ -1311,14 +1311,27 @@ public actor BatchEngine {
                 let deferredParameters = soloParameters
                 let deferredBlockSize = strategy.dflash2BlockSize
                 let deferredDrafterPath = drafterPath
+                let deferredDisableRestore = requiresFreshToolSelection
+                let deferredSkipSeedBoundary = skipDiskBackedToolPromptSeedBoundary
+                let deferredContinuation = continuation
                 let deferredInputs = SendableBox(
                     (input, dflashTarget, cacheCoordinator))
                 let makeIterator: @Sendable () throws -> any TokenIteratorProtocol = {
                     try Task.checkCancellation()
                     let (deferredInput, deferredTarget, deferredCoordinator) =
                         deferredInputs.consume()
-                    let deferredDrafter = try DFlash2DrafterResolver.shared.drafter(
-                        at: deferredDrafterPath)
+                    guard let deferredDrafter = try DFlash2DrafterResolver.shared.optionalDrafter(
+                        at: deferredDrafterPath) else {
+                        var arParameters = deferredParameters
+                        arParameters.draftStrategy = nil
+                        return try TokenIterator(input: deferredInput, model: deferredTarget,
+                            cache: nil, parameters: arParameters, cacheCoordinator: deferredCoordinator,
+                            disableDiskBackedRequiredToolRestore: deferredDisableRestore,
+                            skipDiskBackedToolPromptSeedBoundary: deferredSkipSeedBoundary,
+                            prefillProgressHandler: { progress in
+                                deferredContinuation.yield(.prefillProgress(prefillGate.clamp(progress)))
+                            })
+                    }
                     try Task.checkCancellation()
                     return try DFlash2TokenIterator(
                         input: deferredInput,

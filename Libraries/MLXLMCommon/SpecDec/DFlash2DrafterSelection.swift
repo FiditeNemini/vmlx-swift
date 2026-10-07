@@ -93,6 +93,7 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
             else { return nil }
         }
 
+        guard DFlash2ArtifactMetadata.rejectionReason(at: directory) == nil else { return nil }
         return VMLXDFlash2DrafterInfo(
             path: directory.path,
             blockSize: (dflash["block_size"] as? Int) ?? (root["block_size"] as? Int) ?? 8,

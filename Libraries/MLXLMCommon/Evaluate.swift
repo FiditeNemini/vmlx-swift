@@ -4344,7 +4344,11 @@ public func generate(
         // Vocabulary agreement is checked inside the iterator against the
         // first real logits row rather than here: `vocabularySize` lives on
         // the per-family model protocols, which this module cannot see.
-        let drafter = try DFlash2DrafterResolver.shared.drafter(at: drafterPath)
+        guard let drafter = try DFlash2DrafterResolver.shared.optionalDrafter(at: drafterPath) else {
+            var arParameters = parameters
+            arParameters.draftStrategy = nil
+            return try generate(input: input, cache: cache, parameters: arParameters, context: context, wiredMemoryTicket: wiredMemoryTicket, cacheCoordinator: cacheCoordinator)
+        }
         let iterator = try DFlash2TokenIterator(
             input: input,
             target: dflashTarget,
@@ -4821,7 +4825,11 @@ public func generateTokensTask(
                 "\(type(of: context.model)) does not expose per-layer hidden states and a shared LM head"
             )
         }
-        let drafter = try DFlash2DrafterResolver.shared.drafter(at: drafterPath)
+        guard let drafter = try DFlash2DrafterResolver.shared.optionalDrafter(at: drafterPath) else {
+            var arParameters = parameters
+            arParameters.draftStrategy = nil
+            return try generateTokensTask(input: input, cache: cache, parameters: arParameters, context: context, includeStopToken: includeStopToken, wiredMemoryTicket: wiredMemoryTicket, cacheCoordinator: cacheCoordinator)
+        }
         let iterator = try DFlash2TokenIterator(
             input: input,
             target: dflashTarget,

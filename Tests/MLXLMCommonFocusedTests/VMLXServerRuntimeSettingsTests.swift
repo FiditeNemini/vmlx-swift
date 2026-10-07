@@ -103,17 +103,28 @@ struct VMLXServerRuntimeSettingsTests {
         try FileManager.default.createDirectory(at: drafter, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let drafterConfig = #"""
-            {"architectures": ["DFlash2DraftModel"], "vocab_size": 248320, "hidden_size":5120, "num_target_layers": 64,
+            {"architectures": ["DFlash2DraftModel"], "vocab_size": 248320, "hidden_size":5120, "num_target_layers": 64, "num_hidden_layers":1, "num_attention_heads":40, "num_key_value_heads":8, "head_dim":128, "intermediate_size":64,
              "dflash_config": {"block_size": 8, "target_layer_ids": [5, 19, 33, 47, 61],
-             "mask_token_id": 248070, "selector_rank": 256, "selector_top_k": 16, "conv_kernel_size": 2}}
+             "mask_token_id": 248070, "selector_rank": 256, "selector_top_k": 16, "conv_kernel_size": 2, "conv_group_size":16}}
             """#
         try Data(drafterConfig.utf8).write(to: drafter.appendingPathComponent("config.json"))
-        let header = Data(#"{"fixture.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.utf8)
-        var length = UInt64(header.count).littleEndian
+        let shapes = try DFlash2ArtifactMetadata.requiredShapes(configData: Data(drafterConfig.utf8))
+        var offset = 0
+        var header: [String: Any] = [:]
+        for (name, shape) in shapes {
+            let end = offset + shape.reduce(2, *)
+            header[name] = ["dtype":"BF16", "shape":shape, "data_offsets":[offset,end]]
+            offset = end
+        }
+        let bytes = try JSONSerialization.data(withJSONObject: header)
+        var length = UInt64(bytes.count).littleEndian
         var file = withUnsafeBytes(of: &length) { Data($0) }
-        file.append(header)
-        file.append(Data(repeating: 0, count: 4))
-        try file.write(to: drafter.appendingPathComponent("model.safetensors"))
+        file.append(bytes)
+        let url = drafter.appendingPathComponent("model.safetensors")
+        try file.write(to: url)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(file.count + offset))
+        try handle.close()
         let targetConfig = Data(#"{"model_type": "qwen3_5", "text_config": {"vocab_size": 248320, "hidden_size":5120, "num_hidden_layers": 64}}"#.utf8)
         guard VMLXDFlash2DrafterInfo.read(at: drafter) != nil else {
             Issue.record("fixture is not recognised as a DFlash 2 drafter; update it to the reader's discriminator")
