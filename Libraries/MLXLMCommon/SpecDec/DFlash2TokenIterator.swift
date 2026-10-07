@@ -69,6 +69,8 @@ public struct DFlash2GenerationStats: Sendable, Equatable {
     public var blockSize: Int = 0
     /// Cycles run at each verify width (DFlash2WidthChooser).
     public var widthCycles: [Int: Int] = [:]
+    /// Cycles verified as a draft TREE (DFlash2Tree.swift) instead of a chain.
+    public var treeCycles: Int = 0
     public var verifyCalls: Int = 0
     public var draftedTokens: Int = 0
     public var acceptedTokens: Int = 0
@@ -201,6 +203,20 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     private var useStagedVerify = false
     /// Per-cycle verify width chooser (nil = fixed `blockSize`).
     private var widthChooser: DFlash2WidthChooser?
+
+    // MARK: draft trees (DFlash2Tree.swift)
+    /// nil = not resolved yet (needs the post-prefill cache); then fixed for the request.
+    private var treeMode: Bool?
+    private var treeFilter: SpeculativeTopKAcceptance.Filter?
+    private var treeRNG: SpeculativeHostRNG
+    /// Lattice positions drafted per tree cycle: the widest verify width, so a prefetched lattice
+    /// serves whatever width the chooser picks next (fewer rows = fewer nodes, same lattice).
+    private var treeLatticeRows = 0
+    /// The next cycle's lattice, dispatched right after a commit so the drafter runs on the GPU
+    /// while the host streams the committed tokens.
+    private var pendingLattice: DFlash2LatticeArrays?
+    private static let treePrefetchEnabled =
+        ProcessInfo.processInfo.environment["VMLX_DFLASH2_TREE_PREFETCH"] != "0"
     /// The first staged cycle runs EAGERLY to allocate the staging slots;
     /// `compile()` needs those objects to exist before the trace.
     private var stagedVerifyWarm = false
@@ -416,6 +432,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.originalInput = input
         self.cacheInitParameters = effectiveParameters
         self.mediaSalt = computeCacheSalt(for: input, parameters: effectiveParameters)
+        self.treeRNG = SpeculativeHostRNG(seed: effectiveParameters.randomSeed)
+        var treeFilter = SpeculativeTopKAcceptance.Filter(
+            temperature: effectiveParameters.temperature, topP: effectiveParameters.topP,
+            topK: effectiveParameters.topK, minP: 0)
+        treeFilter?.nucleusWithinTopK = true
+        self.treeFilter = treeFilter
         self.contextHidden = MLXArray.zeros([1, 0, 1])
         self.lastToken = 0
 
@@ -847,7 +869,8 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         }
         // Anything else in flight was speculated against a budget or block
         // size we can no longer use; roll its rows back before proceeding.
-        abandonInFlightVerify()
+        // A prefetched tree lattice stays: it serves any width.
+        abandonInFlightVerify(keepLattice: treeMode == true && !drafterDisabled)
 
         // The block spends one position on the anchor, so a block of size
         // `bs` yields at most `bs` new tokens (bs-1 drafts + 1 bonus).
@@ -856,6 +879,16 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             return runAutoregressiveStep()
         }
         let cycleStart = Date.timeIntervalSinceReferenceDate
+        if treeMode == nil { treeMode = resolveTreeMode() }
+        if treeMode == true, let ok = runTreeCycle(rows: bs) {
+            if ok, widthChooser != nil {
+                widthChooser!.observe(
+                    verifyWidth: bs, tokens: pendingTokens.count,
+                    seconds: Date.timeIntervalSinceReferenceDate - cycleStart)
+                stats.widthCycles[bs, default: 0] += 1
+            }
+            return ok
+        }
         guard let flight = issueVerify(bs: bs) else {
             // The drafter forward produced a degenerate result — an MLX
             // error inside its layer stack degraded to a scalar husk
@@ -1178,9 +1211,147 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         return true
     }
 
+    /// Trees need a target that can verify one, a cache it can commit, and a request whose
+    /// acceptance we can do losslessly on the host (greedy, or sampled with a top-k filter).
+    private func resolveTreeMode() -> Bool {
+        if ProcessInfo.processInfo.environment["VMLX_DFLASH2_TREE"] == "0" { return false }
+        guard let treeTarget = target as? DFlash2TreeVerifyModel,
+            treeTarget.dflash2SupportsTree(cache: cache),
+            isGreedy || treeFilter != nil
+        else { return false }
+        return true
+    }
+
+    private mutating func dispatchLattice() -> DFlash2LatticeArrays? {
+        var blockIds = [Int32(lastToken)]
+        blockIds.append(contentsOf: Array(repeating: Int32(maskTokenID), count: treeLatticeRows - 1))
+        let block = MLXArray(blockIds).reshaped(1, treeLatticeRows)
+        let arrays: DFlash2LatticeArrays?
+        do {
+            arrays = try withError {
+                drafter.proposeLattice(
+                    inputs: block, targetHidden: contextHidden, cache: draftCache,
+                    embedder: target)
+            }
+        } catch {
+            return nil
+        }
+        if let arrays { asyncEval(arrays.arrays) }
+        return arrays
+    }
+
+    /// Pull the drafter cache back to the committed context (it advanced by a lattice block).
+    private mutating func trimDraftCacheToCommitted() {
+        let expectedDraftOffset = promptTokenIds.count + stats.emittedTokens - 1
+        for c in draftCache where c.offset > expectedDraftOffset {
+            let excess = c.offset - expectedDraftOffset
+            if c.isTrimmable {
+                _ = c.trim(excess)
+            } else {
+                c.offsetForDFlash2 = Swift.max(0, c.offset - excess)
+            }
+        }
+    }
+
+    /// One tree cycle. `nil` = could not draft a tree this cycle (caller runs the chain path).
+    private mutating func runTreeCycle(rows: Int) -> Bool? {
+        guard rows >= 2, let treeTarget = target as? DFlash2TreeVerifyModel else { return nil }
+        abandonInFlightVerify(keepLattice: true)
+
+        // MARK: draft — one drafter forward, one small readback, host best-first search
+        let draftStart = Date.timeIntervalSinceReferenceDate
+        if treeLatticeRows == 0 {
+            treeLatticeRows = Swift.max(rows, widthChooser?.widths.max() ?? blockSize)
+        }
+        let prefetched = pendingLattice
+        pendingLattice = nil
+        guard let latticeArrays = prefetched ?? dispatchLattice() else { return nil }
+        MLX.eval(latticeArrays.arrays)
+        trimDraftCacheToCommitted()
+        let lattice = latticeArrays.host()
+        let tree = DFlash2TreeSearch.bestFirst(
+            lattice: lattice, maxNodes: rows - 1, temperature: isGreedy ? 0 : temperature)
+        guard !tree.tokens.isEmpty else { return nil }
+        let plan = DFlash2TreePlan(
+            tokens: [lastToken] + tree.tokens, parents: [-1] + tree.parents.map { $0 + 1 })
+        stats.draftSeconds += Date.timeIntervalSinceReferenceDate - draftStart
+        stats.draftedTokens += tree.tokens.count
+
+        // MARK: verify — every row along its own root path
+        let verifyStart = Date.timeIntervalSinceReferenceDate
+        let scope = DFlash2TreeScope(plan: plan)
+        let input = MLXArray(plan.tokens.map(Int32.init)).reshaped(1, plan.rows)
+        let (logits, captured) = treeTarget.dflash2TreeForward(
+            input, cache: cache, captureLayerIDs: captureLayerIDs, scope: scope)
+        let newHidden = extractContextFeature(captured: captured, targetLayerIDs: orderedLayerIDs)
+
+        // MARK: accept — the cycle's one readback of the target
+        let keptRows: [Int]
+        let bonus: Int
+        if isGreedy {
+            let ids = argMax(logits, axis: -1)
+            MLX.eval(ids, newHidden)
+            let argmax = ids.reshaped(-1).asArray(Int32.self).map(Int.init)
+            (keptRows, bonus) = DFlash2TreeAcceptance.greedyPath(plan: plan, argmax: argmax)
+        } else {
+            let filter = treeFilter!
+            let (ids, logprobs) = SpeculativeTopKAcceptance.topK(logits: logits, filter: filter)
+            MLX.eval(ids, logprobs, newHidden)
+            let k = ids.dim(1)
+            let idRows = ids.asArray(Int32.self)
+            let lpRows = logprobs.asArray(Float.self)
+            let distributions = (0 ..< plan.rows).map { r in
+                SpeculativeTopKAcceptance.distribution(
+                    ids: idRows[(r * k) ..< (r * k + k)], logprobs: lpRows[(r * k) ..< (r * k + k)],
+                    filter: filter)
+            }
+            let path = DFlash2TreeAcceptance.sampledPath(
+                plan: plan, distributions: distributions, rng: &treeRNG)
+            (keptRows, bonus) = (path.rows, path.bonus)
+        }
+        let cycleVerifySeconds = Date.timeIntervalSinceReferenceDate - verifyStart
+        stats.verifySeconds += cycleVerifySeconds
+        stats.verifyCalls += 1
+        let accepted = keptRows.count - 1
+        stats.acceptedTokens += accepted
+
+        // MARK: commit — KV rows compacted to the kept path, recurrent state replayed along it
+        let commitStart = Date.timeIntervalSinceReferenceDate
+        guard treeTarget.dflash2CommitTree(cache: cache, scope: scope, keptRows: keptRows) else {
+            stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
+            FileHandle.standardError.write(Data(
+                ("[DFlash2] ABORTED at cycle \(stats.verifyCalls): tree commit failed for "
+                    + "\(keptRows.count) of \(plan.rows) rows. The turn is TRUNCATED at "
+                    + "\(stats.emittedTokens) tokens.\n").utf8))
+            return false
+        }
+        stats.commitSeconds += Date.timeIntervalSinceReferenceDate - commitStart
+        contextHidden = take(newHidden, MLXArray(keptRows.map(Int32.init)), axis: 1)
+
+        let budget = maxTokens.map { $0 - tokenCount } ?? Int.max
+        var emitted = keptRows.dropFirst().map { plan.tokens[$0] }
+        emitted.append(bonus)
+        if emitted.count > budget { emitted = Array(emitted.prefix(budget)) }
+        guard let last = emitted.last else { return false }
+        lastToken = last
+        pendingTokens = emitted
+        stats.emittedTokens += emitted.count
+        stats.treeCycles += 1
+        if Self.treePrefetchEnabled, emitted.count < budget {
+            pendingLattice = dispatchLattice()
+        }
+        if Self.traceEnabled {
+            FileHandle.standardError.write(Data(
+                ("[DFlash2] tree cycle=\(stats.verifyCalls) rows=\(plan.rows) "
+                    + "depthMax=\(plan.depths.max() ?? 0) accepted=\(accepted) "
+                    + "emitted=\(emitted.count) path=\(keptRows)\n").utf8))
+        }
+        return true
+    }
+
     /// Dispatch the next cycle's forwards, if one is worth having.
     private mutating func prefetchNextVerify() {
-        guard prefetchEnabled, inFlight == nil else { return }
+        guard prefetchEnabled, inFlight == nil, treeMode != true else { return }
         // Budget left AFTER the tokens queued by the cycle that just
         // completed — they have not been consumed by `next()` yet.
         let remaining = maxTokens.map { $0 - tokenCount - pendingTokens.count } ?? Int.max
@@ -1196,7 +1367,11 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
     /// offset were never touched. Must run before ANY path that persists
     /// or reuses the cache, or unverified draft positions leak into a
     /// stored prefix.
-    private mutating func abandonInFlightVerify() {
+    private mutating func abandonInFlightVerify(keepLattice: Bool = false) {
+        if pendingLattice != nil, !keepLattice {
+            pendingLattice = nil
+            trimDraftCacheToCommitted()
+        }
         guard let flight = inFlight else { return }
         inFlight = nil
         for layer in cache where layer.isTrimmable {

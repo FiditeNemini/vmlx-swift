@@ -533,6 +533,27 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return (keys, values)
     }
 
+    /// DFlash 2 tree commit: the last `window` rows hold a draft tree; keep only `keptRows`
+    /// (window-relative, root first), written contiguously at the window start, and drop the
+    /// rest. A pure prefix (a chain accept) is just a trim. Returns false if the cache does not
+    /// end with that window.
+    public func compactTreeWindow(window: Int, keptRows: [Int]) -> Bool {
+        guard let keys = self.keys, let values = self.values, offset >= window,
+            keptRows.count <= window
+        else { return false }
+        let start = offset - window
+        let keep = keptRows.count
+        if keptRows != Array(0 ..< keep) {
+            let index = MLXArray(keptRows.map { Int32(start + $0) })
+            let movedKeys = take(keys[.ellipsis, ..<offset, 0...], index, axis: 2)
+            let movedValues = take(values[.ellipsis, ..<offset, 0...], index, axis: 2)
+            self.keys?[.ellipsis, start ..< (start + keep), 0...] = movedKeys
+            self.values?[.ellipsis, start ..< (start + keep), 0...] = movedValues
+        }
+        offset = start + keep
+        return true
+    }
+
     public override var state: [MLXArray] {
         get {
             guard let keys = self.keys, let values = self.values else { return [] }
