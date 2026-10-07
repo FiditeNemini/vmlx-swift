@@ -49,7 +49,8 @@ public final class DFlash2DrafterResolver: @unchecked Sendable {
         do {
             guard DFlash2ArtifactMetadata.rejectionReason(at: path) == nil else {
                 try Task.checkCancellation()
-                Logger(subsystem: "vmlx", category: "DFlash2").warning("Optional drafter metadata invalid; using AR")
+                Logger(subsystem: "vmlx", category: "DFlash2").warning(
+                    "Optional drafter metadata invalid; using AR")
                 return nil
             }
             let model = try drafter(at: path)
@@ -57,7 +58,9 @@ public final class DFlash2DrafterResolver: @unchecked Sendable {
             return model
         } catch let error as DFlash2LoadError {
             try Task.checkCancellation()
-            Logger(subsystem: "vmlx", category: "DFlash2").warning("Optional drafter unavailable; using AR: \(error.localizedDescription, privacy: .public)")
+            Logger(subsystem: "vmlx", category: "DFlash2").warning(
+                "Optional drafter unavailable; using AR: \(error.localizedDescription, privacy: .public)"
+            )
             return nil
         }
     }

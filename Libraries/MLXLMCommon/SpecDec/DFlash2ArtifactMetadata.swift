@@ -15,7 +15,9 @@ public enum DFlash2ArtifactMetadata {
             c.hiddenSize % c.dflash.convGroupSize == 0,
             !c.targetLayerIds.isEmpty, c.targetLayerIds.allSatisfy({ $0 >= 0 })
         else { throw DFlash2LoadError.targetMismatch("invalid drafter dimensions") }
-        let h = c.hiddenSize, d = c.headDim, rank = c.dflash.selectorRank
+        let h = c.hiddenSize
+        let d = c.headDim
+        let rank = c.dflash.selectorRank
         var shapes: [String: [Int]] = [
             "norm.weight": [h], "hidden_norm.weight": [h],
             "fc.weight": [h, c.targetLayerIds.count * h],
@@ -23,7 +25,7 @@ public enum DFlash2ArtifactMetadata {
             "candidate_selector.successor_codebook.weight": [c.vocabSize, rank],
             "candidate_selector.hidden_projection.weight": [rank, h],
         ]
-        for i in 0..<c.numHiddenLayers {
+        for i in 0 ..< c.numHiddenLayers {
             let p = "layers.\(i)."
             for (name, shape) in [
                 "self_attn.q_proj.weight": [c.numAttentionHeads * d, h],
@@ -39,7 +41,8 @@ public enum DFlash2ArtifactMetadata {
             for name in ["attention_conv", "mlp_conv"] {
                 shapes[p + name + ".base_kernel"] = [2, c.dflash.convKernelSize, h]
                 shapes[p + name + ".kernel_projection.weight"] = [
-                    2 * c.dflash.convKernelSize * (h / c.dflash.convGroupSize), h]
+                    2 * c.dflash.convKernelSize * (h / c.dflash.convGroupSize), h,
+                ]
             }
         }
         return shapes
@@ -53,13 +56,19 @@ public enum DFlash2ArtifactMetadata {
             let root = try JSONSerialization.jsonObject(with: data) as! [String: Any]
             let quant = root["quantization"] as? [String: Any]
             var tensors: [String: (shape: [Int], dtype: String)] = [:]
-            guard let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil)
+            guard
+                let files = FileManager.default.enumerator(
+                    at: directory, includingPropertiesForKeys: nil)
             else { return "Cannot enumerate drafter weights" }
             for case let file as URL in files where file.pathExtension == "safetensors" {
                 let handle = try FileHandle(forReadingFrom: file)
                 defer { try? handle.close() }
-                guard let sizeBytes = try handle.read(upToCount: 8), sizeBytes.count == 8 else { return "Invalid safetensors header" }
-                let size = sizeBytes.enumerated().reduce(UInt64(0)) { $0 | (UInt64($1.element) << UInt64(8 * $1.offset)) }
+                guard let sizeBytes = try handle.read(upToCount: 8), sizeBytes.count == 8 else {
+                    return "Invalid safetensors header"
+                }
+                let size = sizeBytes.enumerated().reduce(UInt64(0)) {
+                    $0 | (UInt64($1.element) << UInt64(8 * $1.offset))
+                }
                 guard size > 0, size <= 64 * 1024 * 1024,
                     let bytes = try handle.read(upToCount: Int(size)), bytes.count == Int(size),
                     let header = try JSONSerialization.jsonObject(with: bytes) as? [String: Any]
@@ -67,22 +76,32 @@ public enum DFlash2ArtifactMetadata {
                 let fileSize = try handle.seekToEnd()
                 for (rawName, value) in header where rawName != "__metadata__" {
                     var name = rawName
-                    if ["candidate_selector.predecessor_codebook", "candidate_selector.successor_codebook"].contains(name) { name += ".weight" }
+                    if [
+                        "candidate_selector.predecessor_codebook",
+                        "candidate_selector.successor_codebook",
+                    ].contains(name) {
+                        name += ".weight"
+                    }
                     guard tensors[name] == nil, let entry = value as? [String: Any],
                         let shape = entry["shape"] as? [Int], shape.allSatisfy({ $0 > 0 }),
                         let dtype = entry["dtype"] as? String,
                         let offsets = entry["data_offsets"] as? [Int], offsets.count == 2,
-                        offsets[0] >= 0, offsets[1] >= offsets[0], UInt64(offsets[1]) <= fileSize - 8 - size
+                        offsets[0] >= 0, offsets[1] >= offsets[0],
+                        UInt64(offsets[1]) <= fileSize - 8 - size
                     else { return "Malformed, duplicate or truncated tensor: \(name)" }
                     let sizes = ["F16": 2, "BF16": 2, "F32": 4, "U32": 4]
-                    guard let width = sizes[dtype] else { return "Unsupported drafter dtype: \(dtype)" }
+                    guard let width = sizes[dtype] else {
+                        return "Unsupported drafter dtype: \(dtype)"
+                    }
                     var count = width
                     for dimension in shape {
                         let product = count.multipliedReportingOverflow(by: dimension)
                         guard !product.overflow else { return "Invalid tensor dimensions" }
                         count = product.partialValue
                     }
-                    guard count == offsets[1] - offsets[0] else { return "Incorrect tensor byte length: \(name)" }
+                    guard count == offsets[1] - offsets[0] else {
+                        return "Incorrect tensor byte length: \(name)"
+                    }
                     tensors[name] = (shape, dtype)
                 }
             }
@@ -102,12 +121,15 @@ public enum DFlash2ArtifactMetadata {
                         let biases = tensors[prefix + ".biases"], biases.shape == scales.shape,
                         biases.dtype == scales.dtype
                     else { return "Incompatible packed drafter tensor: \(name)" }
-                    allowed.insert(prefix + ".scales"); allowed.insert(prefix + ".biases")
+                    allowed.insert(prefix + ".scales")
+                    allowed.insert(prefix + ".biases")
                 } else if tensor.shape != shape || !["F16", "BF16", "F32"].contains(tensor.dtype) {
                     return "Incompatible drafter tensor: \(name)"
                 }
             }
-            if let extra = Set(tensors.keys).subtracting(allowed).sorted().first { return "Unexpected drafter tensor: \(extra)" }
+            if let extra = Set(tensors.keys).subtracting(allowed).sorted().first {
+                return "Unexpected drafter tensor: \(extra)"
+            }
             return nil
         } catch { return "Drafter metadata cannot be validated: \(error.localizedDescription)" }
     }

@@ -70,7 +70,9 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
         // Match the loader's recursive layout, but read headers only. A config-only,
         // missing-shard, malformed-header or truncated download is not a usable drafter.
         let fm = FileManager.default
-        guard let enumerator = fm.enumerator(at: directory, includingPropertiesForKeys: nil) else { return nil }
+        guard let enumerator = fm.enumerator(at: directory, includingPropertiesForKeys: nil) else {
+            return nil
+        }
         var tensorFiles: [String: Set<String>] = [:]
         var bytes: Int64 = 0
         for case let file as URL in enumerator where file.pathExtension == "safetensors" {
@@ -122,7 +124,9 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
             ((text["num_hidden_layers"] as? Int) ?? (root["num_hidden_layers"] as? Int)) != nil,
             ((text["hidden_size"] as? Int) ?? (root["hidden_size"] as? Int)) != nil,
             drafterHiddenSize != nil
-        else { return "Target or drafter dimensions are missing; compatibility cannot be verified." }
+        else {
+            return "Target or drafter dimensions are missing; compatibility cannot be verified."
+        }
         if let vocabulary = (text["vocab_size"] as? Int) ?? (root["vocab_size"] as? Int),
             vocabulary != vocabularySize
         {
@@ -136,7 +140,8 @@ public struct VMLXDFlash2DrafterInfo: Codable, Sendable, Equatable {
                 "Drafter reads layer \(deepest) of its target; this model has \(layers) layers."
         }
         if let layers = (text["num_hidden_layers"] as? Int) ?? (root["num_hidden_layers"] as? Int),
-            layers != targetLayerCount {
+            layers != targetLayerCount
+        {
             return "Drafter expects \(targetLayerCount) target layers; this model has \(layers)."
         }
         if let hidden = (text["hidden_size"] as? Int) ?? (root["hidden_size"] as? Int),

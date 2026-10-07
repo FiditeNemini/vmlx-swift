@@ -79,9 +79,11 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
         return dir
     }
 
-    private func writeCompleteWeights(at dir: URL, omit: String? = nil, packed: Bool = false) throws {
+    private func writeCompleteWeights(at dir: URL, omit: String? = nil, packed: Bool = false) throws
+    {
         let configURL = dir.appendingPathComponent("config.json")
-        var config = try JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as! [String: Any]
+        var config =
+            try JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as! [String: Any]
         if packed { config["quantization"] = ["bits": 4, "group_size": 64, "mode": "affine"] }
         let configData = try JSONSerialization.data(withJSONObject: config)
         try configData.write(to: configURL)
@@ -100,7 +102,8 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
                 add(prefix + ".scales", [shape[0], shape[1] / 64], "BF16", 2)
                 add(prefix + ".biases", [shape[0], shape[1] / 64], "BF16", 2)
             } else {
-                let key = name.hasPrefix("candidate_selector.") && name.contains("codebook")
+                let key =
+                    name.hasPrefix("candidate_selector.") && name.contains("codebook")
                     ? String(name.dropLast(7)) : name
                 add(key, shape, "BF16", 2)
             }
@@ -130,12 +133,16 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
         let file = dir.appendingPathComponent("model.safetensors")
         let reader = try FileHandle(forReadingFrom: file)
         let lengthBytes = try XCTUnwrap(reader.read(upToCount: 8))
-        let oldLength = lengthBytes.enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << UInt64(8 * $1.offset) }
-        var header = try JSONSerialization.jsonObject(with: XCTUnwrap(reader.read(upToCount: Int(oldLength)))) as! [String: Any]
+        let oldLength = lengthBytes.enumerated().reduce(UInt64(0)) {
+            $0 | UInt64($1.element) << UInt64(8 * $1.offset)
+        }
+        var header =
+            try JSONSerialization.jsonObject(
+                with: XCTUnwrap(reader.read(upToCount: Int(oldLength)))) as! [String: Any]
         let oldSize = try reader.seekToEnd()
         try reader.close()
         var projection = header["layers.0.self_attn.q_proj.weight"] as! [String: Any]
-        projection["shape"] = [5120, 4096] // same byte count, wrong orientation
+        projection["shape"] = [5120, 4096]  // same byte count, wrong orientation
         header["layers.0.self_attn.q_proj.weight"] = projection
         let bytes = try JSONSerialization.data(withJSONObject: header)
         var length = UInt64(bytes.count).littleEndian
@@ -158,7 +165,8 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
     }
 
     func testInstalledDrafterHeadersWithoutLoadingWeights() throws {
-        guard let paths = ProcessInfo.processInfo.environment["VMLX_DFLASH_METADATA_LOCAL_PATHS"] else {
+        guard let paths = ProcessInfo.processInfo.environment["VMLX_DFLASH_METADATA_LOCAL_PATHS"]
+        else {
             throw XCTSkip("Set explicit local drafter paths for header-only inventory proof")
         }
         let directories = try JSONDecoder().decode([String].self, from: Data(paths.utf8))
@@ -177,15 +185,15 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
             do {
                 _ = try DFlash2DrafterResolver().optionalDrafter(at: path)
                 return false
-            } catch is CancellationError { return true }
-            catch { return false }
+            } catch is CancellationError { return true } catch { return false }
         }
         let cancelled = await task.value
         XCTAssertTrue(cancelled)
     }
 
     func testOptionalMissingDrafterReturnsARWithoutLoading() throws {
-        XCTAssertNil(try DFlash2DrafterResolver().optionalDrafter(at: root.appendingPathComponent("absent")))
+        XCTAssertNil(
+            try DFlash2DrafterResolver().optionalDrafter(at: root.appendingPathComponent("absent")))
     }
 
     /// A target `config.json` in the nested `text_config` shape Qwen 3.x
@@ -264,14 +272,19 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
     func testOffDisablesSelectedDrafterWithoutDeletingSelection() throws {
         let dir = try makeDrafter()
         var settings = settings(drafter: dir, mode: .off)
-        XCTAssertNil(settings.resolvedMTPDraftStrategy(configData: targetConfig(), jangConfig: nil, status: nil))
+        XCTAssertNil(
+            settings.resolvedMTPDraftStrategy(
+                configData: targetConfig(), jangConfig: nil, status: nil))
         XCTAssertEqual(settings.mtp.dflash2DrafterPath, dir.path)
         settings.mtp.mode = .auto
-        XCTAssertTrue(settings.resolvedMTPDraftStrategy(configData: targetConfig(), jangConfig: nil, status: nil)?.usesDFlash2 == true)
+        XCTAssertTrue(
+            settings.resolvedMTPDraftStrategy(
+                configData: targetConfig(), jangConfig: nil, status: nil)?.usesDFlash2 == true)
     }
 
     func testIncompleteAndTruncatedDraftersAreNotSelectable() throws {
-        XCTAssertNil(VMLXDFlash2DrafterInfo.read(at: try makeDrafter(name: "bare", withWeights: false)))
+        XCTAssertNil(
+            VMLXDFlash2DrafterInfo.read(at: try makeDrafter(name: "bare", withWeights: false)))
         let dir = try makeDrafter()
         let file = dir.appendingPathComponent("model.safetensors")
         let handle = try FileHandle(forWritingTo: file)
@@ -298,11 +311,13 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
     func testMalformedHeadersAndNegativeLayerIDsAreRejected() throws {
         let invalidLayers = try makeDrafter(name: "negative")
         let cfg = invalidLayers.appendingPathComponent("config.json")
-        let text = try String(contentsOf: cfg, encoding: .utf8).replacingOccurrences(of: "[5,19,33,47,61]", with: "[-1,4]")
+        let text = try String(contentsOf: cfg, encoding: .utf8).replacingOccurrences(
+            of: "[5,19,33,47,61]", with: "[-1,4]")
         try text.write(to: cfg, atomically: true, encoding: .utf8)
         XCTAssertNil(VMLXDFlash2DrafterInfo.read(at: invalidLayers))
         let invalidFile = try makeDrafter(name: "malformed")
-        try Data(repeating: 0, count: 32).write(to: invalidFile.appendingPathComponent("model.safetensors"))
+        try Data(repeating: 0, count: 32).write(
+            to: invalidFile.appendingPathComponent("model.safetensors"))
         XCTAssertNil(VMLXDFlash2DrafterInfo.read(at: invalidFile))
     }
 
@@ -404,8 +419,9 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
         let dir = try makeDrafter()
         var s = settings(drafter: dir)
         s.mtp.dflash2BlockSize = 4
-        guard case .dflash2(_, let blockSize)? = s.resolvedMTPDraftStrategy(
-            configData: targetConfig(), jangConfig: nil, status: nil)
+        guard
+            case .dflash2(_, let blockSize)? = s.resolvedMTPDraftStrategy(
+                configData: targetConfig(), jangConfig: nil, status: nil)
         else {
             return XCTFail("expected .dflash2")
         }
