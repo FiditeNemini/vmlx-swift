@@ -29,16 +29,14 @@ struct Qwen35JANGHPreparation {
             ? try Data(contentsOf: sidecarURL) : nil
         guard JANGHModelPreparation.declaresCustomFormat(configuration: configurationData, sidecar: sidecarData)
         else { return nil }
-        // The authoritative JANGH header lives in config.json (`jangtq`). jang_config.json here is a chat/runtime
-        // sidecar that also carries a quantization summary, which the partition would (correctly) refuse as a
-        // second owner — pass it only when config.json has no header.
-        let sidecar: Data? = root["jangtq"] != nil ? nil : sidecarData
+        // Partition admission distinguishes the documented scalar summary from
+        // a second header/plan; never discard a declared conflicting sidecar.
         guard let text = root["text_config"] as? [String: Any],
             let hidden = text["hidden_size"] as? Int, let inter = text["intermediate_size"] as? Int,
             let layers = text["num_hidden_layers"] as? Int
         else { throw Qwen35JANGHError.invalid("qwen3_5 JANGH: missing text_config dimensions") }
         return Self(dense: try JANGHDenseModelPreparation(
-            qwen35Directory: directory, configuration: configurationData, sidecar: sidecar,
+            qwen35Directory: directory, configuration: configurationData, sidecar: sidecarData,
             hiddenSize: hidden, intermediateSize: inter, layerCount: layers))
     }
 

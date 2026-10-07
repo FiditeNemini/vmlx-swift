@@ -45,20 +45,44 @@ struct JANGHConfigurationPartition: Sendable {
         var header = try Self.optionalObject(root, "jangtq")
         if let sidecar {
             let other = try Self.object(sidecar)
-            // Do not identify the format using the legacy label alone.
-            guard other["format"] as? String == "jangtq2",
-                let version = other["format_version"],
-                try Self.encode(["v": version]) == Self.encode(["v": 2]),
-                let otherHeader = try Self.optionalObject(other, "jangtq")
-            else { throw Failure.invalid("unsupported or missing JANGH sidecar contract") }
-            if let header, try Self.encode(header) != Self.encode(otherHeader) {
-                throw Failure.invalid("conflicting config and sidecar JANGH headers")
+            if modelType == "qwen3_5", let authoritative = header {
+                // This converter's sidecar carries chat/runtime metadata and a
+                // scalar summary, not another per-module quantization owner.
+                let version = other["format_version"]
+                guard other["format"] as? String == "jangtq2", let version,
+                    try Self.encode(["v": version]) == Self.encode(["v": 2])
+                        || version as? String == "2.0"
+                else { throw Failure.invalid("unsupported dense Qwen JANGH sidecar version") }
+                if other["jangtq"] != nil {
+                    guard let declared = try Self.optionalObject(other, "jangtq"),
+                        try Self.encode(authoritative) == Self.encode(declared)
+                    else { throw Failure.invalid("conflicting config and sidecar JANGH headers") }
+                }
+                guard other["quantization_config"] == nil else {
+                    throw Failure.invalid("sidecar quantization ownership is not supported")
+                }
+                if let summary = try Self.optionalObject(other, "quantization") {
+                    guard Set(summary.keys).isSubset(of: ["bits", "group_size", "bit_widths_used"]),
+                        summary["bits"] is Int, summary["group_size"] is Int,
+                        summary["bit_widths_used"] is [Int]
+                    else { throw Failure.invalid("dense Qwen sidecar quantization must be summary metadata") }
+                }
+            } else {
+                // Do not identify the format using the legacy label alone.
+                guard other["format"] as? String == "jangtq2",
+                    let version = other["format_version"],
+                    try Self.encode(["v": version]) == Self.encode(["v": 2]),
+                    let otherHeader = try Self.optionalObject(other, "jangtq")
+                else { throw Failure.invalid("unsupported or missing JANGH sidecar contract") }
+                if let header, try Self.encode(header) != Self.encode(otherHeader) {
+                    throw Failure.invalid("conflicting config and sidecar JANGH headers")
+                }
+                // A quantization plan in a sidecar would introduce another unvalidated owner.
+                guard other["quantization"] == nil, other["quantization_config"] == nil else {
+                    throw Failure.invalid("sidecar quantization ownership is not supported")
+                }
+                header = otherHeader
             }
-            // A quantization plan in a sidecar would introduce another unvalidated owner.
-            guard other["quantization"] == nil, other["quantization_config"] == nil else {
-                throw Failure.invalid("sidecar quantization ownership is not supported")
-            }
-            header = otherHeader
         }
         guard let header else { throw Failure.invalid("missing authoritative JANGH header") }
         var canonical = root
