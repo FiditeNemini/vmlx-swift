@@ -1799,6 +1799,113 @@ struct MTPRuntimeFocusedTests {
             "try Task.checkCancellation()\n        MLX.eval(lastLogits, retained)"))
     }
 
+    /// Final sweep 2026-10-07: a single `mtp.fc.weight`, index-only names (shard missing or not containing the
+    /// key) and a header without payload all reported a complete head and auto-launched native MTP. Completeness
+    /// now needs tensors physically present in shard headers AND a head topology (fusion projection + compute block).
+    @Test("native MTP completeness needs physically present tensors and a real head topology")
+    func nativeMTPCompletenessRejectsPartialAndPhantomHeads() throws {
+        func bundle(_ name: String, index: [String: String]?, shards: [String: [String: Int]]) throws -> MTPBundleStatus {
+            let root = try makeTemporaryBundle(name: name)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let config: [String: Any] = ["model_type": "qwen4_exp", "num_hidden_layers": 4, "mtp_num_hidden_layers": 1]
+            try JSONSerialization.data(withJSONObject: config).write(to: root.appendingPathComponent("config.json"))
+            if let index {
+                try JSONSerialization.data(withJSONObject: ["weight_map": index])
+                    .write(to: root.appendingPathComponent("model.safetensors.index.json"))
+            }
+            // shards: file -> tensor -> payload bytes actually written (2 = complete, 0 = header only).
+            for (file, tensors) in shards {
+                var header: [String: Any] = [:]
+                var written = 0
+                for (i, entry) in tensors.sorted(by: { $0.key < $1.key }).enumerated() {
+                    header[entry.key] = ["dtype": "F16", "shape": [1], "data_offsets": [i * 2, i * 2 + 2]]
+                    written += entry.value
+                }
+                let bytes = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+                var length = UInt64(bytes.count).littleEndian
+                var data = withUnsafeBytes(of: &length) { Data($0) }
+                data.append(bytes)
+                data.append(Data(count: written))
+                try data.write(to: root.appendingPathComponent(file))
+            }
+            return try MTPBundleInspector.inspect(modelDirectory: root)
+        }
+        let head = [
+            "mtp.fc_hidden.weight": 2, "mtp.fc_embedding.weight": 2,
+            "mtp.layers.0.self_attn.q_proj.weight": 2, "mtp.layers.0.mlp.shared_expert.down_proj.weight": 2,
+            "model.layers.0.self_attn.q_proj.weight": 2,
+        ]
+        let shard = "model-00001-of-00001.safetensors"
+        let indexFor = { (names: [String: Int]) in names.mapValues { _ in shard } }
+
+        let complete = try bundle("mtp-complete", index: indexFor(head), shards: [shard: head])
+        #expect(complete.hasCompleteMTPArtifact)
+        #expect(complete.tensorCount == 4)
+
+        // Complete head physically in the indexed shard but omitted from the index: still discovered.
+        var partialIndex = indexFor(head)
+        partialIndex = partialIndex.filter { !$0.key.hasPrefix("mtp.") }
+        partialIndex["model.layers.0.self_attn.q_proj.weight"] = shard
+        let headerDiscovered = try bundle("mtp-header-discovered", index: partialIndex, shards: [shard: head])
+        #expect(headerDiscovered.hasCompleteMTPArtifact)
+
+        let fcOnly = try bundle(
+            "mtp-fc-only", index: nil,
+            shards: [shard: ["mtp.fc.weight": 2, "model.layers.0.self_attn.q_proj.weight": 2]])
+        #expect(fcOnly.bundleHasMTP)
+        #expect(!fcOnly.hasCompleteMTPArtifact)
+        #expect(fcOnly.incompleteTopologyReason == "no attention, mixer or MLP block")
+        #expect(!fcOnly.speculativeDecodeEnabled)
+
+        let missingShard = try bundle(
+            "mtp-index-missing-shard",
+            index: ["mtp.fc.weight": "model-00002-of-00002.safetensors", "model.layers.0.self_attn.q_proj.weight": shard],
+            shards: [shard: ["model.layers.0.self_attn.q_proj.weight": 2]])
+        #expect(!missingShard.bundleHasMTP)
+        #expect(!missingShard.hasCompleteMTPArtifact)
+
+        let notInShard = try bundle(
+            "mtp-index-not-in-shard",
+            index: ["mtp.fc.weight": shard, "mtp.layers.0.self_attn.q_proj.weight": shard],
+            shards: [shard: ["model.layers.0.self_attn.q_proj.weight": 2]])
+        #expect(!notInShard.bundleHasMTP)
+
+        var truncated = head
+        for key in truncated.keys where key.hasPrefix("mtp.") { truncated[key] = 0 }
+        truncated["model.layers.0.self_attn.q_proj.weight"] = 0
+        let headerOnly = try bundle("mtp-header-only", index: indexFor(head), shards: [shard: truncated])
+        #expect(!headerOnly.bundleHasMTP)
+        #expect(!headerOnly.hasCompleteMTPArtifact)
+
+        // A stray head file outside the index is not inspected.
+        let stray = try bundle(
+            "mtp-stray-file",
+            index: ["model.layers.0.self_attn.q_proj.weight": shard],
+            shards: [shard: ["model.layers.0.self_attn.q_proj.weight": 2], "mtp-extra.safetensors": head])
+        #expect(!stray.hasCompleteMTPArtifact)
+    }
+
+    @Test("MTP topology accepts every installed family layout")
+    func mtpTopologyAcceptsInstalledFamilyLayouts() {
+        // Flash-Next / Allosaurus (qwen4_exp), Qwen3.8-27B source, Ling, Nemotron Lightning.
+        #expect(MTPBundleInspector.mtpTopologyGap([
+            "mtp.fc_hidden.weight", "mtp.fc_embedding.weight", "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.mlp.experts.gate_up_proj.weight",
+        ]) == nil)
+        #expect(MTPBundleInspector.mtpTopologyGap([
+            "mtp.fc.weight", "mtp.layers.0.self_attn.q_proj.weight", "mtp.layers.0.mlp.down_proj.weight",
+        ]) == nil)
+        #expect(MTPBundleInspector.mtpTopologyGap([
+            "model.layers.20.eh_proj.weight", "model.layers.20.attention.query_key_value.weight",
+            "model.layers.20.mlp.experts.0.down_proj.weight",
+        ]) == nil)
+        #expect(MTPBundleInspector.mtpTopologyGap([
+            "mtp.layers.0.eh_proj.weight", "mtp.layers.0.enorm.weight", "mtp.layers.1.mixer.gate.weight",
+        ]) == nil)
+        #expect(MTPBundleInspector.mtpTopologyGap(["mtp.fc.weight"]) != nil)
+        #expect(MTPBundleInspector.mtpTopologyGap(["mtp.layers.0.self_attn.q_proj.weight"]) != nil)
+    }
+
     @Test("native MTP prefill has cancellation checkpoints around GPU materialization")
     func nativeMTPInitChecksCancellationBeforeGPUStages() throws {
         let testFile = URL(fileURLWithPath: #filePath)
@@ -1812,7 +1919,12 @@ struct MTPRuntimeFocusedTests {
             encoding: .utf8)
 
         #expect(source.contains(
-            "try Task.checkCancellation()\n        let prepared = try model.prepare("))
+            "try Task.checkCancellation()\n        let prepared = try prepareCapturingCacheBoundaries("))
+        // The boundary-capturing prefill checks between every chunk and before the tail.
+        #expect(source.contains(
+            "for boundary in wanted.sorted() {\n            try Task.checkCancellation()"))
+        #expect(source.contains(
+            "try Task.checkCancellation()\n        return try model.prepare(segment(consumed, size)"))
         #expect(source.contains(
             "try Task.checkCancellation()\n        let bridge = model.nativeBackboneForward"))
         #expect(source.contains(
@@ -3043,6 +3155,30 @@ struct MTPRuntimeFocusedTests {
             withJSONObject: object,
             options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url)
+        // The inspector counts only tensors physically present in shard headers (an index entry alone is not
+        // loadable), so an index fixture also writes header-only shards holding exactly its mapped tensors.
+        if url.lastPathComponent == "model.safetensors.index.json",
+            let weightMap = object["weight_map"] as? [String: Any]
+        {
+            try Self.writeHeaderOnlyShards(
+                weightMap.compactMapValues { $0 as? String }, in: url.deletingLastPathComponent())
+        }
+    }
+
+    /// One tiny F16 tensor per name; header byte ranges match the payload so the entries are physically valid.
+    static func writeHeaderOnlyShards(_ weightMap: [String: String], in directory: URL) throws {
+        for (file, names) in Dictionary(grouping: weightMap.keys, by: { weightMap[$0]! }) {
+            var header: [String: Any] = [:]
+            for (i, name) in names.sorted().enumerated() {
+                header[name] = ["dtype": "F16", "shape": [1], "data_offsets": [i * 2, i * 2 + 2]]
+            }
+            let bytes = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+            var length = UInt64(bytes.count).littleEndian
+            var data = withUnsafeBytes(of: &length) { Data($0) }
+            data.append(bytes)
+            data.append(Data(count: names.count * 2))
+            try data.write(to: directory.appendingPathComponent(file))
+        }
     }
 
     private static func source(_ relativePath: String) throws -> String {
