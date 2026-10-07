@@ -97,6 +97,12 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
 
     private var cache: [KVCache]
     private var draftCache: [KVCache]
+    /// Absolute position of the drafter cache's first row (see init). Rows in the drafter cache = committed
+    /// context rows after that base.
+    private var draftPositionBase = 0
+    /// All-sliding drafters see at most `window - 1` context rows; nil otherwise.
+    private var drafterContextLimit: Int?
+    private var committedDraftRows: Int { promptTokenIds.count + stats.emittedTokens - 1 - draftPositionBase }
     private let cacheCoordinator: CacheCoordinator?
 
     private let sampler: LogitSampler
@@ -619,6 +625,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
             config.layerTypes.allSatisfy { $0 == "sliding_attention" }
             ? (config.slidingWindow.map { $0 - 1 })
             : nil
+        self.drafterContextLimit = hiddenLimit
         // Same boundary rule as TokenIterator, so both iterators agree on
         // what the canonical cross-turn checkpoint is (hybrid SSM and
         // standalone rotating/SWA topologies).
@@ -702,12 +709,14 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         self.contextHidden = prefill.hidden
         self.stats.seededContextRows = prefill.hidden.dim(1)
 
-        // The drafter's cache starts counting where the retained hidden
-        // window starts, so its RoPE positions line up with the target's.
-        let hiddenOffset = self.cache.first.map { $0.offset - prefill.hidden.dim(1) } ?? 0
-        for c in self.draftCache {
-            c.offsetForDFlash2 = Swift.max(0, hiddenOffset)
-        }
+        // The drafter cache counts PHYSICAL rows from 0; the absolute position of its first row (the retained hidden
+        // window's start) is kept apart in `draftPositionBase`. Shifting an empty cache's offset instead left the
+        // drafter's RotatingKVCache with offset ahead of its fill: the next update returned `keys[..<offset]` with
+        // zero rows and `temporalOrder` treated the unwrapped ring as wrapped, so after ANY prefix restore (or a
+        // prompt longer than the drafter window) the drafter attended to zero rows and acceptance collapsed (27B
+        // JANGH2 prose follow-up 1.41 -> 0.22 accepted per cycle). Drafter RoPE is relative, so the base only
+        // matters for the committed-row accounting below.
+        self.draftPositionBase = Swift.max(0, self.cache.first.map { $0.offset - prefill.hidden.dim(1) } ?? 0)
 
         self.promptCacheSnapshot = self.cache.map { $0.copy() }
 
@@ -985,6 +994,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // the drafter's sliding window) must surface as a caught error and
         // an AR fallback, never as a degraded husk that dies on the next
         // host-side shape read.
+        clipDrafterContext()
         let proposal: DFlash2Proposal
         do {
             proposal = try withError {
@@ -1019,7 +1029,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         // The sliding clip inside drafter attention can advance the cache
         // offset past the committed token count. Pull it back so the next
         // round's RoPE offsets stay absolute.
-        let expectedDraftOffset = promptTokenIds.count + stats.emittedTokens - 1
+        let expectedDraftOffset = committedDraftRows
         if let head = draftCache.first, head.offset > expectedDraftOffset {
             let excess = head.offset - expectedDraftOffset
             for c in draftCache {
@@ -1274,6 +1284,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         var blockIds = [Int32(lastToken)]
         blockIds.append(contentsOf: Array(repeating: Int32(maskTokenID), count: rows - 1))
         let block = MLXArray(blockIds).reshaped(1, rows)
+        clipDrafterContext()
         let arrays: DFlash2LatticeArrays?
         do {
             arrays = try withError {
@@ -1293,9 +1304,21 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         return arrays
     }
 
+    /// A context chunk longer than an all-sliding drafter's window makes every row already in its cache fall out
+    /// of the window. Start the drafter cache over at the first kept row instead of letting the drafter's
+    /// in-attention clip advance the cache offset past its physical fill (the same offset/fill desync as the old
+    /// init shift).
+    private mutating func clipDrafterContext() {
+        guard let limit = drafterContextLimit, contextHidden.dim(1) > limit else { return }
+        let skip = contextHidden.dim(1) - limit
+        draftPositionBase += (draftCache.first?.offset ?? 0) + skip
+        draftCache = drafter.makeCache()
+        contextHidden = contextHidden[0..., skip..., 0...]
+    }
+
     /// Pull the drafter cache back to the committed context (it advanced by a lattice block).
     private mutating func trimDraftCacheToCommitted() {
-        let expectedDraftOffset = promptTokenIds.count + stats.emittedTokens - 1
+        let expectedDraftOffset = committedDraftRows
         for c in draftCache where c.offset > expectedDraftOffset {
             let excess = c.offset - expectedDraftOffset
             if c.isTrimmable {
@@ -1442,7 +1465,7 @@ struct DFlash2TokenIterator: TokenIteratorProtocol {
         for layer in cache { (layer as? MambaCache)?.clearVerifyStaging() }
         stagedWarmedSizes.removeAll(keepingCapacity: true)
         // The drafter cache also advanced for the abandoned block.
-        let expectedDraftOffset = promptTokenIds.count + stats.emittedTokens - 1
+        let expectedDraftOffset = committedDraftRows
         for c in draftCache where c.offset > expectedDraftOffset {
             let excess = c.offset - expectedDraftOffset
             if c.isTrimmable {

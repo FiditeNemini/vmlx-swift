@@ -282,6 +282,45 @@ func runSpeedProbe(modelPath: String) async throws {
         }
         return
     }
+    // BENCH_SPEED_PROSECONV=1: the live-app prose follow-up shape — essay, then a second essay with the first in
+    // history. Run with and without BENCH_SPEED_CACHE_DIR to separate "restored prefix" from "history content".
+    if env["BENCH_SPEED_PROSECONV"] == "1" {
+        _ = try await run("Say hi.", 16, cat: "warmup")
+        let q1 = "Write a 400-word essay on how the printing press changed European society. Plain prose, no headings."
+        let q2 = "Now write a 400-word essay on how the steam engine changed daily life. Plain prose, no headings."
+        var answer = ""
+        for turn in 0 ..< 2 {
+            var chat: [Chat.Message] = [.user(q1)]
+            if turn == 1 { chat += [.assistant(answer), .user(q2)] }
+            var input = UserInput(chat: chat)
+            input.additionalContext = ["enable_thinking": false]
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let prepared = try await ctx.processor.prepare(input: input)
+            nonisolated(unsafe) let send = prepared
+            let stream = await engine.generate(input: send, parameters: params(maxTokens))
+            var text = ""
+            var first: Double?
+            var tokens = 0
+            var genTime = 0.0
+            for await ev in stream {
+                switch ev {
+                case .chunk(let c):
+                    if first == nil { first = CFAbsoluteTimeGetCurrent() }
+                    text += c
+                case .info(let info):
+                    tokens = info.generationTokenCount
+                    genTime = info.generateTime
+                default: break
+                }
+            }
+            if turn == 0 { answer = text }
+            print(String(
+                format: "[BENCH_SPEED_PROSECONV] turn=%d tokens=%d decode_tok_s=%.2f ttft=%.2f text=%@",
+                turn + 1, tokens, genTime > 0 ? Double(tokens) / genTime : 0,
+                (first ?? t0) - t0, String(reflecting: String(text.prefix(160)))))
+        }
+        return
+    }
     _ = try await run("Say hi.", 16, cat: "warmup")
     var summary: [String: [Double]] = [:]
     var lines: [String] = []
