@@ -278,6 +278,13 @@ public final class JSONSchemaGrammar: @unchecked Sendable {
             }
             if let properties = object["properties"] {
                 guard let properties = properties as? [String: Any] else { throw JSONSchemaGrammarError.invalidSchema("Invalid properties at \(path)") }
+                // The donor additional-property grammar can repeat a named key
+                // with an unconstrained value. Require explicit closure; never
+                // silently change the caller's additionalProperties semantics.
+                if !properties.isEmpty,
+                   object["additionalProperties"].flatMap(boolean) != false {
+                    try fail(path, "named properties require additionalProperties:false")
+                }
                 for (key, child) in properties { try walk(child, path + "/properties/" + component(key), depth + 1) }
             }
             if let required = object["required"] {

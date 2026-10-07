@@ -23,14 +23,16 @@ Active reasoning envelopes and tool-call envelopes are not qualified and are exp
 Admitted structures:
 
 - Primitive `type`, or a nonempty distinct array of primitive type names; `true`/empty schemas.
-- Object `properties`, `required` and boolean/schema `additionalProperties`. Required names must be declared properties. Object constraints require an explicit object type.
+- Object `properties`, `required` and boolean/schema `additionalProperties`. Required names must be declared properties. Nonempty named `properties` require explicit `additionalProperties:false`. Object constraints require an explicit object type.
 - Array schema `items`, `minItems` and `maxItems` (integer bounds 0...1024). Array constraints require an explicit array type.
 - `enum` or `const`, optionally with a consistent type, without other constraint siblings. Enums contain 1...1024 values.
 - `anyOf` with 1...128 branches and no other constraint siblings.
 - `$defs`/`definitions` and acyclic local `$ref` (simple `#/...` schema paths), without constraint siblings. Escaped/percent-encoded pointers, external references, cycles, and targets inside annotations or instance data are rejected. All reference chains are resolved against validated schema locations.
 - Annotation fields `title`, `description`, `$comment`, `default`, `examples`; these do not constrain output. Explicit `$schema` dialect declarations are rejected until a dialect is qualified.
 
-Omitted `additionalProperties` follows JSON Schema's permissive default. The bridge explicitly compiles with `strict_mode=false`; it does not silently insert `additionalProperties:false`.
+Generic objects without named properties retain the permissive default when `additionalProperties` is omitted. The bridge explicitly compiles with `strict_mode=false`; it does not silently insert `additionalProperties:false`.
+
+Nonempty named-property schemas with omitted, true or schema-valued `additionalProperties` are rejected. The pinned donor can otherwise admit a repeated named key through its additional-property rule with the wrong value type; a CPU matcher reproduction confirmed this bypass. The runtime does not silently close such schemas.
 
 Rejected features include `oneOf`, `allOf`, `not`, conditionals, dependencies, numeric bounds/`multipleOf`, `uniqueItems`, `contains`, `pattern`, `format`, `minLength`, `maxLength`, and unknown keywords. `false` schemas are rejected rather than compiling an empty language. Schema input is limited to 1 MiB, nesting depth 64 and 10,000 visited nodes.
 

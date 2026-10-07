@@ -50,10 +50,37 @@ final class JSONSchemaGrammarTests: XCTestCase {
         XCTAssertTrue(try grammar.independentCopy().isTerminated())
     }
 
-    func testOmittedAdditionalPropertiesUsesJSONSchemaDefault() throws {
-        let grammar = try JSONSchemaGrammar(tokenizer: tokenizer(), schema: ##"{"type":"object"}"##)
-        try feed(grammar, [1, 3, 15, 3, 5, 6, 2, 0])
+    func testNamedPropertiesRequireExplicitClosedObject() throws {
+        let schemas = [
+            ##"{"type":"object","properties":{"answer":{"type":"boolean"}},"required":["answer"]}"##,
+            ##"{"type":"object","properties":{"answer":{"type":"boolean"}},"additionalProperties":true}"##,
+            ##"{"type":"object","properties":{"answer":{"type":"boolean"}},"additionalProperties":{"type":"null"}}"##,
+        ]
+        for schema in schemas {
+            XCTAssertThrowsError(try JSONSchemaGrammar.validateSupportedSchema(schema)) { error in
+                guard case JSONSchemaGrammarError.unsupportedSchema(let path, let keyword) = error else {
+                    return XCTFail("Expected typed unsupported schema, got \(error)")
+                }
+                XCTAssertEqual(path, "#")
+                XCTAssertEqual(keyword, "named properties require additionalProperties:false")
+            }
+        }
+        // With the explicitly closed schema the additional-property branch is
+        // absent: a second occurrence cannot bypass the named value's type.
+        let grammar = try JSONSchemaGrammar(tokenizer: tokenizer(), schema: schema)
+        try feed(grammar, [1, 3, 4, 3, 5, 6])
+        XCTAssertFalse(allows(try grammar.nextTokenMask(), 11))
+        XCTAssertThrowsError(try grammar.accept(tokenID: 11))
+        try feed(grammar, [2, 0])
         XCTAssertTrue(try grammar.isTerminated())
+    }
+
+    func testOmittedAdditionalPropertiesUsesJSONSchemaDefault() throws {
+        for schema in [##"{"type":"object"}"##, ##"{"type":"object","properties":{}}"##] {
+            let grammar = try JSONSchemaGrammar(tokenizer: tokenizer(), schema: schema)
+            try feed(grammar, [1, 3, 15, 3, 5, 6, 2, 0])
+            XCTAssertTrue(try grammar.isTerminated())
+        }
     }
 
     func testSupportedNestedSchemasAndReferences() throws {
@@ -62,7 +89,7 @@ final class JSONSchemaGrammarTests: XCTestCase {
             ##"{"type":["string","null"],"enum":["x",null]}"##,
             ##"{"anyOf":[{"type":"boolean"},{"type":"null"}]}"##,
             ##"{"$defs":{"flag":{"type":"boolean"}},"$ref":"#/$defs/flag"}"##,
-            ##"{"type":"object","properties":{"not":{"type":"string"}},"required":["not"]}"##,
+            ##"{"type":"object","properties":{"not":{"type":"string"}},"required":["not"],"additionalProperties":false}"##,
         ] {
             try JSONSchemaGrammar.validateSupportedSchema(schema)
             _ = try JSONSchemaGrammar(tokenizer: tokenizer(), schema: schema)
