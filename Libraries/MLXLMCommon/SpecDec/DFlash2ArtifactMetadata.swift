@@ -6,7 +6,7 @@ public enum DFlash2ArtifactMetadata {
     public static func requiredShapes(configData: Data) throws -> [String: [Int]] {
         guard let root = try JSONSerialization.jsonObject(with: configData) as? [String: Any],
             let heads = root["num_attention_heads"] as? Int, heads > 0,
-            let layers = root["num_hidden_layers"] as? Int, layers > 0
+            let layers = root["num_hidden_layers"] as? Int, layers > 0, layers <= 1024
         else { throw DFlash2LoadError.targetMismatch("invalid attention dimensions") }
         let c = try DFlash2Configuration(json: root)
         guard c.isDFlash2, c.hiddenSize > 0, c.numHiddenLayers > 0,
@@ -15,12 +15,23 @@ public enum DFlash2ArtifactMetadata {
             c.hiddenSize % c.dflash.convGroupSize == 0,
             !c.targetLayerIds.isEmpty, c.targetLayerIds.allSatisfy({ $0 >= 0 })
         else { throw DFlash2LoadError.targetMismatch("invalid drafter dimensions") }
+        func product(_ dimensions: Int...) throws -> Int {
+            var value = 1
+            for dimension in dimensions {
+                let result = value.multipliedReportingOverflow(by: dimension)
+                guard dimension > 0, !result.overflow else {
+                    throw DFlash2LoadError.targetMismatch("drafter dimension overflow")
+                }
+                value = result.partialValue
+            }
+            return value
+        }
         let h = c.hiddenSize
         let d = c.headDim
         let rank = c.dflash.selectorRank
         var shapes: [String: [Int]] = [
             "norm.weight": [h], "hidden_norm.weight": [h],
-            "fc.weight": [h, c.targetLayerIds.count * h],
+            "fc.weight": [h, try product(c.targetLayerIds.count, h)],
             "candidate_selector.predecessor_codebook.weight": [c.vocabSize, rank],
             "candidate_selector.successor_codebook.weight": [c.vocabSize, rank],
             "candidate_selector.hidden_projection.weight": [rank, h],
@@ -28,10 +39,10 @@ public enum DFlash2ArtifactMetadata {
         for i in 0 ..< c.numHiddenLayers {
             let p = "layers.\(i)."
             for (name, shape) in [
-                "self_attn.q_proj.weight": [c.numAttentionHeads * d, h],
-                "self_attn.k_proj.weight": [c.numKeyValueHeads * d, h],
-                "self_attn.v_proj.weight": [c.numKeyValueHeads * d, h],
-                "self_attn.o_proj.weight": [h, c.numAttentionHeads * d],
+                "self_attn.q_proj.weight": [try product(c.numAttentionHeads, d), h],
+                "self_attn.k_proj.weight": [try product(c.numKeyValueHeads, d), h],
+                "self_attn.v_proj.weight": [try product(c.numKeyValueHeads, d), h],
+                "self_attn.o_proj.weight": [h, try product(c.numAttentionHeads, d)],
                 "self_attn.q_norm.weight": [d], "self_attn.k_norm.weight": [d],
                 "input_layernorm.weight": [h], "post_attention_layernorm.weight": [h],
                 "mlp.gate_proj.weight": [c.intermediateSize, h],
@@ -41,9 +52,14 @@ public enum DFlash2ArtifactMetadata {
             for name in ["attention_conv", "mlp_conv"] {
                 shapes[p + name + ".base_kernel"] = [2, c.dflash.convKernelSize, h]
                 shapes[p + name + ".kernel_projection.weight"] = [
-                    2 * c.dflash.convKernelSize * (h / c.dflash.convGroupSize), h,
+                    try product(2, c.dflash.convKernelSize, h / c.dflash.convGroupSize), h,
                 ]
             }
+        }
+        // Validate storage dimensions too, before any later packed-width arithmetic.
+        for shape in shapes.values {
+            var elements = 4
+            for dimension in shape { elements = try product(elements, dimension) }
         }
         return shapes
     }
@@ -114,8 +130,13 @@ public enum DFlash2ArtifactMetadata {
                         let quant, (quant["mode"] as? String ?? "affine") == "affine",
                         let bits = quant["bits"] as? Int, [2, 3, 4, 5, 6, 8].contains(bits),
                         let group = quant["group_size"] as? Int, group > 0,
-                        shape[1] % group == 0, shape[1] * bits % 32 == 0,
-                        tensor.shape == [shape[0], shape[1] * bits / 32],
+                        shape[1] % group == 0,
+                        !shape[1].multipliedReportingOverflow(by: bits).overflow,
+                        shape[1].multipliedReportingOverflow(by: bits).partialValue % 32 == 0,
+                        tensor.shape == [
+                            shape[0],
+                            shape[1].multipliedReportingOverflow(by: bits).partialValue / 32,
+                        ],
                         scales.shape == [shape[0], shape[1] / group],
                         ["F16", "BF16", "F32"].contains(scales.dtype),
                         let biases = tensors[prefix + ".biases"], biases.shape == scales.shape,

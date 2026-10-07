@@ -79,6 +79,32 @@ final class DFlash2DrafterSelectionTests: XCTestCase {
         return dir
     }
 
+    func testExtremeDimensionsRejectWithoutOverflowOrHugeAllocation() throws {
+        let directory = try makeDrafter(withWeights: false)
+        let url = directory.appendingPathComponent("config.json")
+        let baseline =
+            try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        for key in [
+            "hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+            "head_dim", "intermediate_size", "vocab_size",
+        ] {
+            var config = baseline
+            config[key] = Int.max
+            XCTAssertThrowsError(
+                try DFlash2ArtifactMetadata.requiredShapes(
+                    configData: JSONSerialization.data(withJSONObject: config)), key)
+        }
+        for key in ["conv_kernel_size", "selector_rank"] {
+            var config = baseline
+            var inner = config["dflash_config"] as! [String: Any]
+            inner[key] = Int.max
+            config["dflash_config"] = inner
+            XCTAssertThrowsError(
+                try DFlash2ArtifactMetadata.requiredShapes(
+                    configData: JSONSerialization.data(withJSONObject: config)), key)
+        }
+    }
+
     private func writeCompleteWeights(at dir: URL, omit: String? = nil, packed: Bool = false) throws
     {
         let configURL = dir.appendingPathComponent("config.json")
