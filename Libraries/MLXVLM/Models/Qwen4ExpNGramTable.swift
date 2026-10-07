@@ -238,8 +238,17 @@ final class Qwen4ExpNGramTable: @unchecked Sendable {
     /// sparse SSD lookup table and only the rows actually touched enter the page cache. The full warm only
     /// buys faster COLD prefill (Python measured 3-6x on 1.8k-6.7k-token prompts), so it is spent only when
     /// it cannot compete with the weights. This never refuses or delays a load — it only skips a speedup.
+    ///
+    /// DEFAULT OFF (Eric, 2026-10-07): the n-gram table stays on SSD for every bundle. A full warm pulls the
+    /// table's backing files (18-54 GB on Flash-Next / Allosaurus) into RAM for nothing but faster cold prefill,
+    /// which is exactly the "whole model size in RAM" the memory contract forbids. `VMLX_QWEN4_PLE_WARM=1`
+    /// forces it (and `=0` disables it). The size gate below is kept for an explicit `VMLX_QWEN4_PLE_WARM=auto`.
     static func shouldWarm(modelDirectory: URL) -> Bool {
         if let forced = warmOverride { return forced }
+        guard ProcessInfo.processInfo.environment["VMLX_QWEN4_PLE_WARM"]?.lowercased() == "auto" else {
+            log("page-cache warm off (default; n-gram rows are read from SSD on demand)")
+            return false
+        }
         let fm = FileManager.default
         var bundleBytes: UInt64 = 0
         if let names = try? fm.contentsOfDirectory(atPath: modelDirectory.path) {
