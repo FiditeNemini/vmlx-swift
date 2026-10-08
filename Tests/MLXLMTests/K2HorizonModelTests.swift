@@ -87,6 +87,56 @@ final class K2HorizonModelTests: XCTestCase {
         }
     }
 
+    /// The cached unit weight must not change a single bit versus building
+    /// `ones` per call (the previous implementation).
+    func testGroupedNormCachedUnitWeightIsBitIdentical() throws {
+        try MLXMetalTestLock.withLock {
+            for dtype in [DType.bfloat16, .float32] {
+                let norm = K2GroupedRMSNorm(dimensions: 4096, groups: 4, eps: 1e-6)
+                let weight = MLXRandom.normal([4096], key: MLXRandom.key(7)).asType(dtype)
+                try norm.update(
+                    parameters: ModuleParameters.unflattened(["weight": weight]), verify: [.all])
+                for rows in [1, 3] {
+                    let x = (MLXRandom.normal([1, rows, 4096], key: MLXRandom.key(UInt64(rows))) * 4)
+                        .asType(dtype)
+                    let reference = MLXFast.rmsNorm(
+                        x.reshaped([1, rows, 4, 1024]),
+                        weight: MLXArray.ones([1024], dtype: dtype), eps: 1e-6
+                    ).reshaped(x.shape) * weight
+                    for _ in 0 ..< 2 {  // first call fills the cache, second reuses it
+                        let actual = norm(x)
+                        XCTAssertEqual(actual.dtype, reference.dtype)
+                        XCTAssertTrue(
+                            MLX.all(actual .== reference).item(Bool.self),
+                            "grouped norm differs for \(dtype) rows=\(rows)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cold grouped normalization through the unscoped compile closure used by
+    /// BatchCompile.compileForward. No checkpoint or model allocation is needed.
+    func testColdGroupedNormBatchCompileTrace() throws {
+        try MLXMetalTestLock.withLock {
+            let norm = K2GroupedRMSNorm(dimensions: 8, groups: 4, eps: 1e-6)
+            let x = MLXArray([Float(1), 2, 3, 4, 5, 6, 7, 8], [1, 1, 8])
+            eval(x, norm.weight)
+            // Do not run norm eagerly first: that would conceal a cold-cache
+            // eval during tracing by warming the dtype/count entry.
+            let forward: @Sendable ([MLXArray]) -> [MLXArray] = compile {
+                (args: [MLXArray]) -> [MLXArray] in [norm(args[0])]
+            }
+            let actual = forward([x])[0]
+            eval(actual)
+            let expected = MLXFast.rmsNorm(
+                x.reshaped([1, 1, 4, 2]), weight: MLXArray.ones([2]), eps: 1e-6
+            ).reshaped(x.shape) * norm.weight
+            XCTAssertEqual(actual.shape, x.shape)
+            XCTAssertTrue(MLX.all(actual .== expected).item(Bool.self))
+        }
+    }
+
     private func deterministicModel(dtype: DType = .float32) throws -> K2HorizonModel {
         let model = try K2HorizonModel(configuration())
         var weights: [String: MLXArray] = [:]
