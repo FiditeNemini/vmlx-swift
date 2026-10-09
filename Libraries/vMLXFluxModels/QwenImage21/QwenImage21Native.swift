@@ -18,6 +18,7 @@
 //   - timestep quantized through bf16 before the time embedding
 //
 
+import CoreFoundation
 import Foundation
 @preconcurrency import MLX
 import MLXNN
@@ -1110,6 +1111,37 @@ final class QwenImage21VAE {
 // MARK: - Scheduler
 
 enum QwenImage21Schedule {
+    /// The bundle's fixed sigma grid, `model_index.json` `sample_sigmas` (Qwen-Image-2.1-Turbo: 8 distilled
+    /// nodes). Diffusers (PR #14950) passes it to FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas:);
+    /// with the Turbo scheduler config (shift 1.0, no dynamic shifting, no terminal shift) the nodes are
+    /// used unchanged and a terminal 0 is appended. Nil when the bundle defines no grid (Qwen-Image-2.1).
+    static func sampleSigmas(modelPath: URL) throws -> [Float]? {
+        let url = modelPath.appendingPathComponent("model_index.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let data = try Data(contentsOf: url)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw FluxError.invalidRequest("Qwen-Image-2.1 model_index.json must be an object.")
+        }
+        guard let raw = json["sample_sigmas"] else { return nil }
+        guard let values = raw as? [NSNumber], values.count >= 2,
+            values.allSatisfy({ CFGetTypeID($0) != CFBooleanGetTypeID() })
+        else {
+            throw FluxError.invalidRequest("sample_sigmas must contain at least two numeric sigma nodes.")
+        }
+        let grid = values.map { $0.floatValue }
+        guard grid.allSatisfy({ $0.isFinite && $0 > 0 && $0 <= 1 }),
+            zip(grid, grid.dropFirst()).allSatisfy({ $0.0 > $0.1 })
+        else {
+            throw FluxError.invalidRequest("sample_sigmas must be finite, strictly decreasing nodes in (0, 1].")
+        }
+        return grid
+    }
+
+    /// Fixed grid + terminal 0, unshifted.
+    static func sigmas(grid: [Float]) -> MLXArray {
+        MLXArray(grid + [0])
+    }
+
     /// mflux LinearScheduler with resolution shift (base 0.5@256 → max 0.9@8192) and terminal 0.02.
     static func sigmas(steps: Int, width: Int, height: Int) -> MLXArray {
         let n = steps
@@ -1178,8 +1210,12 @@ final class QwenImage21Pipeline: @unchecked Sendable {
     private let processor: QwenImage21Processor
     private var debugDump: [String: MLXArray] = [:]
 
-    init(modelPath: URL, loaded: LoadedWeights) async throws {
+    /// Fixed sampling grid from the bundle (Turbo); nil = shifted linear schedule over `steps`.
+    let sampleSigmas: [Float]?
+
+    init(modelPath: URL, loaded: LoadedWeights, sampleSigmas: [Float]?) async throws {
         cfg = try QwenImage21Config.load(modelPath)
+        self.sampleSigmas = sampleSigmas
         let store = MFluxStore(loaded)
         transformer = try QwenImage21Transformer(store: store, cfg: cfg)
         textEncoder = try QwenImage21TextEncoder(store: store, cfg: cfg)
@@ -1224,9 +1260,11 @@ final class QwenImage21Pipeline: @unchecked Sendable {
     func generate(
         prompt: String, negativePrompt: String?, references: [URL],
         width requestedWidth: Int?, height requestedHeight: Int?,
-        steps: Int, guidance: Float, seed: UInt64, outputResolution: Int = 1024,
+        steps requestedSteps: Int, guidance: Float, seed: UInt64, outputResolution: Int = 1024,
         progress: (Int, Int, Double?) -> Void
     ) throws -> MLXArray {
+        // A bundle with a fixed grid (Turbo) samples on it: the grid sets the step count, as in diffusers.
+        let steps = sampleSigmas?.count ?? requestedSteps
         guard references.count <= 10 else {
             throw FluxError.invalidRequest("Qwen-Image-2.1 supports at most 10 reference images.")
         }
@@ -1282,7 +1320,8 @@ final class QwenImage21Pipeline: @unchecked Sendable {
         let hLat = height / 16, wLat = width / 16
         var latents = MLXRandom.normal([1, cfg.zDim, 1, hLat, wLat], key: noiseKey).asType(dtype)
         latents = latents[0..., 0..., 0, 0..., 0...].transposed(0, 2, 3, 1).reshaped([1, hLat * wLat, cfg.zDim])
-        let sigmas = QwenImage21Schedule.sigmas(steps: steps, width: width, height: height)
+        let sigmas = sampleSigmas.map { QwenImage21Schedule.sigmas(grid: $0) }
+            ?? QwenImage21Schedule.sigmas(steps: steps, width: width, height: height)
         eval(sigmas)
         let dumpURL = ProcessInfo.processInfo.environment["VMLX_QWEN21_DUMP"].map { URL(fileURLWithPath: $0) }
         var dump: [String: MLXArray] = debugDump
